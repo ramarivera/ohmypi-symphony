@@ -46,8 +46,18 @@ class FakeWorker implements RpcWorker {
   readonly followUps: string[] = [];
   aborted = false;
   readonly #listeners = new Set<(event: RpcEvent) => void>();
+  constructor(readonly localOnly = false) {}
   async start(): Promise<void> {}
   async prompt(message: string): Promise<boolean> {
+    if (this.localOnly) {
+      this.prompts.push(message);
+      this.emit({
+        type: "prompt_result",
+        id: "local-prompt",
+        agentInvoked: false,
+      });
+      return true;
+    }
     this.prompts.push(message);
     this.isStreaming = true;
     this.emit({
@@ -115,6 +125,7 @@ let linear: FakeLinear;
 let workspace: FakeWorkspace;
 let workers: FakeWorker[];
 let workerRuns: AgentRunRecord[];
+let nextWorkerLocalOnly: boolean;
 let authority: SessionAuthority;
 
 beforeEach(async () => {
@@ -134,13 +145,15 @@ beforeEach(async () => {
   workspace = new FakeWorkspace();
   workers = [];
   workerRuns = [];
+  nextWorkerLocalOnly = false;
   authority = new SessionAuthority({
     store,
     projector: new ActivityProjector(store, linear),
     workspaces: workspace,
     workerFactory: ({ run }) => {
       workerRuns.push(run);
-      const worker = new FakeWorker();
+      const worker = new FakeWorker(nextWorkerLocalOnly);
+      nextWorkerLocalOnly = false;
       workers.push(worker);
       return worker;
     },
@@ -188,6 +201,27 @@ describe("SessionAuthority", () => {
       ),
     ).toBeTrue();
   });
+
+  test("settles a deferred local-only prompt without waiting for agent_end", async () => {
+    nextWorkerLocalOnly = true;
+    created();
+
+    await authority.processSession("session");
+    await authority.processRunnable();
+
+    expect(workers[0]?.prompts).toEqual(["Implement the issue"]);
+    expect(store.getRun("session")).toMatchObject({
+      state: "waiting",
+      ompSessionFile: "/session.jsonl",
+    });
+    expect(
+      linear.activities.some(
+        (activity) =>
+          activity.content.type === "thought" &&
+          activity.content.body?.includes("completed without starting"),
+      ),
+    ).toBeTrue();
+  });
   test("requeues a prompt after completion and resumes the saved OMP session", async () => {
     created();
     await authority.processSession("session");
@@ -213,6 +247,55 @@ describe("SessionAuthority", () => {
     expect(workers).toHaveLength(2);
     expect(workers[1]?.prompts).toEqual(["Now add tests"]);
     expect(workerRuns[1]?.ompSessionFile).toBe("/session.jsonl");
+  });
+
+  test("resumes an orphaned worker after gateway restart", async () => {
+    created();
+    store.markInputProcessed("session-created");
+    store.updateRun("session", {
+      state: "running",
+      repositoryId: "repo",
+      workspacePath: "/safe/workspace",
+      ompSessionId: "omp-session",
+      ompSessionFile: "/session.jsonl",
+      incrementAttempt: true,
+    });
+    expect(store.claimRun("session", "dead-process", 60_000, 1_000)).toBeTrue();
+    store.recoverInterruptedRuns(2_000);
+
+    await authority.processSession("session");
+
+    expect(workerRuns).toHaveLength(1);
+    expect(workerRuns[0]?.ompSessionFile).toBe("/session.jsonl");
+    expect(workers[0]?.followUps).toEqual([
+      "Continue the interrupted Linear task from the saved session state.",
+    ]);
+    expect(store.getRun("session")?.state).toBe("running");
+  });
+
+  test("aborts an active worker before confirming a stop", async () => {
+    nextWorkerLocalOnly = true;
+    created();
+    await authority.processSession("session");
+    await authority.processRunnable();
+    expect(authority.activeWorkerCount()).toBe(1);
+
+    store.enqueueInput({
+      id: "stop",
+      sessionId: "session",
+      kind: "stop",
+      body: "",
+      payload: {},
+    });
+    await authority.processSession("session");
+    await linear.terminal.promise;
+
+    expect(workers[0]?.aborted).toBeTrue();
+    expect(authority.activeWorkerCount()).toBe(0);
+    expect(store.getRun("session")?.state).toBe("canceled");
+    expect(linear.activities.at(-1)).toMatchObject({
+      content: { type: "response", body: "Stopped as requested." },
+    });
   });
 
   test("stop dominates queued work without creating a worker", async () => {

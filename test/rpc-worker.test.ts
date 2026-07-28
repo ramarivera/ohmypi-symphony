@@ -39,6 +39,28 @@ describe("OhMyPiRpcWorker", () => {
     expect(worker.sessionId).toBe("omp-test");
     await worker.stop();
   });
+  test("emits deferred local-only prompt completion", async () => {
+    const worker = new OhMyPiRpcWorker({
+      command: [
+        process.execPath,
+        join(import.meta.dir, "fixtures/fake-rpc.ts"),
+      ],
+      cwd: process.cwd(),
+      env: Bun.env,
+    });
+    const completed = Promise.withResolvers<RpcEvent>();
+    worker.onEvent((event) => {
+      if (event.type === "prompt_result") completed.resolve(event);
+    });
+    await worker.start();
+    expect(await worker.prompt("local command")).toBeTrue();
+    expect(await completed.promise).toMatchObject({
+      type: "prompt_result",
+      agentInvoked: false,
+    });
+    await worker.stop();
+  });
+
   test("surfaces a late prompt scheduling failure as an agent error event", async () => {
     const worker = new OhMyPiRpcWorker({
       command: [

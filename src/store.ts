@@ -316,33 +316,54 @@ export class GatewayStore {
       .run(at, organizationId);
   }
 
-  async applyPermissionChange(
+  applyPermissionChange(
     organizationId: string,
     appUserId: string,
     addedTeamIds: readonly string[],
     removedTeamIds: readonly string[],
     canAccessAllPublicTeams: boolean,
     at = Date.now(),
-  ): Promise<void> {
-    const installation = await this.getInstallation(organizationId);
-    if (!installation) return;
-    if (installation.appUserId !== appUserId) return;
-    const teamIds = new Set(installation.accessibleTeamIds ?? []);
-    for (const teamId of addedTeamIds) teamIds.add(teamId);
-    for (const teamId of removedTeamIds) teamIds.delete(teamId);
-    await this.putInstallation({
-      ...installation,
-      accessibleTeamIds: [...teamIds].sort(),
-      canAccessAllPublicTeams,
-    });
-    for (const teamId of removedTeamIds) {
+  ): boolean {
+    return this.#db.transaction(() => {
+      const row = this.#db
+        .query<{ accessible_team_ids_json: string | null }, [string, string]>(
+          "SELECT accessible_team_ids_json FROM installation WHERE organization_id=? AND app_user_id=?",
+        )
+        .get(organizationId, appUserId);
+      if (!row) return false;
+
+      const teamIds = new Set(
+        row.accessible_team_ids_json === null
+          ? []
+          : parseStringArray(
+              row.accessible_team_ids_json,
+              "installation team access",
+            ),
+      );
+      for (const teamId of addedTeamIds) teamIds.add(teamId);
+      for (const teamId of removedTeamIds) teamIds.delete(teamId);
       this.#db
         .query(`
-        UPDATE agent_run SET desired_state='canceled', updated_at=?
-        WHERE organization_id=? AND team_id=? AND state NOT IN ('succeeded','failed','canceled')
-      `)
-        .run(at, organizationId, teamId);
-    }
+          UPDATE installation
+          SET accessible_team_ids_json=?, can_access_all_public_teams=?
+          WHERE organization_id=? AND app_user_id=?
+        `)
+        .run(
+          JSON.stringify([...teamIds].sort()),
+          Number(canAccessAllPublicTeams),
+          organizationId,
+          appUserId,
+        );
+      for (const teamId of removedTeamIds) {
+        this.#db
+          .query(`
+            UPDATE agent_run SET desired_state='canceled', updated_at=?
+            WHERE organization_id=? AND team_id=? AND state NOT IN ('succeeded','failed','canceled')
+          `)
+          .run(at, organizationId, teamId);
+      }
+      return true;
+    })();
   }
 
   createOAuthState(hash: string, expiresAt: number, now = Date.now()): void {
@@ -421,6 +442,16 @@ export class GatewayStore {
         "UPDATE webhook_delivery SET status=?, error=? WHERE delivery_id=?",
       )
       .run(status, error ?? null, id);
+  }
+
+  recoverPendingDeliveries(
+    reason = "Gateway restarted before webhook processing completed",
+  ): number {
+    return this.#db
+      .query(
+        "UPDATE webhook_delivery SET status='failed', error=? WHERE status='pending'",
+      )
+      .run(reason).changes;
   }
 
   createRun(input: {
@@ -598,6 +629,28 @@ export class GatewayStore {
         "UPDATE agent_run SET lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE session_id=? AND lease_owner=?",
       )
       .run(Date.now(), sessionId, owner);
+  }
+
+  recoverInterruptedRuns(now = Date.now()): number {
+    const result = this.#db
+      .query(`
+        UPDATE agent_run
+        SET state=CASE
+              WHEN desired_state='canceled' THEN 'stopping'
+              WHEN state IN ('starting','running') THEN 'orphaned'
+              ELSE state
+            END,
+            next_attempt_at=CASE
+              WHEN desired_state='running' AND state IN ('starting','running') THEN ?
+              ELSE next_attempt_at
+            END,
+            lease_owner=NULL,
+            lease_expires_at=NULL,
+            updated_at=?
+        WHERE state NOT IN ('succeeded','failed','canceled')
+      `)
+      .run(now, now);
+    return result.changes;
   }
 
   updateRun(

@@ -15,6 +15,8 @@ const [store, repositoryMap] = await Promise.all([
   GatewayStore.open(config.databasePath, config.tokenEncryptionKey),
   loadRepositoryMap(config.repositoryMapPath),
 ]);
+store.recoverPendingDeliveries();
+store.recoverInterruptedRuns();
 const linear = createLinearGateway(config, store);
 const workspaces = new WorkspaceManager(config.workspaceRoot, repositoryMap);
 const authority = new SessionAuthority({

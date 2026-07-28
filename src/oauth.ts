@@ -72,7 +72,7 @@ export async function completeAuthorization(
   const consumed = store.consumeOAuthState(stateHash);
   if (!consumed) throw new Error("Invalid or expired OAuth state");
 
-  const redirectUri = `${callbackUrl.origin}${callbackUrl.pathname}`;
+  const redirectUri = buildRedirectUri(config, DEFAULT_AUTHORIZE_REDIRECT_PATH);
   const token = await exchangeAuthorizationCode(config, code, redirectUri);
   const { organizationId, appUserId } = await discoverAppInstallation(
     token.accessToken,

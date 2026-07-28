@@ -374,6 +374,9 @@ export class OhMyPiRpcWorker implements RpcWorker {
       }
       return;
     }
+    if (frame.type === "prompt_result" && typeof frame.id === "string") {
+      this.#promptRequestIds.delete(frame.id);
+    }
     if (
       frame.type === "session_info_update" ||
       frame.type === "config_update" ||

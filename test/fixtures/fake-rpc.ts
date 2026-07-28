@@ -55,6 +55,18 @@ while (true) {
           if (
             input.type === "prompt" &&
             "message" in input &&
+            input.message === "local command"
+          ) {
+            send({
+              type: "prompt_result",
+              id: input.id,
+              agentInvoked: false,
+            });
+            continue;
+          }
+          if (
+            input.type === "prompt" &&
+            "message" in input &&
             input.message === "late failure"
           ) {
             send({

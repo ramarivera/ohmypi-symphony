@@ -727,9 +727,7 @@ export async function handleWebhook(
     const message =
       error instanceof WebhookError
         ? error.message
-        : error instanceof Error
-          ? error.message
-          : "Webhook processing failed";
+        : "Webhook processing failed";
     const status = error instanceof WebhookError ? error.status : 500;
     return new Response(message, { status });
   }

@@ -56,6 +56,19 @@ describe("GatewayStore", () => {
     expect(store.acceptDelivery(delivery)).toBeFalse();
   });
 
+  test("reclaims a delivery interrupted before durable processing", () => {
+    const delivery = {
+      id: "delivery-1",
+      organizationId: "org-1",
+      payloadHash: "hash",
+      payload: { type: "AgentSessionEvent" },
+    };
+    expect(store.claimDelivery(delivery)).toBe("claimed");
+    expect(store.claimDelivery(delivery)).toBe("duplicate");
+    expect(store.recoverPendingDeliveries()).toBe(1);
+    expect(store.claimDelivery(delivery)).toBe("claimed");
+  });
+
   test("enforces one lease and permits takeover only after expiry", () => {
     store.createRun({
       sessionId: "session-1",
@@ -66,6 +79,56 @@ describe("GatewayStore", () => {
     expect(store.claimRun("session-1", "worker-a", 1_000, 1_000)).toBeTrue();
     expect(store.claimRun("session-1", "worker-b", 1_000, 1_500)).toBeFalse();
     expect(store.claimRun("session-1", "worker-b", 1_000, 2_001)).toBeTrue();
+  });
+
+  test("recovers active runs and leases after a process restart", () => {
+    store.createRun({
+      sessionId: "running-session",
+      organizationId: "org-1",
+      issueId: "issue-1",
+      now: 1_000,
+    });
+    store.updateRun("running-session", {
+      state: "running",
+      workspacePath: "/workspace",
+      ompSessionFile: "/workspace/session.jsonl",
+    });
+    expect(
+      store.claimRun("running-session", "dead-process", 60_000, 1_000),
+    ).toBeTrue();
+
+    store.createRun({
+      sessionId: "canceled-session",
+      organizationId: "org-1",
+      issueId: "issue-2",
+      now: 1_000,
+    });
+    store.updateRun("canceled-session", { state: "running" });
+    store.enqueueInput({
+      id: "stop",
+      sessionId: "canceled-session",
+      kind: "stop",
+      body: "",
+      payload: {},
+      createdAt: 1_100,
+    });
+
+    expect(store.recoverInterruptedRuns(2_000)).toBe(2);
+    expect(store.getRun("running-session")).toMatchObject({
+      state: "orphaned",
+      nextAttemptAt: 2_000,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    });
+    expect(store.listRunnable(2_000).map((run) => run.sessionId)).toContain(
+      "running-session",
+    );
+    expect(store.getRun("canceled-session")).toMatchObject({
+      state: "stopping",
+      desiredState: "canceled",
+      leaseOwner: null,
+      leaseExpiresAt: null,
+    });
   });
 
   test("stop dominates later prompts and revocation cancels all live runs", async () => {
@@ -96,6 +159,30 @@ describe("GatewayStore", () => {
     expect(store.getRun("session-1")?.desiredState).toBe("canceled");
     store.revokeInstallation("org-1");
     expect((await store.getInstallation("org-1"))?.revokedAt).not.toBeNull();
+  });
+
+  test("updates permission snapshots without rewriting rotating tokens", async () => {
+    await store.putInstallation({
+      ...installation(),
+      accessibleTeamIds: ["team-a"],
+    });
+    const encryptedAccessToken = store.getRawEncryptedAccessToken("org-1");
+
+    expect(
+      store.applyPermissionChange(
+        "org-1",
+        "app-user-1",
+        ["team-b"],
+        ["team-a"],
+        false,
+      ),
+    ).toBeTrue();
+    expect(store.getRawEncryptedAccessToken("org-1")).toBe(
+      encryptedAccessToken,
+    );
+    expect((await store.getInstallation("org-1"))?.accessibleTeamIds).toEqual([
+      "team-b",
+    ]);
   });
 
   test("reserves each projection and terminal outcome once", () => {

@@ -489,6 +489,17 @@ export class SessionAuthority {
       this.#store.updateRun(sessionId, { state: "waiting" });
       return;
     }
+    if (event.type === "prompt_result" && event.agentInvoked === false) {
+      const worker = this.#workers.get(sessionId);
+      if (worker) {
+        await this.#finishLocalCommand(
+          sessionId,
+          worker,
+          typeof event.id === "string" ? event.id : `prompt-result:${sequence}`,
+        );
+      }
+      return;
+    }
     if (event.type === "error") {
       throw new Error(
         typeof event.message === "string"
