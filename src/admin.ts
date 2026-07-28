@@ -316,6 +316,24 @@ export function createAdminRouter(deps: {
         }
       }
 
+      if (url.pathname.startsWith("/runs/") && request.method === "GET") {
+        const session = adminSession(store, request, now);
+        if (!session) return text("Unauthorized", 401);
+        const sessionId = decodeURIComponent(
+          url.pathname.slice("/runs/".length),
+        );
+        const run = store.getRun(sessionId);
+        if (!run || run.organizationId !== session.organizationId) {
+          return text("Not found", 404);
+        }
+        return json({
+          sessionId: run.sessionId,
+          state: run.state,
+          attempt: run.attempt,
+          lastActivityAt: run.lastActivityAt,
+        });
+      }
+
       if (url.pathname === "/api/admin/bootstrap" && request.method === "GET") {
         const session = adminSession(store, request, now);
         if (!session) return text("Unauthorized", 401);

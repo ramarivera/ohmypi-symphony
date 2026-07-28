@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { GatewayConfig } from "./domain";
 import { validLogLevel } from "./logger";
@@ -7,8 +8,17 @@ function required(
   name: string,
 ): string {
   const value = env[name]?.trim();
-  if (!value) throw new Error(`Missing required environment variable ${name}`);
-  return value;
+  if (value) return value;
+
+  const file = env[`${name}_FILE`]?.trim();
+  if (file) {
+    const fileValue = readFileSync(file, "utf8").trim();
+    if (fileValue) return fileValue;
+  }
+
+  throw new Error(
+    `Missing required environment variable ${name} or ${name}_FILE`,
+  );
 }
 
 function positiveInteger(

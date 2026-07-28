@@ -468,6 +468,37 @@ describe("admin control plane", () => {
       expect(body.installation).not.toHaveProperty("refreshToken");
     });
 
+    test("protects run status by admin session and organization", async () => {
+      const now = Date.now();
+      store.createRun({
+        sessionId: "session/private",
+        organizationId: "org-runs",
+        issueId: "issue-runs",
+        now,
+      });
+      const owner = createAdminSession("org-runs", now);
+      const outsider = createAdminSession("org-other", now);
+      const path = `/runs/${encodeURIComponent("session/private")}`;
+
+      const unauthenticated = await fetchHandler(adminRequest(path));
+      expect(unauthenticated.status).toBe(401);
+
+      const crossOrganization = await fetchHandler(
+        adminRequest(path, { token: outsider.token }),
+      );
+      expect(crossOrganization.status).toBe(404);
+
+      const response = await fetchHandler(
+        adminRequest(path, { token: owner.token }),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        sessionId: "session/private",
+        state: "queued",
+        attempt: 0,
+      });
+    });
+
     test("requires origin and csrf for mutations", async () => {
       const now = Date.now();
       const { token, csrf } = await bootstrap("org-csrf", now);

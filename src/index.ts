@@ -98,20 +98,6 @@ function buildFetch(): (request: Request) => Promise<Response> {
         );
       }
 
-      if (url.pathname.startsWith("/runs/") && request.method === "GET") {
-        const sessionId = decodeURIComponent(
-          url.pathname.slice("/runs/".length),
-        );
-        const run = store.getRun(sessionId);
-        if (!run) return new Response("Not found", { status: 404 });
-        return Response.json({
-          sessionId: run.sessionId,
-          state: run.state,
-          attempt: run.attempt,
-          lastActivityAt: run.lastActivityAt,
-        });
-      }
-
       if (url.pathname === "/webhooks/linear") {
         const response = await handleWebhook(
           request,
