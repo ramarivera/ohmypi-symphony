@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { GatewayStore } from "../src/store";
 import { WorkspaceManager } from "../src/workspace";
 
 let root: string;
 let source: string;
+let store: GatewayStore;
+let workspaceManager: WorkspaceManager;
 
 async function git(args: string[], cwd: string): Promise<void> {
   const process = Bun.spawn(["git", ...args], {
@@ -17,6 +20,7 @@ async function git(args: string[], cwd: string): Promise<void> {
 }
 
 beforeEach(async () => {
+  store = await GatewayStore.open(":memory:", new Uint8Array(32).fill(1));
   await mkdir(join(process.cwd(), "data"), { recursive: true });
   root = await mkdtemp(join(process.cwd(), "data", "workspace-test-"));
   source = join(root, "source");
@@ -27,69 +31,75 @@ beforeEach(async () => {
   await writeFile(join(source, "README.txt"), "fixture");
   await git(["add", "README.txt"], source);
   await git(["commit", "-m", "fixture"], source);
+
+  store.createRepository({
+    organizationId: "org",
+    id: "one",
+    url: source,
+    ref: "main",
+    teamIds: ["team"],
+    projectIds: ["project"],
+    labels: [],
+    isDefault: false,
+  });
+  store.createRepository({
+    organizationId: "org",
+    id: "two",
+    url: source,
+    ref: "main",
+    teamIds: ["team"],
+    projectIds: [],
+    labels: [],
+    isDefault: false,
+  });
+
+  workspaceManager = new WorkspaceManager(join(root, "workspaces"), store);
 });
 
 afterEach(async () => {
+  store.close();
   await rm(root, { recursive: true, force: true });
 });
-
-function manager(workspaceRoot = join(root, "workspaces")) {
-  return new WorkspaceManager(workspaceRoot, {
-    repositories: [
-      {
-        id: "one",
-        url: source,
-        ref: "main",
-        teamIds: ["team"],
-        projectIds: ["project"],
-      },
-      {
-        id: "two",
-        url: source,
-        ref: "main",
-        teamIds: ["team"],
-        projectIds: [],
-      },
-    ],
-  });
-}
 
 describe("WorkspaceManager", () => {
   test("prefers project mapping and reports team ambiguity", () => {
     expect(
-      manager().resolve({
+      workspaceManager.resolve({
+        organizationId: "org",
         teamId: "team",
         projectId: "project",
         repositoryId: null,
+        issueLabels: [],
+        projectLabels: [],
       }),
     ).toMatchObject({ kind: "match", repository: { id: "one" } });
     expect(
-      manager().resolve({
+      workspaceManager.resolve({
+        organizationId: "org",
         teamId: "team",
         projectId: null,
         repositoryId: null,
+        issueLabels: [],
+        projectLabels: [],
       }),
     ).toMatchObject({ kind: "ambiguous" });
     expect(
-      manager().resolve({
+      workspaceManager.resolve({
+        organizationId: "org",
         teamId: null,
         projectId: null,
         repositoryId: "missing",
+        issueLabels: [],
+        projectLabels: [],
       }),
     ).toEqual({ kind: "none" });
   });
 
   test("materializes a deterministic repository-bound workspace", async () => {
-    const workspaces = manager();
-    const repository = {
-      id: "one",
-      url: source,
-      ref: "main",
-      teamIds: ["team"],
-      projectIds: ["project"],
-    };
-    const first = await workspaces.materialize("session", repository);
-    const second = await workspaces.materialize("session", repository);
+    const repository = store.getRepository("org", "one");
+    if (!repository) throw new Error("Repository not found");
+    const first = await workspaceManager.materialize("session", repository);
+    const second = await workspaceManager.materialize("session", repository);
     expect(first).toBe(second);
     expect(await Bun.file(join(first, "README.txt")).text()).toBe("fixture");
   }, 15_000);
@@ -97,14 +107,21 @@ describe("WorkspaceManager", () => {
   test("rejects a symlink workspace target", async () => {
     const workspaceRoot = join(root, "linked-workspaces");
     await symlink(source, workspaceRoot);
+    const repository = store.createRepository({
+      organizationId: "org",
+      id: "symlink-repo",
+      url: source,
+      ref: "main",
+      teamIds: [],
+      projectIds: [],
+      labels: [],
+      isDefault: false,
+    });
     await expect(
-      manager(workspaceRoot).materialize("session", {
-        id: "one",
-        url: source,
-        ref: "main",
-        teamIds: [],
-        projectIds: [],
-      }),
+      new WorkspaceManager(workspaceRoot, store).materialize(
+        "session",
+        repository,
+      ),
     ).rejects.toThrow();
   });
 });

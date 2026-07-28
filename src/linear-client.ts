@@ -5,6 +5,8 @@ import type {
   LinearActivityContent,
   LinearGatewayPort,
 } from "./domain";
+import type { Logger } from "./logger";
+import { createLogger } from "./logger";
 import type { GatewayStore } from "./store";
 
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
@@ -208,33 +210,51 @@ class LinearGateway implements LinearGatewayPort {
   readonly #store: GatewayStore;
   readonly #refreshing: Map<string, Promise<InstallationRecord>> = new Map();
   readonly #apiQueues = new Map<string, Promise<void>>();
+  #logger: Logger;
 
-  constructor(config: GatewayConfig, store: GatewayStore) {
+  constructor(config: GatewayConfig, store: GatewayStore, logger?: Logger) {
     this.#config = config;
     this.#store = store;
+    this.#logger =
+      logger ?? createLogger({ name: "linear" }).child({ component: "linear" });
   }
 
   async #performRefresh(
     record: InstallationRecord,
     now: number,
   ): Promise<InstallationRecord> {
-    const response = await exchangeToken(this.#config, {
-      grantType: "refresh_token",
-      refreshToken: record.refreshToken,
-    });
-    const updated: InstallationRecord = {
-      organizationId: record.organizationId,
-      appUserId: record.appUserId,
-      accessToken: response.accessToken,
-      refreshToken: response.refreshToken,
-      expiresAt: now + response.expiresIn * 1000,
-      scopes: response.scopes,
-      revokedAt: null,
-      accessibleTeamIds: record.accessibleTeamIds,
-      canAccessAllPublicTeams: record.canAccessAllPublicTeams,
-    };
-    await this.#store.putInstallation(updated);
-    return updated;
+    try {
+      const response = await exchangeToken(this.#config, {
+        grantType: "refresh_token",
+        refreshToken: record.refreshToken,
+      });
+      const updated: InstallationRecord = {
+        organizationId: record.organizationId,
+        appUserId: record.appUserId,
+        accessToken: response.accessToken,
+        refreshToken: response.refreshToken,
+        expiresAt: now + response.expiresIn * 1000,
+        scopes: response.scopes,
+        revokedAt: null,
+        accessibleTeamIds: record.accessibleTeamIds,
+        canAccessAllPublicTeams: record.canAccessAllPublicTeams,
+      };
+      await this.#store.putInstallation(updated);
+      this.#logger.debug({
+        event: "linear.token.refresh",
+        organizationId: record.organizationId,
+        expiresAt: updated.expiresAt,
+      });
+      return updated;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.#logger.error({
+        event: "linear.token.refresh.failed",
+        organizationId: record.organizationId,
+        error: message,
+      });
+      throw error;
+    }
   }
 
   async #refreshTokens(
@@ -283,7 +303,21 @@ class LinearGateway implements LinearGatewayPort {
           return await operation();
         } catch (error) {
           const delay = rateLimitDelay(error);
-          if (delay === null) throw error;
+          if (delay === null) {
+            const message =
+              error instanceof Error ? error.message : String(error);
+            this.#logger.error({
+              event: "linear.api.activity.failed",
+              organizationId,
+              error: message,
+            });
+            throw error;
+          }
+          this.#logger.debug({
+            event: "linear.api.rateLimited",
+            organizationId,
+            delay,
+          });
           await Bun.sleep(delay);
           return operation();
         }
@@ -370,6 +404,7 @@ class LinearGateway implements LinearGatewayPort {
 export function createLinearGateway(
   config: GatewayConfig,
   store: GatewayStore,
+  logger?: Logger,
 ): LinearGatewayPort {
-  return new LinearGateway(config, store);
+  return new LinearGateway(config, store, logger);
 }

@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import type { GatewayConfig, InstallationRecord } from "./domain";
 import {
   buildInstallationRecord,
@@ -17,8 +17,23 @@ const DEFAULT_SCOPES: readonly string[] = [
   "app:mentionable",
 ];
 
+const ADMIN_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const CSRF_SALT = "omp-gateway-admin-csrf";
+
 function hashState(rawState: string): string {
   return createHash("sha256").update(rawState).digest("base64url");
+}
+
+function generateOpaqueToken(): string {
+  return randomBytes(32).toString("base64url");
+}
+
+function hashToken(raw: string): string {
+  return createHash("sha256").update(raw).digest("base64url");
+}
+
+function deriveCsrfToken(rawToken: string): string {
+  return createHmac("sha256", rawToken).update(CSRF_SALT).digest("base64url");
 }
 
 function generateState(): string {
@@ -80,4 +95,24 @@ export async function completeAuthorization(
   const record = buildInstallationRecord(token, organizationId, appUserId);
   await store.putInstallation(record);
   return record;
+}
+
+export function createAdminSession(
+  store: GatewayStore,
+  organizationId: string,
+  now = Date.now(),
+): { token: string; expiresAt: number } {
+  const token = generateOpaqueToken();
+  const tokenHash = hashToken(token);
+  const csrfToken = deriveCsrfToken(token);
+  const csrfTokenHash = hashToken(csrfToken);
+  const expiresAt = now + ADMIN_SESSION_TTL_MS;
+  store.createAdminSession({
+    organizationId,
+    tokenHash,
+    csrfTokenHash,
+    expiresAt,
+    now,
+  });
+  return { token, expiresAt };
 }

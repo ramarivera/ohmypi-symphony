@@ -1,9 +1,6 @@
 import { resolve } from "node:path";
-import type {
-  GatewayConfig,
-  RepositoryDefinition,
-  RepositoryMap,
-} from "./domain";
+import type { GatewayConfig } from "./domain";
+import { validLogLevel } from "./logger";
 
 function required(
   env: Record<string, string | undefined>,
@@ -45,11 +42,12 @@ export function loadConfig(
     linearWebhookSecret: required(env, "LINEAR_WEBHOOK_SECRET"),
     tokenEncryptionKey: decodeKey(required(env, "TOKEN_ENCRYPTION_KEY")),
     publicUrl,
-    databasePath: resolve(env.DATABASE_PATH ?? "./data/gateway.sqlite"),
+    logLevel: validLogLevel(env.LOG_LEVEL),
+    databasePath:
+      env.DATABASE_PATH === ":memory:"
+        ? ":memory:"
+        : resolve(env.DATABASE_PATH ?? "./data/gateway.sqlite"),
     workspaceRoot: resolve(env.WORKSPACE_ROOT ?? "./data/workspaces"),
-    repositoryMapPath: resolve(
-      env.REPOSITORY_MAP_PATH ?? "./repositories.json",
-    ),
     ompCliPath: env.OMP_CLI_PATH?.trim() || "omp",
     port: positiveInteger(env.PORT, 3000, "PORT"),
     leaseDurationMs: positiveInteger(
@@ -63,58 +61,4 @@ export function loadConfig(
       "WEBHOOK_REPLAY_WINDOW_MS",
     ),
   };
-}
-
-function stringArray(value: unknown, field: string): readonly string[] {
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
-    throw new Error(`${field} must be an array of strings`);
-  }
-  return value;
-}
-
-function parseRepository(value: unknown, index: number): RepositoryDefinition {
-  if (typeof value !== "object" || value === null)
-    throw new Error(`repositories[${index}] must be an object`);
-  const candidate = value as Record<string, unknown>;
-  for (const field of ["id", "url", "ref"] as const) {
-    if (typeof candidate[field] !== "string" || candidate[field].length === 0) {
-      throw new Error(
-        `repositories[${index}].${field} must be a non-empty string`,
-      );
-    }
-  }
-  return {
-    id: candidate.id as string,
-    url: candidate.url as string,
-    ref: candidate.ref as string,
-    teamIds: stringArray(
-      candidate.teamIds ?? [],
-      `repositories[${index}].teamIds`,
-    ),
-    projectIds: stringArray(
-      candidate.projectIds ?? [],
-      `repositories[${index}].projectIds`,
-    ),
-  };
-}
-
-export async function loadRepositoryMap(path: string): Promise<RepositoryMap> {
-  const value: unknown = await Bun.file(path).json();
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !Array.isArray((value as { repositories?: unknown }).repositories)
-  ) {
-    throw new Error("Repository map must contain a repositories array");
-  }
-  const repositories = (value as { repositories: unknown[] }).repositories.map(
-    parseRepository,
-  );
-  const ids = new Set<string>();
-  for (const repository of repositories) {
-    if (ids.has(repository.id))
-      throw new Error(`Duplicate repository id ${repository.id}`);
-    ids.add(repository.id);
-  }
-  return { repositories };
 }

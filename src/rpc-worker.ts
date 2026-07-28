@@ -1,4 +1,6 @@
 import type { RpcEvent, RpcWorker } from "./domain";
+import type { Logger } from "./logger";
+import { createLogger } from "./logger";
 
 interface PendingRequest {
   command: string;
@@ -34,11 +36,20 @@ function sanitizedEnvironment(
   return output;
 }
 
+function frameId(frame: Record<string, unknown>): string | number | null {
+  if (typeof frame.id === "string" || typeof frame.id === "number")
+    return frame.id;
+  if (typeof frame.requestId === "string") return frame.requestId;
+  if (typeof frame.correlationId === "string") return frame.correlationId;
+  return null;
+}
+
 export class OhMyPiRpcWorker implements RpcWorker {
   readonly #command: readonly string[];
   readonly #cwd: string;
   readonly #env: Record<string, string>;
   readonly #startTimeoutMs: number;
+  #logger: Logger;
   readonly #listeners = new Set<(event: RpcEvent) => void>();
   readonly #pending = new Map<string, PendingRequest>();
   #process: Bun.Subprocess<"pipe", "pipe", "pipe"> | null = null;
@@ -56,6 +67,7 @@ export class OhMyPiRpcWorker implements RpcWorker {
     cwd: string;
     env?: Record<string, string | undefined>;
     startTimeoutMs?: number;
+    logger?: Logger;
   }) {
     if (input.command.length === 0)
       throw new Error("RPC command cannot be empty");
@@ -70,6 +82,11 @@ export class OhMyPiRpcWorker implements RpcWorker {
       },
     );
     this.#startTimeoutMs = input.startTimeoutMs ?? 30_000;
+    const base = input.logger ?? createLogger({ name: "omp-rpc" });
+    this.#logger =
+      base.bindings().component === "omp-rpc"
+        ? base
+        : base.child({ component: "omp-rpc" });
   }
 
   get sessionId(): string | null {
@@ -84,6 +101,11 @@ export class OhMyPiRpcWorker implements RpcWorker {
 
   async start(): Promise<void> {
     if (this.#process) throw new Error("RPC worker already started");
+    this.#logger.info({
+      event: "worker.starting",
+      command: this.#command,
+      cwd: this.#cwd,
+    });
     const process = Bun.spawn([...this.#command, "--mode", "rpc"], {
       cwd: this.#cwd,
       env: this.#env,
@@ -111,6 +133,11 @@ export class OhMyPiRpcWorker implements RpcWorker {
       ]);
       if (this.#supportsProtocolV2)
         await this.#send("negotiate_protocol", { protocolVersion: 2 });
+      this.#logger.info({
+        event: "worker.ready",
+        workerPid: process.pid,
+        protocolVersion: this.#supportsProtocolV2 ? 2 : 1,
+      });
     } catch (error) {
       await this.stop();
       throw error;
@@ -140,9 +167,20 @@ export class OhMyPiRpcWorker implements RpcWorker {
   async getState(): Promise<Record<string, unknown>> {
     const response = await this.#send("get_state");
     const state = record(response.data) ? response.data : {};
+    const previousSessionId = this.#sessionId;
+    const previousSessionFile = this.#sessionFile;
     if (typeof state.sessionId === "string") this.#sessionId = state.sessionId;
     if (typeof state.sessionFile === "string")
       this.#sessionFile = state.sessionFile;
+    if (
+      this.#sessionId !== previousSessionId ||
+      this.#sessionFile !== previousSessionFile
+    ) {
+      this.#logger = this.#logger.child({
+        sessionId: this.#sessionId,
+        sessionFile: this.#sessionFile,
+      });
+    }
     return state;
   }
 
@@ -180,6 +218,10 @@ export class OhMyPiRpcWorker implements RpcWorker {
       await process.exited.catch(() => undefined);
     }
     this.#rejectPending(new Error("OhMyPi RPC worker stopped"));
+    this.#logger.info({
+      event: "worker.stopped",
+      workerPid: process.pid,
+    });
   }
 
   async #commandWithoutData(
@@ -202,8 +244,18 @@ export class OhMyPiRpcWorker implements RpcWorker {
       resolve: pending.resolve,
       reject: pending.reject,
     });
+    const frame = { id, type, ...body };
+    if (this.#logger.isLevelEnabled("trace")) {
+      this.#logger.trace({
+        event: "rpc.frame",
+        direction: "outbound",
+        workerPid: process.pid,
+        correlationId: id,
+        frame,
+      });
+    }
     try {
-      process.stdin.write(`${JSON.stringify({ id, type, ...body })}\n`);
+      process.stdin.write(`${JSON.stringify(frame)}\n`);
       await process.stdin.flush();
     } catch (error) {
       this.#pending.delete(id);
@@ -215,6 +267,15 @@ export class OhMyPiRpcWorker implements RpcWorker {
   async #writeFrame(frame: Record<string, unknown>): Promise<void> {
     const process = this.#process;
     if (!process) throw new Error("RPC worker is not running");
+    if (this.#logger.isLevelEnabled("trace")) {
+      this.#logger.trace({
+        event: "rpc.frame",
+        direction: "outbound",
+        workerPid: process.pid,
+        correlationId: frameId(frame),
+        frame,
+      });
+    }
     process.stdin.write(`${JSON.stringify(frame)}\n`);
     await process.stdin.flush();
   }
@@ -242,6 +303,15 @@ export class OhMyPiRpcWorker implements RpcWorker {
         if (line.length > 0) {
           const parsed: unknown = JSON.parse(line);
           if (!record(parsed)) throw new Error("RPC frame must be an object");
+          if (this.#logger.isLevelEnabled("trace")) {
+            this.#logger.trace({
+              event: "rpc.frame",
+              direction: "inbound",
+              workerPid: process.pid,
+              correlationId: frameId(parsed),
+              frame: parsed,
+            });
+          }
           if (!readySeen && parsed.type === "ready") {
             readySeen = true;
             this.#supportsProtocolV2 =
@@ -407,6 +477,11 @@ export class OhMyPiRpcWorker implements RpcWorker {
     this.#process = null;
     this.#streaming = false;
     if (process) process.kill();
+    this.#logger.error({
+      event: "worker.failed",
+      workerPid: process?.pid,
+      error: normalized.message,
+    });
     this.#rejectPending(normalized);
   }
 

@@ -1,7 +1,10 @@
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
-import type { RepositoryDefinition, RepositoryMap } from "./domain";
+import type { RepositoryRecord } from "./domain";
+import type { Logger } from "./logger";
+import { createLogger } from "./logger";
 import type { RepositoryResolution, WorkspacePort } from "./session-authority";
+import type { GatewayStore } from "./store";
 
 interface WorkspaceMarker {
   repositoryId: string;
@@ -45,46 +48,143 @@ function marker(value: unknown): WorkspaceMarker | null {
     : null;
 }
 
+function hasIntersection(
+  haystack: readonly string[],
+  needles: readonly string[],
+): boolean {
+  const set = new Set(haystack);
+  for (const needle of needles) {
+    if (set.has(needle)) return true;
+  }
+  return false;
+}
+
 export class WorkspaceManager implements WorkspacePort {
   readonly #root: string;
-  readonly #repositories: readonly RepositoryDefinition[];
+  readonly #store: GatewayStore;
+  readonly #logger: Logger;
 
-  constructor(root: string, repositoryMap: RepositoryMap) {
+  constructor(root: string, store: GatewayStore, logger?: Logger) {
     this.#root = resolve(root);
-    this.#repositories = repositoryMap.repositories;
+    this.#store = store;
+    this.#logger =
+      logger ??
+      createLogger({ name: "workspace" }).child({
+        component: "workspace",
+      });
   }
 
   resolve(context: {
+    organizationId: string | null;
     teamId: string | null;
     projectId: string | null;
     repositoryId: string | null;
+    issueLabels: readonly string[];
+    projectLabels: readonly string[];
   }): RepositoryResolution {
-    if (context.repositoryId) {
-      const repository = this.#repositories.find(
-        (item) => item.id === context.repositoryId,
-      );
-      return repository ? { kind: "match", repository } : { kind: "none" };
+    const resolution = this.#resolveImpl(context);
+    if (resolution.kind === "match") {
+      this.#logger.info({
+        event: "repository.resolved",
+        organizationId: context.organizationId,
+        repositoryId: resolution.repository.id,
+        repositoryUrl: resolution.repository.url,
+      });
+    } else if (resolution.kind === "ambiguous") {
+      this.#logger.info({
+        event: "repository.ambiguous",
+        organizationId: context.organizationId,
+        repositoryIds: resolution.repositories.map((r) => r.id),
+      });
     }
-    const projectId = context.projectId;
-    const projectMatches = projectId
-      ? this.#repositories.filter((item) => item.projectIds.includes(projectId))
-      : [];
-    const teamId = context.teamId;
-    const matches =
-      projectMatches.length > 0
-        ? projectMatches
-        : teamId
-          ? this.#repositories.filter((item) => item.teamIds.includes(teamId))
-          : [];
-    if (matches.length === 0) return { kind: "none" };
-    if (matches.length > 1) return { kind: "ambiguous", repositories: matches };
-    const repository = matches[0];
-    return repository ? { kind: "match", repository } : { kind: "none" };
+    return resolution;
+  }
+
+  #resolveImpl(context: {
+    organizationId: string | null;
+    teamId: string | null;
+    projectId: string | null;
+    repositoryId: string | null;
+    issueLabels: readonly string[];
+    projectLabels: readonly string[];
+  }): RepositoryResolution {
+    if (context.organizationId === null) return { kind: "none" };
+    const repositories = this.#store.listRepositories(context.organizationId);
+    if (repositories.length === 0) return { kind: "none" };
+
+    const repositoryId =
+      context.repositoryId !== null ? context.repositoryId.trim() : null;
+    if (repositoryId !== null && repositoryId.length > 0) {
+      const match = repositories.find(
+        (repository) =>
+          repository.id.toLowerCase() === repositoryId.toLowerCase(),
+      );
+      return match ? { kind: "match", repository: match } : { kind: "none" };
+    }
+
+    const issueLabels = context.issueLabels;
+    if (issueLabels.length > 0) {
+      const matches = repositories.filter((repository) =>
+        hasIntersection(repository.labels, issueLabels),
+      );
+      const [repository] = matches;
+      if (matches.length === 1 && repository)
+        return { kind: "match", repository };
+      if (matches.length > 1)
+        return { kind: "ambiguous", repositories: matches };
+    }
+
+    const projectLabels = context.projectLabels;
+    if (projectLabels.length > 0) {
+      const matches = repositories.filter((repository) =>
+        hasIntersection(repository.labels, projectLabels),
+      );
+      const [repository] = matches;
+      if (matches.length === 1 && repository)
+        return { kind: "match", repository };
+      if (matches.length > 1)
+        return { kind: "ambiguous", repositories: matches };
+    }
+
+    const projectId =
+      context.projectId !== null
+        ? context.projectId.trim().toLowerCase()
+        : null;
+    if (projectId !== null && projectId.length > 0) {
+      const matches = repositories.filter((repository) =>
+        repository.projectIds.includes(projectId),
+      );
+      const [repository] = matches;
+      if (matches.length === 1 && repository)
+        return { kind: "match", repository };
+      if (matches.length > 1)
+        return { kind: "ambiguous", repositories: matches };
+    }
+
+    const teamId =
+      context.teamId !== null ? context.teamId.trim().toLowerCase() : null;
+    if (teamId !== null && teamId.length > 0) {
+      const matches = repositories.filter((repository) =>
+        repository.teamIds.includes(teamId),
+      );
+      const [repository] = matches;
+      if (matches.length === 1 && repository)
+        return { kind: "match", repository };
+      if (matches.length > 1)
+        return { kind: "ambiguous", repositories: matches };
+    }
+
+    const defaultRepository = this.#store.getDefaultRepository(
+      context.organizationId,
+    );
+    if (defaultRepository)
+      return { kind: "match", repository: defaultRepository };
+    return { kind: "none" };
   }
 
   async materialize(
     sessionId: string,
-    repository: RepositoryDefinition,
+    repository: RepositoryRecord,
   ): Promise<string> {
     try {
       const rootMetadata = await lstat(this.#root);
@@ -133,6 +233,12 @@ export class WorkspaceManager implements WorkspacePort {
       ) {
         throw new Error("Workspace repository identity mismatch");
       }
+      this.#logger.info({
+        event: "workspace.ready",
+        repositoryId: repository.id,
+        path: canonicalTarget,
+        reused: true,
+      });
       return canonicalTarget;
     }
 
@@ -163,6 +269,12 @@ export class WorkspaceManager implements WorkspacePort {
       throw new Error(
         "Materialized workspace resolves outside configured root",
       );
+    this.#logger.info({
+      event: "workspace.ready",
+      repositoryId: repository.id,
+      path: canonicalTarget,
+      reused: false,
+    });
     return canonicalTarget;
   }
 }

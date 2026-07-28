@@ -16,11 +16,11 @@ const config: GatewayConfig = {
   publicUrl: new URL("https://gateway.example/base/"),
   databasePath: ":memory:",
   workspaceRoot: "/workspaces",
-  repositoryMapPath: "/repositories.json",
   ompCliPath: "omp",
   port: 3000,
   leaseDurationMs: 60_000,
   webhookReplayWindowMs: 60_000,
+  logLevel: "info",
 };
 
 describe("Linear OAuth contract", () => {

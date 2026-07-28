@@ -6,6 +6,7 @@ import type {
   DesiredRunState,
   InputKind,
   InstallationRecord,
+  RepositoryRecord,
   RunState,
 } from "./domain";
 import { TokenCipher } from "./token-crypto";
@@ -61,6 +62,27 @@ interface ProjectionOutboxRow {
   activity_type: string;
   payload_json: string;
   attempt: number;
+}
+
+interface RepositoryRow {
+  organization_id: string;
+  id: string;
+  url: string;
+  ref: string;
+  team_ids_json: string;
+  project_ids_json: string;
+  labels_json: string;
+  is_default: number;
+  created_at: number;
+  updated_at: number;
+}
+
+interface AdminSessionRow {
+  token_hash: string;
+  organization_id: string;
+  csrf_token_hash: string;
+  expires_at: number;
+  created_at: number;
 }
 
 export interface ProjectionJob {
@@ -197,6 +219,30 @@ export class GatewayStore {
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS repository (
+        organization_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        url TEXT NOT NULL,
+        ref TEXT NOT NULL,
+        team_ids_json TEXT NOT NULL,
+        project_ids_json TEXT NOT NULL,
+        labels_json TEXT NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, id)
+      );
+      CREATE TABLE IF NOT EXISTS admin_session (
+        token_hash TEXT PRIMARY KEY,
+        organization_id TEXT NOT NULL,
+        csrf_token_hash TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS admin_session_org ON admin_session(organization_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS repository_default
+        ON repository(organization_id, is_default)
+        WHERE is_default = 1;
     `);
     const indexes = this.#db
       .query<{ name: string; unique: number; origin: string }, []>(
@@ -978,6 +1024,196 @@ export class GatewayStore {
         .get(organizationId)?.value ?? null
     );
   }
+
+  createRepository(input: {
+    organizationId: string;
+    id: string;
+    url: string;
+    ref: string;
+    teamIds?: readonly string[];
+    projectIds?: readonly string[];
+    labels?: readonly string[];
+    isDefault?: boolean;
+    now?: number;
+  }): RepositoryRecord {
+    const now = input.now ?? Date.now();
+    const record = validateRepository(input, now);
+    return this.#db.transaction(() => {
+      const existing = this.#db
+        .query<RepositoryRow, [string, string]>(
+          "SELECT organization_id FROM repository WHERE organization_id=? AND id=?",
+        )
+        .get(record.organizationId, record.id);
+      if (existing)
+        throw new Error(
+          `Repository ${record.id} already exists for ${record.organizationId}`,
+        );
+      if (record.isDefault) {
+        this.#db
+          .query(
+            "UPDATE repository SET is_default=0, updated_at=? WHERE organization_id=? AND is_default=1",
+          )
+          .run(now, record.organizationId);
+      }
+      this.#db
+        .query(`
+        INSERT INTO repository (
+          organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, is_default, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+        .run(
+          record.organizationId,
+          record.id,
+          record.url,
+          record.ref,
+          JSON.stringify(record.teamIds),
+          JSON.stringify(record.projectIds),
+          JSON.stringify(record.labels),
+          Number(record.isDefault),
+          record.createdAt,
+          record.updatedAt,
+        );
+      return record;
+    })();
+  }
+
+  updateRepository(
+    organizationId: string,
+    id: string,
+    input: {
+      url?: string;
+      ref?: string;
+      teamIds?: readonly string[];
+      projectIds?: readonly string[];
+      labels?: readonly string[];
+      isDefault?: boolean;
+      now?: number;
+    },
+  ): RepositoryRecord {
+    const now = input.now ?? Date.now();
+    const existing = this.getRepository(organizationId, id);
+    if (!existing)
+      throw new Error(`Repository ${id} not found for ${organizationId}`);
+    const patch = validateRepository(
+      {
+        organizationId,
+        id,
+        url: input.url ?? existing.url,
+        ref: input.ref ?? existing.ref,
+        teamIds: input.teamIds ?? existing.teamIds,
+        projectIds: input.projectIds ?? existing.projectIds,
+        labels: input.labels ?? existing.labels,
+        isDefault: input.isDefault ?? existing.isDefault,
+      },
+      now,
+    );
+    return this.#db.transaction(() => {
+      if (patch.isDefault && !existing.isDefault) {
+        this.#db
+          .query(
+            "UPDATE repository SET is_default=0, updated_at=? WHERE organization_id=? AND is_default=1",
+          )
+          .run(now, organizationId);
+      }
+      this.#db
+        .query(`
+        UPDATE repository
+        SET url=?, ref=?, team_ids_json=?, project_ids_json=?, labels_json=?, is_default=?, updated_at=?
+        WHERE organization_id=? AND id=?
+      `)
+        .run(
+          patch.url,
+          patch.ref,
+          JSON.stringify(patch.teamIds),
+          JSON.stringify(patch.projectIds),
+          JSON.stringify(patch.labels),
+          Number(patch.isDefault),
+          now,
+          organizationId,
+          id,
+        );
+      return { ...patch, createdAt: existing.createdAt, updatedAt: now };
+    })();
+  }
+
+  deleteRepository(organizationId: string, id: string): boolean {
+    const result = this.#db
+      .query("DELETE FROM repository WHERE organization_id=? AND id=?")
+      .run(organizationId, id);
+    return result.changes === 1;
+  }
+
+  getRepository(organizationId: string, id: string): RepositoryRecord | null {
+    const row = this.#db
+      .query<RepositoryRow, [string, string]>(
+        "SELECT * FROM repository WHERE organization_id=? AND id=?",
+      )
+      .get(organizationId, id);
+    return row ? mapRepository(row) : null;
+  }
+
+  listRepositories(organizationId: string): RepositoryRecord[] {
+    return this.#db
+      .query<RepositoryRow, [string]>(
+        "SELECT * FROM repository WHERE organization_id=? ORDER BY created_at, id",
+      )
+      .all(organizationId)
+      .map(mapRepository);
+  }
+
+  getDefaultRepository(organizationId: string): RepositoryRecord | null {
+    const row = this.#db
+      .query<RepositoryRow, [string]>(
+        "SELECT * FROM repository WHERE organization_id=? AND is_default=1 LIMIT 1",
+      )
+      .get(organizationId);
+    return row ? mapRepository(row) : null;
+  }
+
+  createAdminSession(input: {
+    organizationId: string;
+    tokenHash: string;
+    csrfTokenHash: string;
+    expiresAt: number;
+    now?: number;
+  }): void {
+    const now = input.now ?? Date.now();
+    this.#db
+      .query(`
+      INSERT INTO admin_session (token_hash, organization_id, csrf_token_hash, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+      .run(
+        input.tokenHash,
+        input.organizationId,
+        input.csrfTokenHash,
+        input.expiresAt,
+        now,
+      );
+  }
+
+  getAdminSession(
+    tokenHash: string,
+    now = Date.now(),
+  ): { organizationId: string; csrfTokenHash: string } | null {
+    const row = this.#db
+      .query<AdminSessionRow, [string, number]>(
+        "SELECT * FROM admin_session WHERE token_hash=? AND expires_at>=?",
+      )
+      .get(tokenHash, now);
+    if (!row) return null;
+    return {
+      organizationId: row.organization_id,
+      csrfTokenHash: row.csrf_token_hash,
+    };
+  }
+
+  deleteAdminSession(tokenHash: string): boolean {
+    const result = this.#db
+      .query("DELETE FROM admin_session WHERE token_hash=?")
+      .run(tokenHash);
+    return result.changes === 1;
+  }
 }
 
 function mapRun(row: RunRow): AgentRunRecord {
@@ -1011,4 +1247,91 @@ function parseStringArray(json: string, label: string): string[] {
     throw new Error(`Invalid ${label} in database`);
   }
   return value;
+}
+
+function mapRepository(row: RepositoryRow): RepositoryRecord {
+  return {
+    organizationId: row.organization_id,
+    id: row.id,
+    url: row.url,
+    ref: row.ref,
+    teamIds: parseStringArray(row.team_ids_json, "repository team ids"),
+    projectIds: parseStringArray(
+      row.project_ids_json,
+      "repository project ids",
+    ),
+    labels: parseStringArray(row.labels_json, "repository labels"),
+    isDefault: row.is_default === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+const SAFE_ID_RE = /^[a-zA-Z0-9_.-]+$/u;
+
+function validateString(value: unknown, field: string): string {
+  if (typeof value !== "string") throw new Error(`${field} must be a string`);
+  return value.trim();
+}
+
+function isSafeArgument(value: string): boolean {
+  if (value.startsWith("-") || /\s/u.test(value)) return false;
+  return [...value].every((character) => {
+    const code = character.codePointAt(0);
+    return code !== undefined && code > 31 && code !== 127;
+  });
+}
+
+function normalizeStringArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`${field} must be an array`);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string")
+      throw new Error(`${field} must contain only strings`);
+    const trimmed = item.trim().toLowerCase();
+    if (!trimmed) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out.sort();
+}
+
+function validateRepository(
+  input: {
+    organizationId: string;
+    id: string;
+    url: string;
+    ref: string;
+    teamIds?: readonly string[];
+    projectIds?: readonly string[];
+    labels?: readonly string[];
+    isDefault?: boolean;
+  },
+  now: number,
+): RepositoryRecord {
+  const organizationId = validateString(input.organizationId, "organizationId");
+  if (!organizationId) throw new Error("organizationId must not be empty");
+  const id = validateString(input.id, "id");
+  if (!id || !SAFE_ID_RE.test(id))
+    throw new Error("id must be a non-empty safe identifier");
+  const url = validateString(input.url, "url");
+  if (!url || !isSafeArgument(url))
+    throw new Error("url must be a non-empty safe URL");
+  const ref = validateString(input.ref, "ref");
+  if (!ref || !isSafeArgument(ref))
+    throw new Error("ref must be a non-empty safe ref");
+  return {
+    organizationId,
+    id,
+    url,
+    ref,
+    teamIds: normalizeStringArray(input.teamIds ?? [], "teamIds"),
+    projectIds: normalizeStringArray(input.projectIds ?? [], "projectIds"),
+    labels: normalizeStringArray(input.labels ?? [], "labels"),
+    isDefault: input.isDefault === true,
+    createdAt: now,
+    updatedAt: now,
+  };
 }

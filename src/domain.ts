@@ -17,6 +17,14 @@ export type ActivityType =
   | "elicitation"
   | "response"
   | "error";
+export type LogLevel =
+  | "trace"
+  | "debug"
+  | "info"
+  | "warn"
+  | "error"
+  | "fatal"
+  | "silent";
 
 export interface GatewayConfig {
   readonly linearClientId: string;
@@ -24,9 +32,9 @@ export interface GatewayConfig {
   readonly linearWebhookSecret: string;
   readonly tokenEncryptionKey: Uint8Array;
   readonly publicUrl: URL;
+  readonly logLevel: LogLevel;
   readonly databasePath: string;
   readonly workspaceRoot: string;
-  readonly repositoryMapPath: string;
   readonly ompCliPath: string;
   readonly port: number;
   readonly leaseDurationMs: number;
@@ -41,8 +49,12 @@ export interface RepositoryDefinition {
   readonly projectIds: readonly string[];
 }
 
-export interface RepositoryMap {
-  readonly repositories: readonly RepositoryDefinition[];
+export interface RepositoryRecord extends RepositoryDefinition {
+  readonly organizationId: string;
+  readonly labels: readonly string[];
+  readonly isDefault: boolean;
+  readonly createdAt: number;
+  readonly updatedAt: number;
 }
 
 export interface InstallationRecord {

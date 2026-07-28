@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import { Writable } from "node:stream";
+import type { DestinationStream } from "pino";
 import type { RpcEvent } from "../src/domain";
+import { createLogger } from "../src/logger";
 import { OhMyPiRpcWorker } from "../src/rpc-worker";
 
 describe("OhMyPiRpcWorker", () => {
@@ -81,5 +84,62 @@ describe("OhMyPiRpcWorker", () => {
       message: "late scheduling failure",
     });
     await worker.stop();
+  });
+  test("logs raw inbound and outbound RPC frames at trace", async () => {
+    const chunks: string[] = [];
+    const stream = new Writable({
+      write(chunk, _encoding, callback) {
+        chunks.push(chunk.toString());
+        callback();
+      },
+    }) as DestinationStream;
+    const logger = createLogger({
+      level: "trace",
+      name: "rpc-test",
+      stream,
+    });
+    const worker = new OhMyPiRpcWorker({
+      command: [
+        process.execPath,
+        join(import.meta.dir, "fixtures/fake-rpc.ts"),
+      ],
+      cwd: process.cwd(),
+      env: Bun.env,
+      logger,
+    });
+    const messageEnded = Promise.withResolvers<void>();
+    worker.onEvent((event) => {
+      if (event.type === "message_end") messageEnded.resolve();
+    });
+    await worker.start();
+    await worker.prompt("perform fixture task");
+    await messageEnded.promise;
+    await worker.stop();
+
+    const frames = chunks
+      .map((line) => JSON.parse(line))
+      .filter((log) => log.event === "rpc.frame");
+    expect(frames.length).toBeGreaterThanOrEqual(3);
+    expect(frames.some((f) => f.direction === "outbound")).toBeTrue();
+    expect(frames.some((f) => f.direction === "inbound")).toBeTrue();
+    expect(frames.every((f) => f.component === "omp-rpc")).toBeTrue();
+
+    const outbound = frames.find(
+      (f) => f.direction === "outbound" && f.frame?.type === "prompt",
+    );
+    expect(outbound).toMatchObject({
+      direction: "outbound",
+      component: "omp-rpc",
+      frame: expect.objectContaining({ type: "prompt" }),
+    });
+
+    const inbound = frames.find(
+      (f) => f.direction === "inbound" && f.frame?.type === "ready",
+    );
+    expect(inbound).toMatchObject({
+      direction: "inbound",
+      component: "omp-rpc",
+      frame: expect.objectContaining({ type: "ready" }),
+    });
   });
 });

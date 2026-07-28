@@ -1,7 +1,9 @@
 import { hostname } from "node:os";
-import { loadConfig, loadRepositoryMap } from "./config";
+import type { Server } from "bun";
+import { createAdminRouter } from "./admin";
+import { loadConfig } from "./config";
 import { createLinearGateway } from "./linear-client";
-import { completeAuthorization, startAuthorization } from "./oauth";
+import { createLogger } from "./logger";
 import { ActivityProjector } from "./projector";
 import { Reconciler } from "./reconciler";
 import { OhMyPiRpcWorker } from "./rpc-worker";
@@ -11,14 +13,26 @@ import { handleWebhook } from "./webhook";
 import { WorkspaceManager } from "./workspace";
 
 const config = loadConfig();
-const [store, repositoryMap] = await Promise.all([
-  GatewayStore.open(config.databasePath, config.tokenEncryptionKey),
-  loadRepositoryMap(config.repositoryMapPath),
-]);
+const logger = createLogger({ level: config.logLevel, name: "gateway" });
+logger.info({ event: "config.ready" });
+logger.info({ event: "boot", publicUrl: config.publicUrl.toString() });
+
+const store = await GatewayStore.open(
+  config.databasePath,
+  config.tokenEncryptionKey,
+);
 store.recoverPendingDeliveries();
 store.recoverInterruptedRuns();
-const linear = createLinearGateway(config, store);
-const workspaces = new WorkspaceManager(config.workspaceRoot, repositoryMap);
+const linear = createLinearGateway(
+  config,
+  store,
+  logger.child({ component: "linear" }),
+);
+const workspaces = new WorkspaceManager(
+  config.workspaceRoot,
+  store,
+  logger.child({ component: "workspace" }),
+);
 const authority = new SessionAuthority({
   store,
   projector: new ActivityProjector(store, linear),
@@ -31,6 +45,7 @@ const authority = new SessionAuthority({
       ],
       cwd,
       env: Bun.env,
+      logger: logger.child({ component: "omp-rpc" }),
     }),
   owner: `${hostname()}:${process.pid}`,
   leaseDurationMs: config.leaseDurationMs,
@@ -39,15 +54,35 @@ const authority = new SessionAuthority({
       `/runs/${encodeURIComponent(sessionId)}`,
       config.publicUrl,
     ).toString(),
+  logger: logger.child({ component: "session-authority" }),
 });
-const reconciler = new Reconciler(authority);
+const reconciler = new Reconciler(
+  authority,
+  1_000,
+  logger.child({ component: "reconciler" }),
+);
 reconciler.start();
 
-const server = Bun.serve({
-  port: config.port,
-  async fetch(request) {
+const adminRouter = createAdminRouter({
+  config,
+  store,
+  workspaces,
+  reconciler,
+  logger: logger.child({ component: "admin" }),
+});
+
+function text(message: string, status: number): Response {
+  return new Response(message, { status });
+}
+
+function buildFetch(): (request: Request) => Promise<Response> {
+  return async (request) => {
     const url = new URL(request.url);
+    const now = Date.now();
     try {
+      const adminResponse = await adminRouter.handle(request, url, now);
+      if (adminResponse !== null) return adminResponse;
+
       if (url.pathname === "/health" && request.method === "GET") {
         const status = reconciler.status;
         return Response.json(
@@ -62,16 +97,7 @@ const server = Bun.serve({
           { status: status.lastError === null ? 200 : 503 },
         );
       }
-      if (url.pathname === "/oauth/start" && request.method === "GET") {
-        const authorization = await startAuthorization(config, store);
-        return Response.redirect(authorization.url, 302);
-      }
-      if (url.pathname === "/oauth/callback" && request.method === "GET") {
-        await completeAuthorization(config, store, url);
-        return new Response(
-          "Linear installation connected. You can close this window.",
-        );
-      }
+
       if (url.pathname.startsWith("/runs/") && request.method === "GET") {
         const sessionId = decodeURIComponent(
           url.pathname.slice("/runs/".length),
@@ -85,35 +111,85 @@ const server = Bun.serve({
           lastActivityAt: run.lastActivityAt,
         });
       }
+
       if (url.pathname === "/webhooks/linear") {
-        const response = await handleWebhook(request, config, store);
+        const response = await handleWebhook(
+          request,
+          config,
+          store,
+          logger.child({ component: "webhook" }),
+        );
         if (response.ok) void reconciler.tick();
         return response;
       }
+
       return new Response("Not found", { status: 404 });
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Internal server error";
-      console.error(message);
+      if (
+        message.includes("already exists") ||
+        message.includes("already exists for")
+      ) {
+        return text(message, 409);
+      }
+      if (
+        message.includes("is required") ||
+        message.includes("must be") ||
+        message.includes("must not be empty") ||
+        message.includes("must be a non-empty") ||
+        message.includes("does not match path") ||
+        message.includes("Invalid JSON") ||
+        message.includes("Request body must be")
+      ) {
+        return text(message, 400);
+      }
+      logger.error({
+        event: "request.failed",
+        method: request.method,
+        path: url.pathname,
+        error: message,
+      });
       return new Response("Internal server error", { status: 500 });
     }
-  },
-});
-
-console.log(`OhMyPi Linear gateway listening on ${server.url}`);
-
-let stopping = false;
-async function shutdown(): Promise<void> {
-  if (stopping) return;
-  stopping = true;
-  await server.stop(false);
-  await reconciler.stop();
-  store.close();
+  };
 }
 
-process.on("SIGINT", () => {
-  void shutdown().finally(() => process.exit(0));
-});
-process.on("SIGTERM", () => {
-  void shutdown().finally(() => process.exit(0));
-});
+export function createServer(): Server<unknown> {
+  return Bun.serve({
+    port: config.port,
+    fetch: buildFetch(),
+  });
+}
+
+export { buildFetch, config, reconciler, store };
+
+function start(): void {
+  const server = createServer();
+  logger.info({
+    event: "listening",
+    port: config.port,
+    url: server.url.toString(),
+  });
+
+  let stopping = false;
+  async function shutdown(): Promise<void> {
+    if (stopping) return;
+    stopping = true;
+    logger.info({ event: "shutdown" });
+    await server.stop(false);
+    await reconciler.stop();
+    store.close();
+  }
+
+  process.on("SIGINT", () => {
+    void shutdown().finally(() => process.exit(0));
+  });
+  process.on("SIGTERM", () => {
+    void shutdown().finally(() => process.exit(0));
+  });
+}
+
+if (import.meta.main) {
+  start();
+}

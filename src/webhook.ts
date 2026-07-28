@@ -1,5 +1,7 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import type { GatewayConfig, InputKind } from "./domain";
+import type { Logger } from "./logger";
+import { createLogger } from "./logger";
 import type { GatewayStore } from "./store";
 
 const LINEAR_SIGNATURE_HEADER = "linear-signature";
@@ -612,8 +614,18 @@ export async function handleWebhook(
   request: Request,
   config: GatewayConfig,
   store: GatewayStore,
+  logger?: Logger,
 ): Promise<Response> {
+  const log = logger ?? createLogger({ name: "webhook" });
+  const url = new URL(request.url);
   if (request.method !== "POST") {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "method not allowed",
+      method: request.method,
+      path: url.pathname,
+      status: 405,
+    });
     return new Response("Method not allowed", { status: 405 });
   }
 
@@ -621,14 +633,32 @@ export async function handleWebhook(
   try {
     rawBody = Buffer.from(await request.arrayBuffer());
   } catch {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "unable to read body",
+      path: url.pathname,
+      status: 400,
+    });
     return new Response("Unable to read body", { status: 400 });
   }
 
   const signature = request.headers.get(LINEAR_SIGNATURE_HEADER);
   if (!signature) {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "missing signature",
+      path: url.pathname,
+      status: 400,
+    });
     return new Response("Missing signature", { status: 400 });
   }
   if (!verifySignature(rawBody, signature, config.linearWebhookSecret)) {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "invalid signature",
+      path: url.pathname,
+      status: 401,
+    });
     return new Response("Invalid signature", { status: 401 });
   }
 
@@ -636,9 +666,21 @@ export async function handleWebhook(
   try {
     parsed = JSON.parse(rawBody.toString("utf-8"));
   } catch {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "invalid json",
+      path: url.pathname,
+      status: 400,
+    });
     return new Response("Invalid JSON", { status: 400 });
   }
   if (!isRecord(parsed)) {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "payload is not an object",
+      path: url.pathname,
+      status: 400,
+    });
     return new Response("Payload is not an object", { status: 400 });
   }
 
@@ -652,11 +694,23 @@ export async function handleWebhook(
         ? Number(timestampHeader)
         : NaN;
   if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "invalid timestamp",
+      path: url.pathname,
+      status: 400,
+    });
     return new Response("Invalid timestamp", { status: 400 });
   }
 
   const receivedAt = Date.now();
   if (Math.abs(receivedAt - timestamp) > config.webhookReplayWindowMs) {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "timestamp outside replay window",
+      path: url.pathname,
+      status: 401,
+    });
     return new Response("Webhook timestamp outside replay window", {
       status: 401,
     });
@@ -670,6 +724,12 @@ export async function handleWebhook(
     !isString(webhookId) ||
     !isString(eventType)
   ) {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "missing organizationId, webhookId, or type",
+      path: url.pathname,
+      status: 400,
+    });
     return new Response("Payload missing organizationId, webhookId, or type", {
       status: 400,
     });
@@ -680,6 +740,21 @@ export async function handleWebhook(
     request.headers.get(LINEAR_DELIVERY_HEADER) ??
     buildFallbackDeliveryId(parsed);
 
+  log.info({
+    event: "webhook.received",
+    deliveryId,
+    organizationId,
+    webhookId,
+    eventType,
+    path: url.pathname,
+  });
+  log.trace({
+    event: "webhook.payload",
+    deliveryId,
+    organizationId,
+    payload: parsed,
+  });
+
   const claim = store.claimDelivery({
     id: deliveryId,
     organizationId,
@@ -688,13 +763,34 @@ export async function handleWebhook(
     receivedAt,
   });
   if (claim === "duplicate") {
+    log.info({
+      event: "webhook.deduplicated",
+      deliveryId,
+      organizationId,
+      eventType,
+    });
     return new Response("Duplicate delivery", { status: 200 });
   }
   if (claim === "conflict") {
+    log.warn({
+      event: "webhook.rejected",
+      reason: "delivery id reused with different payload",
+      deliveryId,
+      organizationId,
+      eventType,
+      status: 409,
+    });
     return new Response("Delivery id reused with different payload", {
       status: 409,
     });
   }
+
+  log.info({
+    event: "webhook.verified",
+    deliveryId,
+    organizationId,
+    eventType,
+  });
 
   try {
     switch (eventType) {
@@ -717,6 +813,12 @@ export async function handleWebhook(
       }
     }
     store.markDelivery(deliveryId, "processed");
+    log.info({
+      event: "webhook.processed",
+      deliveryId,
+      organizationId,
+      eventType,
+    });
     return new Response("OK", { status: 200 });
   } catch (error) {
     store.markDelivery(
@@ -729,6 +831,14 @@ export async function handleWebhook(
         ? error.message
         : "Webhook processing failed";
     const status = error instanceof WebhookError ? error.status : 500;
+    log.warn({
+      event: "webhook.rejected",
+      reason: message,
+      deliveryId,
+      organizationId,
+      eventType,
+      status,
+    });
     return new Response(message, { status });
   }
 }

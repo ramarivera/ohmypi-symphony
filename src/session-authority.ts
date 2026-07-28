@@ -1,22 +1,26 @@
 import type {
   AgentRunRecord,
   RepositoryDefinition,
+  RepositoryRecord,
   RpcEvent,
   RpcWorker,
 } from "./domain";
+import type { Logger } from "./logger";
+import { createLogger } from "./logger";
 import type { ActivityProjector } from "./projector";
 import type { GatewayStore } from "./store";
-
 export type RepositoryResolution =
-  | { kind: "match"; repository: RepositoryDefinition }
+  | { kind: "match"; repository: RepositoryRecord }
   | { kind: "none" }
-  | { kind: "ambiguous"; repositories: readonly RepositoryDefinition[] };
-
+  | { kind: "ambiguous"; repositories: readonly RepositoryRecord[] };
 export interface WorkspacePort {
   resolve(context: {
+    organizationId: string | null;
     teamId: string | null;
     projectId: string | null;
     repositoryId: string | null;
+    issueLabels: readonly string[];
+    projectLabels: readonly string[];
   }): RepositoryResolution;
   materialize(
     sessionId: string,
@@ -30,9 +34,12 @@ export type WorkerFactory = (input: {
 }) => RpcWorker;
 
 interface InputContext {
+  organizationId: string | null;
   teamId: string | null;
   projectId: string | null;
   repositoryId: string | null;
+  issueLabels: readonly string[];
+  projectLabels: readonly string[];
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -43,19 +50,52 @@ function nullableString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function labelSet(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of value) {
+    let raw: string | null = null;
+    if (typeof item === "string") {
+      raw = item;
+    } else if (record(item) && typeof item.name === "string") {
+      raw = item.name;
+    }
+    if (!raw) continue;
+    const normalized = raw.trim().toLowerCase();
+    if (!normalized) continue;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out.sort();
+}
+
 function inputContext(payload: unknown): InputContext {
   if (!record(payload))
-    return { teamId: null, projectId: null, repositoryId: null };
+    return {
+      organizationId: null,
+      teamId: null,
+      projectId: null,
+      repositoryId: null,
+      issueLabels: [],
+      projectLabels: [],
+    };
   const session = record(payload.agentSession) ? payload.agentSession : null;
   const issue = session && record(session.issue) ? session.issue : null;
   const project = issue && record(issue.project) ? issue.project : null;
   return {
+    organizationId:
+      nullableString(payload.organizationId) ??
+      (session ? nullableString(session.organizationId) : null),
     teamId: issue ? nullableString(issue.teamId) : null,
     projectId: issue
       ? (nullableString(issue.projectId) ??
         (project ? nullableString(project.id) : null))
       : null,
     repositoryId: nullableString(payload.repositoryId),
+    issueLabels: issue ? labelSet(issue.labels) : [],
+    projectLabels: project ? labelSet(project.labels) : [],
   };
 }
 function planItems(value: unknown): Array<{
@@ -95,7 +135,6 @@ function failureCorrelationId(
     .digest("hex")
     .slice(0, 12);
 }
-
 export class SessionAuthority {
   readonly #store: GatewayStore;
   readonly #projector: ActivityProjector;
@@ -109,6 +148,7 @@ export class SessionAuthority {
   readonly #runUrlForSession: ((sessionId: string) => string) | null;
   readonly #eventQueues = new Map<string, Promise<void>>();
   readonly #pendingUi = new Map<string, { id: string; method: string }>();
+  #logger: Logger;
 
   constructor(input: {
     store: GatewayStore;
@@ -119,6 +159,7 @@ export class SessionAuthority {
     leaseDurationMs: number;
     maxAttempts?: number;
     runUrlForSession?: (sessionId: string) => string;
+    logger?: Logger;
   }) {
     this.#store = input.store;
     this.#projector = input.projector;
@@ -128,6 +169,12 @@ export class SessionAuthority {
     this.#leaseDurationMs = input.leaseDurationMs;
     this.#maxAttempts = input.maxAttempts ?? 5;
     this.#runUrlForSession = input.runUrlForSession ?? null;
+    this.#logger =
+      input.logger ??
+      createLogger({ name: "session-authority" }).child({
+        component: "session-authority",
+        owner: this.#owner,
+      });
   }
 
   activeWorkerCount(): number {
@@ -174,6 +221,12 @@ export class SessionAuthority {
     }
     const run = this.#store.getRun(sessionId);
     if (!run) return;
+    this.#logger.info({
+      event: "work.assigned",
+      sessionId,
+      attempt: run.attempt,
+      state: run.state,
+    });
     try {
       if (run.desiredState === "canceled") {
         await this.#cancel(run);
@@ -224,6 +277,12 @@ export class SessionAuthority {
             nextAttemptAt: null,
           });
           const resumed = this.#store.getRun(sessionId) ?? run;
+          this.#logger.info({
+            event: "run.retried",
+            sessionId,
+            attempt: resumed.attempt,
+            workspacePath: run.workspacePath,
+          });
           worker = await this.#startWorker(resumed, run.workspacePath);
           await this.#projector.thought(
             sessionId,
@@ -275,12 +334,16 @@ export class SessionAuthority {
             "Request accepted; preparing the OhMyPi worker.",
           );
           const baseContext = inputContext(input.payload);
+          const resolvedContext: Parameters<WorkspacePort["resolve"]>[0] = {
+            ...baseContext,
+            organizationId: baseContext.organizationId ?? run.organizationId,
+          };
           const context =
             input.kind === "prompted" &&
             latest.state === "waiting" &&
-            baseContext.repositoryId === null
-              ? { ...baseContext, repositoryId: input.body.trim() }
-              : baseContext;
+            resolvedContext.repositoryId === null
+              ? { ...resolvedContext, repositoryId: input.body.trim() }
+              : resolvedContext;
           const resolution = this.#workspaces.resolve(context);
           if (resolution.kind === "none") {
             await this.#projector.elicitation(
@@ -365,6 +428,14 @@ export class SessionAuthority {
     await worker.start();
     this.#store.updateRun(run.sessionId, { state: "running" });
     await this.#captureWorkerState(run.sessionId, worker);
+    this.#logger.info({
+      event: "work.ready",
+      sessionId: run.sessionId,
+      attempt: run.attempt,
+      cwd,
+      ompSessionId: worker.sessionId,
+      ompSessionFile: worker.sessionFile,
+    });
     return worker;
   }
   async #finishLocalCommand(
@@ -408,6 +479,11 @@ export class SessionAuthority {
       this.#store.updateRun(run.sessionId, {
         state: "canceled",
         terminalReason: "Stopped by Linear user",
+      });
+      this.#logger.info({
+        event: "run.canceled",
+        sessionId: run.sessionId,
+        attempt: run.attempt,
       });
       await this.#projector.terminal(
         run.sessionId,
@@ -519,6 +595,11 @@ export class SessionAuthority {
       await this.#captureWorkerState(sessionId, worker);
     }
     if (terminalAgentEnd) {
+      this.#logger.info({
+        event: "run.completed",
+        sessionId,
+        attempt: run.attempt,
+      });
       this.#store.updateRun(sessionId, {
         state: "succeeded",
         nextAttemptAt: null,
@@ -562,6 +643,13 @@ export class SessionAuthority {
         terminalReason: `${message} [${correlationId}]`,
         nextAttemptAt: null,
       });
+      this.#logger.info({
+        event: "run.failed",
+        sessionId,
+        attempt: current.attempt,
+        correlationId,
+        terminalReason: `${message} [${correlationId}]`,
+      });
       await this.#projector.terminal(
         sessionId,
         `failure:${correlationId}`,
@@ -571,10 +659,19 @@ export class SessionAuthority {
       return;
     }
     const delay = Math.min(300_000, 10_000 * 2 ** Math.min(current.attempt, 5));
+    const nextAttemptAt =
+      Date.now() + delay + Math.floor(Math.random() * 1_000);
     this.#store.updateRun(sessionId, {
       state: "orphaned",
       terminalReason: message,
-      nextAttemptAt: Date.now() + delay + Math.floor(Math.random() * 1_000),
+      nextAttemptAt,
+    });
+    this.#logger.info({
+      event: "run.retried",
+      sessionId,
+      attempt: current.attempt,
+      delay,
+      nextAttemptAt,
     });
   }
 }

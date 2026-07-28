@@ -13,11 +13,11 @@ const config: GatewayConfig = {
   publicUrl: new URL("https://gateway.example.com"),
   databasePath: ":memory:",
   workspaceRoot: "/workspaces",
-  repositoryMapPath: "/repositories.json",
   ompCliPath: "omp",
   port: 3000,
   leaseDurationMs: 60_000,
   webhookReplayWindowMs: 60_000,
+  logLevel: "info",
 };
 
 let store: GatewayStore;

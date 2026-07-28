@@ -106,10 +106,15 @@ class FakeWorkspace implements WorkspacePort {
     kind: "match",
     repository: {
       id: "repo",
+      organizationId: "org",
       url: "fixture",
       ref: "main",
       teamIds: ["team"],
       projectIds: [],
+      labels: [],
+      isDefault: false,
+      createdAt: 0,
+      updatedAt: 0,
     },
   };
   resolve(): RepositoryResolution {
@@ -318,8 +323,30 @@ describe("SessionAuthority", () => {
     workspace.resolution = {
       kind: "ambiguous",
       repositories: [
-        { id: "one", url: "one", ref: "main", teamIds: [], projectIds: [] },
-        { id: "two", url: "two", ref: "main", teamIds: [], projectIds: [] },
+        {
+          id: "one",
+          organizationId: "org",
+          url: "one",
+          ref: "main",
+          teamIds: [],
+          projectIds: [],
+          labels: [],
+          isDefault: false,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+        {
+          id: "two",
+          organizationId: "org",
+          url: "two",
+          ref: "main",
+          teamIds: [],
+          projectIds: [],
+          labels: [],
+          isDefault: false,
+          createdAt: 0,
+          updatedAt: 0,
+        },
       ],
     };
     await authority.processSession("session");
