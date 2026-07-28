@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
+import type { RpcEvent } from "../src/domain";
 import { OhMyPiRpcWorker } from "../src/rpc-worker";
 
 describe("OhMyPiRpcWorker", () => {
@@ -36,6 +37,27 @@ describe("OhMyPiRpcWorker", () => {
       sessionFile: "/safe/session.jsonl",
     });
     expect(worker.sessionId).toBe("omp-test");
+    await worker.stop();
+  });
+  test("surfaces a late prompt scheduling failure as an agent error event", async () => {
+    const worker = new OhMyPiRpcWorker({
+      command: [
+        process.execPath,
+        join(import.meta.dir, "fixtures/fake-rpc.ts"),
+      ],
+      cwd: process.cwd(),
+      env: Bun.env,
+    });
+    const failure = Promise.withResolvers<RpcEvent>();
+    worker.onEvent((event) => {
+      if (event.type === "error") failure.resolve(event);
+    });
+    await worker.start();
+    expect(await worker.prompt("late failure")).toBeTrue();
+    expect(await failure.promise).toMatchObject({
+      type: "error",
+      message: "late scheduling failure",
+    });
     await worker.stop();
   });
 });

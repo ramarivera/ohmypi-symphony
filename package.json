@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "bun": ">=1.3.14"
+  },
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
@@ -14,8 +17,13 @@
     "check": "bun run typecheck && bun run lint && bun test && bun run build"
   },
   "dependencies": {
-    "@linear/sdk": "88.3.0"
+    "@linear/sdk": "88.3.0",
+    "@oh-my-pi/pi-coding-agent": "17.1.8"
   },
+  "trustedDependencies": [
+    "onnxruntime-node",
+    "protobufjs"
+  ],
   "devDependencies": {
     "@biomejs/biome": "^2.5.6",
     "@types/bun": "^1.3.14",

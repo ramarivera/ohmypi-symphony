@@ -192,10 +192,22 @@ function mapActivityContent(
   }
 }
 
+function rateLimitDelay(error: unknown): number | null {
+  if (!isRecord(error)) return null;
+  const type = error.type;
+  const status = error.status ?? error.statusCode;
+  if (type !== "Ratelimited" && status !== 429) return null;
+  const retryAfter = error.retryAfter;
+  return typeof retryAfter === "number" && Number.isFinite(retryAfter)
+    ? Math.min(60_000, Math.max(0, retryAfter * 1_000))
+    : 1_000;
+}
+
 class LinearGateway implements LinearGatewayPort {
   readonly #config: GatewayConfig;
   readonly #store: GatewayStore;
   readonly #refreshing: Map<string, Promise<InstallationRecord>> = new Map();
+  readonly #apiQueues = new Map<string, Promise<void>>();
 
   constructor(config: GatewayConfig, store: GatewayStore) {
     this.#config = config;
@@ -259,6 +271,37 @@ class LinearGateway implements LinearGatewayPort {
     return new LinearClient({ accessToken: record.accessToken });
   }
 
+  async #schedule<T>(
+    organizationId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.#apiQueues.get(organizationId) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          return await operation();
+        } catch (error) {
+          const delay = rateLimitDelay(error);
+          if (delay === null) throw error;
+          await Bun.sleep(delay);
+          return operation();
+        }
+      });
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#apiQueues.set(organizationId, tail);
+    try {
+      return await run;
+    } finally {
+      if (this.#apiQueues.get(organizationId) === tail) {
+        this.#apiQueues.delete(organizationId);
+      }
+    }
+  }
+
   async createActivity(input: {
     sessionId: string;
     content: LinearActivityContent;
@@ -268,25 +311,28 @@ class LinearGateway implements LinearGatewayPort {
   }): Promise<string> {
     const run = this.#store.getRun(input.sessionId);
     if (!run) throw new Error(`Unknown run ${input.sessionId}`);
-
-    const client = await this.#clientFor(run.organizationId);
-    const activityInput: Parameters<LinearClient["createAgentActivity"]>[0] = {
-      agentSessionId: input.sessionId,
-      content: mapActivityContent(input.content),
-    };
-    if (input.ephemeral !== undefined)
-      activityInput.ephemeral = input.ephemeral;
-    if (input.signal !== undefined)
-      activityInput.signal = mapActivitySignal(input.signal);
-    if (input.signalMetadata !== undefined)
-      activityInput.signalMetadata = input.signalMetadata;
-
-    const payload = await client.createAgentActivity(activityInput);
-    if (!payload.success)
-      throw new Error("Linear failed to create agent activity");
-    const id = payload.agentActivityId;
-    if (!id) throw new Error("Linear did not return an agent activity id");
-    return id;
+    return this.#schedule(run.organizationId, async () => {
+      const client = await this.#clientFor(run.organizationId);
+      const activityInput: Parameters<LinearClient["createAgentActivity"]>[0] =
+        {
+          agentSessionId: input.sessionId,
+          content: mapActivityContent(input.content),
+        };
+      if (input.ephemeral !== undefined)
+        activityInput.ephemeral = input.ephemeral;
+      if (input.signal !== undefined)
+        activityInput.signal = mapActivitySignal(input.signal);
+      if (input.signalMetadata !== undefined)
+        activityInput.signalMetadata = input.signalMetadata;
+      const payload = await client.createAgentActivity(activityInput);
+      if (!payload.success)
+        throw new Error("Linear failed to create agent activity");
+      const id = payload.agentActivity
+        ? (await payload.agentActivity).id
+        : undefined;
+      if (!id) throw new Error("Linear did not return an agent activity id");
+      return id;
+    });
   }
 
   async updateSession(input: {
@@ -296,23 +342,23 @@ class LinearGateway implements LinearGatewayPort {
   }): Promise<void> {
     const run = this.#store.getRun(input.sessionId);
     if (!run) throw new Error(`Unknown run ${input.sessionId}`);
-
-    const client = await this.#clientFor(run.organizationId);
-    const updateInput: Parameters<LinearClient["updateAgentSession"]>[1] = {};
-    if (input.plan !== undefined) updateInput.plan = input.plan;
-    if (input.externalUrls !== undefined) {
-      updateInput.externalUrls = input.externalUrls.map((url) => ({
-        label: url.label,
-        url: url.url,
-      }));
-    }
-
-    const payload = await client.updateAgentSession(
-      input.sessionId,
-      updateInput,
-    );
-    if (!payload.success)
-      throw new Error("Linear failed to update agent session");
+    await this.#schedule(run.organizationId, async () => {
+      const client = await this.#clientFor(run.organizationId);
+      const updateInput: Parameters<LinearClient["updateAgentSession"]>[1] = {};
+      if (input.plan !== undefined) updateInput.plan = input.plan;
+      if (input.externalUrls !== undefined) {
+        updateInput.externalUrls = input.externalUrls.map((url) => ({
+          label: url.label,
+          url: url.url,
+        }));
+      }
+      const payload = await client.updateAgentSession(
+        input.sessionId,
+        updateInput,
+      );
+      if (!payload.success)
+        throw new Error("Linear failed to update agent session");
+    });
   }
 
   async refreshInstallation(organizationId: string): Promise<string> {

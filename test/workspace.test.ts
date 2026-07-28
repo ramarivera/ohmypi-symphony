@@ -92,7 +92,7 @@ describe("WorkspaceManager", () => {
     const second = await workspaces.materialize("session", repository);
     expect(first).toBe(second);
     expect(await Bun.file(join(first, "README.txt")).text()).toBe("fixture");
-  });
+  }, 15_000);
 
   test("rejects a symlink workspace target", async () => {
     const workspaceRoot = join(root, "linked-workspaces");

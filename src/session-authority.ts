@@ -58,6 +58,43 @@ function inputContext(payload: unknown): InputContext {
     repositoryId: nullableString(payload.repositoryId),
   };
 }
+function planItems(value: unknown): Array<{
+  content: string;
+  status: "pending" | "inProgress" | "completed" | "canceled";
+}> {
+  if (!Array.isArray(value)) return [];
+  const candidates = value.flatMap((phase) =>
+    record(phase) && Array.isArray(phase.tasks) ? phase.tasks : [phase],
+  );
+  const items: Array<{
+    content: string;
+    status: "pending" | "inProgress" | "completed" | "canceled";
+  }> = [];
+  for (const candidate of candidates) {
+    if (!record(candidate) || typeof candidate.content !== "string") continue;
+    const status =
+      candidate.status === "in_progress" || candidate.status === "inProgress"
+        ? "inProgress"
+        : candidate.status === "completed"
+          ? "completed"
+          : candidate.status === "canceled" || candidate.status === "cancelled"
+            ? "canceled"
+            : "pending";
+    items.push({ content: candidate.content, status });
+  }
+  return items;
+}
+
+function failureCorrelationId(
+  sessionId: string,
+  attempt: number,
+  message: string,
+): string {
+  return new Bun.CryptoHasher("sha256")
+    .update(`${sessionId}\0${attempt}\0${message}`)
+    .digest("hex")
+    .slice(0, 12);
+}
 
 export class SessionAuthority {
   readonly #store: GatewayStore;
@@ -66,8 +103,12 @@ export class SessionAuthority {
   readonly #workerFactory: WorkerFactory;
   readonly #owner: string;
   readonly #leaseDurationMs: number;
+  readonly #maxAttempts: number;
   readonly #workers = new Map<string, RpcWorker>();
   readonly #eventSequence = new Map<string, number>();
+  readonly #runUrlForSession: ((sessionId: string) => string) | null;
+  readonly #eventQueues = new Map<string, Promise<void>>();
+  readonly #pendingUi = new Map<string, { id: string; method: string }>();
 
   constructor(input: {
     store: GatewayStore;
@@ -76,6 +117,8 @@ export class SessionAuthority {
     workerFactory: WorkerFactory;
     owner: string;
     leaseDurationMs: number;
+    maxAttempts?: number;
+    runUrlForSession?: (sessionId: string) => string;
   }) {
     this.#store = input.store;
     this.#projector = input.projector;
@@ -83,17 +126,33 @@ export class SessionAuthority {
     this.#workerFactory = input.workerFactory;
     this.#owner = input.owner;
     this.#leaseDurationMs = input.leaseDurationMs;
+    this.#maxAttempts = input.maxAttempts ?? 5;
+    this.#runUrlForSession = input.runUrlForSession ?? null;
   }
 
   activeWorkerCount(): number {
     return this.#workers.size;
   }
-
   async processRunnable(): Promise<void> {
+    await Promise.allSettled(this.#eventQueues.values());
+    await this.#projector.flushPending();
+    for (const [sessionId, worker] of this.#workers) {
+      const run = this.#store.getRun(sessionId);
+      if (!run || run.desiredState === "canceled") continue;
+      if (
+        !this.#store.renewLease(sessionId, this.#owner, this.#leaseDurationMs)
+      ) {
+        await worker.abort().catch(() => undefined);
+        await worker.stop().catch(() => undefined);
+        this.#workers.delete(sessionId);
+      }
+    }
     for (const run of this.#store.listCancellationPending())
       await this.#cancel(run);
-    for (const run of this.#store.listRunnable())
-      await this.processSession(run.sessionId);
+    const sessions = new Set(this.#store.listSessionsWithPendingInputs());
+    for (const run of this.#store.listRunnable()) sessions.add(run.sessionId);
+    for (const sessionId of sessions) await this.processSession(sessionId);
+    await this.#projector.flushPending();
   }
 
   async processSession(sessionId: string): Promise<void> {
@@ -102,8 +161,17 @@ export class SessionAuthority {
       await this.#cancel(initial);
       return;
     }
-    if (!this.#store.claimRun(sessionId, this.#owner, this.#leaseDurationMs))
+    const localWorker = this.#workers.get(sessionId);
+    if (localWorker) {
+      if (
+        !this.#store.renewLease(sessionId, this.#owner, this.#leaseDurationMs)
+      )
+        return;
+    } else if (
+      !this.#store.claimRun(sessionId, this.#owner, this.#leaseDurationMs)
+    ) {
       return;
+    }
     const run = this.#store.getRun(sessionId);
     if (!run) return;
     try {
@@ -119,6 +187,12 @@ export class SessionAuthority {
           state: "failed",
           terminalReason: "Linear installation is unavailable",
         });
+        await this.#projector.terminal(
+          sessionId,
+          `installation-unavailable:${run.organizationId}`,
+          "error",
+          "The Linear installation is unavailable. Reinstall or reauthorize the app, then try again.",
+        );
         return;
       }
       if (
@@ -131,11 +205,51 @@ export class SessionAuthority {
           state: "canceled",
           terminalReason: "Linear team access was removed",
         });
+        await this.#projector.terminal(
+          sessionId,
+          `team-access-removed:${run.teamId}`,
+          "response",
+          "Stopped because this Linear installation no longer has access to the issue's team.",
+        );
         return;
       }
+
       const inputs = this.#store.pendingInputs(sessionId);
-      if (inputs.length === 0) return;
       let worker = this.#workers.get(sessionId);
+      if (inputs.length === 0) {
+        if (!worker && run.state === "orphaned" && run.workspacePath !== null) {
+          this.#store.updateRun(sessionId, {
+            state: "starting",
+            incrementAttempt: true,
+            nextAttemptAt: null,
+          });
+          const resumed = this.#store.getRun(sessionId) ?? run;
+          worker = await this.#startWorker(resumed, run.workspacePath);
+          await this.#projector.thought(
+            sessionId,
+            `retry:${resumed.attempt}`,
+            `Retrying the interrupted OhMyPi run (attempt ${resumed.attempt}).`,
+          );
+          if (run.ompSessionFile !== null) {
+            await worker.followUp(
+              "Continue the interrupted Linear task from the saved session state.",
+            );
+          } else {
+            const latestInput = this.#store.latestActionableInput(sessionId);
+            if (!latestInput)
+              throw new Error("Interrupted run has no input to resume");
+            const agentInvoked = await worker.prompt(latestInput.body);
+            if (!agentInvoked)
+              await this.#finishLocalCommand(
+                sessionId,
+                worker,
+                `retry:${resumed.attempt}`,
+              );
+          }
+        }
+        return;
+      }
+
       for (const input of inputs) {
         const latest = this.#store.getRun(sessionId);
         if (
@@ -148,7 +262,25 @@ export class SessionAuthority {
           break;
         }
         if (!worker) {
-          const context = inputContext(input.payload);
+          if (this.#runUrlForSession) {
+            await this.#projector.externalUrls(
+              sessionId,
+              `run-url:${sessionId}`,
+              [{ label: "OhMyPi run", url: this.#runUrlForSession(sessionId) }],
+            );
+          }
+          await this.#projector.thought(
+            sessionId,
+            `accepted:${input.id}`,
+            "Request accepted; preparing the OhMyPi worker.",
+          );
+          const baseContext = inputContext(input.payload);
+          const context =
+            input.kind === "prompted" &&
+            latest.state === "waiting" &&
+            baseContext.repositoryId === null
+              ? { ...baseContext, repositoryId: input.body.trim() }
+              : baseContext;
           const resolution = this.#workspaces.resolve(context);
           if (resolution.kind === "none") {
             await this.#projector.elicitation(
@@ -187,56 +319,80 @@ export class SessionAuthority {
             workspacePath,
             incrementAttempt: true,
           });
-          worker = this.#workerFactory({
-            run: this.#store.getRun(sessionId) ?? run,
-            cwd: workspacePath,
-          });
-          this.#workers.set(sessionId, worker);
-          worker.onEvent((event) => {
-            void this.#handleEvent(sessionId, event);
-          });
-          await worker.start();
-          this.#store.updateRun(sessionId, { state: "running" });
-          await this.#projector.thought(
-            sessionId,
-            `accepted:${input.id}`,
-            "Request accepted; preparing the OhMyPi worker.",
+          worker = await this.#startWorker(
+            this.#store.getRun(sessionId) ?? run,
+            workspacePath,
           );
-          await worker.prompt(input.body);
+          const agentInvoked = await worker.prompt(input.body);
+          if (!agentInvoked) {
+            await this.#finishLocalCommand(sessionId, worker, input.id);
+          }
         } else if (input.kind === "prompted") {
-          await worker.followUp(input.body);
+          const pendingUi = this.#pendingUi.get(sessionId);
+          if (pendingUi) {
+            const normalized = input.body.trim().toLowerCase();
+            const response =
+              pendingUi.method === "confirm"
+                ? {
+                    confirmed: /^(?:y|yes|true|confirm|confirmed)$/u.test(
+                      normalized,
+                    ),
+                  }
+                : { value: input.body };
+            await worker.respondToUi(pendingUi.id, response);
+            this.#pendingUi.delete(sessionId);
+          } else if (worker.isStreaming) {
+            await worker.steer(input.body);
+          } else {
+            await worker.followUp(input.body);
+          }
           this.#store.updateRun(sessionId, { state: "running" });
         }
         this.#store.markInputProcessed(input.id);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const current = this.#store.getRun(sessionId);
-      const attempt = current?.attempt ?? 0;
-      const delay = Math.min(300_000, 10_000 * 2 ** Math.min(attempt, 5));
-      this.#store.updateRun(sessionId, {
-        state: "orphaned",
-        terminalReason: message,
-        nextAttemptAt: Date.now() + delay + Math.floor(Math.random() * 1_000),
-      });
-      const worker = this.#workers.get(sessionId);
-      if (worker) await worker.stop().catch(() => undefined);
-      this.#workers.delete(sessionId);
+      await this.#handleFailure(sessionId, error);
     } finally {
       if (!this.#workers.has(sessionId))
         this.#store.releaseLease(sessionId, this.#owner);
     }
   }
 
+  async #startWorker(run: AgentRunRecord, cwd: string): Promise<RpcWorker> {
+    const worker = this.#workerFactory({ run, cwd });
+    this.#workers.set(run.sessionId, worker);
+    worker.onEvent((event) => this.#enqueueEvent(run.sessionId, event));
+    await worker.start();
+    this.#store.updateRun(run.sessionId, { state: "running" });
+    await this.#captureWorkerState(run.sessionId, worker);
+    return worker;
+  }
+  async #finishLocalCommand(
+    sessionId: string,
+    worker: RpcWorker,
+    sourceId: string,
+  ): Promise<void> {
+    await this.#captureWorkerState(sessionId, worker);
+    this.#store.updateRun(sessionId, { state: "waiting", nextAttemptAt: null });
+    await this.#projector.thought(
+      sessionId,
+      `local-command:${sourceId}`,
+      "The OhMyPi command completed without starting an agent turn.",
+    );
+  }
+
   async shutdown(): Promise<void> {
     const workers = [...this.#workers.entries()];
     this.#workers.clear();
+    this.#pendingUi.clear();
     await Promise.all(
       workers.map(async ([sessionId, worker]) => {
         await worker.stop().catch(() => undefined);
         this.#store.releaseLease(sessionId, this.#owner);
       }),
     );
+    await Promise.allSettled(this.#eventQueues.values());
+    await this.#projector.flushPending();
   }
 
   async #cancel(run: AgentRunRecord): Promise<void> {
@@ -246,6 +402,7 @@ export class SessionAuthority {
       await worker.stop().catch(() => undefined);
       this.#workers.delete(run.sessionId);
     }
+    this.#pendingUi.delete(run.sessionId);
     const current = this.#store.getRun(run.sessionId);
     if (current && current.state !== "canceled") {
       this.#store.updateRun(run.sessionId, {
@@ -262,32 +419,151 @@ export class SessionAuthority {
     this.#store.releaseLease(run.sessionId, this.#owner);
   }
 
+  #enqueueEvent(sessionId: string, event: RpcEvent): void {
+    const previous = this.#eventQueues.get(sessionId) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(() => this.#handleEvent(sessionId, event))
+      .catch((error: unknown) => this.#handleFailure(sessionId, error))
+      .finally(() => {
+        if (this.#eventQueues.get(sessionId) === next)
+          this.#eventQueues.delete(sessionId);
+      });
+    this.#eventQueues.set(sessionId, next);
+  }
+  async #captureWorkerState(
+    sessionId: string,
+    worker: RpcWorker,
+  ): Promise<void> {
+    const state: Record<string, unknown> = await worker
+      .getState()
+      .catch((): Record<string, unknown> => ({}));
+    const ompSessionId =
+      typeof state.sessionId === "string" ? state.sessionId : worker.sessionId;
+    const ompSessionFile =
+      typeof state.sessionFile === "string"
+        ? state.sessionFile
+        : worker.sessionFile;
+    this.#store.updateRun(sessionId, { ompSessionId, ompSessionFile });
+    if (Array.isArray(state.todoPhases)) {
+      const items = planItems(state.todoPhases);
+      const fingerprint = new Bun.CryptoHasher("sha256")
+        .update(JSON.stringify(items))
+        .digest("hex")
+        .slice(0, 16);
+      await this.#projector.plan(
+        sessionId,
+        `plan:${sessionId}:${fingerprint}`,
+        items,
+      );
+    }
+  }
+
   async #handleEvent(sessionId: string, event: RpcEvent): Promise<void> {
+    const run = this.#store.getRun(sessionId);
+    if (!run || run.desiredState === "canceled" || run.state === "canceled")
+      return;
     const sequence = (this.#eventSequence.get(sessionId) ?? 0) + 1;
     this.#eventSequence.set(sessionId, sequence);
-    await this.#projector.projectRpcEvent(sessionId, sequence, event);
-    if (event.type === "agent_end") {
-      const worker = this.#workers.get(sessionId);
-      if (!worker) return;
-      const state: Record<string, unknown> = await worker
-        .getState()
-        .catch(() => ({}));
-      const session =
-        typeof state.sessionId === "string"
-          ? state.sessionId
-          : worker.sessionId;
-      const sessionFile =
-        typeof state.sessionFile === "string"
-          ? state.sessionFile
-          : worker.sessionFile;
+    if (
+      event.type === "extension_ui_request" &&
+      typeof event.id === "string" &&
+      typeof event.method === "string" &&
+      ["select", "confirm", "input", "editor"].includes(event.method)
+    ) {
+      this.#pendingUi.set(sessionId, { id: event.id, method: event.method });
+      const title =
+        typeof event.title === "string" ? event.title : "Input required";
+      const message = typeof event.message === "string" ? event.message : "";
+      const options = Array.isArray(event.options)
+        ? event.options.filter(
+            (option): option is string => typeof option === "string",
+          )
+        : [];
+      await this.#projector.elicitation(
+        sessionId,
+        `rpc-ui:${event.id}`,
+        [title, message].filter(Boolean).join("\n\n"),
+        options.length > 0 ? options : undefined,
+      );
+      this.#store.updateRun(sessionId, { state: "waiting" });
+      return;
+    }
+    if (event.type === "error") {
+      throw new Error(
+        typeof event.message === "string"
+          ? event.message
+          : "OhMyPi worker failed",
+      );
+    }
+    const worker = this.#workers.get(sessionId);
+    const terminalAgentEnd =
+      event.type === "agent_end" && event.willContinue !== true;
+    if (
+      worker &&
+      (event.type === "agent_start" ||
+        event.type === "turn_end" ||
+        event.type === "agent_end")
+    ) {
+      await this.#captureWorkerState(sessionId, worker);
+    }
+    if (terminalAgentEnd) {
       this.#store.updateRun(sessionId, {
         state: "succeeded",
-        ompSessionId: session,
-        ompSessionFile: sessionFile,
+        nextAttemptAt: null,
       });
-      await worker.stop();
-      this.#workers.delete(sessionId);
-      this.#store.releaseLease(sessionId, this.#owner);
+      try {
+        await this.#projector.projectRpcEvent(sessionId, sequence, event);
+      } finally {
+        if (worker) await worker.stop().catch(() => undefined);
+        this.#workers.delete(sessionId);
+        this.#store.releaseLease(sessionId, this.#owner);
+      }
+      return;
     }
+    await this.#projector.projectRpcEvent(sessionId, sequence, event);
+  }
+
+  async #handleFailure(sessionId: string, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    const worker = this.#workers.get(sessionId);
+    if (worker) await worker.stop().catch(() => undefined);
+    this.#workers.delete(sessionId);
+    const current = this.#store.getRun(sessionId);
+    if (
+      !current ||
+      current.state === "succeeded" ||
+      current.state === "canceled"
+    )
+      return;
+    if (current.desiredState === "canceled") {
+      await this.#cancel(current);
+      return;
+    }
+    if (current.attempt >= this.#maxAttempts) {
+      const correlationId = failureCorrelationId(
+        sessionId,
+        current.attempt,
+        message,
+      );
+      this.#store.updateRun(sessionId, {
+        state: "failed",
+        terminalReason: `${message} [${correlationId}]`,
+        nextAttemptAt: null,
+      });
+      await this.#projector.terminal(
+        sessionId,
+        `failure:${correlationId}`,
+        "error",
+        `The OhMyPi run failed after ${current.attempt} attempts. Reference: ${correlationId}`,
+      );
+      return;
+    }
+    const delay = Math.min(300_000, 10_000 * 2 ** Math.min(current.attempt, 5));
+    this.#store.updateRun(sessionId, {
+      state: "orphaned",
+      terminalReason: message,
+      nextAttemptAt: Date.now() + delay + Math.floor(Math.random() * 1_000),
+    });
   }
 }

@@ -118,12 +118,17 @@ export interface RpcEvent {
 export interface RpcWorker {
   readonly sessionId: string | null;
   readonly sessionFile: string | null;
+  readonly isStreaming: boolean;
   start(): Promise<void>;
-  prompt(message: string): Promise<void>;
+  prompt(message: string): Promise<boolean>;
   steer(message: string): Promise<void>;
   followUp(message: string): Promise<void>;
   abort(): Promise<void>;
   getState(): Promise<Record<string, unknown>>;
+  respondToUi(
+    requestId: string,
+    response: { value: string } | { confirmed: boolean } | { cancelled: true },
+  ): Promise<void>;
   stop(): Promise<void>;
   onEvent(listener: (event: RpcEvent) => void): () => void;
 }

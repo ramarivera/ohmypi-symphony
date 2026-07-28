@@ -1,4 +1,8 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { GatewayStore } from "../src/store";
 
 const key = new Uint8Array(32).fill(7);
@@ -105,10 +109,58 @@ describe("GatewayStore", () => {
       sessionId: "session-1",
       activityType: "response",
       payloadHash: "hash",
+      payload: { body: "done" },
     };
-    expect(store.reserveProjection(projection)).toBeTrue();
-    expect(store.reserveProjection(projection)).toBeFalse();
-    store.completeProjection("event-1", "linear-activity-1");
+    expect(store.enqueueProjection(projection)).toBeTrue();
+    expect(store.enqueueProjection(projection)).toBeFalse();
+    expect(
+      store.claimProjection("event-1", "test-owner", 60_000),
+    ).not.toBeNull();
+    store.completeProjection("event-1", "test-owner", "linear-activity-1");
     expect(store.projectionCount("session-1", "response")).toBe(1);
+  });
+  test("migrates legacy content deduplication without dropping projection history", async () => {
+    store.close();
+    const directory = await mkdtemp(join(tmpdir(), "linear-gateway-store-"));
+    const path = join(directory, "gateway.sqlite");
+    try {
+      const legacy = new Database(path);
+      legacy.exec(`
+        CREATE TABLE activity_projection (
+          source_key TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          activity_type TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          linear_activity_id TEXT,
+          status TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          UNIQUE(session_id, activity_type, payload_hash)
+        );
+      `);
+      legacy.close();
+      store = await GatewayStore.open(path, key);
+      store.createRun({
+        sessionId: "session",
+        organizationId: "org",
+        issueId: null,
+      });
+      const common = {
+        sessionId: "session",
+        activityType: "thought",
+        payloadHash: "same-content",
+        payload: { body: "Accepted" },
+      };
+      expect(
+        store.enqueueProjection({ ...common, sourceKey: "turn-1" }),
+      ).toBeTrue();
+      expect(
+        store.enqueueProjection({ ...common, sourceKey: "turn-2" }),
+      ).toBeTrue();
+    } finally {
+      store.close();
+      await rm(directory, { recursive: true, force: true });
+      store = await GatewayStore.open(":memory:", key);
+    }
   });
 });

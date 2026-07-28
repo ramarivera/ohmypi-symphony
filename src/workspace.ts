@@ -133,8 +133,6 @@ export class WorkspaceManager implements WorkspacePort {
       ) {
         throw new Error("Workspace repository identity mismatch");
       }
-      await runGit(["fetch", "--depth=1", "origin", repository.ref], target);
-      await runGit(["checkout", "--detach", "--force", "FETCH_HEAD"], target);
       return canonicalTarget;
     }
 

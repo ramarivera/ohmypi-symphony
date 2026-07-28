@@ -10,12 +10,12 @@ import type { GatewayStore } from "./store";
 const DEFAULT_AUTHORIZE_REDIRECT_PATH = "oauth/callback";
 const DEFAULT_STATE_TTL_MS = 10 * 60 * 1000;
 const AUTHORIZE_URL = "https://linear.app/oauth/authorize";
-const DEFAULT_SCOPES = [
+const DEFAULT_SCOPES: readonly string[] = [
   "read",
   "write",
   "app:assignable",
   "app:mentionable",
-] as const;
+];
 
 function hashState(rawState: string): string {
   return createHash("sha256").update(rawState).digest("base64url");

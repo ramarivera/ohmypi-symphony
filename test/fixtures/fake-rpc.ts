@@ -52,6 +52,20 @@ while (true) {
             command: input.type,
             success: true,
           });
+          if (
+            input.type === "prompt" &&
+            "message" in input &&
+            input.message === "late failure"
+          ) {
+            send({
+              type: "response",
+              id: input.id,
+              command: input.type,
+              success: false,
+              error: "late scheduling failure",
+            });
+            continue;
+          }
           if (input.type === "prompt") {
             sendMany([
               {

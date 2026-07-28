@@ -21,14 +21,22 @@ const authority = new SessionAuthority({
   store,
   projector: new ActivityProjector(store, linear),
   workspaces,
-  workerFactory: ({ cwd }) =>
+  workerFactory: ({ cwd, run }) =>
     new OhMyPiRpcWorker({
-      command: [config.ompCliPath],
+      command: [
+        config.ompCliPath,
+        ...(run.ompSessionFile ? ["--session", run.ompSessionFile] : []),
+      ],
       cwd,
       env: Bun.env,
     }),
   owner: `${hostname()}:${process.pid}`,
   leaseDurationMs: config.leaseDurationMs,
+  runUrlForSession: (sessionId) =>
+    new URL(
+      `/runs/${encodeURIComponent(sessionId)}`,
+      config.publicUrl,
+    ).toString(),
 });
 const reconciler = new Reconciler(authority);
 reconciler.start();
@@ -39,7 +47,18 @@ const server = Bun.serve({
     const url = new URL(request.url);
     try {
       if (url.pathname === "/health" && request.method === "GET") {
-        return Response.json({ status: "ok", reconciler: reconciler.status });
+        const status = reconciler.status;
+        return Response.json(
+          {
+            status: status.lastError === null ? "ok" : "degraded",
+            reconciler: {
+              running: status.running,
+              lastStartedAt: status.lastStartedAt,
+              lastCompletedAt: status.lastCompletedAt,
+            },
+          },
+          { status: status.lastError === null ? 200 : 503 },
+        );
       }
       if (url.pathname === "/oauth/start" && request.method === "GET") {
         const authorization = await startAuthorization(config, store);
@@ -51,8 +70,23 @@ const server = Bun.serve({
           "Linear installation connected. You can close this window.",
         );
       }
+      if (url.pathname.startsWith("/runs/") && request.method === "GET") {
+        const sessionId = decodeURIComponent(
+          url.pathname.slice("/runs/".length),
+        );
+        const run = store.getRun(sessionId);
+        if (!run) return new Response("Not found", { status: 404 });
+        return Response.json({
+          sessionId: run.sessionId,
+          state: run.state,
+          attempt: run.attempt,
+          lastActivityAt: run.lastActivityAt,
+        });
+      }
       if (url.pathname === "/webhooks/linear") {
-        return handleWebhook(request, config, store);
+        const response = await handleWebhook(request, config, store);
+        if (response.ok) void reconciler.tick();
+        return response;
       }
       return new Response("Not found", { status: 404 });
     } catch (error) {

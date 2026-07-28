@@ -1,6 +1,7 @@
 import type { RpcEvent, RpcWorker } from "./domain";
 
 interface PendingRequest {
+  command: string;
   resolve(value: Record<string, unknown>): void;
   reject(error: Error): void;
 }
@@ -46,6 +47,9 @@ export class OhMyPiRpcWorker implements RpcWorker {
   #sessionId: string | null = null;
   #sessionFile: string | null = null;
   #supportsProtocolV2 = false;
+  #streaming = false;
+  #stderrTail = "";
+  readonly #promptRequestIds = new Set<string>();
 
   constructor(input: {
     command: readonly string[];
@@ -74,6 +78,9 @@ export class OhMyPiRpcWorker implements RpcWorker {
   get sessionFile(): string | null {
     return this.#sessionFile;
   }
+  get isStreaming(): boolean {
+    return this.#streaming;
+  }
 
   async start(): Promise<void> {
     if (this.#process) throw new Error("RPC worker already started");
@@ -89,6 +96,7 @@ export class OhMyPiRpcWorker implements RpcWorker {
     void this.#readOutput(process, ready).catch((error: unknown) =>
       this.#fail(error),
     );
+    void this.#readStderr(process).catch(() => undefined);
     const timeout = setTimeout(
       () =>
         ready.reject(new Error("Timed out waiting for OhMyPi RPC ready frame")),
@@ -111,8 +119,13 @@ export class OhMyPiRpcWorker implements RpcWorker {
     }
   }
 
-  prompt(message: string): Promise<void> {
-    return this.#commandWithoutData("prompt", { message });
+  async prompt(message: string): Promise<boolean> {
+    const response = await this.#send("prompt", { message });
+    const data = record(response.data) ? response.data : null;
+    const agentInvoked = data?.agentInvoked !== false;
+    if (!agentInvoked && typeof response.id === "string")
+      this.#promptRequestIds.delete(response.id);
+    return agentInvoked;
   }
   steer(message: string): Promise<void> {
     return this.#commandWithoutData("steer", { message });
@@ -126,7 +139,22 @@ export class OhMyPiRpcWorker implements RpcWorker {
 
   async getState(): Promise<Record<string, unknown>> {
     const response = await this.#send("get_state");
-    return record(response.data) ? response.data : {};
+    const state = record(response.data) ? response.data : {};
+    if (typeof state.sessionId === "string") this.#sessionId = state.sessionId;
+    if (typeof state.sessionFile === "string")
+      this.#sessionFile = state.sessionFile;
+    return state;
+  }
+
+  async respondToUi(
+    requestId: string,
+    response: { value: string } | { confirmed: boolean } | { cancelled: true },
+  ): Promise<void> {
+    await this.#writeFrame({
+      type: "extension_ui_response",
+      id: requestId,
+      ...response,
+    });
   }
 
   onEvent(listener: (event: RpcEvent) => void): () => void {
@@ -169,7 +197,11 @@ export class OhMyPiRpcWorker implements RpcWorker {
     if (!process) throw new Error("RPC worker is not running");
     const id = `gateway-${++this.#requestSequence}`;
     const pending = Promise.withResolvers<Record<string, unknown>>();
-    this.#pending.set(id, { resolve: pending.resolve, reject: pending.reject });
+    this.#pending.set(id, {
+      command: type,
+      resolve: pending.resolve,
+      reject: pending.reject,
+    });
     try {
       process.stdin.write(`${JSON.stringify({ id, type, ...body })}\n`);
       await process.stdin.flush();
@@ -178,6 +210,13 @@ export class OhMyPiRpcWorker implements RpcWorker {
       throw error;
     }
     return pending.promise;
+  }
+
+  async #writeFrame(frame: Record<string, unknown>): Promise<void> {
+    const process = this.#process;
+    if (!process) throw new Error("RPC worker is not running");
+    process.stdin.write(`${JSON.stringify(frame)}\n`);
+    await process.stdin.flush();
   }
 
   async #readOutput(
@@ -220,6 +259,21 @@ export class OhMyPiRpcWorker implements RpcWorker {
     if (!readySeen) ready.reject(new Error("OhMyPi output ended before ready"));
     if (this.#process === process)
       this.#fail(new Error("OhMyPi RPC output ended"));
+  }
+
+  async #readStderr(
+    process: Bun.Subprocess<"pipe", "pipe", "pipe">,
+  ): Promise<void> {
+    const reader = process.stderr.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const result = await reader.read();
+      if (result.done) break;
+      this.#stderrTail =
+        `${this.#stderrTail}${decoder.decode(result.value, { stream: true })}`.slice(
+          -16_384,
+        );
+    }
   }
 
   #decodeFrame(frame: Record<string, unknown>): Record<string, unknown> | null {
@@ -282,9 +336,24 @@ export class OhMyPiRpcWorker implements RpcWorker {
   #dispatch(frame: Record<string, unknown>): void {
     if (frame.type === "response" && typeof frame.id === "string") {
       const pending = this.#pending.get(frame.id);
-      if (!pending) return;
+      if (!pending) {
+        if (
+          frame.success === false &&
+          this.#promptRequestIds.delete(frame.id)
+        ) {
+          this.#emit({
+            type: "error",
+            message:
+              typeof frame.error === "string"
+                ? frame.error
+                : "RPC prompt scheduling failed",
+            command: frame.command,
+          });
+        }
+        return;
+      }
       this.#pending.delete(frame.id);
-      if (frame.success === false)
+      if (frame.success === false) {
         pending.reject(
           new Error(
             typeof frame.error === "string"
@@ -292,7 +361,17 @@ export class OhMyPiRpcWorker implements RpcWorker {
               : "RPC command failed",
           ),
         );
-      else pending.resolve(frame);
+      } else {
+        if (pending.command === "prompt") {
+          this.#promptRequestIds.add(frame.id);
+          if (this.#promptRequestIds.size > 256) {
+            const oldest = this.#promptRequestIds.values().next().value;
+            if (typeof oldest === "string")
+              this.#promptRequestIds.delete(oldest);
+          }
+        }
+        pending.resolve(frame);
+      }
       return;
     }
     if (
@@ -305,17 +384,25 @@ export class OhMyPiRpcWorker implements RpcWorker {
       if (typeof frame.sessionFile === "string")
         this.#sessionFile = frame.sessionFile;
     }
-    if (typeof frame.type === "string") {
-      const event: RpcEvent = { ...frame, type: frame.type };
-      for (const listener of this.#listeners) listener(event);
-    }
+    if (frame.type === "agent_start") this.#promptRequestIds.clear();
+    if (frame.type === "agent_start") this.#streaming = true;
+    if (frame.type === "agent_end" && frame.willContinue !== true)
+      this.#streaming = false;
+    if (typeof frame.type === "string")
+      this.#emit({ ...frame, type: frame.type });
+  }
+
+  #emit(event: RpcEvent): void {
+    for (const listener of this.#listeners) listener(event);
   }
 
   #fail(error: unknown): void {
-    const normalized =
-      error instanceof Error ? error : new Error(String(error));
+    const base = error instanceof Error ? error.message : String(error);
+    const stderr = this.#stderrTail.trim();
+    const normalized = new Error(stderr ? `${base}: ${stderr}` : base);
     const process = this.#process;
     this.#process = null;
+    this.#streaming = false;
     if (process) process.kill();
     this.#rejectPending(normalized);
   }

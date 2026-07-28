@@ -49,6 +49,28 @@ interface ValueRow {
   value: string;
 }
 
+interface ProjectionIdentityRow {
+  source_key: string;
+  payload_hash: string;
+  status: string;
+}
+
+interface ProjectionOutboxRow {
+  source_key: string;
+  session_id: string;
+  activity_type: string;
+  payload_json: string;
+  attempt: number;
+}
+
+export interface ProjectionJob {
+  readonly sourceKey: string;
+  readonly sessionId: string;
+  readonly activityType: string;
+  readonly payload: unknown;
+  readonly attempt: number;
+}
+
 const TERMINAL_STATES: readonly RunState[] = [
   "succeeded",
   "failed",
@@ -147,9 +169,24 @@ export class GatewayStore {
         linear_activity_id TEXT,
         status TEXT NOT NULL,
         created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        UNIQUE(session_id, activity_type, payload_hash)
+        updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS projection_outbox (
+        source_key TEXT PRIMARY KEY REFERENCES activity_projection(source_key) ON DELETE CASCADE,
+        session_id TEXT NOT NULL REFERENCES agent_run(session_id) ON DELETE CASCADE,
+        activity_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempt INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        lease_owner TEXT,
+        lease_expires_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS projection_outbox_due
+        ON projection_outbox(status, next_attempt_at, lease_expires_at);
       CREATE TABLE IF NOT EXISTS workspace (
         session_id TEXT PRIMARY KEY REFERENCES agent_run(session_id) ON DELETE CASCADE,
         canonical_path TEXT NOT NULL UNIQUE,
@@ -161,6 +198,36 @@ export class GatewayStore {
         updated_at INTEGER NOT NULL
       );
     `);
+    const indexes = this.#db
+      .query<{ name: string; unique: number; origin: string }, []>(
+        'PRAGMA index_list("activity_projection")',
+      )
+      .all();
+    if (indexes.some((index) => index.unique === 1 && index.origin === "u")) {
+      this.#db.exec(`
+        PRAGMA foreign_keys=OFF;
+        BEGIN IMMEDIATE;
+        CREATE TABLE activity_projection_v2 (
+          source_key TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES agent_run(session_id) ON DELETE CASCADE,
+          activity_type TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          linear_activity_id TEXT,
+          status TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO activity_projection_v2
+          (source_key, session_id, activity_type, payload_hash, linear_activity_id, status, created_at, updated_at)
+          SELECT source_key, session_id, activity_type, payload_hash, linear_activity_id, status, created_at, updated_at
+          FROM activity_projection;
+        DROP TABLE activity_projection;
+        ALTER TABLE activity_projection_v2 RENAME TO activity_projection;
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+      `);
+    }
+    this.#db.exec("PRAGMA user_version=1");
   }
 
   async putInstallation(record: InstallationRecord): Promise<void> {
@@ -318,6 +385,31 @@ export class GatewayStore {
       );
     return result.changes === 1;
   }
+  claimDelivery(input: {
+    id: string;
+    organizationId: string;
+    payloadHash: string;
+    payload: unknown;
+    receivedAt?: number;
+  }): "claimed" | "duplicate" | "conflict" {
+    return this.#db.transaction(() => {
+      if (this.acceptDelivery(input)) return "claimed";
+      const existing = this.#db
+        .query<{ payload_hash: string; status: string }, [string]>(
+          "SELECT payload_hash, status FROM webhook_delivery WHERE delivery_id=?",
+        )
+        .get(input.id);
+      if (!existing) throw new Error(`Delivery ${input.id} disappeared`);
+      if (existing.payload_hash !== input.payloadHash) return "conflict";
+      if (existing.status !== "failed") return "duplicate";
+      const claimed = this.#db
+        .query(
+          "UPDATE webhook_delivery SET status='pending', error=NULL WHERE delivery_id=? AND status='failed'",
+        )
+        .run(input.id);
+      return claimed.changes === 1 ? "claimed" : "duplicate";
+    })();
+  }
 
   markDelivery(
     id: string,
@@ -394,6 +486,16 @@ export class GatewayStore {
           JSON.stringify(input.payload),
           input.createdAt ?? Date.now(),
         );
+      if (result.changes === 1 && input.kind !== "stop") {
+        this.#db
+          .query(`
+          UPDATE agent_run
+          SET state='queued', desired_state='running', attempt=0,
+            terminal_reason=NULL, next_attempt_at=NULL, updated_at=?
+          WHERE session_id=? AND state IN ('succeeded','failed')
+        `)
+          .run(Date.now(), input.sessionId);
+      }
       if (input.kind === "stop") {
         this.#db
           .query(`
@@ -424,6 +526,33 @@ export class GatewayStore {
       body: row.body,
       payload: JSON.parse(row.payload_json) as unknown,
     }));
+  }
+  latestActionableInput(
+    sessionId: string,
+  ): { body: string; kind: InputKind } | null {
+    return (
+      this.#db
+        .query<{ body: string; kind: InputKind }, [string]>(`
+      SELECT body, kind FROM run_input
+      WHERE session_id=? AND kind!='stop'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1
+    `)
+        .get(sessionId) ?? null
+    );
+  }
+
+  listSessionsWithPendingInputs(): string[] {
+    return this.#db
+      .query<{ session_id: string }, []>(`
+      SELECT DISTINCT r.session_id
+      FROM agent_run r
+      JOIN run_input i ON i.session_id=r.session_id AND i.processed_at IS NULL
+      WHERE r.state NOT IN ('succeeded','failed','canceled')
+      ORDER BY r.session_id
+    `)
+      .all()
+      .map((row) => row.session_id);
   }
 
   markInputProcessed(id: string, at = Date.now()): void {
@@ -548,36 +677,200 @@ export class GatewayStore {
       .map(mapRun);
   }
 
-  reserveProjection(input: {
+  enqueueProjection(input: {
     sourceKey: string;
     sessionId: string;
     activityType: string;
     payloadHash: string;
+    payload: unknown;
     now?: number;
+    firstWriteWins?: boolean;
   }): boolean {
     const now = input.now ?? Date.now();
-    const result = this.#db
-      .query(`
-      INSERT INTO activity_projection (source_key, session_id, activity_type, payload_hash, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'pending', ?, ?) ON CONFLICT DO NOTHING
-    `)
-      .run(
-        input.sourceKey,
-        input.sessionId,
-        input.activityType,
-        input.payloadHash,
-        now,
-        now,
-      );
-    return result.changes === 1;
+    return this.#db.transaction(() => {
+      const reserved = this.#db
+        .query(`
+        INSERT INTO activity_projection (
+          source_key, session_id, activity_type, payload_hash, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
+        ON CONFLICT DO NOTHING
+      `)
+        .run(
+          input.sourceKey,
+          input.sessionId,
+          input.activityType,
+          input.payloadHash,
+          now,
+          now,
+        );
+      if (reserved.changes !== 1) {
+        const existingBySource = this.#db
+          .query<ProjectionIdentityRow, [string]>(`
+          SELECT source_key, payload_hash, status FROM activity_projection WHERE source_key=?
+        `)
+          .get(input.sourceKey);
+        const existing =
+          existingBySource ??
+          this.#db
+            .query<ProjectionIdentityRow, [string, string, string]>(`
+            SELECT source_key, payload_hash, status FROM activity_projection
+            WHERE session_id=? AND activity_type=? AND payload_hash=?
+          `)
+            .get(input.sessionId, input.activityType, input.payloadHash);
+        if (!existing)
+          throw new Error(
+            `Projection ${input.sourceKey} reservation disappeared`,
+          );
+        if (existing.source_key !== input.sourceKey) return false;
+        if (existing.payload_hash !== input.payloadHash) {
+          if (input.firstWriteWins) return false;
+          throw new Error(
+            `Projection ${input.sourceKey} was reused with a different payload`,
+          );
+        }
+        if (existing.status === "completed") return false;
+        this.#db
+          .query(`
+          INSERT INTO projection_outbox (
+            source_key, session_id, activity_type, payload_json, status,
+            attempt, next_attempt_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+          ON CONFLICT(source_key) DO NOTHING
+        `)
+          .run(
+            input.sourceKey,
+            input.sessionId,
+            input.activityType,
+            JSON.stringify(input.payload),
+            now,
+            now,
+            now,
+          );
+        return false;
+      }
+      this.#db
+        .query(`
+        INSERT INTO projection_outbox (
+          source_key, session_id, activity_type, payload_json, status,
+          attempt, next_attempt_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+      `)
+        .run(
+          input.sourceKey,
+          input.sessionId,
+          input.activityType,
+          JSON.stringify(input.payload),
+          now,
+          now,
+          now,
+        );
+      return true;
+    })();
   }
 
-  completeProjection(sourceKey: string, activityId: string): void {
-    this.#db
-      .query(
-        "UPDATE activity_projection SET status='completed', linear_activity_id=?, updated_at=? WHERE source_key=?",
-      )
-      .run(activityId, Date.now(), sourceKey);
+  claimProjection(
+    sourceKey: string,
+    owner: string,
+    leaseDurationMs: number,
+    now = Date.now(),
+  ): ProjectionJob | null {
+    return this.#db.transaction(() => {
+      const claimed = this.#db
+        .query(`
+        UPDATE projection_outbox
+        SET status='processing', attempt=attempt+1, lease_owner=?, lease_expires_at=?,
+          last_error=NULL, updated_at=?
+        WHERE source_key=? AND next_attempt_at<=?
+          AND (
+            status IN ('pending', 'failed')
+            OR (status='processing' AND lease_expires_at<?)
+          )
+      `)
+        .run(owner, now + leaseDurationMs, now, sourceKey, now, now);
+      if (claimed.changes !== 1) return null;
+      const row = this.#db
+        .query<ProjectionOutboxRow, [string]>(`
+        SELECT source_key, session_id, activity_type, payload_json, attempt
+        FROM projection_outbox WHERE source_key=?
+      `)
+        .get(sourceKey);
+      if (!row)
+        throw new Error(`Projection ${sourceKey} disappeared after claim`);
+      return {
+        sourceKey: row.source_key,
+        sessionId: row.session_id,
+        activityType: row.activity_type,
+        payload: JSON.parse(row.payload_json) as unknown,
+        attempt: row.attempt,
+      };
+    })();
+  }
+
+  listDueProjectionKeys(now = Date.now(), limit = 50): string[] {
+    return this.#db
+      .query<{ source_key: string }, [number, number, number]>(`
+      SELECT source_key FROM projection_outbox
+      WHERE next_attempt_at<=?
+        AND (
+          status IN ('pending', 'failed')
+          OR (status='processing' AND lease_expires_at<?)
+        )
+      ORDER BY next_attempt_at, created_at, source_key
+      LIMIT ?
+    `)
+      .all(now, now, limit)
+      .map((row) => row.source_key);
+  }
+
+  failProjection(
+    sourceKey: string,
+    owner: string,
+    error: string,
+    nextAttemptAt: number,
+  ): void {
+    this.#db.transaction(() => {
+      this.#db
+        .query(`
+        UPDATE projection_outbox
+        SET status='failed', next_attempt_at=?, lease_owner=NULL, lease_expires_at=NULL,
+          last_error=?, updated_at=?
+        WHERE source_key=? AND lease_owner=?
+      `)
+        .run(nextAttemptAt, error, Date.now(), sourceKey, owner);
+      this.#db
+        .query(`
+        UPDATE activity_projection SET status='failed', updated_at=? WHERE source_key=?
+      `)
+        .run(Date.now(), sourceKey);
+    })();
+  }
+
+  completeProjection(
+    sourceKey: string,
+    owner: string,
+    activityId: string | null,
+  ): void {
+    this.#db.transaction(() => {
+      const completed = this.#db
+        .query(`
+        UPDATE projection_outbox
+        SET status='completed', lease_owner=NULL, lease_expires_at=NULL,
+          last_error=NULL, updated_at=?
+        WHERE source_key=? AND lease_owner=? AND status='processing'
+      `)
+        .run(Date.now(), sourceKey, owner);
+      if (completed.changes !== 1) {
+        throw new Error(
+          `Projection ${sourceKey} lease was lost before completion`,
+        );
+      }
+      this.#db
+        .query(`
+        UPDATE activity_projection
+        SET status='completed', linear_activity_id=?, updated_at=? WHERE source_key=?
+      `)
+        .run(activityId, Date.now(), sourceKey);
+    })();
   }
 
   projectionCount(sessionId: string, activityType?: string): number {

@@ -6,6 +6,15 @@ const LINEAR_SIGNATURE_HEADER = "linear-signature";
 const LINEAR_TIMESTAMP_HEADER = "linear-timestamp";
 const LINEAR_DELIVERY_HEADER = "linear-delivery";
 
+class WebhookError extends Error {
+  readonly status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+    Object.setPrototypeOf(this, WebhookError.prototype);
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -22,21 +31,14 @@ function isBoolean(value: unknown): value is boolean {
   return typeof value === "boolean";
 }
 
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function requireString(value: Record<string, unknown>, key: string): string {
   const field = value[key];
   if (!isString(field))
-    throw new Error(`Webhook payload missing or invalid ${key}`);
-  return field;
-}
-
-function optionalStringField(
-  value: Record<string, unknown>,
-  key: string,
-): string | undefined {
-  const field = value[key];
-  if (field === undefined || field === null) return undefined;
-  if (!isString(field))
-    throw new Error(`Webhook payload field ${key} is not a string`);
+    throw new WebhookError(400, `Webhook payload missing or invalid ${key}`);
   return field;
 }
 
@@ -47,44 +49,112 @@ function optionalStringOrNullField(
   const field = value[key];
   if (field === undefined || field === null) return null;
   if (!isString(field))
-    throw new Error(`Webhook payload field ${key} is not a string or null`);
+    throw new WebhookError(
+      400,
+      `Webhook payload field ${key} is not a string or null`,
+    );
   return field;
 }
 
-function extractBody(content: unknown): string {
-  if (!isRecord(content))
-    throw new Error("Webhook activity content is not an object");
-  const body = content.body;
-  if (body === undefined || body === null) return "";
-  if (!isString(body))
-    throw new Error("Webhook activity content body is not a string");
-  return body;
+function coerceOptionalString(
+  value: Record<string, unknown>,
+  key: string,
+): string | null {
+  const field = value[key];
+  if (field === undefined || field === null) return null;
+  if (isString(field)) return field;
+  return null;
 }
+
+function optionalRecord(
+  value: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> | null {
+  const field = value[key];
+  if (field === undefined || field === null) return null;
+  if (isRecord(field)) return field;
+  throw new WebhookError(400, `Webhook payload field ${key} is not an object`);
+}
+
+function optionalArray(
+  value: Record<string, unknown>,
+  key: string,
+): readonly unknown[] {
+  const field = value[key];
+  if (field === undefined || field === null) return [];
+  if (Array.isArray(field)) return field;
+  throw new WebhookError(400, `Webhook payload field ${key} is not an array`);
+}
+
+function requireRecord(
+  value: Record<string, unknown>,
+  key: string,
+): Record<string, unknown> {
+  const field = value[key];
+  if (!isRecord(field))
+    throw new WebhookError(400, `Webhook payload missing ${key}`);
+  return field;
+}
+
+type Comment = {
+  readonly id: string;
+  readonly body: string;
+};
+
+type Guidance = {
+  readonly body: string;
+};
+
+type Issue = {
+  readonly id: string;
+  readonly title: string;
+  readonly description: string | null;
+  readonly identifier: string | null;
+  readonly url: string | null;
+  readonly teamId: string | null;
+  readonly projectId: string | null;
+};
+
+type AgentActivity = {
+  readonly id: string;
+  readonly agentSessionId: string;
+  readonly content: Record<string, unknown>;
+  readonly signal: string | null;
+  readonly raw: Record<string, unknown>;
+};
+
+type AgentSession = {
+  readonly id: string;
+  readonly appUserId: string;
+  readonly organizationId: string;
+  readonly status: string;
+  readonly type: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly issueId: string | null;
+  readonly commentId: string | null;
+  readonly sourceCommentId: string | null;
+  readonly summary: string | null;
+  readonly url: string | null;
+  readonly archivedAt: string | null;
+  readonly startedAt: string | null;
+  readonly endedAt: string | null;
+  readonly comment: Comment | null;
+  readonly issue: Issue | null;
+};
 
 type AgentSessionEventPayload = {
   readonly action: string;
-  readonly raw: Record<string, unknown>;
-  readonly agentSession: {
-    readonly id: string;
-    readonly organizationId: string;
-    readonly issueId: string | null;
-    readonly teamId: string | null;
-    readonly projectId: string | null;
-    readonly summary?: string | undefined;
-    readonly raw: Record<string, unknown>;
-  };
-  readonly agentActivity?:
-    | {
-        readonly id: string;
-        readonly agentSessionId: string;
-        readonly content: unknown;
-        readonly signal: string | null;
-        readonly raw: Record<string, unknown>;
-      }
-    | undefined;
-  readonly promptContext?: string | undefined;
   readonly organizationId: string;
+  readonly appUserId: string;
+  readonly oauthClientId: string;
   readonly webhookId: string;
+  readonly promptContext: string | null;
+  readonly guidance: readonly Guidance[];
+  readonly previousComments: readonly Comment[];
+  readonly agentActivity: AgentActivity | null;
+  readonly agentSession: AgentSession;
+  readonly raw: Record<string, unknown>;
 };
 
 type OAuthAppPayload = {
@@ -105,64 +175,138 @@ type PermissionChangePayload = {
   readonly webhookId: string;
 };
 
+function extractComment(value: Record<string, unknown>): Comment | null {
+  const body = coerceOptionalString(value, "body");
+  if (body === null) return null;
+  const id = coerceOptionalString(value, "id") ?? "";
+  return { id, body };
+}
+
+function extractComments(value: unknown): readonly Comment[] {
+  if (!Array.isArray(value)) return [];
+  const result: Comment[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    const comment = extractComment(item);
+    if (comment) result.push(comment);
+  }
+  return result;
+}
+
+function extractGuidance(value: unknown): readonly Guidance[] {
+  if (!Array.isArray(value)) return [];
+  const result: Guidance[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) continue;
+    const body = coerceOptionalString(item, "body");
+    if (body) result.push({ body });
+  }
+  return result;
+}
+
+function extractIssue(value: Record<string, unknown>): Issue | null {
+  const title = coerceOptionalString(value, "title");
+  if (title === null) return null;
+  const id = coerceOptionalString(value, "id") ?? "";
+  const description = coerceOptionalString(value, "description") ?? null;
+  const identifier = coerceOptionalString(value, "identifier") ?? null;
+  const url = coerceOptionalString(value, "url") ?? null;
+  const teamIdValue = coerceOptionalString(value, "teamId");
+  const team = optionalRecord(value, "team");
+  const teamId = teamIdValue ?? coerceOptionalString(team ?? {}, "id") ?? null;
+  const projectIdValue = coerceOptionalString(value, "projectId");
+  const project = optionalRecord(value, "project");
+  const projectId =
+    projectIdValue ?? coerceOptionalString(project ?? {}, "id") ?? null;
+  return { id, title, description, identifier, url, teamId, projectId };
+}
+
+function asAgentSessionActivity(value: Record<string, unknown>): AgentActivity {
+  const id = requireString(value, "id");
+  const agentSessionId = requireString(value, "agentSessionId");
+  const content = value.content;
+  if (!isRecord(content))
+    throw new WebhookError(400, "Agent activity content is not an object");
+  const signal = optionalStringOrNullField(value, "signal");
+  return { id, agentSessionId, content, signal, raw: value };
+}
+
+function asAgentSession(value: Record<string, unknown>): AgentSession {
+  const id = requireString(value, "id");
+  const appUserId = requireString(value, "appUserId");
+  const organizationId = requireString(value, "organizationId");
+  const status = requireString(value, "status");
+  const type = requireString(value, "type");
+  const createdAt = requireString(value, "createdAt");
+  const updatedAt = requireString(value, "updatedAt");
+  const issueId = optionalStringOrNullField(value, "issueId");
+  const commentId = optionalStringOrNullField(value, "commentId");
+  const sourceCommentId = optionalStringOrNullField(value, "sourceCommentId");
+  const summary = optionalStringOrNullField(value, "summary");
+  const url = optionalStringOrNullField(value, "url");
+  const archivedAt = optionalStringOrNullField(value, "archivedAt");
+  const startedAt = optionalStringOrNullField(value, "startedAt");
+  const endedAt = optionalStringOrNullField(value, "endedAt");
+  const comment = optionalRecord(value, "comment");
+  const issue = optionalRecord(value, "issue");
+  return {
+    id,
+    appUserId,
+    organizationId,
+    status,
+    type,
+    createdAt,
+    updatedAt,
+    issueId,
+    commentId,
+    sourceCommentId,
+    summary,
+    url,
+    archivedAt,
+    startedAt,
+    endedAt,
+    comment: comment ? extractComment(comment) : null,
+    issue: issue ? extractIssue(issue) : null,
+  };
+}
+
 function asAgentSessionEvent(
   value: Record<string, unknown>,
 ): AgentSessionEventPayload {
   const action = requireString(value, "action");
   const organizationId = requireString(value, "organizationId");
+  const appUserId = requireString(value, "appUserId");
+  const oauthClientId = requireString(value, "oauthClientId");
   const webhookId = requireString(value, "webhookId");
-
-  const rawSession = value.agentSession;
-  if (!isRecord(rawSession))
-    throw new Error("AgentSessionEvent missing agentSession");
-
-  const sessionId = requireString(rawSession, "id");
-  const sessionOrganizationId = requireString(rawSession, "organizationId");
-  const issueId = optionalStringOrNullField(rawSession, "issueId");
-  const summary = optionalStringField(rawSession, "summary");
-  const promptContext = optionalStringField(value, "promptContext");
-  const rawIssue = rawSession.issue;
-  const teamId = isRecord(rawIssue)
-    ? optionalStringOrNullField(rawIssue, "teamId")
-    : null;
-  const projectId = isRecord(rawIssue)
-    ? optionalStringOrNullField(rawIssue, "projectId")
-    : null;
+  const promptContext = optionalStringOrNullField(value, "promptContext");
+  const guidance = extractGuidance(optionalArray(value, "guidance"));
+  const previousComments = extractComments(
+    optionalArray(value, "previousComments"),
+  );
 
   const rawActivity = value.agentActivity;
-  let agentActivity: AgentSessionEventPayload["agentActivity"] | undefined;
+  let agentActivity: AgentActivity | null = null;
   if (rawActivity !== undefined && rawActivity !== null) {
     if (!isRecord(rawActivity))
-      throw new Error("AgentSessionEvent agentActivity is not an object");
-    const activityId = requireString(rawActivity, "id");
-    const activitySessionId = requireString(rawActivity, "agentSessionId");
-    const content = rawActivity.content;
-    const signal = optionalStringOrNullField(rawActivity, "signal");
-    agentActivity = {
-      id: activityId,
-      agentSessionId: activitySessionId,
-      content,
-      signal,
-      raw: rawActivity,
-    };
+      throw new WebhookError(400, "Agent activity is not an object");
+    agentActivity = asAgentSessionActivity(rawActivity);
   }
+
+  const rawSession = requireRecord(value, "agentSession");
+  const agentSession = asAgentSession(rawSession);
 
   return {
     action,
-    raw: value,
-    agentSession: {
-      id: sessionId,
-      organizationId: sessionOrganizationId,
-      issueId,
-      summary,
-      teamId,
-      projectId,
-      raw: rawSession,
-    },
-    agentActivity,
-    promptContext,
     organizationId,
+    appUserId,
+    oauthClientId,
     webhookId,
+    promptContext,
+    guidance,
+    previousComments,
+    agentActivity,
+    agentSession,
+    raw: value,
   };
 }
 
@@ -181,11 +325,14 @@ function asPermissionChangePayload(
   const added = value.addedTeamIds;
   const removed = value.removedTeamIds;
   if (!isStringArray(added) || !isStringArray(removed)) {
-    throw new Error("PermissionChange missing or invalid team id arrays");
+    throw new WebhookError(400, "PermissionChange missing or invalid team ids");
   }
   const canAccess = value.canAccessAllPublicTeams;
   if (!isBoolean(canAccess))
-    throw new Error("PermissionChange missing canAccessAllPublicTeams");
+    throw new WebhookError(
+      400,
+      "PermissionChange missing canAccessAllPublicTeams",
+    );
 
   return {
     action: requireString(value, "action"),
@@ -223,89 +370,206 @@ function payloadHash(rawBody: Buffer): string {
   return createHash("sha256").update(rawBody).digest("hex");
 }
 
-function createInputBodyForCreated(event: AgentSessionEventPayload): string {
-  if (isString(event.promptContext)) return event.promptContext;
-  if (isString(event.agentSession.summary)) return event.agentSession.summary;
+function buildFallbackDeliveryId(parsed: Record<string, unknown>): string {
+  const webhookId = isString(parsed.webhookId) ? parsed.webhookId : "unknown";
+  const timestamp = isNumber(parsed.webhookTimestamp)
+    ? String(parsed.webhookTimestamp)
+    : "0";
+  const action = isString(parsed.action) ? parsed.action : "unknown";
+  const organizationId = isString(parsed.organizationId)
+    ? parsed.organizationId
+    : "unknown";
+  return `linear:${webhookId}:${timestamp}:${action}:${organizationId}`;
+}
+
+function extractPromptBody(activity: AgentActivity | null): string {
+  if (!activity) return "";
+  const { content } = activity;
+  const rawBody = content.body;
+  const rawTitle = content.title;
+  const body = isString(rawBody) ? rawBody : "";
+  const title = isString(rawTitle) ? rawTitle : "";
+  if (title && body) return `# ${title}\n\n${body}`;
+  if (body) return body;
+  if (title) return title;
   return "";
+}
+
+function buildCreatedInputBody(event: AgentSessionEventPayload): string {
+  const sections: string[] = [];
+
+  const userPrompt =
+    event.promptContext?.trim() || event.agentSession.summary?.trim() || "";
+  if (userPrompt) {
+    sections.push(`User request:\n${userPrompt}`);
+  } else if (
+    event.agentSession.issue !== null ||
+    event.agentSession.comment !== null ||
+    event.previousComments.length > 0 ||
+    event.guidance.length > 0
+  ) {
+    sections.push("User request:\nWork on the issue below.");
+  }
+
+  const issue = event.agentSession.issue;
+  if (issue) {
+    const lines: string[] = [
+      `Issue: ${issue.title}${issue.identifier ? ` (${issue.identifier})` : ""}`,
+    ];
+    if (issue.url) lines.push(`URL: ${issue.url}`);
+    if (issue.teamId) lines.push(`Team: ${issue.teamId}`);
+    if (issue.projectId) lines.push(`Project: ${issue.projectId}`);
+    if (issue.description) lines.push(`\nDescription:\n${issue.description}`);
+    sections.push(`Issue context:\n${lines.join("\n")}`);
+  }
+
+  const comment = event.agentSession.comment;
+  if (comment) {
+    sections.push(`Thread comment:\n${comment.body}`);
+  }
+
+  if (event.previousComments.length > 0) {
+    const list = event.previousComments
+      .map((c, index) => `${index + 1}. ${c.body}`)
+      .join("\n");
+    sections.push(`Previous comments:\n${list}`);
+  }
+
+  if (event.guidance.length > 0) {
+    const list = event.guidance
+      .map((g, index) => `${index + 1}. ${g.body}`)
+      .join("\n");
+    sections.push(`Guidance:\n${list}`);
+  }
+
+  return sections.join("\n\n");
+}
+
+function buildInputId(
+  event: AgentSessionEventPayload,
+  kind: InputKind,
+): string {
+  const activityId = event.agentActivity?.id;
+  if (activityId) return `${event.agentSession.id}:${kind}:${activityId}`;
+  return `${event.agentSession.id}:${kind}`;
+}
+
+async function validateAgentSessionIdentity(
+  event: AgentSessionEventPayload,
+  store: GatewayStore,
+  config: GatewayConfig,
+): Promise<void> {
+  if (event.oauthClientId !== config.linearClientId) {
+    throw new WebhookError(401, "OAuth client identity mismatch");
+  }
+  if (event.organizationId !== event.agentSession.organizationId) {
+    throw new WebhookError(401, "Organization identity mismatch");
+  }
+  if (event.appUserId !== event.agentSession.appUserId) {
+    throw new WebhookError(401, "App user identity mismatch");
+  }
+  const installation = await store.getInstallation(event.organizationId);
+  if (!installation) {
+    throw new WebhookError(401, "No installation for organization");
+  }
+  if (installation.revokedAt !== null) {
+    throw new WebhookError(401, "Installation is revoked");
+  }
+  if (installation.appUserId !== event.appUserId) {
+    throw new WebhookError(401, "Installation app user mismatch");
+  }
+}
+
+async function validatePermissionChangeIdentity(
+  payload: PermissionChangePayload,
+  store: GatewayStore,
+  config: GatewayConfig,
+): Promise<void> {
+  if (payload.oauthClientId !== config.linearClientId) {
+    throw new WebhookError(401, "OAuth client identity mismatch");
+  }
+  const installation = await store.getInstallation(payload.organizationId);
+  if (!installation) {
+    throw new WebhookError(401, "No installation for organization");
+  }
+  if (installation.revokedAt !== null) {
+    throw new WebhookError(401, "Installation is revoked");
+  }
+  if (installation.appUserId !== payload.appUserId) {
+    throw new WebhookError(401, "App user mismatch");
+  }
 }
 
 function handleAgentSessionEvent(
   event: AgentSessionEventPayload,
   store: GatewayStore,
-  now: number,
+  timestamp: number,
 ): void {
-  const sessionId = event.agentSession.id;
-  const organizationId = event.agentSession.organizationId;
+  const issue = event.agentSession.issue;
   const issueId = event.agentSession.issueId;
-  const teamId = event.agentSession.teamId;
-  const projectId = event.agentSession.projectId;
+  const teamId = issue?.teamId ?? null;
+  const projectId = issue?.projectId ?? null;
+
+  store.createRun({
+    sessionId: event.agentSession.id,
+    organizationId: event.agentSession.organizationId,
+    issueId,
+    teamId,
+    projectId,
+    now: timestamp,
+  });
 
   if (event.action === "created") {
-    store.createRun({
-      sessionId,
-      organizationId,
-      issueId,
-      teamId,
-      projectId,
-      now,
-    });
-    const body = createInputBodyForCreated(event);
+    const body = buildCreatedInputBody(event);
     store.enqueueInput({
-      id: event.webhookId,
-      sessionId,
+      id: buildInputId(event, "created"),
+      sessionId: event.agentSession.id,
       kind: "created",
       body,
       payload: event.raw,
-      createdAt: now,
+      createdAt: timestamp,
     });
     return;
   }
 
   if (event.action === "prompted") {
-    if (!event.agentActivity)
-      throw new Error("AgentSessionEvent prompted missing agentActivity");
-    if (event.agentActivity.agentSessionId !== sessionId) {
-      throw new Error("AgentSessionEvent prompted activity session mismatch");
+    if (!event.agentActivity) {
+      throw new WebhookError(
+        400,
+        "AgentSessionEvent prompted missing agentActivity",
+      );
     }
-    store.createRun({
-      sessionId,
-      organizationId,
-      issueId,
-      teamId,
-      projectId,
-      now,
-    });
-    const body = extractBody(event.agentActivity.content);
+    if (event.agentActivity.agentSessionId !== event.agentSession.id) {
+      throw new WebhookError(
+        401,
+        "AgentSessionEvent prompted activity session mismatch",
+      );
+    }
+    const body = extractPromptBody(event.agentActivity);
     const kind: InputKind =
       event.agentActivity.signal === "stop" ? "stop" : "prompted";
     store.enqueueInput({
-      id: event.webhookId,
-      sessionId,
+      id: buildInputId(event, kind),
+      sessionId: event.agentSession.id,
       kind,
       body,
       payload: event.raw,
-      createdAt: now,
+      createdAt: timestamp,
     });
     return;
   }
 
   if (event.action === "stop") {
-    store.createRun({
-      sessionId,
-      organizationId,
-      issueId,
-      teamId,
-      projectId,
-      now,
-    });
-    const body = createInputBodyForCreated(event);
+    const body = event.agentActivity
+      ? extractPromptBody(event.agentActivity)
+      : "";
     store.enqueueInput({
-      id: event.webhookId,
-      sessionId,
+      id: buildInputId(event, "stop"),
+      sessionId: event.agentSession.id,
       kind: "stop",
       body,
       payload: event.raw,
-      createdAt: now,
+      createdAt: timestamp,
     });
     return;
   }
@@ -317,7 +581,9 @@ function handleOAuthAppRevoked(
   config: GatewayConfig,
   now: number,
 ): void {
-  if (payload.oauthClientId !== config.linearClientId) return;
+  if (payload.oauthClientId !== config.linearClientId) {
+    throw new WebhookError(401, "OAuth client identity mismatch");
+  }
   if (payload.action !== "revoked" && payload.action !== "revoke") return;
   store.revokeInstallation(payload.organizationId, now);
 }
@@ -328,7 +594,9 @@ async function handlePermissionChange(
   config: GatewayConfig,
   now: number,
 ): Promise<void> {
-  if (payload.oauthClientId !== config.linearClientId) return;
+  if (payload.oauthClientId !== config.linearClientId) {
+    throw new WebhookError(401, "OAuth client identity mismatch");
+  }
   if (payload.action !== "teamAccessChanged") return;
   await store.applyPermissionChange(
     payload.organizationId,
@@ -356,11 +624,10 @@ export async function handleWebhook(
     return new Response("Unable to read body", { status: 400 });
   }
 
-  const headers = request.headers;
-  const signature = headers.get(LINEAR_SIGNATURE_HEADER);
-  const timestampHeader = headers.get(LINEAR_TIMESTAMP_HEADER);
-  const deliveryId = headers.get(LINEAR_DELIVERY_HEADER);
-  if (!signature) return new Response("Missing signature", { status: 400 });
+  const signature = request.headers.get(LINEAR_SIGNATURE_HEADER);
+  if (!signature) {
+    return new Response("Missing signature", { status: 400 });
+  }
   if (!verifySignature(rawBody, signature, config.linearWebhookSecret)) {
     return new Response("Invalid signature", { status: 401 });
   }
@@ -371,18 +638,25 @@ export async function handleWebhook(
   } catch {
     return new Response("Invalid JSON", { status: 400 });
   }
-  if (!isRecord(parsed))
+  if (!isRecord(parsed)) {
     return new Response("Payload is not an object", { status: 400 });
+  }
 
   const payloadTimestamp = parsed.webhookTimestamp;
+  const timestampHeader = request.headers.get(LINEAR_TIMESTAMP_HEADER);
   const timestamp =
-    typeof payloadTimestamp === "number"
+    typeof payloadTimestamp === "number" &&
+    Number.isSafeInteger(payloadTimestamp)
       ? payloadTimestamp
-      : Number(timestampHeader);
-  if (!Number.isSafeInteger(timestamp))
+      : typeof timestampHeader === "string" && timestampHeader.length > 0
+        ? Number(timestampHeader)
+        : NaN;
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
     return new Response("Invalid timestamp", { status: 400 });
-  const now = Date.now();
-  if (Math.abs(now - timestamp) > config.webhookReplayWindowMs) {
+  }
+
+  const receivedAt = Date.now();
+  if (Math.abs(receivedAt - timestamp) > config.webhookReplayWindowMs) {
     return new Response("Webhook timestamp outside replay window", {
       status: 401,
     });
@@ -401,44 +675,62 @@ export async function handleWebhook(
     });
   }
 
-  const delivery = deliveryId ?? webhookId;
   const hash = payloadHash(rawBody);
-  const accepted = store.acceptDelivery({
-    id: delivery,
+  const deliveryId =
+    request.headers.get(LINEAR_DELIVERY_HEADER) ??
+    buildFallbackDeliveryId(parsed);
+
+  const claim = store.claimDelivery({
+    id: deliveryId,
     organizationId,
     payloadHash: hash,
     payload: parsed,
-    receivedAt: now,
+    receivedAt,
   });
-  if (!accepted) {
+  if (claim === "duplicate") {
     return new Response("Duplicate delivery", { status: 200 });
+  }
+  if (claim === "conflict") {
+    return new Response("Delivery id reused with different payload", {
+      status: 409,
+    });
   }
 
   try {
     switch (eventType) {
       case "AgentSessionEvent": {
         const event = asAgentSessionEvent(parsed);
-        handleAgentSessionEvent(event, store, now);
+        await validateAgentSessionIdentity(event, store, config);
+        handleAgentSessionEvent(event, store, timestamp);
         break;
       }
       case "OAuthApp": {
         const payload = asOAuthAppPayload(parsed);
-        handleOAuthAppRevoked(payload, store, config, now);
+        handleOAuthAppRevoked(payload, store, config, timestamp);
         break;
       }
       case "PermissionChange": {
         const payload = asPermissionChangePayload(parsed);
-        await handlePermissionChange(payload, store, config, now);
+        await validatePermissionChangeIdentity(payload, store, config);
+        await handlePermissionChange(payload, store, config, timestamp);
         break;
       }
     }
-    store.markDelivery(delivery, "processed");
+    store.markDelivery(deliveryId, "processed");
+    return new Response("OK", { status: 200 });
   } catch (error) {
+    store.markDelivery(
+      deliveryId,
+      "failed",
+      error instanceof Error ? error.message : "Webhook processing failed",
+    );
     const message =
-      error instanceof Error ? error.message : "Webhook processing failed";
-    store.markDelivery(delivery, "failed", message);
-    return new Response(message, { status: 500 });
+      error instanceof WebhookError
+        ? error.message
+        : error instanceof Error
+          ? error.message
+          : "Webhook processing failed";
+    const status = error instanceof WebhookError ? error.status : 500;
+    return new Response(message, { status });
   }
-
-  return new Response("OK", { status: 200 });
 }
