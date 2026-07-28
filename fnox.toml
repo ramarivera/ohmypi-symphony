@@ -1,0 +1,9 @@
+# Encrypted Linear gateway secrets. `fnox set <KEY>` adds ciphertext here
+# using the configured default age provider; plaintext is only exposed to
+# child processes launched through `fnox exec`.
+#
+# Required keys:
+# - LINEAR_CLIENT_ID
+# - LINEAR_CLIENT_SECRET
+# - LINEAR_WEBHOOK_SECRET
+# - TOKEN_ENCRYPTION_KEY

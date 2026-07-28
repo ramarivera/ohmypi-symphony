@@ -1,0 +1,28 @@
+
+[tools]
+bun = "1.3.14"
+fnox = "1.17.0"
+
+[tasks.install]
+description = "Install frozen Bun dependencies"
+run = "bun install --frozen-lockfile"
+
+[tasks.dev]
+description = "Start the gateway with fnox-managed secrets and file watching"
+run = "fnox exec -- bun --watch src/index.ts"
+
+[tasks.start]
+description = "Start the gateway with fnox-managed secrets"
+run = "fnox exec -- bun src/index.ts"
+
+[tasks.check]
+description = "Run typecheck, lint, tests, and production bundle"
+run = "bun run check"
+
+[tasks.secrets]
+description = "Open the fnox secret manager"
+run = "fnox tui"
+
+[tasks."secrets:check"]
+description = "Validate the configured fnox secrets and providers"
+run = "fnox check"
