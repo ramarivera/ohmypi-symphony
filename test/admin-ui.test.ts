@@ -27,6 +27,17 @@ describe("renderLandingPage", () => {
     expect(lower).toContain("</body>");
   });
 
+  test("renders accessible theme and mode controls with a pre-paint bootstrap", () => {
+    const html = renderLandingPage();
+    expect(html).toContain('data-theme-control="theme"');
+    expect(html).toContain('data-theme-control="mode"');
+    expect(html).toContain('aria-label="Theme family"');
+    expect(html).toContain('aria-label="Color mode"');
+    expect(html).toContain("ohmypi-admin-appearance");
+    expect(html).toContain("prefers-color-scheme: dark");
+    expect(html.indexOf("<script>")).toBeLessThan(html.indexOf("<style>"));
+  });
+
   test("exposes exactly one 'Connect Linear' anchor pointing at /oauth/start", () => {
     const html = renderLandingPage();
     const ctaMatches = html.match(/<a\b[^>]*href="\/oauth\/start"/g) ?? [];
@@ -107,6 +118,19 @@ describe("renderAdminPage", () => {
     expect(lower).toContain("<script>");
     expect(lower).not.toMatch(/<link\b[^>]+href=["']https?:/);
     expect(html).not.toMatch(/fonts\.googleapis|fonts\.gstatic|typekit/);
+  });
+
+  test("exposes the same orthogonal appearance controls on the dashboard", () => {
+    const html = renderAdminPage();
+    expect(html).toContain('data-theme-control="theme"');
+    expect(html).toContain('data-theme-control="mode"');
+    expect(html).toContain('value="editorial"');
+    expect(html).toContain('value="linear"');
+    expect(html).toContain('value="light"');
+    expect(html).toContain('value="dark"');
+    expect(html).toContain('value="system"');
+    expect(html).toContain("localStorage.setItem(STORAGE_KEY");
+    expect(html).toContain('addEventListener("change", handleSystemChange)');
   });
 
   test("declares every documented /api/admin/* endpoint in the client script", () => {

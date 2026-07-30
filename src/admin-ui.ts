@@ -29,6 +29,7 @@
 import { ADMIN_BODY, ADMIN_SCRIPT } from "./admin-ui/dashboard";
 import { LANDING_BODY } from "./admin-ui/landing";
 import { PAGE_STYLES } from "./admin-ui/styles";
+import { THEME_BOOTSTRAP_SCRIPT, THEME_SCRIPT } from "./admin-ui/theme";
 
 const DOCTYPE = "<!doctype html>";
 
@@ -50,8 +51,8 @@ function renderDocument(meta: {
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<meta name="referrer" content="no-referrer">',
     `<title>${meta.title}</title>`,
-    `<style>${PAGE_STYLES}</style>`,
     meta.extraHead ?? "",
+    `<style>${PAGE_STYLES}</style>`,
   ]
     .filter((part) => part.length > 0)
     .join("\n");
@@ -81,6 +82,8 @@ export function renderLandingPage(): string {
   return renderDocument({
     title: "OhMyPi ↔ Linear — Connect",
     body: LANDING_BODY,
+    script: THEME_SCRIPT,
+    extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,
     pageClass: "landing-shell",
   });
 }
@@ -95,7 +98,9 @@ export function renderAdminPage(): string {
   return renderDocument({
     title: "OhMyPi ↔ Linear — Console",
     body: ADMIN_BODY,
-    script: ADMIN_SCRIPT,
+    script: `${THEME_SCRIPT}
+${ADMIN_SCRIPT}`,
+    extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,
     pageClass: "admin-shell",
   });
 }

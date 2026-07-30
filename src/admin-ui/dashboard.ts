@@ -11,10 +11,12 @@
  * and an application/json body. A 401 on any response bounces back to "/".
  */
 
+import { THEME_CONTROLS } from "./theme";
 export const ADMIN_BODY = `
 <header class="admin-header" role="banner">
   <div class="title"><strong>OhMyPi</strong> &nbsp;↔&nbsp; Linear Control Plane</div>
   <div class="header-actions">
+    ${THEME_CONTROLS}
     <span class="status-pill" id="header-status" data-state="loading" aria-live="polite">loading…</span>
     <button id="logout-btn" type="button" class="btn" hidden>Log out</button>
   </div>

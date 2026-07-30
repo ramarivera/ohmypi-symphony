@@ -5,10 +5,14 @@
  * JavaScript is required. All copy is author-controlled and is safe to embed
  * as a constant string — no API or user data is interpolated here.
  */
+import { THEME_CONTROLS } from "./theme";
 export const LANDING_BODY = `
 <header class="landing-header">
   <div class="brand"><strong>OhMyPi</strong> &nbsp;↔&nbsp; Linear Control Plane</div>
-  <div class="version">v1 · operator console</div>
+  <div class="landing-header-tools">
+    <div class="version">v1 · operator console</div>
+    ${THEME_CONTROLS}
+  </div>
 </header>
 
 <main class="landing" role="main">
