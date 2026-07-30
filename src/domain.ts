@@ -116,7 +116,7 @@ export interface LinearGatewayPort {
   }): Promise<string>;
   updateSession(input: {
     sessionId: string;
-    plan?: Record<string, unknown>;
+    plan?: readonly { content: string; status: string }[];
     externalUrls?: readonly { label: string; url: string }[];
   }): Promise<void>;
   refreshInstallation(organizationId: string): Promise<string>;

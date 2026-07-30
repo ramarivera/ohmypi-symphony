@@ -122,7 +122,7 @@ describe("ActivityProjector", () => {
     ).toBeTrue();
 
     expect(linear.updates).toEqual([
-      { sessionId: "session", plan: { items: plan } },
+      { sessionId: "session", plan },
       {
         sessionId: "session",
         externalUrls: [

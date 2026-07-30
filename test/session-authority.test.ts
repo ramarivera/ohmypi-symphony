@@ -200,9 +200,7 @@ describe("SessionAuthority", () => {
       linear.updates.some(
         (update) =>
           JSON.stringify(update.plan) ===
-          JSON.stringify({
-            items: [{ content: "Implement", status: "inProgress" }],
-          }),
+          JSON.stringify([{ content: "Implement", status: "inProgress" }]),
       ),
     ).toBeTrue();
   });

@@ -371,7 +371,7 @@ class LinearGateway implements LinearGatewayPort {
 
   async updateSession(input: {
     sessionId: string;
-    plan?: Record<string, unknown>;
+    plan?: readonly { content: string; status: string }[];
     externalUrls?: readonly { label: string; url: string }[];
   }): Promise<void> {
     const run = this.#store.getRun(input.sessionId);
