@@ -2,6 +2,8 @@
 
 Research date: 2026-07-28
 
+> **Read this first (2026-07-30):** the `agentSession.type` production bug (400 on every native webhook) was avoidable — the schema table in this dossier never listed `type` on the embedded webhook session payload. Treat this dossier + the pinned `@linear/sdk` types as the data-model contract; never invent fields, and check here before writing validators.
+
 ## Source baseline
 
 | Source | Canonical repository / docs | Pinned revision |
@@ -291,3 +293,12 @@ Do not start with generic Linear CRUD, polling, a web dashboard, SSH workers, or
 ## Linear documentation coverage
 
 Firecrawl successfully retrieved all 29 pages mapped beneath `/developers`. Close reading focused on agent APIs, Agent Interaction, Best Practices, Signals/AIG, OAuth and actor authorization, webhooks and SDK verification, GraphQL, pagination/filtering, rate limiting, errors, and reliability constraints. OAuth manifests, deprecations, file access/upload, attachments, customers, issue creation links, and other non-agent pages received coverage-level review to identify applicable constraints; they were not read line by line. Therefore this report claims complete mapped-page retrieval, not exhaustive line-by-line reading of all Linear developer documentation.
+
+## 2026-07-30 prior-art pass (community repos; patterns only, never schema)
+
+Clones at `~/.context/` (ephemeral): `linear/linear-agent-demo`, `hiasinho/linear-pi-agent`, `tokezooo/linear-agent-bridge`.
+
+- **Issue state transitions (bead sym-yop):** `linear-agent-bridge/src/webhook/issue-policy.ts` — `ensureStarted()` fetches the issue's current `state.type`, no-ops when already `started|completed|canceled` (idempotent, never fights humans), else resolves the team's started workflow state and calls `issueUpdate(id, { stateId })`. `resolveStartedState()` looks up `team.states` by `type` and caches per `teamId` (workflow state IDs are team-specific). Completion analog in `src/webhook/close-intent.ts` (`resolveCompletedState` → `issueUpdate(close)`).
+- **Activity hygiene (bead sym-h8r and projector):** `linear-pi-agent/src/progress.ts` — `redact()` strips bearer tokens and sensitive URL query params before any text reaches Linear; activities carry a `dedupeKey`. Same scrubbing applies to anything rendered on `/runs/<id>`.
+- **Lifecycle reference:** `linear/weather-bot` remains the official trace (sections above); `linear-agent-demo` covers OAuth + `actor=app` on Cloudflare.
+- **Schema authority:** the pinned SDK (`node_modules/@linear/sdk/dist/index-C88K1_EK.d.mts`) and this dossier's schema table. Community repo types that disagree are drift, not ground truth.
