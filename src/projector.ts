@@ -317,17 +317,6 @@ export class ActivityProjector {
       );
       return;
     }
-    if (event.type === "extension_ui_request") {
-      const title =
-        text(event.title) ?? text(event.message) ?? "Input required";
-      const options = Array.isArray(event.options)
-        ? event.options.filter(
-            (item): item is string => typeof item === "string",
-          )
-        : undefined;
-      await this.elicitation(sessionId, sourceKey, title, options);
-      return;
-    }
     if (event.type === "message_end") {
       const body = assistantText(event);
       if (body) this.#assistantDraft.set(sessionId, body);

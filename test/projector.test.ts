@@ -111,6 +111,14 @@ describe("ActivityProjector", () => {
     });
   });
 
+  test("does not project extension UI events as generic elicitations", async () => {
+    await projector.projectRpcEvent("session", 1, {
+      type: "extension_ui_request",
+      method: "setStatus",
+    });
+    expect(linear.activities).toHaveLength(0);
+  });
+
   test("ignores empty plans because Linear rejects them", async () => {
     expect(await projector.plan("session", "plan:empty", [])).toBeFalse();
     expect(linear.updates).toHaveLength(0);
