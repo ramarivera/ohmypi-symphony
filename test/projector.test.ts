@@ -111,6 +111,11 @@ describe("ActivityProjector", () => {
     });
   });
 
+  test("ignores empty plans because Linear rejects them", async () => {
+    expect(await projector.plan("session", "plan:empty", [])).toBeFalse();
+    expect(linear.updates).toHaveLength(0);
+  });
+
   test("migrates queued plans from the legacy items wrapper", async () => {
     const plan = [{ content: "Implement", status: "inProgress" }] as const;
     store.enqueueProjection({
@@ -123,6 +128,21 @@ describe("ActivityProjector", () => {
 
     expect(await projector.flushPending()).toBe(1);
     expect(linear.updates).toEqual([{ sessionId: "session", plan }]);
+  });
+
+  test("settles queued empty legacy plans without calling Linear", async () => {
+    store.enqueueProjection({
+      sourceKey: "plan:legacy-empty",
+      sessionId: "session",
+      activityType: "plan",
+      payloadHash: "legacy-empty",
+      payload: {
+        request: { sessionId: "session", plan: { items: [] } },
+      },
+    });
+
+    expect(await projector.flushPending()).toBe(1);
+    expect(linear.updates).toHaveLength(0);
   });
 
   test("projects full plans and mutation-side external URLs idempotently", async () => {

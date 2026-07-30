@@ -227,6 +227,7 @@ export class ActivityProjector {
     sourceKey: string,
     items: readonly LinearPlanItem[],
   ): Promise<boolean> {
+    if (items.length === 0) return false;
     const normalized = items.map((item) => ({
       content: item.content,
       status: item.status,
@@ -417,7 +418,8 @@ export class ActivityProjector {
     try {
       let activityId: string | null = null;
       if (job.activityType === "plan" || job.activityType === "externalUrls") {
-        await this.#linear.updateSession(decodeSessionUpdate(job));
+        const update = decodeSessionUpdate(job);
+        if (update.plan?.length !== 0) await this.#linear.updateSession(update);
       } else {
         activityId = await this.#linear.createActivity(
           decodeActivityRequest(job),
