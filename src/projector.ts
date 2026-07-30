@@ -120,19 +120,22 @@ function decodeSessionUpdate(
     throw new Error(`Projection ${job.sourceKey} session update is invalid`);
   }
   const raw = job.payload.request;
-  const plan = Array.isArray(raw.plan)
-    ? raw.plan.map((entry) => {
-        if (!record(entry)) {
-          throw new Error(`Projection ${job.sourceKey} plan item is invalid`);
-        }
-        const content = text(entry.content);
-        const status = text(entry.status);
-        if (content === null || status === null) {
-          throw new Error(`Projection ${job.sourceKey} plan item is invalid`);
-        }
-        return { content, status };
-      })
-    : undefined;
+  const planInput = Array.isArray(raw.plan)
+    ? raw.plan
+    : record(raw.plan) && Array.isArray(raw.plan.items)
+      ? raw.plan.items
+      : undefined;
+  const plan = planInput?.map((entry) => {
+    if (!record(entry)) {
+      throw new Error(`Projection ${job.sourceKey} plan item is invalid`);
+    }
+    const content = text(entry.content);
+    const status = text(entry.status);
+    if (content === null || status === null) {
+      throw new Error(`Projection ${job.sourceKey} plan item is invalid`);
+    }
+    return { content, status };
+  });
   const externalUrls = Array.isArray(raw.externalUrls)
     ? raw.externalUrls.map((entry) => {
         if (!record(entry)) {

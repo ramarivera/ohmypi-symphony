@@ -111,6 +111,20 @@ describe("ActivityProjector", () => {
     });
   });
 
+  test("migrates queued plans from the legacy items wrapper", async () => {
+    const plan = [{ content: "Implement", status: "inProgress" }] as const;
+    store.enqueueProjection({
+      sourceKey: "plan:legacy",
+      sessionId: "session",
+      activityType: "plan",
+      payloadHash: "legacy",
+      payload: { request: { sessionId: "session", plan: { items: plan } } },
+    });
+
+    expect(await projector.flushPending()).toBe(1);
+    expect(linear.updates).toEqual([{ sessionId: "session", plan }]);
+  });
+
   test("projects full plans and mutation-side external URLs idempotently", async () => {
     const plan = [{ content: "Implement", status: "inProgress" }] as const;
     expect(await projector.plan("session", "plan:v1", plan)).toBeTrue();
