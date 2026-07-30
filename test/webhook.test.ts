@@ -100,7 +100,6 @@ function agentSessionBase(
     appUserId: "app-user",
     organizationId: "org",
     status: "pending",
-    type: "agentSession",
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
     ...overrides,
@@ -313,6 +312,80 @@ describe("Linear webhook input correctness", () => {
     const [input] = store.pendingInputs("session-1");
     expect(input?.kind).toBe("created");
     expect(input?.body).toBe("User request:\nSummary of direct chat");
+  });
+
+  test("accepts real Linear AgentSessionEvent created payload with null guidance and no agentSession.type", async () => {
+    await install();
+    const payload = createdPayload({
+      webhookId: "webhook-uuid",
+      createdAt: "2024-01-01T00:00:00.000Z",
+      promptContext: "Implement the issue",
+      guidance: null,
+      previousComments: [
+        {
+          id: "prev-1",
+          body: "Earlier comment",
+          userId: "user-1",
+          issueId: "issue-1",
+        },
+      ],
+      agentSession: agentSessionBase({
+        commentId: "comment-1",
+        sourceCommentId: null,
+        issueId: "issue-1",
+        pullRequestId: null,
+        slugId: "slug-1",
+        archivedAt: null,
+        startedAt: null,
+        endedAt: null,
+        dismissedAt: null,
+        dismissedById: null,
+        externalLink: null,
+        summary: null,
+        url: "https://linear.app/issue/TEAM-123/session-1",
+        externalUrls: [],
+        context: [],
+        sourceMetadata: { source: "linear" },
+        plan: null,
+        workspaceDiff: null,
+        creatorId: "user-1",
+        creator: {
+          id: "user-1",
+          name: "Test User",
+          email: "test@example.com",
+          avatarUrl: "https://example.com/avatar.png",
+          url: "https://linear.app/user/user-1",
+        },
+        comment: {
+          id: "comment-1",
+          body: "A thread comment",
+          userId: "user-1",
+          issueId: "issue-1",
+        },
+        issue: {
+          id: "issue-1",
+          title: "Fix the bug",
+          description: "The bug description",
+          identifier: "TEAM-123",
+          url: "https://linear.app/issue/TEAM-123",
+          teamId: "team-a",
+          team: { id: "team-a" },
+        },
+      }),
+    });
+
+    const response = await handleWebhook(signedRequest(payload), config, store);
+
+    expect(response.status).toBe(200);
+    expect(store.getRun("session-1")).toMatchObject({
+      organizationId: "org",
+      issueId: "issue-1",
+      teamId: "team-a",
+    });
+    const [input] = store.pendingInputs("session-1");
+    expect(input).toBeDefined();
+    expect(input?.kind).toBe("created");
+    expect(input?.body).not.toContain("Guidance:");
   });
 
   test("prompted event appends agent activity body", async () => {

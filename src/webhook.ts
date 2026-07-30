@@ -130,7 +130,6 @@ type AgentSession = {
   readonly appUserId: string;
   readonly organizationId: string;
   readonly status: string;
-  readonly type: string;
   readonly createdAt: string;
   readonly updatedAt: string;
   readonly issueId: string | null;
@@ -238,7 +237,6 @@ function asAgentSession(value: Record<string, unknown>): AgentSession {
   const appUserId = requireString(value, "appUserId");
   const organizationId = requireString(value, "organizationId");
   const status = requireString(value, "status");
-  const type = requireString(value, "type");
   const createdAt = requireString(value, "createdAt");
   const updatedAt = requireString(value, "updatedAt");
   const issueId = optionalStringOrNullField(value, "issueId");
@@ -256,7 +254,6 @@ function asAgentSession(value: Record<string, unknown>): AgentSession {
     appUserId,
     organizationId,
     status,
-    type,
     createdAt,
     updatedAt,
     issueId,
