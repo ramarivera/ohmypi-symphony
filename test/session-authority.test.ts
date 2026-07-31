@@ -205,6 +205,40 @@ describe("SessionAuthority", () => {
     ).toBeTrue();
   });
 
+  test("persists run timeline events from inputs and projections", async () => {
+    created();
+    await authority.processSession("session");
+    await linear.terminal.promise;
+    await authority.processRunnable();
+    const events = store.listRunEvents("session");
+    expect(events.length).toBeGreaterThan(0);
+    expect(
+      events.some(
+        (event) =>
+          event.sourceKey === "input:session-created" &&
+          event.kind === "input:created" &&
+          event.level === "info",
+      ),
+    ).toBeTrue();
+    expect(events.some((event) => event.kind === "thought")).toBeTrue();
+    expect(events.some((event) => event.kind === "plan")).toBeTrue();
+    expect(events.some((event) => event.kind === "message_end")).toBeTrue();
+    expect(events.some((event) => event.kind === "agent_end")).toBeTrue();
+    const response = events.find((event) => event.kind === "response");
+    expect(response).toMatchObject({
+      level: "result",
+      text: "completed",
+      status: "completed",
+    });
+    expect(
+      events.every(
+        (event, index) =>
+          index === 0 ||
+          event.createdAt >= (events[index - 1]?.createdAt ?? event.createdAt),
+      ),
+    ).toBeTrue();
+  });
+
   test("settles a deferred local-only prompt without waiting for agent_end", async () => {
     nextWorkerLocalOnly = true;
     created();

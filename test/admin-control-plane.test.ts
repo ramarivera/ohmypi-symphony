@@ -468,35 +468,94 @@ describe("admin control plane", () => {
       expect(body.installation).not.toHaveProperty("refreshToken");
     });
 
-    test("protects run status by admin session and organization", async () => {
-      const now = Date.now();
+    test("renders a public terminal run page and preserves its JSON representation", async () => {
+      const now = Date.UTC(2026, 6, 31, 12, 0, 0);
+      const sessionId = "session/private";
       store.createRun({
-        sessionId: "session/private",
+        sessionId,
         organizationId: "org-runs",
         issueId: "issue-runs",
         now,
       });
-      const owner = createAdminSession("org-runs", now);
-      const outsider = createAdminSession("org-other", now);
-      const path = `/runs/${encodeURIComponent("session/private")}`;
+      store.updateRun(sessionId, {
+        state: "succeeded",
+        terminalReason:
+          "Authorization: Bearer terminal-secret https://example.test/?token=query-secret",
+        lastActivityAt: now + 1_000,
+      });
+      store.upsertRunEvent({
+        sourceKey: "input:run-created",
+        sessionId,
+        kind: "input:created",
+        level: "info",
+        text: "Authorization: Bearer payload-secret https://example.test/?signature=payload-signature",
+        payload: {
+          accessToken: "payload-access-token",
+          agentSession: {
+            issue: {
+              identifier: "TEAM-123",
+              title: "Fix the run page",
+              url: "https://linear.app/issue/TEAM-123",
+            },
+          },
+        },
+        status: "completed",
+        now,
+      });
+      const path = `/runs/${encodeURIComponent(sessionId)}`;
 
-      const unauthenticated = await fetchHandler(adminRequest(path));
-      expect(unauthenticated.status).toBe(401);
+      const htmlResponse = await fetchHandler(adminRequest(path));
+      expect(htmlResponse.status).toBe(200);
+      expect(htmlResponse.headers.get("content-type")).toContain("text/html");
+      const page = await htmlResponse.text();
+      expect(page).toContain("Run details");
+      expect(page).toContain("TEAM-123");
+      expect(page).toContain('data-run-level-toggle="debug"');
+      expect(page).toContain('data-run-level-toggle="error"');
+      expect(page).toContain("ohmypi-admin-appearance");
+      expect(page).toContain("redacted");
+      expect(page).not.toContain("terminal-secret");
+      expect(page).not.toContain("payload-secret");
+      expect(page).not.toContain("payload-signature");
+      expect(page).not.toContain("payload-access-token");
 
-      const crossOrganization = await fetchHandler(
-        adminRequest(path, { token: outsider.token }),
+      const jsonResponse = await fetchHandler(
+        new Request(new URL(path, config.publicUrl).toString(), {
+          headers: { Accept: "application/json" },
+        }),
       );
-      expect(crossOrganization.status).toBe(404);
-
-      const response = await fetchHandler(
-        adminRequest(path, { token: owner.token }),
+      expect(jsonResponse.status).toBe(200);
+      expect(jsonResponse.headers.get("content-type")).toContain(
+        "application/json",
       );
-      expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({
-        sessionId: "session/private",
-        state: "queued",
+      const detail = (await jsonResponse.json()) as {
+        sessionId: string;
+        state: string;
+        attempt: number;
+        run: { terminalReason: string | null };
+        events: Array<{ sourceKey: string; text: string | null }>;
+      };
+      expect(detail).toMatchObject({
+        sessionId,
+        state: "succeeded",
         attempt: 0,
       });
+      expect(detail.run.terminalReason).toContain(
+        "Authorization: Bearer redacted",
+      );
+      expect(
+        detail.events.find((event) => event.sourceKey === "input:run-created"),
+      ).toMatchObject({
+        sourceKey: "input:run-created",
+        text: "Authorization: Bearer redacted https://example.test/?signature=redacted",
+      });
+      expect(JSON.stringify(detail)).not.toContain("query-secret");
+
+      const suffixResponse = await fetchHandler(adminRequest(`${path}.json`));
+      expect(suffixResponse.status).toBe(200);
+      expect(suffixResponse.headers.get("content-type")).toContain(
+        "application/json",
+      );
     });
 
     test("requires origin and csrf for mutations", async () => {

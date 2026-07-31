@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { renderAdminPage, renderLandingPage } from "../src/admin-ui";
+import {
+  type RunDetailModel,
+  renderAdminPage,
+  renderLandingPage,
+  renderRunDetailPage,
+} from "../src/admin-ui";
 
 /**
  * Focused tests for the admin UI presentation module.
@@ -287,5 +292,64 @@ describe("renderAdminPage", () => {
     expect(html).not.toMatch(/cdn\./);
     // Same-origin credentials are explicit, never wildcard.
     expect(html).not.toMatch(/credentials:\s*"include"/);
+  });
+});
+
+describe("renderRunDetailPage", () => {
+  const terminalRun: RunDetailModel = {
+    run: {
+      sessionId: "session-terminal",
+      organizationId: "org-1",
+      issueId: "issue-1",
+      repositoryId: "repo-1",
+      state: "succeeded",
+      desiredState: "running",
+      ompSessionId: "omp-1",
+      ompSessionFile: "/work/session.jsonl",
+      workspacePath: "/work/repo",
+      teamId: "team-1",
+      projectId: "project-1",
+      attempt: 2,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      lastActivityAt: 1_753_966_400_000,
+      terminalReason: "completed",
+      nextAttemptAt: null,
+      createdAt: 1_753_966_300_000,
+      updatedAt: 1_753_966_400_000,
+    },
+    issue: {
+      identifier: "TEAM-123",
+      title: "Render the run detail",
+      url: "https://linear.app/issue/TEAM-123",
+    },
+    events: [
+      {
+        sourceKey: "activity:1",
+        kind: "response",
+        level: "result",
+        text: "Authorization: Bearer renderer-secret",
+        payload: '{"url":"https://example.test/?token=renderer-token"}',
+        status: "completed",
+        error: null,
+        createdAt: 1_753_966_400_000,
+        updatedAt: 1_753_966_400_000,
+      },
+    ],
+  };
+
+  test("renders a complete terminal run page with shared appearance controls and level filters", () => {
+    const html = renderRunDetailPage(terminalRun);
+    expect(html.startsWith("<!doctype html>")).toBe(true);
+    expect(html).toContain("Run details");
+    expect(html).toContain("Timeline");
+    expect(html).toContain('data-run-level-toggle="debug"');
+    expect(html).toContain('data-run-level-toggle="result"');
+    expect(html).toContain('data-run-level-toggle="error"');
+    expect(html).toContain("ohmypi-admin-appearance");
+    expect(html).toContain("data-run-updated-at");
+    expect(html).not.toContain("renderer-secret");
+    expect(html).not.toContain("renderer-token");
+    expect(html).toContain("redacted");
   });
 });

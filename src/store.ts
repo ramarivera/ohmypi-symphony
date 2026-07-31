@@ -41,6 +41,8 @@ interface RunRow {
   last_activity_at: number | null;
   terminal_reason: string | null;
   next_attempt_at: number | null;
+  created_at: number;
+  updated_at: number;
 }
 
 interface CountRow {
@@ -62,6 +64,19 @@ interface ProjectionOutboxRow {
   activity_type: string;
   payload_json: string;
   attempt: number;
+}
+
+interface RunEventRow {
+  source_key: string;
+  session_id: string;
+  kind: string;
+  level: string;
+  text: string | null;
+  payload_json: string;
+  status: string | null;
+  error: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
 interface RepositoryRow {
@@ -91,6 +106,22 @@ export interface ProjectionJob {
   readonly activityType: string;
   readonly payload: unknown;
   readonly attempt: number;
+}
+
+export type RunEventLevel = "debug" | "info" | "warn" | "result" | "error";
+export type RunEventStatus = "observed" | "pending" | "completed" | "failed";
+
+export interface RunEventRecord {
+  readonly sourceKey: string;
+  readonly sessionId: string;
+  readonly kind: string;
+  readonly level: RunEventLevel;
+  readonly text: string | null;
+  readonly payload: unknown;
+  readonly status: RunEventStatus | null;
+  readonly error: string | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
 }
 
 const TERMINAL_STATES: readonly RunState[] = [
@@ -243,6 +274,20 @@ export class GatewayStore {
       CREATE UNIQUE INDEX IF NOT EXISTS repository_default
         ON repository(organization_id, is_default)
         WHERE is_default = 1;
+      CREATE TABLE IF NOT EXISTS run_event (
+        source_key TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES agent_run(session_id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        level TEXT NOT NULL,
+        text TEXT,
+        payload_json TEXT NOT NULL,
+        status TEXT,
+        error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS run_event_session
+        ON run_event(session_id, created_at, source_key);
     `);
     const indexes = this.#db
       .query<{ name: string; unique: number; origin: string }, []>(
@@ -537,6 +582,70 @@ export class GatewayStore {
     return row ? mapRun(row) : null;
   }
 
+  upsertRunEvent(input: {
+    sourceKey: string;
+    sessionId: string;
+    kind: string;
+    level: RunEventLevel;
+    text?: string | null;
+    payload?: unknown;
+    status?: RunEventStatus | null;
+    error?: string | null;
+    now?: number;
+  }): void {
+    const now = input.now ?? Date.now();
+    const text = input.text ?? null;
+    const payloadJson = JSON.stringify(input.payload ?? null);
+    const status = input.status ?? null;
+    const error = input.error ?? null;
+    this.#db
+      .query(
+        `
+        INSERT INTO run_event (
+          source_key, session_id, kind, level, text, payload_json, status, error, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_key) DO UPDATE SET
+          kind=?,
+          level=?,
+          text=?,
+          payload_json=?,
+          status=?,
+          error=?,
+          created_at=run_event.created_at,
+          updated_at=?
+        WHERE run_event.status IS NULL OR run_event.status NOT IN ('completed','failed')
+      `,
+      )
+      .run(
+        input.sourceKey,
+        input.sessionId,
+        input.kind,
+        input.level,
+        text,
+        payloadJson,
+        status,
+        error,
+        now,
+        now,
+        input.kind,
+        input.level,
+        text,
+        payloadJson,
+        status,
+        error,
+        now,
+      );
+  }
+
+  listRunEvents(sessionId: string): RunEventRecord[] {
+    return this.#db
+      .query<RunEventRow, [string]>(
+        "SELECT * FROM run_event WHERE session_id=? ORDER BY created_at, source_key",
+      )
+      .all(sessionId)
+      .map(mapRunEvent);
+  }
+
   enqueueInput(input: {
     id: string;
     sessionId: string;
@@ -563,6 +672,18 @@ export class GatewayStore {
           JSON.stringify(input.payload),
           input.createdAt ?? Date.now(),
         );
+      if (result.changes === 1) {
+        this.upsertRunEvent({
+          sourceKey: `input:${input.id}`,
+          sessionId: input.sessionId,
+          kind: `input:${input.kind}`,
+          level: input.kind === "stop" ? "warn" : "info",
+          text: input.body || null,
+          payload: input.payload,
+          status: null,
+          now: input.createdAt ?? Date.now(),
+        });
+      }
       if (result.changes === 1 && input.kind !== "stop") {
         this.#db
           .query(`
@@ -722,13 +843,16 @@ export class GatewayStore {
     ) {
       throw new Error("Terminal run state is immutable");
     }
+    const state = patch.state ?? current.state;
+    const attempt = current.attempt + (patch.incrementAttempt ? 1 : 0);
+    const now = Date.now();
     this.#db
       .query(`
       UPDATE agent_run SET state=?, repository_id=?, workspace_path=?, omp_session_id=?, omp_session_file=?,
         terminal_reason=?, last_activity_at=?, next_attempt_at=?, attempt=attempt+?, updated_at=? WHERE session_id=?
     `)
       .run(
-        patch.state ?? current.state,
+        state,
         patch.repositoryId === undefined
           ? current.repositoryId
           : patch.repositoryId,
@@ -751,9 +875,22 @@ export class GatewayStore {
           ? current.nextAttemptAt
           : patch.nextAttemptAt,
         patch.incrementAttempt ? 1 : 0,
-        Date.now(),
+        now,
         sessionId,
       );
+    if (state !== current.state) {
+      this.upsertRunEvent({
+        sourceKey: `state:${sessionId}:${attempt}:${state}`,
+        sessionId,
+        kind: "state",
+        level: state === "failed" || state === "canceled" ? "error" : "info",
+        text: `${current.state} → ${state}`,
+        payload: { from: current.state, to: state, attempt },
+        status: "observed",
+        error: patch.terminalReason ?? null,
+        now,
+      });
+    }
   }
 
   listRunnable(now = Date.now()): AgentRunRecord[] {
@@ -845,6 +982,17 @@ export class GatewayStore {
             now,
             now,
           );
+        this.upsertRunEvent({
+          sourceKey: input.sourceKey,
+          sessionId: input.sessionId,
+          kind: input.activityType,
+          level: runEventLevelFromKind(input.activityType),
+          text: runEventTextFromPayload(input.activityType, input.payload),
+          payload: input.payload,
+          status: "pending",
+          now,
+        });
+
         return false;
       }
       this.#db
@@ -863,6 +1011,17 @@ export class GatewayStore {
           now,
           now,
         );
+      this.upsertRunEvent({
+        sourceKey: input.sourceKey,
+        sessionId: input.sessionId,
+        kind: input.activityType,
+        level: runEventLevelFromKind(input.activityType),
+        text: runEventTextFromPayload(input.activityType, input.payload),
+        payload: input.payload,
+        status: "pending",
+        now,
+      });
+
       return true;
     })();
   }
@@ -895,6 +1054,12 @@ export class GatewayStore {
         .get(sourceKey);
       if (!row)
         throw new Error(`Projection ${sourceKey} disappeared after claim`);
+      this.#db
+        .query(
+          "UPDATE run_event SET status='pending', updated_at=? WHERE source_key=?",
+        )
+        .run(now, sourceKey);
+
       return {
         sourceKey: row.source_key,
         sessionId: row.session_id,
@@ -941,6 +1106,11 @@ export class GatewayStore {
         UPDATE activity_projection SET status='failed', updated_at=? WHERE source_key=?
       `)
         .run(Date.now(), sourceKey);
+      this.#db
+        .query(
+          "UPDATE run_event SET status='failed', error=?, updated_at=? WHERE source_key=?",
+        )
+        .run(error, Date.now(), sourceKey);
     })();
   }
 
@@ -969,6 +1139,11 @@ export class GatewayStore {
         SET status='completed', linear_activity_id=?, updated_at=? WHERE source_key=?
       `)
         .run(activityId, Date.now(), sourceKey);
+      this.#db
+        .query(
+          "UPDATE run_event SET status='completed', error=NULL, updated_at=? WHERE source_key=?",
+        )
+        .run(Date.now(), sourceKey);
     })();
   }
 
@@ -1235,6 +1410,8 @@ function mapRun(row: RunRow): AgentRunRecord {
     lastActivityAt: row.last_activity_at,
     terminalReason: row.terminal_reason,
     nextAttemptAt: row.next_attempt_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
   };
 }
 
@@ -1262,6 +1439,105 @@ function mapRepository(row: RepositoryRow): RepositoryRecord {
     ),
     labels: parseStringArray(row.labels_json, "repository labels"),
     isDefault: row.is_default === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function text(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function runEventLevelFromKind(kind: string): RunEventLevel {
+  switch (kind) {
+    case "thought":
+      return "debug";
+    case "action":
+      return "info";
+    case "elicitation":
+      return "warn";
+    case "response":
+      return "result";
+    case "error":
+      return "error";
+    default:
+      return "info";
+  }
+}
+
+function runEventTextFromPayload(
+  kind: string,
+  payload: unknown,
+): string | null {
+  if (!record(payload)) return null;
+  const request = record(payload.request) ? payload.request : payload;
+
+  if (kind === "plan") {
+    const plan = Array.isArray(request.plan) ? request.plan : [];
+    if (plan.length === 0) return null;
+    return plan
+      .filter(
+        (item): item is Record<string, unknown> & { content: string } =>
+          record(item) && typeof item.content === "string",
+      )
+      .map(
+        (item) =>
+          `${item.content} (${
+            typeof item.status === "string" ? item.status : "pending"
+          })`,
+      )
+      .join("; ");
+  }
+
+  if (kind === "externalUrls") {
+    const urls = Array.isArray(request.externalUrls)
+      ? request.externalUrls
+      : [];
+    if (urls.length === 0) return null;
+    return urls
+      .filter(
+        (
+          entry,
+        ): entry is Record<string, unknown> & { label: string; url: string } =>
+          record(entry) &&
+          typeof entry.label === "string" &&
+          typeof entry.url === "string",
+      )
+      .map((entry) => `${entry.label}: ${entry.url}`)
+      .join("; ");
+  }
+
+  const content = record(request.content) ? request.content : request;
+  const body = text(content.body);
+  if (body) return body;
+
+  if (kind === "action" || text(content.action)) {
+    const action = text(content.action) ?? "tool";
+    const parameter = text(content.parameter);
+    const result = text(content.result);
+    if (parameter && result) return `${action}: ${parameter} → ${result}`;
+    if (parameter) return `${action}: ${parameter}`;
+    if (result) return `${action} → ${result}`;
+    return action;
+  }
+
+  return null;
+}
+
+function mapRunEvent(row: RunEventRow): RunEventRecord {
+  return {
+    sourceKey: row.source_key,
+    sessionId: row.session_id,
+    kind: row.kind,
+    level: row.level as RunEventLevel,
+    text: row.text,
+    payload: JSON.parse(row.payload_json) as unknown,
+    status: (row.status as RunEventStatus | null) ?? null,
+    error: row.error,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };

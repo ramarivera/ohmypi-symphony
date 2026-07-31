@@ -1,6 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { renderAdminPage, renderLandingPage } from "./admin-ui";
+import {
+  renderAdminPage,
+  renderLandingPage,
+  renderRunDetailPage,
+} from "./admin-ui";
+import { type RunDetailModel, redact } from "./admin-ui/run-detail";
 import type {
+  AgentRunRecord,
   GatewayConfig,
   InstallationRecord,
   RepositoryRecord,
@@ -13,7 +19,7 @@ import {
 } from "./oauth";
 import type { Reconciler } from "./reconciler";
 import type { WorkspacePort } from "./session-authority";
-import type { GatewayStore } from "./store";
+import type { GatewayStore, RunEventRecord } from "./store";
 
 const ADMIN_COOKIE = "omp_gateway_admin";
 const CSRF_SALT = "omp-gateway-admin-csrf";
@@ -219,6 +225,92 @@ function toAdminInstallation(installation: InstallationRecord) {
   };
 }
 
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function stringField(
+  value: Record<string, unknown>,
+  key: string,
+): string | null {
+  const field = value[key];
+  return typeof field === "string" && field.length > 0 ? field : null;
+}
+
+function safeUrl(value: string | null): string | null {
+  if (value === null) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:"
+      ? redact(value)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function redactedStringField(
+  value: Record<string, unknown>,
+  key: string,
+): string | null {
+  const field = stringField(value, key);
+  return field === null ? null : redact(field);
+}
+
+function issueForRun(
+  run: AgentRunRecord,
+  events: readonly RunEventRecord[],
+): RunDetailModel["issue"] {
+  for (const event of events) {
+    if (!record(event.payload) || !record(event.payload.agentSession)) continue;
+    const issue = event.payload.agentSession.issue;
+    if (!record(issue)) continue;
+    return {
+      identifier: redactedStringField(issue, "identifier"),
+      title: redactedStringField(issue, "title"),
+      url: safeUrl(stringField(issue, "url")),
+    };
+  }
+  return run.issueId === null
+    ? null
+    : { identifier: redact(run.issueId), title: null, url: null };
+}
+
+function runDetailModel(
+  run: AgentRunRecord,
+  events: readonly RunEventRecord[],
+): RunDetailModel {
+  const redactNullable = (value: string | null): string | null =>
+    value === null ? null : redact(value);
+  return {
+    run: {
+      ...run,
+      organizationId: redact(run.organizationId),
+      issueId: redactNullable(run.issueId),
+      repositoryId: redactNullable(run.repositoryId),
+      ompSessionId: redactNullable(run.ompSessionId),
+      ompSessionFile: redactNullable(run.ompSessionFile),
+      workspacePath: redactNullable(run.workspacePath),
+      teamId: redactNullable(run.teamId),
+      projectId: redactNullable(run.projectId),
+      leaseOwner: redactNullable(run.leaseOwner),
+      terminalReason: redactNullable(run.terminalReason),
+    },
+    issue: issueForRun(run, events),
+    events: events.map((event) => ({
+      sourceKey: redact(event.sourceKey),
+      kind: redact(event.kind),
+      level: event.level,
+      text: redactNullable(event.text),
+      payload: redact(JSON.stringify(event.payload, null, 2) ?? "null"),
+      status: redactNullable(event.status),
+      error: redactNullable(event.error),
+      createdAt: event.createdAt,
+      updatedAt: event.updatedAt,
+    })),
+  };
+}
+
 function json(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,
@@ -317,21 +409,26 @@ export function createAdminRouter(deps: {
       }
 
       if (url.pathname.startsWith("/runs/") && request.method === "GET") {
-        const session = adminSession(store, request, now);
-        if (!session) return text("Unauthorized", 401);
+        const encodedRunId = url.pathname.slice("/runs/".length);
+        const isJsonPath = encodedRunId.endsWith(".json");
         const sessionId = decodeURIComponent(
-          url.pathname.slice("/runs/".length),
+          isJsonPath ? encodedRunId.slice(0, -".json".length) : encodedRunId,
         );
         const run = store.getRun(sessionId);
-        if (!run || run.organizationId !== session.organizationId) {
-          return text("Not found", 404);
-        }
-        return json({
-          sessionId: run.sessionId,
-          state: run.state,
-          attempt: run.attempt,
-          lastActivityAt: run.lastActivityAt,
-        });
+        if (!run) return text("Not found", 404);
+        const model = runDetailModel(run, store.listRunEvents(sessionId));
+        const acceptsJson =
+          request.headers.get("accept")?.includes("application/json") ?? false;
+        const detail = {
+          sessionId: model.run.sessionId,
+          state: model.run.state,
+          attempt: model.run.attempt,
+          lastActivityAt: model.run.lastActivityAt,
+          ...model,
+        };
+        return isJsonPath || acceptsJson
+          ? json(detail)
+          : html(renderRunDetailPage(model));
       }
 
       if (url.pathname === "/api/admin/bootstrap" && request.method === "GET") {
