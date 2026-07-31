@@ -1,10 +1,12 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, it, test } from "@effect/vitest"
+import { Schema } from "effect";
 import {
   type RunDetailModel,
   renderAdminPage,
   renderLandingPage,
   renderRunDetailPage,
 } from "../src/admin-ui";
+import { redact } from "../src/admin-ui/run-detail.js";
 
 /**
  * Focused tests for the admin UI presentation module.
@@ -352,4 +354,32 @@ describe("renderRunDetailPage", () => {
     expect(html).not.toContain("renderer-token");
     expect(html).toContain("redacted");
   });
+});
+
+describe("redaction invariants", () => {
+  it.prop(
+    "redact removes bearer tokens and query/JSON credentials",
+    {
+      secret: Schema.String.pipe(
+        Schema.minLength(1),
+        Schema.pattern(/^[A-Za-z0-9._~+\-/=]+$/u),
+      ),
+      kind: Schema.Literal("token", "key", "secret", "signature", "password"),
+    },
+    ({ secret, kind }) => {
+      const bearer = `Authorization: Bearer ${secret}`;
+      const redactedBearer = redact(bearer);
+      expect(redactedBearer).toBe("Authorization: Bearer redacted");
+
+      const query = `https://example.test/?${kind}=${secret}`;
+      const redactedQuery = redact(query);
+      expect(redactedQuery).not.toContain(`${kind}=${secret}`);
+      expect(redactedQuery).toContain(`?${kind}=redacted`);
+
+      const json = `{"${kind}": "${secret}"}`;
+      const redactedJson = redact(json);
+      expect(redactedJson).not.toContain(`"${kind}": "${secret}"`);
+      expect(redactedJson).toContain(`"redacted"`);
+    },
+  );
 });

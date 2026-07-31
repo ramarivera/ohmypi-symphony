@@ -1,9 +1,15 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, test } from "@effect/vitest"
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { Schema } from "effect";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { GatewayStore } from "../src/store";
+import { createAdminRouter } from "../src/admin";
+import { loadConfig } from "../src/config";
+import type { GatewayConfig } from "../src/domain";
+import { createLogger } from "../src/logger";
+import type { Reconciler } from "../src/reconciler";
+import { GatewayStore } from "../src/store";
 import { WorkspaceManager } from "../src/workspace";
 
 process.env.PUBLIC_URL = "http://localhost:3000";
@@ -22,9 +28,8 @@ process.env.WEBHOOK_REPLAY_WINDOW_MS = "60000";
 
 const CSRF_SALT = "omp-gateway-admin-csrf";
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
-
+let config: GatewayConfig;
 let fetchHandler: (request: Request) => Promise<Response>;
-let config: { publicUrl: URL };
 let store: GatewayStore;
 let reconciler: { stop: () => Promise<void> };
 let tempRoot: string;
@@ -90,15 +95,35 @@ function adminRequest(
 }
 
 beforeAll(async () => {
-  // src/index.ts calls loadConfig() at the top of the module, so we must
-  // set environment variables before any static import. Dynamic import is
-  // the test boundary that lets us configure the environment first.
-  const mod = await import("../src/index");
-  fetchHandler = mod.buildFetch();
-  config = mod.config;
-  store = mod.store;
-  reconciler = mod.reconciler;
   tempRoot = await mkdtemp(join(tmpdir(), "admin-workspace-"));
+  config = loadConfig();
+  store = await GatewayStore.open(config.databasePath, config.tokenEncryptionKey);
+  const logger = createLogger({ level: "silent" });
+  const fakeReconciler: Reconciler = {
+    get status() {
+      return {
+        running: false,
+        lastStartedAt: null,
+        lastCompletedAt: null,
+        lastError: null,
+      };
+    },
+    stop: async () => {},
+  } as Reconciler;
+  reconciler = fakeReconciler;
+  const workspaces = new WorkspaceManager(tempRoot, store, logger);
+  const adminRouter = createAdminRouter({
+    config,
+    store,
+    workspaces,
+    reconciler: fakeReconciler,
+    logger,
+  });
+  fetchHandler = async (request: Request) => {
+    const url = new URL(request.url);
+    const response = await adminRouter.handle(request, url, Date.now());
+    return response ?? new Response("Not found", { status: 404 });
+  };
 });
 
 afterAll(async () => {
@@ -386,8 +411,8 @@ describe("admin control plane", () => {
       expect(logout.status).toBe(302);
       expect(logout.headers.get("location")).toBe("/");
       const clearCookie = logout.headers.get("set-cookie") ?? "";
-      expect(clearCookie).toInclude("omp_gateway_admin=");
-      expect(clearCookie).toInclude("Max-Age=0");
+      expect(clearCookie).toContain("omp_gateway_admin=");
+      expect(clearCookie).toContain("Max-Age=0");
       expect(store.getAdminSession(tokenHash(token), now)).toBeNull();
     });
   });
@@ -764,4 +789,32 @@ describe("admin control plane", () => {
       ]);
     });
   });
+});
+
+describe("admin session crypto invariants", () => {
+  it.prop(
+    "token, CSRF, and hash helpers are deterministic and equality-reflecting",
+    {
+      rawA: Schema.String,
+      rawB: Schema.String,
+      csrfA: Schema.String,
+      csrfB: Schema.String,
+    },
+    ({ rawA, rawB, csrfA, csrfB }) => {
+      const h1 = tokenHash(rawA);
+      const h2 = tokenHash(rawA);
+      expect(h2).toBe(h1);
+      expect(tokenHash(rawB) === h1).toBe(rawA === rawB);
+
+      const c1 = deriveCsrfToken(rawA);
+      const c2 = deriveCsrfToken(rawA);
+      expect(c2).toBe(c1);
+      expect(deriveCsrfToken(rawB) === c1).toBe(rawA === rawB);
+
+      const ch1 = csrfHash(csrfA);
+      const ch2 = csrfHash(csrfA);
+      expect(ch2).toBe(ch1);
+      expect(csrfHash(csrfB) === ch1).toBe(csrfA === csrfB);
+    },
+  );
 });

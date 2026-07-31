@@ -3,7 +3,7 @@ import type { OrganizationId, SessionId, WorkspaceId } from "../../domain/ids.js
 import type { TeamId, ProjectId } from "../../domain/ids.js";
 import { RepositoryRecord } from "../../domain/models.js";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
-import { SqliteClient, tryDb, decodeRow, decodeRows, transact } from "./sqlite-client.js";
+import { SqliteClient, tryDb, runChanges, decodeRow, decodeRows, transact } from "./sqlite-client.js";
 
 const RepositoryRow = Schema.Struct({
   organization_id: Schema.String,
@@ -80,7 +80,7 @@ const validateRepository = (
       const ref = validateString(input.ref, "ref");
       if (!ref || !isSafeArgument(ref))
         throw new Error("ref must be a non-empty safe ref");
-      return {
+      return Schema.decodeUnknownSync(RepositoryRecord)({
         organizationId,
         id,
         url,
@@ -91,7 +91,7 @@ const validateRepository = (
         isDefault: input.isDefault === true,
         createdAt: now,
         updatedAt: now,
-      } as RepositoryRecord;
+      });
     },
     catch: (error) =>
       new RowDecodeError({
@@ -162,10 +162,10 @@ const parseStringArray = (
         }),
     });
     if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
-      return yield* new RowDecodeError({
+      return yield* Effect.fail(new RowDecodeError({
         message: `Invalid string array in ${label}`,
         entity: "RepositoryRecord",
-      });
+      }));
     }
     return value;
   });
@@ -185,31 +185,26 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           readonly url: string;
           readonly ref: string;
           readonly state: string;
-        }): Effect.Effect<void, DatabaseError> {
-          yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
-          const now = yield* Clock.currentTimeMillis;
-          return yield* tryDb(
-            () =>
-              db
-                .query(`
-                  INSERT INTO workspace (session_id, canonical_path, repository_id, repository_url, repository_ref, state, created_at, updated_at)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                  ON CONFLICT(session_id) DO UPDATE SET canonical_path=excluded.canonical_path, repository_id=excluded.repository_id,
-                    repository_url=excluded.repository_url, repository_ref=excluded.repository_ref, state=excluded.state, updated_at=excluded.updated_at
-                `)
-                .run(
-                  input.sessionId,
-                  input.path,
-                  input.repositoryId,
-                  input.url,
-                  input.ref,
-                  input.state,
-                  now,
-                  now,
-                ),
-            "WorkspaceRepo.setWorkspace",
-          );
-        },
+        }) { yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
+        const now = yield* Clock.currentTimeMillis;
+        yield* tryDb(() =>
+          db
+            .query(`
+              INSERT INTO workspace (session_id, canonical_path, repository_id, repository_url, repository_ref, state, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(session_id) DO UPDATE SET canonical_path=excluded.canonical_path, repository_id=excluded.repository_id,
+                repository_url=excluded.repository_url, repository_ref=excluded.repository_ref, state=excluded.state, updated_at=excluded.updated_at
+            `)
+            .run(
+              input.sessionId,
+              input.path,
+              input.repositoryId,
+              input.url,
+              input.ref,
+              input.state,
+              now,
+              now,
+            ), "WorkspaceRepo.setWorkspace"); },
       );
 
       const createRepository = Effect.fn("WorkspaceRepo.createRepository")(
@@ -223,235 +218,208 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           readonly labels?: ReadonlyArray<string>;
           readonly isDefault?: boolean;
           readonly now?: number;
-        }): Effect.Effect<RepositoryRecord, DatabaseError | RowDecodeError> {
-          yield* Effect.annotateCurrentSpan("repositoryId", input.id);
-          const now = input.now ?? (yield* Clock.currentTimeMillis);
-          const record = yield* validateRepository(input, now);
-
-          const tx = Effect.gen(function* () {
-            const existing = yield* tryDb(
-              () =>
-                db
-                  .query<RepositoryRow, [string, string]>(
-                    "SELECT organization_id FROM repository WHERE organization_id=? AND id=?",
-                  )
-                  .get(record.organizationId, record.id),
-              "WorkspaceRepo.createRepository.select",
-            );
-            if (existing !== null) {
-              return yield* Effect.die(
-                new Error(
-                  `Repository ${record.id} already exists for ${record.organizationId}`,
-                ),
-              );
-            }
-
-            if (record.isDefault) {
-              yield* tryDb(
-                () =>
-                  db
-                    .query(
-                      "UPDATE repository SET is_default=0, updated_at=? WHERE organization_id=? AND is_default=1",
-                    )
-                    .run(now, record.organizationId),
-                "WorkspaceRepo.createRepository.default",
-              );
-            }
-
-            yield* tryDb(
-              () =>
-                db
-                  .query(`
-                    INSERT INTO repository (
-                      organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, is_default, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  `)
-                  .run(
-                    record.organizationId,
-                    record.id,
-                    record.url,
-                    record.ref,
-                    JSON.stringify(record.teamIds),
-                    JSON.stringify(record.projectIds),
-                    JSON.stringify(record.labels),
-                    record.isDefault ? 1 : 0,
-                    record.createdAt,
-                    record.updatedAt,
-                  ),
-              "WorkspaceRepo.createRepository.insert",
-            );
-
-            return record;
-          });
-
-          return yield* transact(tx);
-        },
-      );
-
-      const updateRepository = Effect.fn("WorkspaceRepo.updateRepository")(
-        function* (
-          organizationId: OrganizationId,
-          id: WorkspaceId,
-          input: {
-            readonly url?: string;
-            readonly ref?: string;
-            readonly teamIds?: ReadonlyArray<TeamId>;
-            readonly projectIds?: ReadonlyArray<ProjectId>;
-            readonly labels?: ReadonlyArray<string>;
-            readonly isDefault?: boolean;
-            readonly now?: number;
-          },
-        ): Effect.Effect<RepositoryRecord, DatabaseError | RowDecodeError> {
-          yield* Effect.annotateCurrentSpan("repositoryId", id);
-          const current = yield* getRepository(organizationId, id);
-          if (Option.isNone(current)) {
-            return yield* Effect.die(
-              new Error(`Repository ${id} not found for ${organizationId}`),
-            );
-          }
-          const existing = current.value;
-          const now = input.now ?? (yield* Clock.currentTimeMillis);
-
-          const patch = yield* validateRepository(
-            {
-              organizationId,
-              id,
-              url: input.url ?? existing.url,
-              ref: input.ref ?? existing.ref,
-              teamIds: input.teamIds ?? existing.teamIds,
-              projectIds: input.projectIds ?? existing.projectIds,
-              labels: input.labels ?? existing.labels,
-              isDefault: input.isDefault ?? existing.isDefault,
-            },
-            now,
-          );
-
-          const tx = Effect.gen(function* () {
-            if (patch.isDefault && !existing.isDefault) {
-              yield* tryDb(
-                () =>
-                  db
-                    .query(
-                      "UPDATE repository SET is_default=0, updated_at=? WHERE organization_id=? AND is_default=1",
-                    )
-                    .run(now, organizationId),
-                "WorkspaceRepo.updateRepository.default",
-              );
-            }
-
-            yield* tryDb(
-              () =>
-                db
-                  .query(`
-                    UPDATE repository
-                    SET url=?, ref=?, team_ids_json=?, project_ids_json=?, labels_json=?, is_default=?, updated_at=?
-                    WHERE organization_id=? AND id=?
-                  `)
-                  .run(
-                    patch.url,
-                    patch.ref,
-                    JSON.stringify(patch.teamIds),
-                    JSON.stringify(patch.projectIds),
-                    JSON.stringify(patch.labels),
-                    patch.isDefault ? 1 : 0,
-                    now,
-                    organizationId,
-                    id,
-                  ),
-              "WorkspaceRepo.updateRepository.update",
-            );
-
-            return {
-              ...patch,
-              createdAt: existing.createdAt,
-              updatedAt: now,
-            } as RepositoryRecord;
-          });
-
-          return yield* transact(tx);
-        },
-      );
-
-      const deleteRepository = Effect.fn("WorkspaceRepo.deleteRepository")(
-        function* (
-          organizationId: OrganizationId,
-          id: WorkspaceId,
-        ): Effect.Effect<boolean, DatabaseError> {
-          yield* Effect.annotateCurrentSpan("repositoryId", id);
-          const result = yield* tryDb(
-            () =>
-              db
-                .query("DELETE FROM repository WHERE organization_id=? AND id=?")
-                .run(organizationId, id),
-            "WorkspaceRepo.deleteRepository",
-          );
-          return (result as { changes: number }).changes === 1;
-        },
-      );
-
-      const getRepository = Effect.fn("WorkspaceRepo.getRepository")(
-        function* (
-          organizationId: OrganizationId,
-          id: WorkspaceId,
-        ): Effect.Effect<Option.Option<RepositoryRecord>, DatabaseError | RowDecodeError> {
-          yield* Effect.annotateCurrentSpan("repositoryId", id);
-          const row = yield* tryDb(
+        }) { yield* Effect.annotateCurrentSpan("repositoryId", input.id);
+        const now = input.now ?? (yield* Clock.currentTimeMillis);
+        const record = yield* validateRepository(input, now);
+        
+        const tx = Effect.gen(function* () {
+          const existing = yield* tryDb(
             () =>
               db
                 .query<RepositoryRow, [string, string]>(
-                  "SELECT * FROM repository WHERE organization_id=? AND id=?",
+                  "SELECT organization_id FROM repository WHERE organization_id=? AND id=?",
                 )
-                .get(organizationId, id),
-            "WorkspaceRepo.getRepository",
+                .get(record.organizationId, record.id),
+            "WorkspaceRepo.createRepository.select",
           );
-          if (row === null) return Option.none();
-          const decoded = yield* decodeRow(RepositoryRow, row, "RepositoryRecord");
-          const record = yield* rowToRepositoryRecord(decoded);
-          return Option.some(record);
-        },
+          if (existing !== null) {
+            return yield* Effect.fail(new DatabaseError({ message: `Repository ${record.id} already exists for ${record.organizationId}` }))
+          }
+        
+          if (record.isDefault) {
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "UPDATE repository SET is_default=0, updated_at=? WHERE organization_id=? AND is_default=1",
+                  )
+                  .run(now, record.organizationId),
+              "WorkspaceRepo.createRepository.default",
+            );
+          }
+        
+          yield* tryDb(
+            () =>
+              db
+                .query(`
+                  INSERT INTO repository (
+                    organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, is_default, created_at, updated_at
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `)
+                .run(
+                  record.organizationId,
+                  record.id,
+                  record.url,
+                  record.ref,
+                  JSON.stringify(record.teamIds),
+                  JSON.stringify(record.projectIds),
+                  JSON.stringify(record.labels),
+                  record.isDefault ? 1 : 0,
+                  record.createdAt,
+                  record.updatedAt,
+                ),
+            "WorkspaceRepo.createRepository.insert",
+          );
+        
+          return record;
+        });
+        
+        return yield* transact(db, tx); },
+      );
+
+      const updateRepository = Effect.fn("WorkspaceRepo.updateRepository")(
+        function* (organizationId: OrganizationId,
+        id: WorkspaceId,
+        input: {
+          readonly url?: string;
+          readonly ref?: string;
+          readonly teamIds?: ReadonlyArray<TeamId>;
+          readonly projectIds?: ReadonlyArray<ProjectId>;
+          readonly labels?: ReadonlyArray<string>;
+          readonly isDefault?: boolean;
+          readonly now?: number;
+        },) { yield* Effect.annotateCurrentSpan("repositoryId", id);
+        const current = yield* getRepository(organizationId, id);
+        if (Option.isNone(current)) {
+          return yield* Effect.fail(new DatabaseError({ message: `Repository ${id} not found for ${organizationId}` }))
+        }
+        const existing = current.value;
+        const now = input.now ?? (yield* Clock.currentTimeMillis);
+        
+        const patch = yield* validateRepository(
+          {
+            organizationId,
+            id,
+            url: input.url ?? existing.url,
+            ref: input.ref ?? existing.ref,
+            teamIds: input.teamIds ?? existing.teamIds,
+            projectIds: input.projectIds ?? existing.projectIds,
+            labels: input.labels ?? existing.labels,
+            isDefault: input.isDefault ?? existing.isDefault,
+          },
+          now,
+        );
+        
+        const tx = Effect.gen(function* () {
+          if (patch.isDefault && !existing.isDefault) {
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "UPDATE repository SET is_default=0, updated_at=? WHERE organization_id=? AND is_default=1",
+                  )
+                  .run(now, organizationId),
+              "WorkspaceRepo.updateRepository.default",
+            );
+          }
+        
+          yield* tryDb(
+            () =>
+              db
+                .query(`
+                  UPDATE repository
+                  SET url=?, ref=?, team_ids_json=?, project_ids_json=?, labels_json=?, is_default=?, updated_at=?
+                  WHERE organization_id=? AND id=?
+                `)
+                .run(
+                  patch.url,
+                  patch.ref,
+                  JSON.stringify(patch.teamIds),
+                  JSON.stringify(patch.projectIds),
+                  JSON.stringify(patch.labels),
+                  patch.isDefault ? 1 : 0,
+                  now,
+                  organizationId,
+                  id,
+                ),
+            "WorkspaceRepo.updateRepository.update",
+          );
+        
+          return yield* decodeRow(
+            RepositoryRecord,
+            {
+              ...patch,
+              createdAt: existing.createdAt,
+              updatedAt: now,
+            },
+            "RepositoryRecord",
+          );
+        });
+        
+        return yield* transact(db, tx); },
+      );
+
+      const deleteRepository = Effect.fn("WorkspaceRepo.deleteRepository")(
+        function* (organizationId: OrganizationId,
+        id: WorkspaceId,) { yield* Effect.annotateCurrentSpan("repositoryId", id);
+        const result = yield* tryDb(
+          () =>
+            db
+              .query("DELETE FROM repository WHERE organization_id=? AND id=?")
+              .run(organizationId, id),
+          "WorkspaceRepo.deleteRepository",
+        );
+        return (yield* runChanges(result, "WorkspaceRepo.deleteRepository")) === 1; },
+      );
+
+      const getRepository = Effect.fn("WorkspaceRepo.getRepository")(
+        function* (organizationId: OrganizationId,
+        id: WorkspaceId,) { yield* Effect.annotateCurrentSpan("repositoryId", id);
+        const row = yield* tryDb(
+          () =>
+            db
+              .query<RepositoryRow, [string, string]>(
+                "SELECT * FROM repository WHERE organization_id=? AND id=?",
+              )
+              .get(organizationId, id),
+          "WorkspaceRepo.getRepository",
+        );
+        if (row === null) return Option.none();
+        const decoded = yield* decodeRow(RepositoryRow, row, "RepositoryRecord");
+        const record = yield* rowToRepositoryRecord(decoded);
+        return Option.some(record); },
       );
 
       const listRepositories = Effect.fn("WorkspaceRepo.listRepositories")(
-        function* (
-          organizationId: OrganizationId,
-        ): Effect.Effect<
-          ReadonlyArray<RepositoryRecord>,
-          DatabaseError | RowDecodeError
-        > {
-          yield* Effect.annotateCurrentSpan("organizationId", organizationId);
-          const rows = yield* tryDb(
-            () =>
-              db
-                .query<RepositoryRow, [string]>(
-                  "SELECT * FROM repository WHERE organization_id=? ORDER BY created_at, id",
-                )
-                .all(organizationId),
-            "WorkspaceRepo.listRepositories",
-          );
-          const decoded = yield* decodeRows(RepositoryRow, rows, "RepositoryRecord");
-          return yield* Effect.forEach(decoded, rowToRepositoryRecord);
-        },
+        function* (organizationId: OrganizationId,) { yield* Effect.annotateCurrentSpan("organizationId", organizationId);
+        const rows = yield* tryDb(
+          () =>
+            db
+              .query<RepositoryRow, [string]>(
+                "SELECT * FROM repository WHERE organization_id=? ORDER BY created_at, id",
+              )
+              .all(organizationId),
+          "WorkspaceRepo.listRepositories",
+        );
+        const decoded = yield* decodeRows(RepositoryRow, rows, "RepositoryRecord");
+        return yield* Effect.forEach(decoded, rowToRepositoryRecord); },
       );
 
       const getDefaultRepository = Effect.fn("WorkspaceRepo.getDefaultRepository")(
-        function* (
-          organizationId: OrganizationId,
-        ): Effect.Effect<Option.Option<RepositoryRecord>, DatabaseError | RowDecodeError> {
-          yield* Effect.annotateCurrentSpan("organizationId", organizationId);
-          const row = yield* tryDb(
-            () =>
-              db
-                .query<RepositoryRow, [string]>(
-                  "SELECT * FROM repository WHERE organization_id=? AND is_default=1 LIMIT 1",
-                )
-                .get(organizationId),
-            "WorkspaceRepo.getDefaultRepository",
-          );
-          if (row === null) return Option.none();
-          const decoded = yield* decodeRow(RepositoryRow, row, "RepositoryRecord");
-          const record = yield* rowToRepositoryRecord(decoded);
-          return Option.some(record);
-        },
+        function* (organizationId: OrganizationId,) { yield* Effect.annotateCurrentSpan("organizationId", organizationId);
+        const row = yield* tryDb(
+          () =>
+            db
+              .query<RepositoryRow, [string]>(
+                "SELECT * FROM repository WHERE organization_id=? AND is_default=1 LIMIT 1",
+              )
+              .get(organizationId),
+          "WorkspaceRepo.getDefaultRepository",
+        );
+        if (row === null) return Option.none();
+        const decoded = yield* decodeRow(RepositoryRow, row, "RepositoryRecord");
+        const record = yield* rowToRepositoryRecord(decoded);
+        return Option.some(record); },
       );
 
       return {

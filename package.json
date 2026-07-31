@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "test": "vitest run",
+    "test": "bunx --bun vitest run",
     "check": "bun run typecheck && bun run lint && bun run test && bun run build"
   },
   "dependencies": {

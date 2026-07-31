@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, test } from "@effect/vitest"
 import { createHmac } from "node:crypto";
+import { Effect, Schema } from "effect";
 import type { GatewayConfig } from "../src/domain";
 import { GatewayStore } from "../src/store";
 import { handleWebhook } from "../src/webhook";
@@ -769,4 +770,71 @@ describe("Linear webhook input correctness", () => {
       projectId: "project-child",
     });
   });
+});
+
+describe("webhook signature invariants", () => {
+  it.prop(
+    "HMAC-SHA256 signature is deterministic and sensitive to body and secret",
+    {
+      body: Schema.String.pipe(Schema.minLength(1)),
+      otherBody: Schema.String.pipe(Schema.minLength(1)),
+      secret1: Schema.String.pipe(Schema.minLength(1)),
+      secret2: Schema.String.pipe(Schema.minLength(1)),
+    },
+    ({ body, otherBody, secret1, secret2 }) => {
+      const sign = (data: string, secret: string): string =>
+        createHmac("sha256", secret).update(data).digest("hex");
+
+      const a = sign(body, secret1);
+      const b = sign(body, secret1);
+      expect(b).toBe(a);
+
+      const c = sign(body, secret2);
+      const d = sign(otherBody, secret1);
+
+      expect(c === a).toBe(secret1 === secret2);
+      expect(d === a).toBe(body === otherBody);
+    },
+  );
+});
+
+describe("replay window invariants", () => {
+  it.effect.prop(
+    "acceptance strictly matches abs(now - timestamp) <= window",
+    {
+      now: Schema.Number.pipe(Schema.int(), Schema.between(1, 1_000_000_000_000)),
+      timestamp: Schema.Number.pipe(Schema.int(), Schema.between(1, 1_000_000_000_000)),
+      window: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+    },
+    ({ now, timestamp, window }) =>
+      Effect.gen(function* () {
+        const originalNow = Date.now;
+        Date.now = () => now;
+        try {
+          const payload = {
+            type: "OAuthApp",
+            action: "created",
+            oauthClientId: config.linearClientId,
+            organizationId: "org",
+            webhookId: "webhook-config",
+            webhookTimestamp: timestamp,
+          };
+          const request = signedRequest(payload);
+          const response = yield* Effect.tryPromise({
+            try: () =>
+              handleWebhook(
+                request,
+                { ...config, webhookReplayWindowMs: window },
+                store,
+              ),
+            catch: (error) => new Error(String(error)),
+          });
+          const accepted = response.status === 200;
+          const expected = Math.abs(now - timestamp) <= window;
+          expect(accepted).toBe(expected);
+        } finally {
+          Date.now = originalNow;
+        }
+      }),
+  );
 });

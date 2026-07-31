@@ -1,4 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, test } from "@effect/vitest"
+import * as fc from "effect/FastCheck";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { GatewayStore } from "../src/store";
@@ -124,4 +125,38 @@ describe("WorkspaceManager", () => {
       ),
     ).rejects.toThrow();
   });
+});
+
+describe("WorkspaceManager invariants", () => {
+  it.prop(
+    "resolve is deterministic for any context",
+    {
+      organizationId: fc.string({ maxLength: 20 }),
+      repositoryId: fc.string({ maxLength: 20 }),
+      issueLabels: fc.array(fc.string({ maxLength: 20 })),
+      projectLabels: fc.array(fc.string({ maxLength: 20 })),
+      projectId: fc.string({ maxLength: 20 }),
+      teamId: fc.string({ maxLength: 20 }),
+    },
+    ({
+      organizationId,
+      repositoryId,
+      issueLabels,
+      projectLabels,
+      projectId,
+      teamId,
+    }) => {
+      const context = {
+        organizationId,
+        repositoryId,
+        issueLabels,
+        projectLabels,
+        projectId,
+        teamId,
+      };
+      const first = workspaceManager.resolve(context);
+      const second = workspaceManager.resolve(context);
+      expect(second).toEqual(first);
+    },
+  );
 });

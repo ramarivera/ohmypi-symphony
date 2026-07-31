@@ -79,7 +79,7 @@ const repoDeps = Layer.mergeAll(
 ).pipe(Layer.provide(sqlite));
 const deps = Layer.mergeAll(repoDeps, Layer.succeed(LinearGateway, mockLinear));
 const ActivityProjectorLayer = Layer.mergeAll(
-  ActivityProjector.Default.pipe(Layer.provide(deps)),
+  ActivityProjector.DefaultWithoutDependencies.pipe(Layer.provide(deps)),
   deps,
 );
 

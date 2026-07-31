@@ -3,7 +3,10 @@ import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { Effect, Option } from "effect";
-import { WorkspaceError } from "../domain/errors.js";
+import { DatabaseError, RowDecodeError, WorkspaceError } from "../domain/errors.js";
+import type { OrganizationId } from "../domain/ids.js";
+import { WorkspaceRepo } from "./store/repositories.js";
+import { GatewayConfig } from "./config.js";
 import type { RepositoryRecord } from "../domain/models.js";
 
 export type RepositoryResolution =
@@ -27,9 +30,7 @@ interface ResolveContext {
 }
 
 export interface WorkspaceRepoShape {
-  readonly list: (organizationId: string) => Effect.Effect<ReadonlyArray<RepositoryRecord>, never>;
-  readonly get: (organizationId: string, id: string) => Effect.Effect<Option.Option<RepositoryRecord>, never>;
-  readonly getDefault?: (organizationId: string) => Effect.Effect<Option.Option<RepositoryRecord>, never>;
+  readonly listRepositories: (organizationId: OrganizationId) => Effect.Effect<ReadonlyArray<RepositoryRecord>, DatabaseError | RowDecodeError>;
 }
 
 export function safeSessionKey(sessionId: string): string {
@@ -292,7 +293,7 @@ export const makeWorkspace = (input: {
 }) =>
   Effect.gen(function* () {
     const resolve = Effect.fn("Workspace.resolve")(
-      function* (context: unknown): Effect.Effect<RepositoryResolution, never> {
+      function* (context: unknown): Effect.fn.Return<RepositoryResolution, DatabaseError | RowDecodeError> {
         const parsed = parseContext(context);
         if (Option.isNone(parsed)) {
           yield* Effect.logWarning("Workspace resolve rejected: invalid context", {
@@ -305,7 +306,7 @@ export const makeWorkspace = (input: {
           return { kind: "none" };
         }
 
-        const repositories = yield* input.repo.list(parsed.value.organizationId);
+        const repositories = yield* input.repo.listRepositories(parsed.value.organizationId as OrganizationId);
         const resolution = resolveFromRepositories(parsed.value, repositories);
 
         yield* Effect.annotateCurrentSpan({
@@ -333,7 +334,7 @@ export const makeWorkspace = (input: {
     );
 
     const materialize = Effect.fn("Workspace.materialize")(
-      function* (sessionId: string, repository: RepositoryRecord): Effect.Effect<string, WorkspaceError> {
+      function* (sessionId: string, repository: RepositoryRecord): Effect.fn.Return<string, WorkspaceError> {
         yield* Effect.annotateCurrentSpan({
           "workspace.session_id": sessionId,
           "workspace.repository_id": repository.id,
@@ -408,3 +409,14 @@ export const makeWorkspace = (input: {
 
     return { resolve, materialize };
   });
+
+
+export class Workspace extends Effect.Service<Workspace>()("Workspace", {
+  accessors: true,
+  dependencies: [GatewayConfig.Default, WorkspaceRepo.Default],
+  effect: Effect.gen(function* () {
+    const config = yield* GatewayConfig;
+    const repo = yield* WorkspaceRepo;
+    return yield* makeWorkspace({ workspaceRoot: config.workspaceRoot, repo });
+  }),
+}) {}

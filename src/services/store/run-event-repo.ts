@@ -152,73 +152,64 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
           readonly status?: "observed" | "pending" | "completed" | "failed" | null;
           readonly error?: string | null;
           readonly now?: number;
-        }): Effect.Effect<void, DatabaseError> {
-          yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
-          const now = input.now ?? (yield* Clock.currentTimeMillis);
-          const text = input.text ?? null;
-          const payloadJson = JSON.stringify(input.payload ?? null);
-          const status = input.status ?? null;
-          const error = input.error ?? null;
-
-          return yield* tryDb(
-            () =>
-              db
-                .query(`
-                  INSERT INTO run_event (
-                    source_key, session_id, kind, level, text, payload_json, status, error, created_at, updated_at
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  ON CONFLICT(source_key) DO UPDATE SET
-                    kind=?,
-                    level=?,
-                    text=?,
-                    payload_json=?,
-                    status=?,
-                    error=?,
-                    created_at=run_event.created_at,
-                    updated_at=?
-                  WHERE run_event.status IS NULL OR run_event.status NOT IN ('completed','failed')
-                `)
-                .run(
-                  input.sourceKey,
-                  input.sessionId,
-                  input.kind,
-                  input.level,
-                  text,
-                  payloadJson,
-                  status,
-                  error,
-                  now,
-                  now,
-                  input.kind,
-                  input.level,
-                  text,
-                  payloadJson,
-                  status,
-                  error,
-                  now,
-                ),
-            "RunEventRepo.upsert",
-          );
-        },
+        }) { yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
+        const now = input.now ?? (yield* Clock.currentTimeMillis);
+        const text = input.text ?? null;
+        const payloadJson = JSON.stringify(input.payload ?? null);
+        const status = input.status ?? null;
+        const error = input.error ?? null;
+        
+        yield* tryDb(() =>
+          db
+            .query(`
+              INSERT INTO run_event (
+                source_key, session_id, kind, level, text, payload_json, status, error, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(source_key) DO UPDATE SET
+                kind=?,
+                level=?,
+                text=?,
+                payload_json=?,
+                status=?,
+                error=?,
+                created_at=run_event.created_at,
+                updated_at=?
+              WHERE run_event.status IS NULL OR run_event.status NOT IN ('completed','failed')
+            `)
+            .run(
+              input.sourceKey,
+              input.sessionId,
+              input.kind,
+              input.level,
+              text,
+              payloadJson,
+              status,
+              error,
+              now,
+              now,
+              input.kind,
+              input.level,
+              text,
+              payloadJson,
+              status,
+              error,
+              now,
+            ), "RunEventRepo.upsert"); },
       );
 
       const list = Effect.fn("RunEventRepo.list")(
-        function* (
-          sessionId: SessionId,
-        ): Effect.Effect<ReadonlyArray<RunEvent>, DatabaseError | RowDecodeError> {
-          yield* Effect.annotateCurrentSpan("sessionId", sessionId);
-          const rows = yield* tryDb(
-            () =>
-              db
-                .query<RunEventRow, [string]>(
-                  "SELECT * FROM run_event WHERE session_id=? ORDER BY created_at, source_key",
-                )
-                .all(sessionId),
-            "RunEventRepo.list",
-          );
-          const decoded = yield* decodeRows(RunEventRow, rows, "RunEvent");
-          return yield* Effect.forEach(decoded, rowToRunEvent);
-        },
+        function* (sessionId: SessionId,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+        const rows = yield* tryDb(
+          () =>
+            db
+              .query<RunEventRow, [string]>(
+                "SELECT * FROM run_event WHERE session_id=? ORDER BY created_at, source_key",
+              )
+              .all(sessionId),
+          "RunEventRepo.list",
+        );
+        const decoded = yield* decodeRows(RunEventRow, rows, "RunEvent");
+        return yield* Effect.forEach(decoded, rowToRunEvent); },
       );
 
       return { upsert, list };

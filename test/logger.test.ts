@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, it, test } from "@effect/vitest"
 import { Writable } from "node:stream";
+import { Schema } from "effect";
 import type pino from "pino";
 import { createLogger, validLogLevel } from "../src/logger";
 
@@ -99,4 +100,30 @@ describe("validLogLevel", () => {
     expect(validLogLevel("")).toBe("info");
     expect(validLogLevel("verbose", "debug")).toBe("debug");
   });
+});
+
+describe("validLogLevel invariants", () => {
+  const VALID_LEVELS: Record<string, true> = {
+    trace: true,
+    debug: true,
+    info: true,
+    warn: true,
+    error: true,
+    fatal: true,
+    silent: true,
+  };
+
+  it.prop(
+    "returns the normalized value for valid levels and the fallback otherwise",
+    {
+      value: Schema.String,
+      fallback: Schema.Literal("trace", "debug", "info", "warn", "error", "fatal", "silent"),
+    },
+    ({ value, fallback }) => {
+      const normalized = value.trim().toLowerCase();
+      const expected = VALID_LEVELS[normalized] === true ? normalized : fallback;
+      expect(validLogLevel(value, fallback)).toBe(expected);
+    },
+  );
+
 });

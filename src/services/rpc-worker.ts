@@ -304,12 +304,12 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             }
 
             if (index === 0) {
-              yield* Ref.set(chunkRef, {
+              yield* Ref.set(chunkRef, Option.some({
                 id: chunkId,
                 count,
                 byteLength,
                 parts: [],
-              });
+              }));
             }
 
             const state = yield* Ref.get(chunkRef);
@@ -387,18 +387,19 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           frame: Record<string, unknown>,
         ): Effect.Effect<void, RpcProtocolError, never> =>
           Effect.gen(function* () {
-            if (frame.type === "response" && isString(frame.id)) {
+            const id = frame.id;
+            if (frame.type === "response" && isString(id)) {
               const pending = yield* Ref.get(pendingRef);
-              const request = pending.get(frame.id);
+              const request = pending.get(id);
 
               if (request === undefined) {
                 const promptRequestIds = yield* Ref.get(promptRequestIdsRef);
                 if (
                   frame.success === false &&
-                  promptRequestIds.has(frame.id)
+                  promptRequestIds.has(id)
                 ) {
                   yield* Ref.update(promptRequestIdsRef, (set) => {
-                    set.delete(frame.id);
+                    set.delete(id);
                     return set;
                   });
                   yield* emit({
@@ -414,7 +415,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               }
 
               yield* Ref.update(pendingRef, (map) => {
-                map.delete(frame.id);
+                map.delete(id);
                 return map;
               });
 
@@ -432,7 +433,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               } else {
                 if (request.command === "prompt") {
                   yield* Ref.update(promptRequestIdsRef, (set) => {
-                    set.add(frame.id);
+                    set.add(id);
                     if (set.size > MAX_PROMPT_REQUEST_IDS) {
                       const oldest = set.values().next().value;
                       if (typeof oldest === "string") set.delete(oldest);
@@ -446,9 +447,9 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               return;
             }
 
-            if (frame.type === "prompt_result" && isString(frame.id)) {
+            if (frame.type === "prompt_result" && isString(id)) {
               yield* Ref.update(promptRequestIdsRef, (set) => {
-                set.delete(frame.id);
+                set.delete(id);
                 return set;
               });
             }
@@ -479,7 +480,6 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               yield* emit({ ...frame, type: frame.type } as RpcEvent);
             }
           });
-
         const readOutput = (
           process: Subprocess<"pipe", "pipe", "pipe">,
         ): Effect.Effect<void, never, never> =>

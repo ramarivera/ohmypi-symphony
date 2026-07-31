@@ -29,10 +29,10 @@ export const tryDb = <A>(
   });
 
 export const transact = <A, E, R>(
-  effect: Effect.Effect<A, E, R | SqliteClient>,
-): Effect.Effect<A, E | DatabaseError, R | SqliteClient> =>
+  db: Database,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E | DatabaseError, R> =>
   Effect.gen(function* () {
-    const { db } = yield* SqliteClient;
     const begin = () => db.exec("BEGIN IMMEDIATE");
     const commit = () => db.exec("COMMIT");
     const rollback = () => db.exec("ROLLBACK");
@@ -66,7 +66,7 @@ export const decodeRow = <A, I, R>(
   Schema.decodeUnknown(schema)(row).pipe(
     Effect.mapError((error) =>
       new RowDecodeError({
-        message: ParseResult.TreeFormatter.formatError(error),
+        message: ParseResult.TreeFormatter.formatErrorSync(error),
         entity,
         cause: String(error),
       }),
@@ -79,6 +79,21 @@ export const decodeRows = <A, I, R>(
   entity: string,
 ): Effect.Effect<ReadonlyArray<A>, RowDecodeError, R> =>
   Effect.forEach(rows, (row) => decodeRow(schema, row, entity));
+
+const RunResult = Schema.Struct({ changes: Schema.Number });
+
+export const runChanges = (
+  result: unknown,
+  operation: string,
+): Effect.Effect<number, DatabaseError> =>
+  Schema.decodeUnknown(RunResult)(result).pipe(
+    Effect.map((r) => r.changes),
+    Effect.mapError(() =>
+      new DatabaseError({
+        message: `${operation}: run result did not contain changes`,
+      }),
+    ),
+  );
 
 const migrate = (db: Database): void => {
   db.exec(`

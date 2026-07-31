@@ -1,4 +1,4 @@
-import { Schema } from "effect";
+import { Option, Schema } from "effect";
 import {
   ActivityId,
   AppUserId,
@@ -114,6 +114,7 @@ export const RunEvent = Schema.Struct({
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
 });
+export type RunEvent = Schema.Schema.Type<typeof RunEvent>;
 
 export const ProjectionJob = Schema.Struct({
   sourceKey: SourceKey,
@@ -127,46 +128,61 @@ export const ProjectionJob = Schema.Struct({
 });
 export type ProjectionJob = Schema.Schema.Type<typeof ProjectionJob>;
 
-export const AgentSessionComment = Schema.Struct({ id: Schema.String, body: Schema.String });
+export const AgentSessionComment = Schema.Struct(
+  {
+    id: Schema.optionalWith(Schema.String, { default: () => "" }),
+    body: Schema.String,
+  },
+  { key: Schema.String, value: Schema.Unknown },
+);
 export type AgentSessionComment = Schema.Schema.Type<typeof AgentSessionComment>;
-export const AgentSessionIssue = Schema.Struct({
-  id: Schema.String,
-  title: Schema.String,
-  description: Schema.NullOr(Schema.String),
-  identifier: Schema.NullOr(Schema.String),
-  url: Schema.NullOr(Schema.String),
-  teamId: Schema.NullOr(Schema.String),
-  projectId: Schema.NullOr(Schema.String),
-});
-export type AgentSessionIssue = Schema.Schema.Encoded<typeof AgentSessionIssue>;
-export const AgentSessionActivity = Schema.Struct({
-  id: Schema.String,
-  agentSessionId: Schema.String,
-  content: Schema.Unknown,
-  signal: Schema.NullOr(Schema.String),
-});
-export type AgentSessionActivity = Schema.Schema.Encoded<typeof AgentSessionActivity>;
+export const AgentSessionIssue = Schema.Struct(
+  {
+    id: Schema.String,
+    title: Schema.String,
+    description: Schema.NullOr(Schema.String),
+    identifier: Schema.NullOr(Schema.String),
+    url: Schema.NullOr(Schema.String),
+    teamId: Schema.NullOr(Schema.String),
+    projectId: Schema.NullOr(Schema.String),
+  },
+  { key: Schema.String, value: Schema.Unknown },
+);
+export type AgentSessionIssue = Schema.Schema.Type<typeof AgentSessionIssue>;
+export const AgentSessionActivity = Schema.Struct(
+  {
+    id: Schema.String,
+    agentSessionId: Schema.String,
+    content: Schema.Unknown,
+    signal: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+  },
+  { key: Schema.String, value: Schema.Unknown },
+);
+export type AgentSessionActivity = Schema.Schema.Type<typeof AgentSessionActivity>;
 
 // Linear's embedded webhook AgentSession payload has no `type` field.
-export const AgentSessionWebhookPayload = Schema.Struct({
-  id: Schema.String,
-  appUserId: Schema.String,
-  organizationId: Schema.String,
-  status: Schema.String,
-  createdAt: Schema.String,
-  updatedAt: Schema.String,
-  issueId: Schema.NullOr(Schema.String),
-  commentId: Schema.NullOr(Schema.String),
-  sourceCommentId: Schema.NullOr(Schema.String),
-  summary: Schema.NullOr(Schema.String),
-  url: Schema.NullOr(Schema.String),
-  archivedAt: Schema.NullOr(Schema.String),
-  startedAt: Schema.NullOr(Schema.String),
-  endedAt: Schema.NullOr(Schema.String),
-  comment: Schema.NullOr(AgentSessionComment),
-  issue: Schema.NullOr(AgentSessionIssue),
-});
-export type AgentSessionWebhookPayload = Schema.Schema.Encoded<typeof AgentSessionWebhookPayload>;
+export const AgentSessionWebhookPayload = Schema.Struct(
+  {
+    id: Schema.String,
+    appUserId: Schema.String,
+    organizationId: Schema.String,
+    status: Schema.String,
+    createdAt: Schema.String,
+    updatedAt: Schema.String,
+    issueId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    commentId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    sourceCommentId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    summary: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    url: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    archivedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    startedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    endedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    comment: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionComment), { default: () => Option.none() }),
+    issue: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionIssue), { default: () => Option.none() }),
+  },
+  { key: Schema.String, value: Schema.Unknown },
+);
+export type AgentSessionWebhookPayload = Schema.Schema.Type<typeof AgentSessionWebhookPayload>;
 
 export const AgentSessionEvent = Schema.Struct({
   type: Schema.Literal("AgentSessionEvent"),
@@ -175,12 +191,12 @@ export const AgentSessionEvent = Schema.Struct({
   appUserId: Schema.String,
   oauthClientId: Schema.String,
   webhookId: Schema.String,
-  webhookTimestamp: Schema.String,
-  createdAt: Schema.String,
-  promptContext: Schema.NullOr(Schema.String),
-  guidance: Schema.NullOr(Schema.Array(Schema.Struct({ body: Schema.String }))),
-  previousComments: Schema.NullOr(Schema.Array(AgentSessionComment)),
-  agentActivity: Schema.NullOr(AgentSessionActivity),
+  webhookTimestamp: Schema.Number,
+  createdAt: Schema.optionalWith(Schema.String, { default: () => "1970-01-01T00:00:00.000Z" }),
+  promptContext: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+  guidance: Schema.optionalWith(Schema.OptionFromNullOr(Schema.Array(Schema.Struct({ body: Schema.String }))), { default: () => Option.none() }),
+  previousComments: Schema.optionalWith(Schema.OptionFromNullOr(Schema.Array(AgentSessionComment)), { default: () => Option.none() }),
+  agentActivity: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionActivity), { default: () => Option.none() }),
   agentSession: AgentSessionWebhookPayload,
 });
-export type AgentSessionEvent = Schema.Schema.Encoded<typeof AgentSessionEvent>;
+export type AgentSessionEvent = Schema.Schema.Type<typeof AgentSessionEvent>;

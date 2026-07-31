@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, it, test } from "@effect/vitest"
 import { createHash } from "node:crypto";
+import { Schema } from "effect";
 import type { GatewayConfig } from "../src/domain";
 import {
   buildInstallationRecord,
@@ -53,8 +54,8 @@ describe("Linear OAuth contract", () => {
       const stateHash = createHash("sha256")
         .update(authorization.state)
         .digest("base64url");
-      expect(store.consumeOAuthState(stateHash)).toBeTrue();
-      expect(store.consumeOAuthState(stateHash)).toBeFalse();
+      expect(store.consumeOAuthState(stateHash)).toBe(true);
+      expect(store.consumeOAuthState(stateHash)).toBe(false);
     } finally {
       store.close();
     }
@@ -87,4 +88,37 @@ describe("Linear OAuth contract", () => {
       canAccessAllPublicTeams: null,
     });
   });
+});
+
+describe("OAuth token invariants", () => {
+  it.prop(
+    "buildInstallationRecord computes expiresAt and preserves token fields",
+    {
+      accessToken: Schema.String.pipe(Schema.minLength(1)),
+      refreshToken: Schema.String.pipe(Schema.minLength(1)),
+      expiresIn: Schema.Number.pipe(Schema.int(), Schema.between(1, 100_000)),
+      organizationId: Schema.String.pipe(Schema.minLength(1)),
+      appUserId: Schema.String.pipe(Schema.minLength(1)),
+      now: Schema.Number.pipe(Schema.int(), Schema.between(0, 2_000_000_000_000)),
+    },
+    ({ accessToken, refreshToken, expiresIn, organizationId, appUserId, now }) => {
+      const token = parseTokenResponse({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        expires_in: expiresIn,
+        token_type: "Bearer",
+        scope: "read,write app:assignable app:mentionable",
+      });
+      const installation = buildInstallationRecord(token, organizationId, appUserId, now);
+      expect(installation.organizationId).toBe(organizationId);
+      expect(installation.appUserId).toBe(appUserId);
+      expect(installation.accessToken).toBe(accessToken);
+      expect(installation.refreshToken).toBe(refreshToken);
+      expect(installation.expiresAt).toBe(now + expiresIn * 1000);
+      expect(installation.scopes).toEqual(["read", "write", "app:assignable", "app:mentionable"]);
+      expect(installation.revokedAt).toBeNull();
+      expect(installation.accessibleTeamIds).toBeNull();
+      expect(installation.canAccessAllPublicTeams).toBeNull();
+    },
+  );
 });

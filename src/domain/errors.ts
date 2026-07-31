@@ -17,6 +17,7 @@ export class TokenRefreshError extends Schema.TaggedError<TokenRefreshError>()("
 export class WebhookSignatureError extends Schema.TaggedError<WebhookSignatureError>()("@Gateway/WebhookSignatureError", message) {}
 export class WebhookReplayError extends Schema.TaggedError<WebhookReplayError>()("@Gateway/WebhookReplayError", { ...message, timestamp: Schema.Number }) {}
 export class WebhookPayloadError extends Schema.TaggedError<WebhookPayloadError>()("@Gateway/WebhookPayloadError", { ...message, status: Schema.Number }) {}
+export class WebhookIdentityError extends Schema.TaggedError<WebhookIdentityError>()("@Gateway/WebhookIdentityError", message) {}
 export class DeliveryConflictError extends Schema.TaggedError<DeliveryConflictError>()("@Gateway/DeliveryConflictError", { ...message, deliveryId: Schema.String }) {}
 export class RunLeaseError extends Schema.TaggedError<RunLeaseError>()("@Gateway/RunLeaseError", { ...message, sessionId: Schema.String }) {}
 export class RpcSpawnError extends Schema.TaggedError<RpcSpawnError>()("@Gateway/RpcSpawnError", message) {}

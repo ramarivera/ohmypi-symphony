@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Schema } from "effect";
-import { RpcEvent } from "../src/services/rpc-worker.js";
+import { type RpcEvent } from "../src/services/rpc-worker.js";
 
 const rpcSourceKey = (
   sessionId: string,
