@@ -140,11 +140,21 @@ export const AgentSessionIssue = Schema.Struct(
   {
     id: Schema.String,
     title: Schema.String,
-    description: Schema.NullOr(Schema.String),
-    identifier: Schema.NullOr(Schema.String),
-    url: Schema.NullOr(Schema.String),
-    teamId: Schema.NullOr(Schema.String),
-    projectId: Schema.NullOr(Schema.String),
+    description: Schema.optionalWith(Schema.NullOr(Schema.String), {
+      default: () => null,
+    }),
+    identifier: Schema.optionalWith(Schema.NullOr(Schema.String), {
+      default: () => null,
+    }),
+    url: Schema.optionalWith(Schema.NullOr(Schema.String), {
+      default: () => null,
+    }),
+    teamId: Schema.optionalWith(Schema.NullOr(Schema.String), {
+      default: () => null,
+    }),
+    projectId: Schema.optionalWith(Schema.NullOr(Schema.String), {
+      default: () => null,
+    }),
   },
   { key: Schema.String, value: Schema.Unknown },
 );

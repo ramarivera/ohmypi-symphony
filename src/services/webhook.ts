@@ -921,12 +921,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                 break;
               }
               default:
-                return yield* Effect.fail(
-                  new WebhookPayloadError({
-                    message: `Unhandled webhook event type ${eventType}`,
-                    status: 400,
-                  }),
-                );
+                break;
             }
 
             yield* deliveryRepo.mark(deliveryId, "processed");
