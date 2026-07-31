@@ -87,6 +87,8 @@ export interface AgentRunRecord {
   readonly lastActivityAt: number | null;
   readonly terminalReason: string | null;
   readonly nextAttemptAt: number | null;
+  readonly createdAt: number;
+  readonly updatedAt: number;
 }
 
 export interface RunInput {

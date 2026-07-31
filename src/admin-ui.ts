@@ -28,8 +28,16 @@
 
 import { ADMIN_BODY, ADMIN_SCRIPT } from "./admin-ui/dashboard";
 import { LANDING_BODY } from "./admin-ui/landing";
+import {
+  RUN_DETAIL_SCRIPT,
+  RUN_DETAIL_STYLES,
+  type RunDetailModel,
+  renderRunDetailBody,
+} from "./admin-ui/run-detail";
 import { PAGE_STYLES } from "./admin-ui/styles";
 import { THEME_BOOTSTRAP_SCRIPT, THEME_SCRIPT } from "./admin-ui/theme";
+
+export type { RunDetailModel } from "./admin-ui/run-detail";
 
 const DOCTYPE = "<!doctype html>";
 
@@ -44,6 +52,7 @@ function renderDocument(meta: {
   readonly body: string;
   readonly script?: string;
   readonly extraHead?: string;
+  readonly extraStyles?: string;
   readonly pageClass: string;
 }): string {
   const head = [
@@ -52,7 +61,7 @@ function renderDocument(meta: {
     '<meta name="referrer" content="no-referrer">',
     `<title>${meta.title}</title>`,
     meta.extraHead ?? "",
-    `<style>${PAGE_STYLES}</style>`,
+    `<style>${PAGE_STYLES}${meta.extraStyles ?? ""}</style>`,
   ]
     .filter((part) => part.length > 0)
     .join("\n");
@@ -102,5 +111,21 @@ export function renderAdminPage(): string {
 ${ADMIN_SCRIPT}`,
     extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,
     pageClass: "admin-shell",
+  });
+}
+
+/**
+ * Render a public, redacted run-observability page. The document uses the
+ * shared theme bootstrap and styles so it retains the operator's appearance.
+ */
+export function renderRunDetailPage(model: RunDetailModel): string {
+  return renderDocument({
+    title: `OhMyPi run ${model.run.sessionId}`,
+    body: renderRunDetailBody(model),
+    script: `${THEME_SCRIPT}
+${RUN_DETAIL_SCRIPT}`,
+    extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,
+    extraStyles: RUN_DETAIL_STYLES,
+    pageClass: "run-detail-shell",
   });
 }

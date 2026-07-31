@@ -8,7 +8,7 @@ import type {
 import type { Logger } from "./logger";
 import { createLogger } from "./logger";
 import type { ActivityProjector } from "./projector";
-import type { GatewayStore } from "./store";
+import type { GatewayStore, RunEventLevel } from "./store";
 export type RepositoryResolution =
   | { kind: "match"; repository: RepositoryRecord }
   | { kind: "none" }
@@ -48,6 +48,12 @@ function record(value: unknown): value is Record<string, unknown> {
 
 function nullableString(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function jsonValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined || value === null) return "{}";
+  return JSON.stringify(value);
 }
 
 function labelSet(value: unknown): string[] {
@@ -541,6 +547,7 @@ export class SessionAuthority {
       return;
     const sequence = (this.#eventSequence.get(sessionId) ?? 0) + 1;
     this.#eventSequence.set(sessionId, sequence);
+    this.#recordRunEvent(sessionId, sequence, event);
     if (
       event.type === "extension_ui_request" &&
       typeof event.id === "string" &&
@@ -614,6 +621,111 @@ export class SessionAuthority {
       return;
     }
     await this.#projector.projectRpcEvent(sessionId, sequence, event);
+  }
+
+  #recordRunEvent(sessionId: string, sequence: number, event: RpcEvent): void {
+    const type = event.type;
+    let sourceKey = `rpc:${sessionId}:${sequence}:${type}`;
+    let kind = type;
+    let level: RunEventLevel;
+    let text: string | null = null;
+
+    switch (type) {
+      case "agent_start":
+      case "turn_start":
+      case "message_end":
+        level = "debug";
+        break;
+      case "tool_execution_start":
+      case "tool_execution_end":
+      case "agent_end":
+      case "turn_end":
+        level = "info";
+        break;
+      case "error":
+        level = "error";
+        break;
+      default:
+        level = "info";
+    }
+
+    switch (type) {
+      case "agent_start":
+        text = "OhMyPi worker started";
+        break;
+      case "turn_start":
+        text = "Starting the next agent turn";
+        break;
+      case "turn_end":
+      case "agent_end":
+        text = "Agent turn finished";
+        break;
+      case "message_end":
+        text = "Assistant message received";
+        break;
+      case "tool_execution_start": {
+        const toolName =
+          nullableString(event.toolName) ??
+          nullableString(event.tool) ??
+          "tool";
+        text = `${toolName}: ${jsonValue(event.args)}`;
+        break;
+      }
+      case "tool_execution_end": {
+        const toolName =
+          nullableString(event.toolName) ??
+          nullableString(event.tool) ??
+          "tool";
+        text = `${toolName} completed → ${jsonValue(event.result)}`;
+        break;
+      }
+      case "prompt_result": {
+        if (event.agentInvoked === false) {
+          const sourceId =
+            typeof event.id === "string"
+              ? event.id
+              : `prompt-result:${sequence}`;
+          sourceKey = `local-command:${sourceId}`;
+          kind = "prompt_result";
+          level = "debug";
+          text = "Command completed without starting an agent turn";
+        } else {
+          kind = "prompt_result";
+          level = "debug";
+          text = "Prompt accepted";
+        }
+        break;
+      }
+      case "extension_ui_request": {
+        if (typeof event.id === "string") {
+          sourceKey = `rpc-ui:${event.id}`;
+        }
+        const title =
+          typeof event.title === "string" ? event.title : "Input required";
+        const message = typeof event.message === "string" ? event.message : "";
+        text = [title, message].filter(Boolean).join("\n\n");
+        level = "warn";
+        break;
+      }
+      case "error":
+        text =
+          typeof event.message === "string"
+            ? event.message
+            : "OhMyPi worker failed";
+        break;
+      default:
+        text = type;
+    }
+
+    this.#store.upsertRunEvent({
+      sourceKey,
+      sessionId,
+      kind,
+      level,
+      text,
+      payload: event,
+      status: "observed",
+    });
   }
 
   async #handleFailure(sessionId: string, error: unknown): Promise<void> {
