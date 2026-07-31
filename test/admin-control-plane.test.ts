@@ -21,28 +21,28 @@ import type {
 } from "../src/domain/ids.js";
 import { httpApp } from "../src/http/router.js";
 import {
+  Admin,
   createAdminSession,
   csrfHash,
   deriveCsrfToken,
   tokenHash,
 } from "../src/services/admin.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { OAuth } from "../src/services/oauth.js";
+import { Reconciler } from "../src/services/reconciler.js";
 import {
-  Admin,
   AdminSessionRepo,
   DeliveryRepo,
   InstallationRepo,
-  OAuth,
-  Reconciler,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
-  WebhookPipeline,
-  Workspace,
   WorkspaceRepo,
-} from "../src/services/contracts.js";
+} from "../src/services/store/repositories.js";
 import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { WebhookPipeline } from "../src/services/webhook.js";
+import { Workspace } from "../src/services/workspace.js";
 
 const PUBLIC_URL = "http://localhost:3000";
 const TEST_KEY = Buffer.from(new Uint8Array(32).fill(9)).toString("base64");

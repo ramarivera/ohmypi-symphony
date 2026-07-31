@@ -1,19 +1,23 @@
 import { Clock, Effect, Option, Schema } from "effect";
-import type { ActivityId, SessionId, SourceKey } from "../../domain/ids.js";
-import { ProjectionJob } from "../../domain/models.js";
 import {
   DatabaseError,
   RowDecodeError,
   RunLeaseError,
 } from "../../domain/errors.js";
+import type { ActivityId, SessionId, SourceKey } from "../../domain/ids.js";
+import { ProjectionJob } from "../../domain/models.js";
 import {
-  SqliteClient,
-  tryDb,
-  runChanges,
+  RunEventRepo,
+  runEventLevelFromKind,
+  runEventTextFromPayload,
+} from "./run-event-repo.js";
+import {
   decodeRow,
+  runChanges,
+  SqliteClient,
   transact,
+  tryDb,
 } from "./sqlite-client.js";
-import { RunEventRepo, runEventLevelFromKind, runEventTextFromPayload } from "./run-event-repo.js";
 
 const ProjectionJobRow = Schema.Struct({
   source_key: Schema.String,
@@ -77,16 +81,16 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
       const { db } = yield* SqliteClient;
       const runEventRepo = yield* RunEventRepo;
 
-      const enqueue = Effect.fn("ProjectionRepo.enqueue")(
-        function* (input: {
-          readonly sourceKey: SourceKey;
-          readonly sessionId: SessionId;
-          readonly activityType: string;
-          readonly payloadHash: string;
-          readonly payload: unknown;
-          readonly now?: number;
-          readonly firstWriteWins?: boolean;
-        }) { yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
+      const enqueue = Effect.fn("ProjectionRepo.enqueue")(function* (input: {
+        readonly sourceKey: SourceKey;
+        readonly sessionId: SessionId;
+        readonly activityType: string;
+        readonly payloadHash: string;
+        readonly payload: unknown;
+        readonly now?: number;
+        readonly firstWriteWins?: boolean;
+      }) {
+        yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
         const now = input.now ?? (yield* Clock.currentTimeMillis);
 
         const tx = Effect.gen(function* () {
@@ -110,7 +114,10 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
             "ProjectionRepo.enqueue.reserve",
           );
 
-          if ((yield* runChanges(reserved, "ProjectionRepo.enqueue.reserve")) === 1) {
+          if (
+            (yield* runChanges(reserved, "ProjectionRepo.enqueue.reserve")) ===
+            1
+          ) {
             yield* tryDb(
               () =>
                 db
@@ -158,7 +165,11 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
             ));
 
           if (existing === null) {
-            return yield* Effect.fail(new DatabaseError({ message: `Projection ${input.sourceKey} reservation disappeared` }))
+            return yield* Effect.fail(
+              new DatabaseError({
+                message: `Projection ${input.sourceKey} reservation disappeared`,
+              }),
+            );
           }
 
           const decoded = yield* decodeRow(
@@ -173,7 +184,11 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
 
           if (decoded.payload_hash !== input.payloadHash) {
             if (input.firstWriteWins) return false;
-            return yield* Effect.fail(new DatabaseError({ message: `Projection ${input.sourceKey} was reused with a different payload` }))
+            return yield* Effect.fail(
+              new DatabaseError({
+                message: `Projection ${input.sourceKey} was reused with a different payload`,
+              }),
+            );
           }
 
           if (decoded.status === "completed") {
@@ -205,21 +220,24 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
           return false;
         });
 
-        return yield* transact(db, tx); },
-      );
+        return yield* transact(db, tx);
+      });
 
       const claimProjection = Effect.fn("ProjectionRepo.claimProjection")(
-        function* (sourceKey: SourceKey,
-        owner: string,
-        leaseDurationMs: number,
-        now?: number,) { yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
-        const at = now ?? (yield* Clock.currentTimeMillis);
+        function* (
+          sourceKey: SourceKey,
+          owner: string,
+          leaseDurationMs: number,
+          now?: number,
+        ) {
+          yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
+          const at = now ?? (yield* Clock.currentTimeMillis);
 
-        const tx = Effect.gen(function* () {
-          const claimed = yield* tryDb(
-            () =>
-              db
-                .query(`
+          const tx = Effect.gen(function* () {
+            const claimed = yield* tryDb(
+              () =>
+                db
+                  .query(`
                   UPDATE projection_outbox
                   SET status='processing', attempt=attempt+1, lease_owner=?, lease_expires_at=?,
                     last_error=NULL, updated_at=?
@@ -229,54 +247,65 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
                       OR (status='processing' AND lease_expires_at<?)
                     )
                 `)
-                .run(owner, at + leaseDurationMs, at, sourceKey, at, at),
-            "ProjectionRepo.claimProjection",
-          );
+                  .run(owner, at + leaseDurationMs, at, sourceKey, at, at),
+              "ProjectionRepo.claimProjection",
+            );
 
-          if ((yield* runChanges(claimed, "ProjectionRepo.claimProjection")) !== 1) {
-            return Option.none();
-          }
+            if (
+              (yield* runChanges(claimed, "ProjectionRepo.claimProjection")) !==
+              1
+            ) {
+              return Option.none();
+            }
 
-          const row = yield* tryDb(
-            () =>
-              db
-                .query<ProjectionJobRow, [string]>(`
+            const row = yield* tryDb(
+              () =>
+                db
+                  .query<ProjectionJobRow, [string]>(`
                   SELECT o.source_key, o.session_id, o.activity_type, o.payload_json,
                     a.payload_hash, o.attempt, o.next_attempt_at, o.created_at
                   FROM projection_outbox o
                   JOIN activity_projection a ON a.source_key=o.source_key
                   WHERE o.source_key=?
                 `)
-                .get(sourceKey),
-            "ProjectionRepo.claimProjection.select",
-          );
-          if (row === null) {
-            return yield* Effect.fail(new DatabaseError({ message: `Projection ${sourceKey} disappeared after claim` }))
-          }
+                  .get(sourceKey),
+              "ProjectionRepo.claimProjection.select",
+            );
+            if (row === null) {
+              return yield* Effect.fail(
+                new DatabaseError({
+                  message: `Projection ${sourceKey} disappeared after claim`,
+                }),
+              );
+            }
 
-          yield* tryDb(
-            () =>
-              db
-                .query(
-                  "UPDATE run_event SET status='pending', updated_at=? WHERE source_key=?",
-                )
-                .run(at, sourceKey),
-            "ProjectionRepo.claimProjection.event",
-          );
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "UPDATE run_event SET status='pending', updated_at=? WHERE source_key=?",
+                  )
+                  .run(at, sourceKey),
+              "ProjectionRepo.claimProjection.event",
+            );
 
-          const decoded = yield* decodeRow(ProjectionJobRow, row, "ProjectionJob");
-          const job = yield* rowToProjectionJob(decoded);
-          return Option.some(job);
-        });
+            const decoded = yield* decodeRow(
+              ProjectionJobRow,
+              row,
+              "ProjectionJob",
+            );
+            const job = yield* rowToProjectionJob(decoded);
+            return Option.some(job);
+          });
 
-        return yield* transact(db, tx); },
+          return yield* transact(db, tx);
+        },
       );
 
       const listDueProjectionKeys = Effect.fn(
         "ProjectionRepo.listDueProjectionKeys",
-      )(
-        function* (now?: number,
-        limit = 50,) { const at = now ?? (yield* Clock.currentTimeMillis);
+      )(function* (now?: number, limit = 50) {
+        const at = now ?? (yield* Clock.currentTimeMillis);
         const rows = yield* tryDb(
           () =>
             db
@@ -295,128 +324,142 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         );
         return yield* Effect.forEach(rows, (row) =>
           decodeRow(Schema.String, row.source_key, "SourceKey"),
-        ); },
-      );
+        );
+      });
 
       const failProjection = Effect.fn("ProjectionRepo.failProjection")(
-        function* (sourceKey: SourceKey,
-        owner: string,
-        error: string,
-        nextAttemptAt: number,) { yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
-        const now = yield* Clock.currentTimeMillis;
+        function* (
+          sourceKey: SourceKey,
+          owner: string,
+          error: string,
+          nextAttemptAt: number,
+        ) {
+          yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
+          const now = yield* Clock.currentTimeMillis;
 
-        const tx = Effect.gen(function* () {
-          yield* tryDb(
-            () =>
-              db
-                .query(`
+          const tx = Effect.gen(function* () {
+            yield* tryDb(
+              () =>
+                db
+                  .query(`
                   UPDATE projection_outbox
                   SET status='failed', next_attempt_at=?, lease_owner=NULL, lease_expires_at=NULL,
                     last_error=?, updated_at=?
                   WHERE source_key=? AND lease_owner=?
                 `)
-                .run(nextAttemptAt, error, now, sourceKey, owner),
-            "ProjectionRepo.failProjection.outbox",
-          );
-          yield* tryDb(
-            () =>
-              db
-                .query(
-                  "UPDATE activity_projection SET status='failed', updated_at=? WHERE source_key=?",
-                )
-                .run(now, sourceKey),
-            "ProjectionRepo.failProjection.activity",
-          );
-          yield* tryDb(
-            () =>
-              db
-                .query(
-                  "UPDATE run_event SET status='failed', error=?, updated_at=? WHERE source_key=?",
-                )
-                .run(error, now, sourceKey),
-            "ProjectionRepo.failProjection.event",
-          );
-        });
+                  .run(nextAttemptAt, error, now, sourceKey, owner),
+              "ProjectionRepo.failProjection.outbox",
+            );
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "UPDATE activity_projection SET status='failed', updated_at=? WHERE source_key=?",
+                  )
+                  .run(now, sourceKey),
+              "ProjectionRepo.failProjection.activity",
+            );
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "UPDATE run_event SET status='failed', error=?, updated_at=? WHERE source_key=?",
+                  )
+                  .run(error, now, sourceKey),
+              "ProjectionRepo.failProjection.event",
+            );
+          });
 
-        return yield* transact(db, tx); },
+          return yield* transact(db, tx);
+        },
       );
 
       const completeProjection = Effect.fn("ProjectionRepo.completeProjection")(
-        function* (sourceKey: SourceKey,
-        owner: string,
-        activityId: Option.Option<ActivityId>,) { yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
-        const now = yield* Clock.currentTimeMillis;
+        function* (
+          sourceKey: SourceKey,
+          owner: string,
+          activityId: Option.Option<ActivityId>,
+        ) {
+          yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
+          const now = yield* Clock.currentTimeMillis;
 
-        const tx = Effect.gen(function* () {
-          const completed = yield* tryDb(
-            () =>
-              db
-                .query(`
+          const tx = Effect.gen(function* () {
+            const completed = yield* tryDb(
+              () =>
+                db
+                  .query(`
                   UPDATE projection_outbox
                   SET status='completed', lease_owner=NULL, lease_expires_at=NULL,
                     last_error=NULL, updated_at=?
                   WHERE source_key=? AND lease_owner=? AND status='processing'
                 `)
-                .run(now, sourceKey, owner),
-            "ProjectionRepo.completeProjection.outbox",
-          );
-
-          if ((yield* runChanges(completed, "ProjectionRepo.completeProjection.outbox")) !== 1) {
-            return yield* Effect.fail(
-              new RunLeaseError({
-                sessionId: sourceKey,
-                message: `Projection ${sourceKey} lease was lost before completion`,
-              }),
+                  .run(now, sourceKey, owner),
+              "ProjectionRepo.completeProjection.outbox",
             );
-          }
 
-          yield* tryDb(
-            () =>
-              db
-                .query(`
+            if (
+              (yield* runChanges(
+                completed,
+                "ProjectionRepo.completeProjection.outbox",
+              )) !== 1
+            ) {
+              return yield* Effect.fail(
+                new RunLeaseError({
+                  sessionId: sourceKey,
+                  message: `Projection ${sourceKey} lease was lost before completion`,
+                }),
+              );
+            }
+
+            yield* tryDb(
+              () =>
+                db
+                  .query(`
                   UPDATE activity_projection
                   SET status='completed', linear_activity_id=?, updated_at=? WHERE source_key=?
                 `)
-                .run(optionToSql(activityId), now, sourceKey),
-            "ProjectionRepo.completeProjection.activity",
-          );
-          yield* tryDb(
-            () =>
-              db
-                .query(
-                  "UPDATE run_event SET status='completed', error=NULL, updated_at=? WHERE source_key=?",
-                )
-                .run(now, sourceKey),
-            "ProjectionRepo.completeProjection.event",
-          );
-        });
+                  .run(optionToSql(activityId), now, sourceKey),
+              "ProjectionRepo.completeProjection.activity",
+            );
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "UPDATE run_event SET status='completed', error=NULL, updated_at=? WHERE source_key=?",
+                  )
+                  .run(now, sourceKey),
+              "ProjectionRepo.completeProjection.event",
+            );
+          });
 
-        return yield* transact(db, tx); },
+          return yield* transact(db, tx);
+        },
       );
 
       const projectionCount = Effect.fn("ProjectionRepo.projectionCount")(
-        function* (sessionId: SessionId,
-        activityType?: string,) { const row =
-          activityType === undefined
-            ? yield* tryDb(
-                () =>
-                  db
-                    .query<{ count: number }, [string]>(
-                      "SELECT COUNT(*) count FROM activity_projection WHERE session_id=?",
-                    )
-                    .get(sessionId),
-                "ProjectionRepo.projectionCount",
-              )
-            : yield* tryDb(
-                () =>
-                  db
-                    .query<{ count: number }, [string, string]>(
-                      "SELECT COUNT(*) count FROM activity_projection WHERE session_id=? AND activity_type=?",
-                    )
-                    .get(sessionId, activityType),
-                "ProjectionRepo.projectionCount",
-              );
-        return (row as { count: number }).count ?? 0; },
+        function* (sessionId: SessionId, activityType?: string) {
+          const row =
+            activityType === undefined
+              ? yield* tryDb(
+                  () =>
+                    db
+                      .query<{ count: number }, [string]>(
+                        "SELECT COUNT(*) count FROM activity_projection WHERE session_id=?",
+                      )
+                      .get(sessionId),
+                  "ProjectionRepo.projectionCount",
+                )
+              : yield* tryDb(
+                  () =>
+                    db
+                      .query<{ count: number }, [string, string]>(
+                        "SELECT COUNT(*) count FROM activity_projection WHERE session_id=? AND activity_type=?",
+                      )
+                      .get(sessionId, activityType),
+                  "ProjectionRepo.projectionCount",
+                );
+          return (row as { count: number }).count ?? 0;
+        },
       );
 
       function upsertProjectionEvent(
@@ -440,8 +483,10 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         });
       }
 
-      const get = Effect.fn("ProjectionRepo.get")(
-        function* (sourceKey: SourceKey,) { yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
+      const get = Effect.fn("ProjectionRepo.get")(function* (
+        sourceKey: SourceKey,
+      ) {
+        yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
         const row = yield* tryDb(
           () =>
             db
@@ -458,10 +503,14 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         if (row === null) {
           return Option.none();
         }
-        const decoded = yield* decodeRow(ProjectionJobRow, row, "ProjectionJob");
+        const decoded = yield* decodeRow(
+          ProjectionJobRow,
+          row,
+          "ProjectionJob",
+        );
         const job = yield* rowToProjectionJob(decoded);
-        return Option.some(job); },
-      );
+        return Option.some(job);
+      });
 
       return {
         enqueue,
@@ -477,5 +526,5 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         projectionCount,
       };
     }),
-  }
+  },
 ) {}

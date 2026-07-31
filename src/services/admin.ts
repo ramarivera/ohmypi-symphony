@@ -26,7 +26,7 @@ import type {
   RunEvent,
 } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
-import { Reconciler, Workspace } from "./contracts.js";
+import { Reconciler } from "./reconciler.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
@@ -34,7 +34,7 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
-import type { RepositoryResolution } from "./workspace.js";
+import { type RepositoryResolution, Workspace } from "./workspace.js";
 
 const ADMIN_COOKIE = "omp_gateway_admin";
 const CSRF_SALT = "omp-gateway-admin-csrf";
@@ -84,13 +84,6 @@ export interface AdminDeps {
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
 }
-interface Session {
-  readonly organizationId: OrganizationId;
-  readonly rawToken: string;
-  readonly csrfTokenHash: string;
-}
-
-
 
 interface RepositoryPayload {
   readonly id: string;

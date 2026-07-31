@@ -1,10 +1,27 @@
 import { Clock, Effect, Option, Schema } from "effect";
-import type { IssueId, OrganizationId, ProjectId, SessionId, TeamId, WorkspaceId } from "../../domain/ids.js";
+import { DatabaseError, type RowDecodeError } from "../../domain/errors.js";
+import type {
+  IssueId,
+  OrganizationId,
+  ProjectId,
+  SessionId,
+  TeamId,
+  WorkspaceId,
+} from "../../domain/ids.js";
 import { SourceKey } from "../../domain/ids.js";
-import { AgentRun as AgentRunSchema, type AgentRun, type RunState } from "../../domain/models.js";
-import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
-import { SqliteClient, tryDb, runChanges, decodeRow, decodeRows, transact } from "./sqlite-client.js";
+import {
+  type AgentRun,
+  AgentRun as AgentRunSchema,
+  type RunState,
+} from "../../domain/models.js";
 import { RunEventRepo } from "./run-event-repo.js";
+import {
+  decodeRow,
+  decodeRows,
+  runChanges,
+  SqliteClient,
+  tryDb,
+} from "./sqlite-client.js";
 
 const AgentRunRow = Schema.Struct({
   session_id: Schema.String,
@@ -36,7 +53,9 @@ const TERMINAL_STATES: ReadonlyArray<RunState> = [
   "canceled",
 ];
 
-const rowToAgentRun = (row: AgentRunRow): Effect.Effect<AgentRun, RowDecodeError> =>
+const rowToAgentRun = (
+  row: AgentRunRow,
+): Effect.Effect<AgentRun, RowDecodeError> =>
   decodeRow(
     AgentRunSchema,
     {
@@ -71,35 +90,38 @@ const getNullable = <A>(
 const optionToSql = <A>(value: Option.Option<A>): A | null =>
   Option.match(value, { onNone: () => null, onSome: (v) => v });
 
-export class RunRepo extends Effect.Service<RunRepo>()(
-  "RunRepo",
-  {
-    accessors: true,
-    dependencies: [RunEventRepo.Default],
-    effect: Effect.gen(function* () {
-      const { db } = yield* SqliteClient;
-      const runEventRepo = yield* RunEventRepo;
-      const get = Effect.fn("RunRepo.get")(function* (sessionId: SessionId,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
+  accessors: true,
+  dependencies: [RunEventRepo.Default],
+  effect: Effect.gen(function* () {
+    const { db } = yield* SqliteClient;
+    const runEventRepo = yield* RunEventRepo;
+    const get = Effect.fn("RunRepo.get")(function* (sessionId: SessionId) {
+      yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const row = yield* tryDb(
         () =>
           db
-            .query<AgentRunRow, [string]>("SELECT * FROM agent_run WHERE session_id=?")
+            .query<AgentRunRow, [string]>(
+              "SELECT * FROM agent_run WHERE session_id=?",
+            )
             .get(sessionId),
         "RunRepo.get",
       );
       if (row === null) return Option.none();
       const decoded = yield* decodeRow(AgentRunRow, row, "AgentRun");
       const run = yield* rowToAgentRun(decoded);
-      return Option.some(run); });
+      return Option.some(run);
+    });
 
-      const create = Effect.fn("RunRepo.create")(function* (input: {
-        readonly sessionId: SessionId;
-        readonly organizationId: OrganizationId;
-        readonly issueId: Option.Option<IssueId>;
-        readonly teamId?: Option.Option<TeamId>;
-        readonly projectId?: Option.Option<ProjectId>;
-        readonly now?: number;
-      }) { yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
+    const create = Effect.fn("RunRepo.create")(function* (input: {
+      readonly sessionId: SessionId;
+      readonly organizationId: OrganizationId;
+      readonly issueId: Option.Option<IssueId>;
+      readonly teamId?: Option.Option<TeamId>;
+      readonly projectId?: Option.Option<ProjectId>;
+      readonly now?: number;
+    }) {
+      yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
       const now = input.now ?? (yield* Clock.currentTimeMillis);
       yield* tryDb(
         () =>
@@ -123,11 +145,18 @@ export class RunRepo extends Effect.Service<RunRepo>()(
       );
       const run = yield* get(input.sessionId);
       return yield* Option.match(run, {
-        onNone: () => Effect.fail(new DatabaseError({ message: `Failed to create run ${input.sessionId}` })),
+        onNone: () =>
+          Effect.fail(
+            new DatabaseError({
+              message: `Failed to create run ${input.sessionId}`,
+            }),
+          ),
         onSome: Effect.succeed,
-      }); });
+      });
+    });
 
-      const update = Effect.fn("RunRepo.update")(function* (sessionId: SessionId,
+    const update = Effect.fn("RunRepo.update")(function* (
+      sessionId: SessionId,
       patch: {
         readonly state?: RunState;
         readonly repositoryId?: Option.Option<WorkspaceId>;
@@ -138,10 +167,14 @@ export class RunRepo extends Effect.Service<RunRepo>()(
         readonly lastActivityAt?: Option.Option<number>;
         readonly nextAttemptAt?: Option.Option<number>;
         readonly incrementAttempt?: boolean;
-      },) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+      },
+    ) {
+      yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const current = yield* get(sessionId);
       if (Option.isNone(current)) {
-        return yield* Effect.fail(new DatabaseError({ message: `Unknown run ${sessionId}` }))
+        return yield* Effect.fail(
+          new DatabaseError({ message: `Unknown run ${sessionId}` }),
+        );
       }
       const run = current.value;
 
@@ -150,7 +183,9 @@ export class RunRepo extends Effect.Service<RunRepo>()(
         patch.state !== undefined &&
         patch.state !== run.state
       ) {
-        return yield* Effect.fail(new DatabaseError({ message: "Terminal run state is immutable" }))
+        return yield* Effect.fail(
+          new DatabaseError({ message: "Terminal run state is immutable" }),
+        );
       }
 
       const state = patch.state ?? run.state;
@@ -160,9 +195,18 @@ export class RunRepo extends Effect.Service<RunRepo>()(
       const repositoryId = getNullable(run.repositoryId, patch.repositoryId);
       const workspacePath = getNullable(run.workspacePath, patch.workspacePath);
       const ompSessionId = getNullable(run.ompSessionId, patch.ompSessionId);
-      const ompSessionFile = getNullable(run.ompSessionFile, patch.ompSessionFile);
-      const terminalReason = getNullable(run.terminalReason, patch.terminalReason);
-      const lastActivityAt = getNullable(run.lastActivityAt, patch.lastActivityAt);
+      const ompSessionFile = getNullable(
+        run.ompSessionFile,
+        patch.ompSessionFile,
+      );
+      const terminalReason = getNullable(
+        run.terminalReason,
+        patch.terminalReason,
+      );
+      const lastActivityAt = getNullable(
+        run.lastActivityAt,
+        patch.lastActivityAt,
+      );
       const nextAttemptAt = getNullable(run.nextAttemptAt, patch.nextAttemptAt);
 
       yield* tryDb(
@@ -195,8 +239,7 @@ export class RunRepo extends Effect.Service<RunRepo>()(
           sourceKey,
           sessionId,
           kind: "state",
-          level:
-            state === "failed" || state === "canceled" ? "error" : "info",
+          level: state === "failed" || state === "canceled" ? "error" : "info",
           text: `${run.state} → ${state}`,
           payload: { from: run.state, to: state, attempt },
           status: "observed",
@@ -206,7 +249,10 @@ export class RunRepo extends Effect.Service<RunRepo>()(
       }
     });
 
-      const listRunnable = Effect.fn("RunRepo.listRunnable")(function* (now: number,) { const rows = yield* tryDb(
+    const listRunnable = Effect.fn("RunRepo.listRunnable")(function* (
+      now: number,
+    ) {
+      const rows = yield* tryDb(
         () =>
           db
             .query<AgentRunRow, [number, number]>(`
@@ -218,9 +264,13 @@ export class RunRepo extends Effect.Service<RunRepo>()(
         "RunRepo.listRunnable",
       );
       const decoded = yield* decodeRows(AgentRunRow, rows, "AgentRun");
-      return yield* Effect.forEach(decoded, rowToAgentRun); });
+      return yield* Effect.forEach(decoded, rowToAgentRun);
+    });
 
-      const listCancellationPending = Effect.fn("RunRepo.listCancellationPending")(function* () { const rows = yield* tryDb(
+    const listCancellationPending = Effect.fn(
+      "RunRepo.listCancellationPending",
+    )(function* () {
+      const rows = yield* tryDb(
         () =>
           db
             .query<AgentRunRow, []>(
@@ -230,12 +280,16 @@ export class RunRepo extends Effect.Service<RunRepo>()(
         "RunRepo.listCancellationPending",
       );
       const decoded = yield* decodeRows(AgentRunRow, rows, "AgentRun");
-      return yield* Effect.forEach(decoded, rowToAgentRun); });
+      return yield* Effect.forEach(decoded, rowToAgentRun);
+    });
 
-      const claimLease = Effect.fn("RunRepo.claimLease")(function* (sessionId: SessionId,
+    const claimLease = Effect.fn("RunRepo.claimLease")(function* (
+      sessionId: SessionId,
       owner: string,
       leaseDurationMs: number,
-      now?: number,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+      now?: number,
+    ) {
+      yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const at = now ?? (yield* Clock.currentTimeMillis);
       const result = yield* tryDb(
         () =>
@@ -248,12 +302,16 @@ export class RunRepo extends Effect.Service<RunRepo>()(
             .run(owner, at + leaseDurationMs, at, sessionId, owner, at),
         "RunRepo.claimLease",
       );
-      return (yield* runChanges(result, "RunRepo.claimLease")) === 1; });
+      return (yield* runChanges(result, "RunRepo.claimLease")) === 1;
+    });
 
-      const renewLease = Effect.fn("RunRepo.renewLease")(function* (sessionId: SessionId,
+    const renewLease = Effect.fn("RunRepo.renewLease")(function* (
+      sessionId: SessionId,
       owner: string,
       leaseDurationMs: number,
-      now?: number,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+      now?: number,
+    ) {
+      yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const at = now ?? (yield* Clock.currentTimeMillis);
       const result = yield* tryDb(
         () =>
@@ -264,23 +322,33 @@ export class RunRepo extends Effect.Service<RunRepo>()(
             .run(at + leaseDurationMs, at, sessionId, owner, at),
         "RunRepo.renewLease",
       );
-      return (yield* runChanges(result, "RunRepo.renewLease")) === 1; });
+      return (yield* runChanges(result, "RunRepo.renewLease")) === 1;
+    });
 
-      const releaseLease = Effect.fn("RunRepo.releaseLease")(function* (sessionId: SessionId,
-      owner: string,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+    const releaseLease = Effect.fn("RunRepo.releaseLease")(function* (
+      sessionId: SessionId,
+      owner: string,
+    ) {
+      yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const now = yield* Clock.currentTimeMillis;
-      yield* tryDb(() =>
-        db
-          .query(
-            "UPDATE agent_run SET lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE session_id=? AND lease_owner=?",
-          )
-          .run(now, sessionId, owner), "RunRepo.releaseLease"); });
-
-      const recoverInterruptedRuns = Effect.fn("RunRepo.recoverInterruptedRuns")(function* (now?: number) { const at = now ?? (yield* Clock.currentTimeMillis);
-      const result = yield* tryDb(
+      yield* tryDb(
         () =>
           db
-            .query(`
+            .query(
+              "UPDATE agent_run SET lease_owner=NULL, lease_expires_at=NULL, updated_at=? WHERE session_id=? AND lease_owner=?",
+            )
+            .run(now, sessionId, owner),
+        "RunRepo.releaseLease",
+      );
+    });
+
+    const recoverInterruptedRuns = Effect.fn("RunRepo.recoverInterruptedRuns")(
+      function* (now?: number) {
+        const at = now ?? (yield* Clock.currentTimeMillis);
+        const result = yield* tryDb(
+          () =>
+            db
+              .query(`
               UPDATE agent_run
               SET state=CASE
                     WHEN desired_state='canceled' THEN 'stopping'
@@ -296,22 +364,23 @@ export class RunRepo extends Effect.Service<RunRepo>()(
                   updated_at=?
               WHERE state NOT IN ('succeeded','failed','canceled')
             `)
-            .run(at, at),
-        "RunRepo.recoverInterruptedRuns",
-      );
-      return yield* runChanges(result, "RunRepo.recoverInterruptedRuns"); });
+              .run(at, at),
+          "RunRepo.recoverInterruptedRuns",
+        );
+        return yield* runChanges(result, "RunRepo.recoverInterruptedRuns");
+      },
+    );
 
-      return {
-        create,
-        get,
-        update,
-        listRunnable,
-        listCancellationPending,
-        claimLease,
-        renewLease,
-        releaseLease,
-        recoverInterruptedRuns,
-      };
-    }),
-  }
-) {}
+    return {
+      create,
+      get,
+      update,
+      listRunnable,
+      listCancellationPending,
+      claimLease,
+      renewLease,
+      releaseLease,
+      recoverInterruptedRuns,
+    };
+  }),
+}) {}

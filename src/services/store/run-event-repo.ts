@@ -1,8 +1,8 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Effect, Schema } from "effect";
+import { RowDecodeError } from "../../domain/errors.js";
 import type { SessionId, SourceKey } from "../../domain/ids.js";
 import { RunEvent } from "../../domain/models.js";
-import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
-import { SqliteClient, tryDb, decodeRow, decodeRows } from "./sqlite-client.js";
+import { decodeRow, decodeRows, SqliteClient, tryDb } from "./sqlite-client.js";
 
 const RunEventRow = Schema.Struct({
   source_key: Schema.String,
@@ -11,7 +11,9 @@ const RunEventRow = Schema.Struct({
   level: Schema.Literal("debug", "info", "warn", "result", "error"),
   text: Schema.NullOr(Schema.String),
   payload_json: Schema.String,
-  status: Schema.NullOr(Schema.Literal("observed", "pending", "completed", "failed")),
+  status: Schema.NullOr(
+    Schema.Literal("observed", "pending", "completed", "failed"),
+  ),
   error: Schema.NullOr(Schema.String),
   created_at: Schema.Number,
   updated_at: Schema.Number,
@@ -105,7 +107,9 @@ export const runEventTextFromPayload = (
   return null;
 };
 
-const rowToRunEvent = (row: RunEventRow): Effect.Effect<RunEvent, RowDecodeError> =>
+const rowToRunEvent = (
+  row: RunEventRow,
+): Effect.Effect<RunEvent, RowDecodeError> =>
   Effect.gen(function* () {
     const payload = yield* Effect.try({
       try: () => JSON.parse(row.payload_json) as unknown,
@@ -141,27 +145,33 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
     effect: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
-      const upsert = Effect.fn("RunEventRepo.upsert")(
-        function* (input: {
-          readonly sourceKey: SourceKey;
-          readonly sessionId: SessionId;
-          readonly kind: string;
-          readonly level: "debug" | "info" | "warn" | "result" | "error";
-          readonly text?: string | null;
-          readonly payload?: unknown;
-          readonly status?: "observed" | "pending" | "completed" | "failed" | null;
-          readonly error?: string | null;
-          readonly now?: number;
-        }) { yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
+      const upsert = Effect.fn("RunEventRepo.upsert")(function* (input: {
+        readonly sourceKey: SourceKey;
+        readonly sessionId: SessionId;
+        readonly kind: string;
+        readonly level: "debug" | "info" | "warn" | "result" | "error";
+        readonly text?: string | null;
+        readonly payload?: unknown;
+        readonly status?:
+          | "observed"
+          | "pending"
+          | "completed"
+          | "failed"
+          | null;
+        readonly error?: string | null;
+        readonly now?: number;
+      }) {
+        yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
         const now = input.now ?? (yield* Clock.currentTimeMillis);
         const text = input.text ?? null;
         const payloadJson = JSON.stringify(input.payload ?? null);
         const status = input.status ?? null;
         const error = input.error ?? null;
 
-        yield* tryDb(() =>
-          db
-            .query(`
+        yield* tryDb(
+          () =>
+            db
+              .query(`
               INSERT INTO run_event (
                 source_key, session_id, kind, level, text, payload_json, status, error, created_at, updated_at
               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -176,29 +186,33 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
                 updated_at=?
               WHERE run_event.status IS NULL OR run_event.status NOT IN ('completed','failed')
             `)
-            .run(
-              input.sourceKey,
-              input.sessionId,
-              input.kind,
-              input.level,
-              text,
-              payloadJson,
-              status,
-              error,
-              now,
-              now,
-              input.kind,
-              input.level,
-              text,
-              payloadJson,
-              status,
-              error,
-              now,
-            ), "RunEventRepo.upsert"); },
-      );
+              .run(
+                input.sourceKey,
+                input.sessionId,
+                input.kind,
+                input.level,
+                text,
+                payloadJson,
+                status,
+                error,
+                now,
+                now,
+                input.kind,
+                input.level,
+                text,
+                payloadJson,
+                status,
+                error,
+                now,
+              ),
+          "RunEventRepo.upsert",
+        );
+      });
 
-      const list = Effect.fn("RunEventRepo.list")(
-        function* (sessionId: SessionId,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+      const list = Effect.fn("RunEventRepo.list")(function* (
+        sessionId: SessionId,
+      ) {
+        yield* Effect.annotateCurrentSpan("sessionId", sessionId);
         const rows = yield* tryDb(
           () =>
             db
@@ -209,10 +223,10 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
           "RunEventRepo.list",
         );
         const decoded = yield* decodeRows(RunEventRow, rows, "RunEvent");
-        return yield* Effect.forEach(decoded, rowToRunEvent); },
-      );
+        return yield* Effect.forEach(decoded, rowToRunEvent);
+      });
 
       return { upsert, list };
     }),
-  }
+  },
 ) {}

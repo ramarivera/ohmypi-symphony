@@ -1,11 +1,17 @@
 import { Clock, Effect, Option, Schema } from "effect";
-import type { InputId } from "../../domain/ids.js";
-import { SessionId } from "../../domain/ids.js";
-import { SourceKey } from "../../domain/ids.js";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
+import type { InputId } from "../../domain/ids.js";
+import { SessionId, SourceKey } from "../../domain/ids.js";
 import { InputKind, RunInput } from "../../domain/models.js";
-import { SqliteClient, tryDb, runChanges, decodeRow, decodeRows, transact } from "./sqlite-client.js";
 import { RunEventRepo } from "./run-event-repo.js";
+import {
+  decodeRow,
+  decodeRows,
+  runChanges,
+  SqliteClient,
+  transact,
+  tryDb,
+} from "./sqlite-client.js";
 
 const RunInputRow = Schema.Struct({
   id: Schema.String,
@@ -19,13 +25,25 @@ const RunInputRow = Schema.Struct({
 type RunInputRow = Schema.Schema.Type<typeof RunInputRow>;
 
 const RunRowState = Schema.Struct({
-  state: Schema.Literal("queued", "starting", "running", "waiting", "stopping", "succeeded", "failed", "canceled", "orphaned"),
+  state: Schema.Literal(
+    "queued",
+    "starting",
+    "running",
+    "waiting",
+    "stopping",
+    "succeeded",
+    "failed",
+    "canceled",
+    "orphaned",
+  ),
   desired_state: Schema.Literal("running", "canceled"),
 });
 
 type RunRowState = Schema.Schema.Type<typeof RunRowState>;
 
-const rowToRunInput = (row: RunInputRow): Effect.Effect<RunInput, RowDecodeError> =>
+const rowToRunInput = (
+  row: RunInputRow,
+): Effect.Effect<RunInput, RowDecodeError> =>
   Effect.gen(function* () {
     const payload = yield* Effect.try({
       try: () => JSON.parse(row.payload_json) as unknown,
@@ -61,7 +79,10 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
 
       const getRunState = (
         sessionId: SessionId,
-      ): Effect.Effect<Option.Option<RunRowState>, DatabaseError | RowDecodeError> =>
+      ): Effect.Effect<
+        Option.Option<RunRowState>,
+        DatabaseError | RowDecodeError
+      > =>
         Effect.gen(function* () {
           const row = yield* tryDb(
             () =>
@@ -76,20 +97,22 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           return Option.some(yield* decodeRow(RunRowState, row, "AgentRun"));
         });
 
-      const enqueue = Effect.fn("RunInputRepo.enqueue")(
-        function* (input: {
-          readonly id: InputId;
-          readonly sessionId: SessionId;
-          readonly kind: InputKind;
-          readonly body: string;
-          readonly payload: unknown;
-          readonly createdAt?: number;
-        }) { yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
+      const enqueue = Effect.fn("RunInputRepo.enqueue")(function* (input: {
+        readonly id: InputId;
+        readonly sessionId: SessionId;
+        readonly kind: InputKind;
+        readonly body: string;
+        readonly payload: unknown;
+        readonly createdAt?: number;
+      }) {
+        yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
 
         const tx = Effect.gen(function* () {
           const run = yield* getRunState(input.sessionId);
           if (Option.isNone(run)) {
-            return yield* Effect.fail(new DatabaseError({ message: `Unknown run ${input.sessionId}` }))
+            return yield* Effect.fail(
+              new DatabaseError({ message: `Unknown run ${input.sessionId}` }),
+            );
           }
           if (input.kind !== "stop" && run.value.desired_state === "canceled") {
             return false;
@@ -113,7 +136,9 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
                 ),
             "RunInputRepo.enqueue.insert",
           );
-          const inserted = (yield* runChanges(insertResult, "RunInputRepo.enqueue.insert")) === 1;
+          const inserted =
+            (yield* runChanges(insertResult, "RunInputRepo.enqueue.insert")) ===
+            1;
           if (inserted) {
             const sourceKey = Schema.decodeUnknownSync(SourceKey)(
               `input:${input.id}`,
@@ -162,11 +187,13 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           return inserted;
         });
 
-        return yield* transact(db, tx); },
-      );
+        return yield* transact(db, tx);
+      });
 
-      const pending = Effect.fn("RunInputRepo.pending")(
-        function* (sessionId: SessionId,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+      const pending = Effect.fn("RunInputRepo.pending")(function* (
+        sessionId: SessionId,
+      ) {
+        yield* Effect.annotateCurrentSpan("sessionId", sessionId);
         const rows = yield* tryDb(
           () =>
             db
@@ -177,13 +204,13 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           "RunInputRepo.pending",
         );
         const decoded = yield* decodeRows(RunInputRow, rows, "RunInput");
-        return yield* Effect.forEach(decoded, rowToRunInput); },
-      );
+        return yield* Effect.forEach(decoded, rowToRunInput);
+      });
 
       const latestActionableInput = Effect.fn(
         "RunInputRepo.latestActionableInput",
-      )(
-        function* (sessionId: SessionId,) { yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+      )(function* (sessionId: SessionId) {
+        yield* Effect.annotateCurrentSpan("sessionId", sessionId);
         const row = yield* tryDb(
           () =>
             db
@@ -197,41 +224,44 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           "RunInputRepo.latestActionableInput",
         );
         if (row === null) return Option.none();
-        return Option.some({ body: row.body, kind: row.kind }); },
-      );
+        return Option.some({ body: row.body, kind: row.kind });
+      });
 
       const listSessionsWithPendingInputs = Effect.fn(
         "RunInputRepo.listSessionsWithPendingInputs",
-      )(
-        function* () {
-          const rows = yield* tryDb(
-            () =>
-              db
-                .query<{ session_id: string }, []>(`
+      )(function* () {
+        const rows = yield* tryDb(
+          () =>
+            db
+              .query<{ session_id: string }, []>(`
                   SELECT DISTINCT r.session_id
                   FROM agent_run r
                   JOIN run_input i ON i.session_id=r.session_id AND i.processed_at IS NULL
                   WHERE r.state NOT IN ('succeeded','failed','canceled')
                   ORDER BY r.session_id
                 `)
-                .all(),
-            "RunInputRepo.listSessionsWithPendingInputs",
-          );
-          return yield* Effect.forEach(rows, (row) =>
-            decodeRow(SessionId, row.session_id, "SessionId"),
-          );
-        }
-      );
+              .all(),
+          "RunInputRepo.listSessionsWithPendingInputs",
+        );
+        return yield* Effect.forEach(rows, (row) =>
+          decodeRow(SessionId, row.session_id, "SessionId"),
+        );
+      });
 
-      const markProcessed = Effect.fn("RunInputRepo.markProcessed")(
-        function* (id: InputId,
-        at?: number,) { yield* Effect.annotateCurrentSpan("inputId", id);
+      const markProcessed = Effect.fn("RunInputRepo.markProcessed")(function* (
+        id: InputId,
+        at?: number,
+      ) {
+        yield* Effect.annotateCurrentSpan("inputId", id);
         const processedAt = at ?? (yield* Clock.currentTimeMillis);
-        yield* tryDb(() =>
-          db
-            .query("UPDATE run_input SET processed_at=? WHERE id=?")
-            .run(processedAt, id), "RunInputRepo.markProcessed"); },
-      );
+        yield* tryDb(
+          () =>
+            db
+              .query("UPDATE run_input SET processed_at=? WHERE id=?")
+              .run(processedAt, id),
+          "RunInputRepo.markProcessed",
+        );
+      });
 
       return {
         enqueue,
@@ -241,5 +271,5 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
         markProcessed,
       };
     }),
-  }
+  },
 ) {}

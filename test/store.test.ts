@@ -1,20 +1,26 @@
 import { it } from "@effect/vitest";
-import { Clock, ConfigProvider, Effect, Either, Layer, Option, Schema } from "effect";
-import { describe, expect } from "vitest";
-import { type Installation, RunState } from "../src/domain/models.js";
 import {
-  type ActivityId,
-  type AppUserId,
-  type DeliveryId,
-  type InputId,
-  type IssueId,
-  type OrganizationId,
-  type ProjectId,
-  type SessionId,
-  type SourceKey,
-  type TeamId,
-  type WorkspaceId,
+  Clock,
+  ConfigProvider,
+  Effect,
+  Either,
+  Layer,
+  Option,
+  Schema,
+} from "effect";
+import { describe, expect } from "vitest";
+import type {
+  ActivityId,
+  AppUserId,
+  DeliveryId,
+  InputId,
+  IssueId,
+  OrganizationId,
+  SessionId,
+  SourceKey,
+  TeamId,
 } from "../src/domain/ids.js";
+import { type Installation, RunState } from "../src/domain/models.js";
 import {
   DeliveryRepo,
   InstallationRepo,
@@ -23,7 +29,7 @@ import {
   RunInputRepo,
   RunRepo,
 } from "../src/services/store/repositories.js";
-import { SqliteClient, SqliteClientLive } from "../src/services/store/sqlite-client.js";
+import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 
 const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
@@ -52,23 +58,28 @@ const withRepos = <A, E>(effect: Effect.Effect<A, E, RepoServices>) =>
       RunEventRepo.Default,
       ProjectionRepo.Default,
       TokenCrypto.Default,
-    ).pipe(Layer.provide(Layer.mergeAll(sqlite, Layer.setConfigProvider(configProvider))));
+    ).pipe(
+      Layer.provide(
+        Layer.mergeAll(sqlite, Layer.setConfigProvider(configProvider)),
+      ),
+    );
     return yield* effect.pipe(Effect.provide(repos));
   });
 
 const makeSessionId = (value: string): SessionId => value as SessionId;
 const makeDeliveryId = (value: string): DeliveryId => value as DeliveryId;
-const makeOrganizationId = (value: string): OrganizationId => value as OrganizationId;
+const makeOrganizationId = (value: string): OrganizationId =>
+  value as OrganizationId;
 const makeIssueId = (value: string): IssueId => value as IssueId;
 const makeTeamId = (value: string): TeamId => value as TeamId;
 const makeAppUserId = (value: string): AppUserId => value as AppUserId;
 const makeSourceKey = (value: string): SourceKey => value as SourceKey;
 const makeInputId = (value: string): InputId => value as InputId;
 const makeActivityId = (value: string): ActivityId => value as ActivityId;
-const makeProjectId = (value: string): ProjectId => value as ProjectId;
-const makeWorkspaceId = (value: string): WorkspaceId => value as WorkspaceId;
 
-const makeInstallation = (overrides: Partial<Installation> = {}): Installation => ({
+const makeInstallation = (
+  overrides: Partial<Installation> = {},
+): Installation => ({
   organizationId: makeOrganizationId("org-1"),
   appUserId: makeAppUserId("app-user-1"),
   accessToken: "access-secret",
@@ -99,7 +110,9 @@ describe("Store repositories", () => {
         const expected = makeInstallation();
         yield* repo.put(expected);
 
-        const raw = yield* repo.getRawEncryptedAccessToken(expected.organizationId);
+        const raw = yield* repo.getRawEncryptedAccessToken(
+          expected.organizationId,
+        );
         if (Option.isSome(raw)) {
           expect(raw.value).not.toContain("access-secret");
         }
@@ -139,39 +152,64 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("reclaims a delivery interrupted before durable processing", () =>
-    withRepos(
-      Effect.gen(function* () {
-        const repo = yield* DeliveryRepo;
-        const delivery = {
-          id: makeDeliveryId("delivery-1"),
-          organizationId: makeOrganizationId("org-1"),
-          payloadHash: "hash",
-          payload: { type: "AgentSessionEvent" },
-        };
-        expect(yield* repo.claim(delivery)).toBe("claimed");
-        expect(yield* repo.claim(delivery)).toBe("duplicate");
-        expect(yield* repo.recoverPendingDeliveries()).toBe(1);
-        expect(yield* repo.claim(delivery)).toBe("claimed");
-      }),
-    ),
+  it.scopedLive(
+    "reclaims a delivery interrupted before durable processing",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* DeliveryRepo;
+          const delivery = {
+            id: makeDeliveryId("delivery-1"),
+            organizationId: makeOrganizationId("org-1"),
+            payloadHash: "hash",
+            payload: { type: "AgentSessionEvent" },
+          };
+          expect(yield* repo.claim(delivery)).toBe("claimed");
+          expect(yield* repo.claim(delivery)).toBe("duplicate");
+          expect(yield* repo.recoverPendingDeliveries()).toBe(1);
+          expect(yield* repo.claim(delivery)).toBe("claimed");
+        }),
+      ),
   );
 
-  it.scopedLive("enforces one lease and permits takeover only after expiry", () =>
-    withRepos(
-      Effect.gen(function* () {
-        const repo = yield* RunRepo;
-        yield* repo.create({
-          sessionId: makeSessionId("session-1"),
-          organizationId: makeOrganizationId("org-1"),
-          issueId: Option.none(),
-          now: 1_000,
-        });
-        expect(yield* repo.claimLease(makeSessionId("session-1"), "worker-a", 1_000, 1_000)).toBe(true);
-        expect(yield* repo.claimLease(makeSessionId("session-1"), "worker-b", 1_000, 1_500)).toBe(false);
-        expect(yield* repo.claimLease(makeSessionId("session-1"), "worker-b", 1_000, 2_001)).toBe(true);
-      }),
-    ),
+  it.scopedLive(
+    "enforces one lease and permits takeover only after expiry",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* RunRepo;
+          yield* repo.create({
+            sessionId: makeSessionId("session-1"),
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+            now: 1_000,
+          });
+          expect(
+            yield* repo.claimLease(
+              makeSessionId("session-1"),
+              "worker-a",
+              1_000,
+              1_000,
+            ),
+          ).toBe(true);
+          expect(
+            yield* repo.claimLease(
+              makeSessionId("session-1"),
+              "worker-b",
+              1_000,
+              1_500,
+            ),
+          ).toBe(false);
+          expect(
+            yield* repo.claimLease(
+              makeSessionId("session-1"),
+              "worker-b",
+              1_000,
+              2_001,
+            ),
+          ).toBe(true);
+        }),
+      ),
   );
 
   it.scopedLive("recovers active runs and leases after a process restart", () =>
@@ -192,7 +230,12 @@ describe("Store repositories", () => {
           ompSessionFile: Option.some("/workspace/session.jsonl"),
         });
         expect(
-          yield* runRepo.claimLease(makeSessionId("running-session"), "dead-process", 60_000, 1_000),
+          yield* runRepo.claimLease(
+            makeSessionId("running-session"),
+            "dead-process",
+            60_000,
+            1_000,
+          ),
         ).toBe(true);
 
         yield* runRepo.create({
@@ -201,7 +244,9 @@ describe("Store repositories", () => {
           issueId: Option.some(makeIssueId("issue-2")),
           now: 1_000,
         });
-        yield* runRepo.update(makeSessionId("canceled-session"), { state: "running" });
+        yield* runRepo.update(makeSessionId("canceled-session"), {
+          state: "running",
+        });
         yield* inputRepo.enqueue({
           id: makeInputId("stop"),
           sessionId: makeSessionId("canceled-session"),
@@ -213,7 +258,9 @@ describe("Store repositories", () => {
 
         expect(yield* runRepo.recoverInterruptedRuns(2_000)).toBe(2);
 
-        const maybeRunning = yield* runRepo.get(makeSessionId("running-session"));
+        const maybeRunning = yield* runRepo.get(
+          makeSessionId("running-session"),
+        );
         Option.match(maybeRunning, {
           onNone: () => expect.fail("running-session not found"),
           onSome: (run) => {
@@ -227,9 +274,13 @@ describe("Store repositories", () => {
         });
 
         const runnable = yield* runRepo.listRunnable(2_000);
-        expect(runnable.map((run) => run.sessionId)).toContain(makeSessionId("running-session"));
+        expect(runnable.map((run) => run.sessionId)).toContain(
+          makeSessionId("running-session"),
+        );
 
-        const maybeCanceled = yield* runRepo.get(makeSessionId("canceled-session"));
+        const maybeCanceled = yield* runRepo.get(
+          makeSessionId("canceled-session"),
+        );
         Option.match(maybeCanceled, {
           onNone: () => expect.fail("canceled-session not found"),
           onSome: (run) => {
@@ -245,90 +296,108 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("stop dominates later prompts and revocation cancels all live runs", () =>
-    withRepos(
-      Effect.gen(function* () {
-        const installationRepo = yield* InstallationRepo;
-        const runRepo = yield* RunRepo;
-        const inputRepo = yield* RunInputRepo;
+  it.scopedLive(
+    "stop dominates later prompts and revocation cancels all live runs",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const inputRepo = yield* RunInputRepo;
 
-        yield* installationRepo.put(makeInstallation());
-        yield* runRepo.create({
-          sessionId: makeSessionId("session-1"),
-          organizationId: makeOrganizationId("org-1"),
-          issueId: Option.none(),
-        });
-
-        expect(
-          yield* inputRepo.enqueue({
-            id: makeInputId("stop"),
+          yield* installationRepo.put(makeInstallation());
+          yield* runRepo.create({
             sessionId: makeSessionId("session-1"),
-            kind: "stop",
-            body: "stop",
-            payload: {},
-          }),
-        ).toBe(true);
-        expect(
-          yield* inputRepo.enqueue({
-            id: makeInputId("late"),
-            sessionId: makeSessionId("session-1"),
-            kind: "prompted",
-            body: "keep going",
-            payload: {},
-          }),
-        ).toBe(false);
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
 
-        const maybeRun = yield* runRepo.get(makeSessionId("session-1"));
-        Option.match(maybeRun, {
-          onNone: () => expect.fail("run not found"),
-          onSome: (run) => expect(run.desiredState).toBe("canceled"),
-        });
+          expect(
+            yield* inputRepo.enqueue({
+              id: makeInputId("stop"),
+              sessionId: makeSessionId("session-1"),
+              kind: "stop",
+              body: "stop",
+              payload: {},
+            }),
+          ).toBe(true);
+          expect(
+            yield* inputRepo.enqueue({
+              id: makeInputId("late"),
+              sessionId: makeSessionId("session-1"),
+              kind: "prompted",
+              body: "keep going",
+              payload: {},
+            }),
+          ).toBe(false);
 
-        const revokedAt = yield* Clock.currentTimeMillis;
-        yield* installationRepo.revoke(makeOrganizationId("org-1"), revokedAt);
-        const maybeInstallation = yield* installationRepo.get(makeOrganizationId("org-1"));
-        Option.match(maybeInstallation, {
-          onNone: () => expect.fail("installation not found"),
-          onSome: (installation) => expect(installation.revokedAt).not.toEqual(Option.none()),
-        });
-      }),
-    ),
+          const maybeRun = yield* runRepo.get(makeSessionId("session-1"));
+          Option.match(maybeRun, {
+            onNone: () => expect.fail("run not found"),
+            onSome: (run) => expect(run.desiredState).toBe("canceled"),
+          });
+
+          const revokedAt = yield* Clock.currentTimeMillis;
+          yield* installationRepo.revoke(
+            makeOrganizationId("org-1"),
+            revokedAt,
+          );
+          const maybeInstallation = yield* installationRepo.get(
+            makeOrganizationId("org-1"),
+          );
+          Option.match(maybeInstallation, {
+            onNone: () => expect.fail("installation not found"),
+            onSome: (installation) =>
+              expect(installation.revokedAt).not.toEqual(Option.none()),
+          });
+        }),
+      ),
   );
 
-  it.scopedLive("updates permission snapshots without rewriting rotating tokens", () =>
-    withRepos(
-      Effect.gen(function* () {
-        const repo = yield* InstallationRepo;
-        yield* repo.put(
-          makeInstallation({
-            accessibleTeamIds: Option.some([makeTeamId("team-a")]),
-          }),
-        );
+  it.scopedLive(
+    "updates permission snapshots without rewriting rotating tokens",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* InstallationRepo;
+          yield* repo.put(
+            makeInstallation({
+              accessibleTeamIds: Option.some([makeTeamId("team-a")]),
+            }),
+          );
 
-        const before = yield* repo.getRawEncryptedAccessToken(makeOrganizationId("org-1"));
+          const before = yield* repo.getRawEncryptedAccessToken(
+            makeOrganizationId("org-1"),
+          );
 
-        const changed = yield* repo.applyPermissionChange(
-          makeOrganizationId("org-1"),
-          makeAppUserId("app-user-1"),
-          [makeTeamId("team-b")],
-          [makeTeamId("team-a")],
-          false,
-          0,
-        );
-        expect(changed).toBe(true);
+          const changed = yield* repo.applyPermissionChange(
+            makeOrganizationId("org-1"),
+            makeAppUserId("app-user-1"),
+            [makeTeamId("team-b")],
+            [makeTeamId("team-a")],
+            false,
+            0,
+          );
+          expect(changed).toBe(true);
 
-        const after = yield* repo.getRawEncryptedAccessToken(makeOrganizationId("org-1"));
-        expect(after).toEqual(before);
+          const after = yield* repo.getRawEncryptedAccessToken(
+            makeOrganizationId("org-1"),
+          );
+          expect(after).toEqual(before);
 
-        const maybeInstallation = yield* repo.get(makeOrganizationId("org-1"));
-        Option.match(maybeInstallation, {
-          onNone: () => expect.fail("installation not found"),
-          onSome: (installation) => {
-            expect(installation.accessibleTeamIds).toEqual(Option.some([makeTeamId("team-b")]));
-          },
-        });
-      }),
-    ),
+          const maybeInstallation = yield* repo.get(
+            makeOrganizationId("org-1"),
+          );
+          Option.match(maybeInstallation, {
+            onNone: () => expect.fail("installation not found"),
+            onSome: (installation) => {
+              expect(installation.accessibleTeamIds).toEqual(
+                Option.some([makeTeamId("team-b")]),
+              );
+            },
+          });
+        }),
+      ),
   );
 
   it.scopedLive("reserves each projection and terminal outcome once", () =>
@@ -354,71 +423,86 @@ describe("Store repositories", () => {
         expect(yield* projectionRepo.enqueue(projection)).toBe(true);
         expect(yield* projectionRepo.enqueue(projection)).toBe(false);
 
-        const job = yield* projectionRepo.claim(projection.sourceKey, "test-owner", 60_000);
+        const job = yield* projectionRepo.claim(
+          projection.sourceKey,
+          "test-owner",
+          60_000,
+        );
         expect(job).not.toEqual(Option.none());
 
-        yield* projectionRepo.complete(projection.sourceKey, "test-owner", Option.some(makeActivityId("linear-activity-1")));
-        expect(yield* projectionRepo.projectionCount(makeSessionId("session-1"), "response")).toBe(1);
+        yield* projectionRepo.complete(
+          projection.sourceKey,
+          "test-owner",
+          Option.some(makeActivityId("linear-activity-1")),
+        );
+        expect(
+          yield* projectionRepo.projectionCount(
+            makeSessionId("session-1"),
+            "response",
+          ),
+        ).toBe(1);
       }),
     ),
   );
 
-  it.scopedLive("persist inputs and projections as chronological run events", () =>
-    withRepos(
-      Effect.gen(function* () {
-        const runRepo = yield* RunRepo;
-        const inputRepo = yield* RunInputRepo;
-        const projectionRepo = yield* ProjectionRepo;
-        const eventRepo = yield* RunEventRepo;
+  it.scopedLive(
+    "persist inputs and projections as chronological run events",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const runRepo = yield* RunRepo;
+          const inputRepo = yield* RunInputRepo;
+          const projectionRepo = yield* ProjectionRepo;
+          const eventRepo = yield* RunEventRepo;
 
-        yield* runRepo.create({
-          sessionId: makeSessionId("session-1"),
-          organizationId: makeOrganizationId("org-1"),
-          issueId: Option.none(),
-        });
+          yield* runRepo.create({
+            sessionId: makeSessionId("session-1"),
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
 
-        yield* inputRepo.enqueue({
-          id: makeInputId("input-1"),
-          sessionId: makeSessionId("session-1"),
-          kind: "created",
-          body: "Implement the issue",
-          payload: { agentSession: { issue: { teamId: "team" } } },
-          createdAt: 1_000,
-        });
+          yield* inputRepo.enqueue({
+            id: makeInputId("input-1"),
+            sessionId: makeSessionId("session-1"),
+            kind: "created",
+            body: "Implement the issue",
+            payload: { agentSession: { issue: { teamId: "team" } } },
+            createdAt: 1_000,
+          });
 
-        yield* projectionRepo.enqueue({
-          sourceKey: makeSourceKey("event-1"),
-          sessionId: makeSessionId("session-1"),
-          activityType: "thought",
-          payloadHash: "hash",
-          payload: {
-            request: { content: { type: "thought", body: "Thinking..." } },
-          },
-          now: 2_000,
-        });
+          yield* projectionRepo.enqueue({
+            sourceKey: makeSourceKey("event-1"),
+            sessionId: makeSessionId("session-1"),
+            activityType: "thought",
+            payloadHash: "hash",
+            payload: {
+              request: { content: { type: "thought", body: "Thinking..." } },
+            },
+            now: 2_000,
+          });
 
-        const events = yield* eventRepo.list(makeSessionId("session-1"));
-        expect(events.length).toBe(2);
-        expect(events[0]).toMatchObject({
-          sourceKey: makeSourceKey("input:input-1"),
-          sessionId: makeSessionId("session-1"),
-          kind: "input:created",
-          level: "info",
-          text: Option.some("Implement the issue"),
-          status: Option.none(),
-          createdAt: 1_000,
-        });
-        expect(events[1]).toMatchObject({
-          sourceKey: makeSourceKey("event-1"),
-          sessionId: makeSessionId("session-1"),
-          kind: "thought",
-          level: "debug",
-          text: Option.some("Thinking..."),
-          status: Option.some("pending"),
-          createdAt: 2_000,
-        });
-      }),
-    ),
+          const events = yield* eventRepo.list(makeSessionId("session-1"));
+          expect(events.length).toBe(2);
+          expect(events[0]).toMatchObject({
+            sourceKey: makeSourceKey("input:input-1"),
+            sessionId: makeSessionId("session-1"),
+            kind: "input:created",
+            level: "info",
+            text: Option.some("Implement the issue"),
+            status: Option.none(),
+            createdAt: 1_000,
+          });
+          expect(events[1]).toMatchObject({
+            sourceKey: makeSourceKey("event-1"),
+            sessionId: makeSessionId("session-1"),
+            kind: "thought",
+            level: "debug",
+            text: Option.some("Thinking..."),
+            status: Option.some("pending"),
+            createdAt: 2_000,
+          });
+        }),
+      ),
   );
 
   it.scopedLive("records state transitions with a stable source key", () =>
@@ -437,7 +521,9 @@ describe("Store repositories", () => {
           terminalReason: Option.some("Worker exited"),
         });
 
-        const events = yield* eventRepo.list(makeSessionId("session-transition"));
+        const events = yield* eventRepo.list(
+          makeSessionId("session-transition"),
+        );
         const transition = events.find((event) => event.kind === "state");
         expect(transition).toMatchObject({
           sourceKey: makeSourceKey("state:session-transition:0:failed"),
@@ -450,53 +536,55 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("deduplicates run events by source key and preserves created at", () =>
-    withRepos(
-      Effect.gen(function* () {
-        const runRepo = yield* RunRepo;
-        const eventRepo = yield* RunEventRepo;
+  it.scopedLive(
+    "deduplicates run events by source key and preserves created at",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const runRepo = yield* RunRepo;
+          const eventRepo = yield* RunEventRepo;
 
-        yield* runRepo.create({
-          sessionId: makeSessionId("session-1"),
-          organizationId: makeOrganizationId("org-1"),
-          issueId: Option.none(),
-        });
+          yield* runRepo.create({
+            sessionId: makeSessionId("session-1"),
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+          });
 
-        yield* eventRepo.upsert({
-          sourceKey: makeSourceKey("rpc:session-1:1:agent_start"),
-          sessionId: makeSessionId("session-1"),
-          kind: "agent_start",
-          level: "info",
-          text: "Worker started",
-          payload: { type: "agent_start" },
-          status: "observed",
-          now: 1_000,
-        });
-        yield* eventRepo.upsert({
-          sourceKey: makeSourceKey("rpc:session-1:1:agent_start"),
-          sessionId: makeSessionId("session-1"),
-          kind: "thought",
-          level: "debug",
-          text: "Worker started",
-          payload: {
-            request: { content: { type: "thought", body: "Worker started" } },
-          },
-          status: "pending",
-          now: 2_000,
-        });
+          yield* eventRepo.upsert({
+            sourceKey: makeSourceKey("rpc:session-1:1:agent_start"),
+            sessionId: makeSessionId("session-1"),
+            kind: "agent_start",
+            level: "info",
+            text: "Worker started",
+            payload: { type: "agent_start" },
+            status: "observed",
+            now: 1_000,
+          });
+          yield* eventRepo.upsert({
+            sourceKey: makeSourceKey("rpc:session-1:1:agent_start"),
+            sessionId: makeSessionId("session-1"),
+            kind: "thought",
+            level: "debug",
+            text: "Worker started",
+            payload: {
+              request: { content: { type: "thought", body: "Worker started" } },
+            },
+            status: "pending",
+            now: 2_000,
+          });
 
-        const events = yield* eventRepo.list(makeSessionId("session-1"));
-        expect(events.length).toBe(1);
-        expect(events[0]).toMatchObject({
-          sourceKey: makeSourceKey("rpc:session-1:1:agent_start"),
-          kind: "thought",
-          level: "debug",
-          status: Option.some("pending"),
-          createdAt: 1_000,
-          updatedAt: 2_000,
-        });
-      }),
-    ),
+          const events = yield* eventRepo.list(makeSessionId("session-1"));
+          expect(events.length).toBe(1);
+          expect(events[0]).toMatchObject({
+            sourceKey: makeSourceKey("rpc:session-1:1:agent_start"),
+            kind: "thought",
+            level: "debug",
+            status: Option.some("pending"),
+            createdAt: 1_000,
+            updatedAt: 2_000,
+          });
+        }),
+      ),
   );
 
   it.scopedLive("tracks projection lifecycle status and errors", () =>
@@ -530,12 +618,20 @@ describe("Store repositories", () => {
         const events1 = yield* eventRepo.list(makeSessionId("session-1"));
         expect(events1[0]?.status).toEqual(Option.some("pending"));
 
-        const job = yield* projectionRepo.claim(makeSourceKey("event-1"), "owner", 60_000);
+        const job = yield* projectionRepo.claim(
+          makeSourceKey("event-1"),
+          "owner",
+          60_000,
+        );
         expect(job).not.toEqual(Option.none());
         const events2 = yield* eventRepo.list(makeSessionId("session-1"));
         expect(events2[0]?.status).toEqual(Option.some("pending"));
 
-        yield* projectionRepo.complete(makeSourceKey("event-1"), "owner", Option.some(makeActivityId("linear-1")));
+        yield* projectionRepo.complete(
+          makeSourceKey("event-1"),
+          "owner",
+          Option.some(makeActivityId("linear-1")),
+        );
         const events3 = yield* eventRepo.list(makeSessionId("session-1"));
         const event1 = events3[0];
         expect(event1?.status).toEqual(Option.some("completed"));
@@ -549,10 +645,17 @@ describe("Store repositories", () => {
           payload: { request: { content: { type: "response", body: "Done" } } },
         });
         yield* projectionRepo.claim(makeSourceKey("event-2"), "owner", 60_000);
-        yield* projectionRepo.fail(makeSourceKey("event-2"), "owner", "Linear API error", 0);
+        yield* projectionRepo.fail(
+          makeSourceKey("event-2"),
+          "owner",
+          "Linear API error",
+          0,
+        );
 
         const events4 = yield* eventRepo.list(makeSessionId("session-1"));
-        const event2 = events4.find((e) => e.sourceKey === makeSourceKey("event-2"));
+        const event2 = events4.find(
+          (e) => e.sourceKey === makeSourceKey("event-2"),
+        );
         expect(event2?.status).toEqual(Option.some("failed"));
         expect(event2?.error).toEqual(Option.some("Linear API error"));
       }),
@@ -584,7 +687,12 @@ describe("Store repositories", () => {
           },
           now: 1_000,
         });
-        yield* projectionRepo.claim(makeSourceKey("terminal:session-1:stop"), "owner", 60_000, 1_000);
+        yield* projectionRepo.claim(
+          makeSourceKey("terminal:session-1:stop"),
+          "owner",
+          60_000,
+          1_000,
+        );
         yield* projectionRepo.complete(
           makeSourceKey("terminal:session-1:stop"),
           "owner",
@@ -633,9 +741,15 @@ describe("pure invariants", () => {
             organizationId: makeOrganizationId(organizationId),
             payload,
           };
-          expect(yield* repo.claim({ ...common, payloadHash: first })).toBe("claimed");
-          expect(yield* repo.claim({ ...common, payloadHash: first })).toBe("duplicate");
-          expect(yield* repo.claim({ ...common, payloadHash: second })).toBe("conflict");
+          expect(yield* repo.claim({ ...common, payloadHash: first })).toBe(
+            "claimed",
+          );
+          expect(yield* repo.claim({ ...common, payloadHash: first })).toBe(
+            "duplicate",
+          );
+          expect(yield* repo.claim({ ...common, payloadHash: second })).toBe(
+            "conflict",
+          );
         }),
       ),
   );
@@ -660,9 +774,28 @@ describe("pure invariants", () => {
             issueId: Option.none(),
             now,
           });
-          expect(yield* repo.claimLease(makeSessionId(sessionId), owner, duration, now)).toBe(true);
-          expect(yield* repo.claimLease(makeSessionId(sessionId), owner, duration, now + 1)).toBe(true);
-          const other = yield* repo.claimLease(makeSessionId(sessionId), otherOwner, duration, now + 1);
+          expect(
+            yield* repo.claimLease(
+              makeSessionId(sessionId),
+              owner,
+              duration,
+              now,
+            ),
+          ).toBe(true);
+          expect(
+            yield* repo.claimLease(
+              makeSessionId(sessionId),
+              owner,
+              duration,
+              now + 1,
+            ),
+          ).toBe(true);
+          const other = yield* repo.claimLease(
+            makeSessionId(sessionId),
+            otherOwner,
+            duration,
+            now + 1,
+          );
           if (owner === otherOwner) {
             expect(other).toBe(true);
           } else {
@@ -681,7 +814,13 @@ describe("pure invariants", () => {
       texts: NonEmptyDistinctStrings,
       bodies: NonEmptyDistinctStrings,
     },
-    ({ sessionId, organizationId, sourceKey, texts: { first: text1, second: text2 }, bodies: { first: body1, second: body2 } }) =>
+    ({
+      sessionId,
+      organizationId,
+      sourceKey,
+      texts: { first: text1, second: text2 },
+      bodies: { first: body1, second: body2 },
+    }) =>
       withRepos(
         Effect.gen(function* () {
           const runRepo = yield* RunRepo;
@@ -821,14 +960,20 @@ describe("pure invariants", () => {
           const job = yield* projectionRepo.claim(key, "owner", 60_000);
           expect(job).not.toEqual(Option.none());
 
-          yield* projectionRepo.complete(key, "owner", Option.some(makeActivityId(activityId)));
+          yield* projectionRepo.complete(
+            key,
+            "owner",
+            Option.some(makeActivityId(activityId)),
+          );
 
           const differentHash = yield* projectionRepo.enqueue({
             sourceKey: key,
             sessionId: makeSessionId(sessionId),
             activityType: "response",
             payloadHash: secondHash,
-            payload: { request: { content: { type: "response", body: otherBody } } },
+            payload: {
+              request: { content: { type: "response", body: otherBody } },
+            },
             now: 2_000,
             firstWriteWins: true,
           });
@@ -871,15 +1016,21 @@ describe("pure invariants", () => {
             expect(first.value.state).toBe(firstState);
           }
 
-          const either = yield* Effect.either(repo.update(sid, { state: secondState }));
+          const either = yield* Effect.either(
+            repo.update(sid, { state: secondState }),
+          );
           const terminal = ["succeeded", "failed", "canceled"] as const;
-          const isTerminal = terminal.includes(firstState as (typeof terminal)[number]);
+          const isTerminal = terminal.includes(
+            firstState as (typeof terminal)[number],
+          );
           const shouldFail = isTerminal && secondState !== firstState;
 
           if (shouldFail) {
             expect(Either.isLeft(either)).toBe(true);
             if (Either.isLeft(either)) {
-              expect(either.left.message).toBe("Terminal run state is immutable");
+              expect(either.left.message).toBe(
+                "Terminal run state is immutable",
+              );
             }
           } else {
             expect(Either.isRight(either)).toBe(true);

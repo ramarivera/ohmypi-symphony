@@ -1,6 +1,5 @@
 import { Option, Schema } from "effect";
 import {
-  ActivityId,
   AppUserId,
   DeliveryId,
   InputId,
@@ -13,15 +12,39 @@ import {
   WorkspaceId,
 } from "./ids.js";
 
-export const RunState = Schema.Literal("queued", "starting", "running", "waiting", "stopping", "succeeded", "failed", "canceled", "orphaned");
+export const RunState = Schema.Literal(
+  "queued",
+  "starting",
+  "running",
+  "waiting",
+  "stopping",
+  "succeeded",
+  "failed",
+  "canceled",
+  "orphaned",
+);
 export type RunState = Schema.Schema.Type<typeof RunState>;
 export const DesiredRunState = Schema.Literal("running", "canceled");
 export type DesiredRunState = Schema.Schema.Type<typeof DesiredRunState>;
 export const InputKind = Schema.Literal("created", "prompted", "stop");
 export type InputKind = Schema.Schema.Type<typeof InputKind>;
-export const ActivityType = Schema.Literal("thought", "action", "elicitation", "response", "error");
+export const ActivityType = Schema.Literal(
+  "thought",
+  "action",
+  "elicitation",
+  "response",
+  "error",
+);
 export type ActivityType = Schema.Schema.Type<typeof ActivityType>;
-export const LogLevel = Schema.Literal("trace", "debug", "info", "warn", "error", "fatal", "silent");
+export const LogLevel = Schema.Literal(
+  "trace",
+  "debug",
+  "info",
+  "warn",
+  "error",
+  "fatal",
+  "silent",
+);
 export type LogLevel = Schema.Schema.Type<typeof LogLevel>;
 
 const NullableString = Schema.OptionFromNullOr(Schema.String);
@@ -34,15 +57,20 @@ export const RepositoryDefinition = Schema.Struct({
   teamIds: Schema.Array(TeamId),
   projectIds: Schema.Array(ProjectId),
 });
-export type RepositoryDefinition = Schema.Schema.Type<typeof RepositoryDefinition>;
+export type RepositoryDefinition = Schema.Schema.Type<
+  typeof RepositoryDefinition
+>;
 
-export const RepositoryRecord = Schema.extend(RepositoryDefinition, Schema.Struct({
-  organizationId: OrganizationId,
-  labels: Schema.Array(Schema.String),
-  isDefault: Schema.Boolean,
-  createdAt: Schema.Number,
-  updatedAt: Schema.Number,
-}));
+export const RepositoryRecord = Schema.extend(
+  RepositoryDefinition,
+  Schema.Struct({
+    organizationId: OrganizationId,
+    labels: Schema.Array(Schema.String),
+    isDefault: Schema.Boolean,
+    createdAt: Schema.Number,
+    updatedAt: Schema.Number,
+  }),
+);
 export type RepositoryRecord = Schema.Schema.Type<typeof RepositoryRecord>;
 
 export const Installation = Schema.Struct({
@@ -101,7 +129,12 @@ export const RunInput = Schema.Struct({
 });
 export type RunInput = Schema.Schema.Type<typeof RunInput>;
 
-const RunEventStatus = Schema.Literal("observed", "pending", "completed", "failed");
+const RunEventStatus = Schema.Literal(
+  "observed",
+  "pending",
+  "completed",
+  "failed",
+);
 export const RunEvent = Schema.Struct({
   sourceKey: SourceKey,
   sessionId: SessionId,
@@ -135,7 +168,9 @@ export const AgentSessionComment = Schema.Struct(
   },
   { key: Schema.String, value: Schema.Unknown },
 );
-export type AgentSessionComment = Schema.Schema.Type<typeof AgentSessionComment>;
+export type AgentSessionComment = Schema.Schema.Type<
+  typeof AgentSessionComment
+>;
 export const AgentSessionIssue = Schema.Struct(
   {
     id: Schema.String,
@@ -164,11 +199,15 @@ export const AgentSessionActivity = Schema.Struct(
     id: Schema.String,
     agentSessionId: Schema.String,
     content: Schema.Unknown,
-    signal: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
+    signal: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
   },
   { key: Schema.String, value: Schema.Unknown },
 );
-export type AgentSessionActivity = Schema.Schema.Type<typeof AgentSessionActivity>;
+export type AgentSessionActivity = Schema.Schema.Type<
+  typeof AgentSessionActivity
+>;
 
 // Linear's embedded webhook AgentSession payload has no `type` field.
 export const AgentSessionWebhookPayload = Schema.Struct(
@@ -179,20 +218,43 @@ export const AgentSessionWebhookPayload = Schema.Struct(
     status: Schema.String,
     createdAt: Schema.String,
     updatedAt: Schema.String,
-    issueId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    commentId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    sourceCommentId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    summary: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    url: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    archivedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    startedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    endedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-    comment: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionComment), { default: () => Option.none() }),
-    issue: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionIssue), { default: () => Option.none() }),
+    issueId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    commentId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    sourceCommentId: Schema.optionalWith(
+      Schema.OptionFromNullOr(Schema.String),
+      { default: () => Option.none() },
+    ),
+    summary: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    url: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    archivedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    startedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    endedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    comment: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionComment), {
+      default: () => Option.none(),
+    }),
+    issue: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionIssue), {
+      default: () => Option.none(),
+    }),
   },
   { key: Schema.String, value: Schema.Unknown },
 );
-export type AgentSessionWebhookPayload = Schema.Schema.Type<typeof AgentSessionWebhookPayload>;
+export type AgentSessionWebhookPayload = Schema.Schema.Type<
+  typeof AgentSessionWebhookPayload
+>;
 
 export const AgentSessionEvent = Schema.Struct({
   type: Schema.Literal("AgentSessionEvent"),
@@ -202,11 +264,26 @@ export const AgentSessionEvent = Schema.Struct({
   oauthClientId: Schema.String,
   webhookId: Schema.String,
   webhookTimestamp: Schema.Number,
-  createdAt: Schema.optionalWith(Schema.String, { default: () => "1970-01-01T00:00:00.000Z" }),
-  promptContext: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), { default: () => Option.none() }),
-  guidance: Schema.optionalWith(Schema.OptionFromNullOr(Schema.Array(Schema.Struct({ body: Schema.String }))), { default: () => Option.none() }),
-  previousComments: Schema.optionalWith(Schema.OptionFromNullOr(Schema.Array(AgentSessionComment)), { default: () => Option.none() }),
-  agentActivity: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionActivity), { default: () => Option.none() }),
+  createdAt: Schema.optionalWith(Schema.String, {
+    default: () => "1970-01-01T00:00:00.000Z",
+  }),
+  promptContext: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+    default: () => Option.none(),
+  }),
+  guidance: Schema.optionalWith(
+    Schema.OptionFromNullOr(
+      Schema.Array(Schema.Struct({ body: Schema.String })),
+    ),
+    { default: () => Option.none() },
+  ),
+  previousComments: Schema.optionalWith(
+    Schema.OptionFromNullOr(Schema.Array(AgentSessionComment)),
+    { default: () => Option.none() },
+  ),
+  agentActivity: Schema.optionalWith(
+    Schema.OptionFromNullOr(AgentSessionActivity),
+    { default: () => Option.none() },
+  ),
   agentSession: AgentSessionWebhookPayload,
 });
 export type AgentSessionEvent = Schema.Schema.Type<typeof AgentSessionEvent>;

@@ -2,27 +2,40 @@ import type * as LinearSdk from "@linear/sdk";
 import { vi } from "vitest";
 
 const sdkState = vi.hoisted(() => {
-  type ActivityInput = { readonly content?: unknown; readonly signalMetadata?: unknown };
-  type UpdateInput = { readonly plan?: unknown; readonly externalUrls?: unknown };
-  type Pending = { readonly resolve: (value: unknown) => void; readonly reject: (error: unknown) => void };
+  type ActivityInput = {
+    readonly content?: unknown;
+    readonly signalMetadata?: unknown;
+  };
+  type UpdateInput = {
+    readonly plan?: unknown;
+    readonly externalUrls?: unknown;
+  };
+  type Pending = {
+    readonly resolve: (value: unknown) => void;
+    readonly reject: (error: unknown) => void;
+  };
 
   const state: {
     readonly activities: ActivityInput[];
     readonly updates: UpdateInput[];
     readonly pending: Pending[];
-    readonly waiters: Array<{ readonly count: number; readonly resolve: () => void }>;
+    readonly waiters: Array<{
+      readonly count: number;
+      readonly resolve: () => void;
+    }>;
     activityHandler: (input: ActivityInput) => Promise<unknown>;
   } = {
     activities: [],
     updates: [],
     pending: [],
     waiters: [],
-    activityHandler: async () => ({ success: true, agentActivityId: "activity-id" }),
+    activityHandler: async () => ({
+      success: true,
+      agentActivityId: "activity-id",
+    }),
   };
 
   class TestLinearClient {
-    constructor(_options: unknown) {}
-
     createAgentActivity(input: ActivityInput): Promise<unknown> {
       state.activities.push(input);
       for (const waiter of state.waiters.splice(0)) {
@@ -32,7 +45,10 @@ const sdkState = vi.hoisted(() => {
       return state.activityHandler(input);
     }
 
-    updateAgentSession(_sessionId: string, input: UpdateInput): Promise<unknown> {
+    updateAgentSession(
+      _sessionId: string,
+      input: UpdateInput,
+    ): Promise<unknown> {
       state.updates.push(input);
       return Promise.resolve({ success: true });
     }
@@ -46,7 +62,10 @@ const sdkState = vi.hoisted(() => {
       state.updates.length = 0;
       state.pending.length = 0;
       state.waiters.length = 0;
-      state.activityHandler = async () => ({ success: true, agentActivityId: "activity-id" });
+      state.activityHandler = async () => ({
+        success: true,
+        agentActivityId: "activity-id",
+      });
     },
     waitForActivity: (count: number) => {
       if (state.activities.length >= count) return Promise.resolve();
@@ -64,15 +83,25 @@ vi.mock("@linear/sdk", async () => {
 
 import { Effect, Exit, Fiber, Layer, Option, Redacted, Schema } from "effect";
 import { beforeEach, describe, expect, it } from "vitest";
-import { AppUserId, OrganizationId, SessionId } from "../src/domain/ids.js";
 import { LinearRateLimitError } from "../src/domain/errors.js";
+import { AppUserId, OrganizationId, SessionId } from "../src/domain/ids.js";
 import type { AgentRun, Installation } from "../src/domain/models.js";
-import { LinearGateway } from "../src/services/linear-gateway.js";
 import { GatewayConfig } from "../src/services/config.js";
-import { InstallationRepo, RunRepo } from "../src/services/store/repositories.js";
-const organizationId = Schema.decodeUnknownSync(OrganizationId)("11111111-1111-4111-8111-111111111111");
-const sessionId = Schema.decodeUnknownSync(SessionId)("22222222-2222-4222-8222-222222222222");
-const appUserId = Schema.decodeUnknownSync(AppUserId)("33333333-3333-4333-8333-333333333333");
+import { LinearGateway } from "../src/services/linear-gateway.js";
+import {
+  InstallationRepo,
+  RunRepo,
+} from "../src/services/store/repositories.js";
+
+const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+  "11111111-1111-4111-8111-111111111111",
+);
+const sessionId = Schema.decodeUnknownSync(SessionId)(
+  "22222222-2222-4222-8222-222222222222",
+);
+const appUserId = Schema.decodeUnknownSync(AppUserId)(
+  "33333333-3333-4333-8333-333333333333",
+);
 const run: AgentRun = {
   sessionId,
   organizationId,
@@ -166,7 +195,12 @@ const getGateway = () =>
   );
 
 const activityBody = (content: unknown): string | undefined => {
-  if (typeof content !== "object" || content === null || Array.isArray(content) || !("body" in content)) {
+  if (
+    typeof content !== "object" ||
+    content === null ||
+    Array.isArray(content) ||
+    !("body" in content)
+  ) {
     return undefined;
   }
   return typeof content.body === "string" ? content.body : undefined;
@@ -181,11 +215,16 @@ describe("LinearGateway parity", () => {
       type: "thought",
       body: "secret-like persisted content",
       signal: "select",
-      signalMetadata: { token: "persisted-verbatim", nested: { value: "kept" } },
+      signalMetadata: {
+        token: "persisted-verbatim",
+        nested: { value: "kept" },
+      },
     };
 
     await Effect.runPromise(
-      gateway.createActivity({ sessionId, content }).pipe(Effect.provide(gatewayLayer)),
+      gateway
+        .createActivity({ sessionId, content })
+        .pipe(Effect.provide(gatewayLayer)),
     );
 
     expect(sdkState.state.activities[0]).toMatchObject({
@@ -197,10 +236,14 @@ describe("LinearGateway parity", () => {
   it("forwards persisted plan and external URL fields verbatim", async () => {
     const gateway = await getGateway();
     const plan = [{ content: "plan secret", status: "completed" }];
-    const externalUrls = [{ label: "private label", url: "https://example.test/private" }];
+    const externalUrls = [
+      { label: "private label", url: "https://example.test/private" },
+    ];
 
     await Effect.runPromise(
-      gateway.updateSession({ sessionId, plan, externalUrls }).pipe(Effect.provide(gatewayLayer)),
+      gateway
+        .updateSession({ sessionId, plan, externalUrls })
+        .pipe(Effect.provide(gatewayLayer)),
     );
 
     expect(sdkState.state.updates).toEqual([{ plan, externalUrls }]);
@@ -208,7 +251,7 @@ describe("LinearGateway parity", () => {
 
   it("executes three same-organization requests in order", async () => {
     const gateway = await getGateway();
-    sdkState.state.activityHandler = (input) =>
+    sdkState.state.activityHandler = (_input) =>
       (() => {
         const { promise, resolve, reject } = Promise.withResolvers<unknown>();
         sdkState.state.pending.push({ resolve, reject });
@@ -216,25 +259,58 @@ describe("LinearGateway parity", () => {
       })();
 
     const first = Effect.runPromise(
-      gateway.createActivity({ sessionId, content: { type: "thought", body: "one" } }).pipe(Effect.provide(gatewayLayer)),
+      gateway
+        .createActivity({
+          sessionId,
+          content: { type: "thought", body: "one" },
+        })
+        .pipe(Effect.provide(gatewayLayer)),
     );
     await sdkState.waitForActivity(1);
     const second = Effect.runPromise(
-      gateway.createActivity({ sessionId, content: { type: "thought", body: "two" } }).pipe(Effect.provide(gatewayLayer)),
+      gateway
+        .createActivity({
+          sessionId,
+          content: { type: "thought", body: "two" },
+        })
+        .pipe(Effect.provide(gatewayLayer)),
     );
     const third = Effect.runPromise(
-      gateway.createActivity({ sessionId, content: { type: "thought", body: "three" } }).pipe(Effect.provide(gatewayLayer)),
+      gateway
+        .createActivity({
+          sessionId,
+          content: { type: "thought", body: "three" },
+        })
+        .pipe(Effect.provide(gatewayLayer)),
     );
 
     expect(sdkState.state.activities).toHaveLength(1);
-    sdkState.state.pending.shift()?.resolve({ success: true, agentActivityId: "one" });
+    sdkState.state.pending
+      .shift()
+      ?.resolve({ success: true, agentActivityId: "one" });
     await sdkState.waitForActivity(2);
-    expect(sdkState.state.activities.map((activity) => activityBody(activity.content))).toEqual(["one", "two"]);
-    sdkState.state.pending.shift()?.resolve({ success: true, agentActivityId: "two" });
+    expect(
+      sdkState.state.activities.map((activity) =>
+        activityBody(activity.content),
+      ),
+    ).toEqual(["one", "two"]);
+    sdkState.state.pending
+      .shift()
+      ?.resolve({ success: true, agentActivityId: "two" });
     await sdkState.waitForActivity(3);
-    expect(sdkState.state.activities.map((activity) => activityBody(activity.content))).toEqual(["one", "two", "three"]);
-    sdkState.state.pending.shift()?.resolve({ success: true, agentActivityId: "three" });
-    await expect(Promise.all([first, second, third])).resolves.toEqual(["one", "two", "three"]);
+    expect(
+      sdkState.state.activities.map((activity) =>
+        activityBody(activity.content),
+      ),
+    ).toEqual(["one", "two", "three"]);
+    sdkState.state.pending
+      .shift()
+      ?.resolve({ success: true, agentActivityId: "three" });
+    await expect(Promise.all([first, second, third])).resolves.toEqual([
+      "one",
+      "two",
+      "three",
+    ]);
   });
 
   it("does not let an interrupted waiter bypass the active organization request", async () => {
@@ -299,14 +375,20 @@ describe("LinearGateway parity", () => {
     };
 
     const exit = await Effect.runPromiseExit(
-      gateway.createActivity({ sessionId, content: { type: "thought", body: "rate limited" } }).pipe(Effect.provide(gatewayLayer)),
+      gateway
+        .createActivity({
+          sessionId,
+          content: { type: "thought", body: "rate limited" },
+        })
+        .pipe(Effect.provide(gatewayLayer)),
     );
 
     expect(attempts).toBe(2);
     expect(Exit.isFailure(exit)).toBe(true);
     if (Exit.isFailure(exit)) {
       expect(exit.cause._tag).toBe("Fail");
-      if (exit.cause._tag === "Fail") expect(exit.cause.error).toBeInstanceOf(LinearRateLimitError);
+      if (exit.cause._tag === "Fail")
+        expect(exit.cause.error).toBeInstanceOf(LinearRateLimitError);
     }
   });
 });

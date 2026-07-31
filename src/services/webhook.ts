@@ -1,33 +1,12 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Effect, Option, Redacted, Schema } from "effect";
 import {
-  isActivitySignal,
-  isNumber,
-  isRecord,
-  isString,
-  redactStringValues,
-} from "./linear-helpers.js";
-import { GatewayConfig } from "./config.js";
-import {
-  AgentSessionActivity,
-  AgentSessionComment,
-  AgentSessionEvent,
-  AgentSessionIssue,
-  AgentSessionWebhookPayload,
-} from "../domain/models.js";
-import type {
-  AgentSessionActivity as AgentSessionActivityType,
-  AgentSessionComment as AgentSessionCommentType,
-  AgentSessionEvent as AgentSessionEventType,
-  AgentSessionIssue as AgentSessionIssueType,
-  AgentSessionWebhookPayload as AgentSessionWebhookPayloadType,
-} from "../domain/models.js";
-import {
-  DeliveryRepo,
-  InstallationRepo,
-  RunInputRepo,
-  RunRepo,
-} from "./store/repositories.js";
+  type DatabaseError,
+  type RowDecodeError,
+  type TokenCipherError,
+  WebhookIdentityError,
+  WebhookPayloadError,
+} from "../domain/errors.js";
 import {
   AppUserId,
   DeliveryId,
@@ -38,13 +17,25 @@ import {
   SessionId,
   TeamId,
 } from "../domain/ids.js";
+import type {
+  AgentSessionActivity as AgentSessionActivityType,
+  AgentSessionEvent as AgentSessionEventType,
+  AgentSessionIssue as AgentSessionIssueType,
+} from "../domain/models.js";
+import { AgentSessionEvent } from "../domain/models.js";
+import { GatewayConfig } from "./config.js";
 import {
-  DatabaseError,
-  RowDecodeError,
-  TokenCipherError,
-  WebhookIdentityError,
-  WebhookPayloadError,
-} from "../domain/errors.js";
+  isNumber,
+  isRecord,
+  isString,
+  redactStringValues,
+} from "./linear-helpers.js";
+import {
+  DeliveryRepo,
+  InstallationRepo,
+  RunInputRepo,
+  RunRepo,
+} from "./store/repositories.js";
 
 const LINEAR_SIGNATURE_HEADER = "linear-signature";
 const LINEAR_TIMESTAMP_HEADER = "linear-timestamp";
@@ -231,7 +222,11 @@ const validateAgentSessionIdentity = (
   event: AgentSessionEventType,
   config: { readonly linearClientId: string },
   installationRepo: InstallationRepo,
-): Effect.Effect<void, WebhookIdentityError | DatabaseError | TokenCipherError | RowDecodeError, never> =>
+): Effect.Effect<
+  void,
+  WebhookIdentityError | DatabaseError | TokenCipherError | RowDecodeError,
+  never
+> =>
   Effect.gen(function* () {
     if (event.oauthClientId !== config.linearClientId) {
       return yield* Effect.fail(
@@ -290,17 +285,18 @@ const handleAgentSessionEvent = (
   timestamp: number,
   runRepo: RunRepo,
   runInputRepo: RunInputRepo,
-): Effect.Effect<void, WebhookPayloadError | WebhookIdentityError | DatabaseError | RowDecodeError, never> =>
+): Effect.Effect<
+  void,
+  WebhookPayloadError | WebhookIdentityError | DatabaseError | RowDecodeError,
+  never
+> =>
   Effect.gen(function* () {
     const issue = event.agentSession.issue.pipe(Option.getOrElse(() => null));
     const rawIssue =
       isRecord(rawAgentSession) && isRecord(rawAgentSession.issue)
         ? rawAgentSession.issue
         : undefined;
-    const { teamId, projectId } = resolveTeamAndProject(
-      issue,
-      rawIssue,
-    );
+    const { teamId, projectId } = resolveTeamAndProject(issue, rawIssue);
 
     const sessionId = yield* Schema.decodeUnknown(SessionId)(
       event.agentSession.id,
@@ -365,9 +361,7 @@ const handleAgentSessionEvent = (
     }
 
     if (event.action === "prompted") {
-      const activity = event.agentActivity.pipe(
-        Option.getOrElse(() => null),
-      );
+      const activity = event.agentActivity.pipe(Option.getOrElse(() => null));
       if (activity === null) {
         return yield* Effect.fail(
           new WebhookPayloadError({
@@ -385,7 +379,9 @@ const handleAgentSessionEvent = (
       }
       const body = extractPromptBody(activity);
       const kind: "prompted" | "stop" =
-        Option.getOrElse(activity.signal, () => "") === "stop" ? "stop" : "prompted";
+        Option.getOrElse(activity.signal, () => "") === "stop"
+          ? "stop"
+          : "prompted";
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, kind),
       ).pipe(
@@ -447,7 +443,11 @@ const validateOAuthAppPayload = (
     const action = parsed.action;
     const oauthClientId = parsed.oauthClientId;
     const organizationId = parsed.organizationId;
-    if (!isString(action) || !isString(oauthClientId) || !isString(organizationId)) {
+    if (
+      !isString(action) ||
+      !isString(oauthClientId) ||
+      !isString(organizationId)
+    ) {
       return yield* Effect.fail(
         new WebhookPayloadError({
           message: "OAuthApp payload missing required fields",
@@ -654,11 +654,13 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       const runInputRepo = yield* RunInputRepo;
       const deliveryRepo = yield* DeliveryRepo;
 
-      const handle = Effect.fn("WebhookPipeline.handle")(
-        function* (request: Request) {
-          let deliveryId: DeliveryId | undefined;
+      const handle = Effect.fn("WebhookPipeline.handle")(function* (
+        request: Request,
+      ) {
+        let deliveryId: DeliveryId | undefined;
 
-          const process: Effect.Effect<Response, WebhookProcessingError, never> = Effect.gen(function* () {
+        const process: Effect.Effect<Response, WebhookProcessingError, never> =
+          Effect.gen(function* () {
             const url = new URL(request.url);
 
             yield* Effect.annotateCurrentSpan({
@@ -695,7 +697,9 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
               });
               return new Response("Missing signature", { status: 400 });
             }
-            if (!verifySignature(rawBody, signature, config.linearWebhookSecret)) {
+            if (
+              !verifySignature(rawBody, signature, config.linearWebhookSecret)
+            ) {
               yield* Effect.logWarning("webhook.rejected", {
                 reason: "invalid signature",
                 path: url.pathname,
@@ -725,7 +729,9 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
             }
 
             const payloadTimestamp = parsed.webhookTimestamp;
-            const timestampHeader = request.headers.get(LINEAR_TIMESTAMP_HEADER);
+            const timestampHeader = request.headers.get(
+              LINEAR_TIMESTAMP_HEADER,
+            );
             const timestamp = isNumber(payloadTimestamp)
               ? payloadTimestamp
               : timestampHeader !== null && timestampHeader.length > 0
@@ -740,10 +746,12 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
               return new Response("Invalid timestamp", { status: 400 });
             }
 
-            const receivedAt = yield* Effect.clockWith((clock) =>
-              clock.currentTimeMillis,
+            const receivedAt = yield* Effect.clockWith(
+              (clock) => clock.currentTimeMillis,
             );
-            if (Math.abs(receivedAt - timestamp) > config.webhookReplayWindowMs) {
+            if (
+              Math.abs(receivedAt - timestamp) > config.webhookReplayWindowMs
+            ) {
               yield* Effect.logWarning("webhook.rejected", {
                 reason: "timestamp outside replay window",
                 path: url.pathname,
@@ -821,10 +829,9 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                 eventType,
                 status: 409,
               });
-              return new Response(
-                "Delivery id reused with different payload",
-                { status: 409 },
-              );
+              return new Response("Delivery id reused with different payload", {
+                status: 409,
+              });
             }
 
             yield* Effect.logInfo("webhook.verified", {
@@ -933,70 +940,69 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
             return new Response("OK", { status: 200 });
           });
 
-          return yield* process.pipe(
-            Effect.catchTags({
-              "@Gateway/WebhookPayloadError": (error) =>
-                Effect.gen(function* () {
-                  yield* markDelivery(
-                    deliveryRepo,
-                    deliveryId,
-                    "failed",
-                    error.message,
-                  );
-                  return new Response(error.message, {
-                    status: error.status,
-                  });
-                }),
-              "@Gateway/WebhookIdentityError": (error) =>
-                Effect.gen(function* () {
-                  yield* markDelivery(
-                    deliveryRepo,
-                    deliveryId,
-                    "failed",
-                    error.message,
-                  );
-                  return new Response(error.message, { status: 401 });
-                }),
-              "@Gateway/DatabaseError": (error) =>
-                Effect.gen(function* () {
-                  yield* markDelivery(
-                    deliveryRepo,
-                    deliveryId,
-                    "failed",
-                    error.message,
-                  );
-                  return new Response("Webhook processing failed", {
-                    status: 500,
-                  });
-                }),
-              "@Gateway/RowDecodeError": (error) =>
-                Effect.gen(function* () {
-                  yield* markDelivery(
-                    deliveryRepo,
-                    deliveryId,
-                    "failed",
-                    error.message,
-                  );
-                  return new Response("Webhook processing failed", {
-                    status: 500,
-                  });
-                }),
-              "@Gateway/TokenCipherError": (error) =>
-                Effect.gen(function* () {
-                  yield* markDelivery(
-                    deliveryRepo,
-                    deliveryId,
-                    "failed",
-                    error.message,
-                  );
-                  return new Response("Webhook processing failed", {
-                    status: 500,
-                  });
-                }),
-            }),
-          );
-        },
-      );
+        return yield* process.pipe(
+          Effect.catchTags({
+            "@Gateway/WebhookPayloadError": (error) =>
+              Effect.gen(function* () {
+                yield* markDelivery(
+                  deliveryRepo,
+                  deliveryId,
+                  "failed",
+                  error.message,
+                );
+                return new Response(error.message, {
+                  status: error.status,
+                });
+              }),
+            "@Gateway/WebhookIdentityError": (error) =>
+              Effect.gen(function* () {
+                yield* markDelivery(
+                  deliveryRepo,
+                  deliveryId,
+                  "failed",
+                  error.message,
+                );
+                return new Response(error.message, { status: 401 });
+              }),
+            "@Gateway/DatabaseError": (error) =>
+              Effect.gen(function* () {
+                yield* markDelivery(
+                  deliveryRepo,
+                  deliveryId,
+                  "failed",
+                  error.message,
+                );
+                return new Response("Webhook processing failed", {
+                  status: 500,
+                });
+              }),
+            "@Gateway/RowDecodeError": (error) =>
+              Effect.gen(function* () {
+                yield* markDelivery(
+                  deliveryRepo,
+                  deliveryId,
+                  "failed",
+                  error.message,
+                );
+                return new Response("Webhook processing failed", {
+                  status: 500,
+                });
+              }),
+            "@Gateway/TokenCipherError": (error) =>
+              Effect.gen(function* () {
+                yield* markDelivery(
+                  deliveryRepo,
+                  deliveryId,
+                  "failed",
+                  error.message,
+                );
+                return new Response("Webhook processing failed", {
+                  status: 500,
+                });
+              }),
+          }),
+        );
+      });
 
       return { handle };
     }),

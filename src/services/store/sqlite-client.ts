@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
-import { Context, Effect, Layer, ParseResult, Schema, Scope } from "effect";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import { Context, Effect, Layer, ParseResult, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 
 export interface SqliteClientShape {
@@ -64,12 +64,13 @@ export const decodeRow = <A, I, R>(
   entity: string,
 ): Effect.Effect<A, RowDecodeError, R> =>
   Schema.decodeUnknown(schema)(row).pipe(
-    Effect.mapError((error) =>
-      new RowDecodeError({
-        message: ParseResult.TreeFormatter.formatErrorSync(error),
-        entity,
-        cause: String(error),
-      }),
+    Effect.mapError(
+      (error) =>
+        new RowDecodeError({
+          message: ParseResult.TreeFormatter.formatErrorSync(error),
+          entity,
+          cause: String(error),
+        }),
     ),
   );
 
@@ -88,10 +89,11 @@ export const runChanges = (
 ): Effect.Effect<number, DatabaseError> =>
   Schema.decodeUnknown(RunResult)(result).pipe(
     Effect.map((r) => r.changes),
-    Effect.mapError(() =>
-      new DatabaseError({
-        message: `${operation}: run result did not contain changes`,
-      }),
+    Effect.mapError(
+      () =>
+        new DatabaseError({
+          message: `${operation}: run result did not contain changes`,
+        }),
     ),
   );
 

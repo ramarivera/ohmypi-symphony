@@ -1,11 +1,22 @@
-import { describe, expect, it } from "vitest";
 import { Effect, Option, Redacted, Schema } from "effect";
-import { createAdminHandle, csrfHash, deriveCsrfToken, type AdminDeps } from "../src/services/admin.js";
-import { AdminSessionRepo, InstallationRepo, RunEventRepo, RunRepo, WorkspaceRepo } from "../src/services/store/repositories.js";
-import type { RepositoryRecord } from "../src/domain/models.js";
-import { OrganizationId } from "../src/domain/ids.js";
+import { describe, expect, it } from "vitest";
 import { WorkspaceError } from "../src/domain/errors.js";
+import { OrganizationId } from "../src/domain/ids.js";
+import type { RepositoryRecord } from "../src/domain/models.js";
+import {
+  type AdminDeps,
+  createAdminHandle,
+  csrfHash,
+  deriveCsrfToken,
+} from "../src/services/admin.js";
 import type { GatewayConfigShape } from "../src/services/config.js";
+import {
+  AdminSessionRepo,
+  InstallationRepo,
+  RunEventRepo,
+  RunRepo,
+  WorkspaceRepo,
+} from "../src/services/store/repositories.js";
 
 const unreachable = (..._args: ReadonlyArray<unknown>) => Effect.never;
 const token = "admin-token";
@@ -31,7 +42,13 @@ const config: GatewayConfigShape = {
 const deps: AdminDeps = {
   config,
   adminSessionRepo: AdminSessionRepo.make({
-    get: () => Effect.succeed(Option.some({ organizationId, csrfTokenHash: csrfHash(deriveCsrfToken(token)) })),
+    get: () =>
+      Effect.succeed(
+        Option.some({
+          organizationId,
+          csrfTokenHash: csrfHash(deriveCsrfToken(token)),
+        }),
+      ),
     create: unreachable,
     deleteAdminSession: unreachable,
   }),

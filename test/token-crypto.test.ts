@@ -1,6 +1,6 @@
-import { describe, it, expect } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Either, Layer, Schema } from "effect";
-import { TokenCrypto, TokenCipherError } from "../src/services/token-crypto.js";
+import { TokenCipherError, TokenCrypto } from "../src/services/token-crypto.js";
 
 const testKey = new Uint8Array(32).fill(0x42);
 const testKeyBase64 = Buffer.from(testKey).toString("base64");
@@ -16,7 +16,9 @@ const TestLive = TokenCrypto.Default.pipe(
 const tamper = (encoded: string): string => {
   const bytes = new Uint8Array(Buffer.from(encoded, "base64url"));
   const index = 1 + IV_BYTES;
-  bytes[index] = bytes[index]! ^ 0xff;
+  const value = bytes[index];
+  if (value === undefined) throw new Error("Encrypted payload is truncated");
+  bytes[index] = value ^ 0xff;
   return Buffer.from(bytes).toString("base64url");
 };
 

@@ -1,7 +1,6 @@
 import { Clock, Effect, Option, Schema } from "effect";
 import { OrganizationId } from "../../domain/ids.js";
-import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
-import { SqliteClient, tryDb, runChanges, decodeRow } from "./sqlite-client.js";
+import { decodeRow, runChanges, SqliteClient, tryDb } from "./sqlite-client.js";
 
 const AdminSessionRow = Schema.Struct({
   token_hash: Schema.String,
@@ -20,33 +19,41 @@ export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
     effect: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
-      const create = Effect.fn("AdminSessionRepo.create")(
-        function* (input: {
-          readonly organizationId: OrganizationId;
-          readonly tokenHash: string;
-          readonly csrfTokenHash: string;
-          readonly expiresAt: number;
-          readonly now?: number;
-        }) { yield* Effect.annotateCurrentSpan("organizationId", input.organizationId);
+      const create = Effect.fn("AdminSessionRepo.create")(function* (input: {
+        readonly organizationId: OrganizationId;
+        readonly tokenHash: string;
+        readonly csrfTokenHash: string;
+        readonly expiresAt: number;
+        readonly now?: number;
+      }) {
+        yield* Effect.annotateCurrentSpan(
+          "organizationId",
+          input.organizationId,
+        );
         const now = input.now ?? (yield* Clock.currentTimeMillis);
-        yield* tryDb(() =>
-          db
-            .query(`
+        yield* tryDb(
+          () =>
+            db
+              .query(`
               INSERT INTO admin_session (token_hash, organization_id, csrf_token_hash, expires_at, created_at)
               VALUES (?, ?, ?, ?, ?)
             `)
-            .run(
-              input.tokenHash,
-              input.organizationId,
-              input.csrfTokenHash,
-              input.expiresAt,
-              now,
-            ), "AdminSessionRepo.create"); },
-      );
+              .run(
+                input.tokenHash,
+                input.organizationId,
+                input.csrfTokenHash,
+                input.expiresAt,
+                now,
+              ),
+          "AdminSessionRepo.create",
+        );
+      });
 
-      const get = Effect.fn("AdminSessionRepo.get")(
-        function* (tokenHash: string,
-        now?: number,) { yield* Effect.annotateCurrentSpan("tokenHash", tokenHash);
+      const get = Effect.fn("AdminSessionRepo.get")(function* (
+        tokenHash: string,
+        now?: number,
+      ) {
+        yield* Effect.annotateCurrentSpan("tokenHash", tokenHash);
         const at = now ?? (yield* Clock.currentTimeMillis);
         const row = yield* tryDb(
           () =>
@@ -62,11 +69,13 @@ export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
         return Option.some({
           organizationId: decoded.organization_id,
           csrfTokenHash: decoded.csrf_token_hash,
-        }); },
-      );
+        });
+      });
 
-      const deleteAdminSession = Effect.fn("AdminSessionRepo.deleteAdminSession")(
-        function* (tokenHash: string) { yield* Effect.annotateCurrentSpan("tokenHash", tokenHash);
+      const deleteAdminSession = Effect.fn(
+        "AdminSessionRepo.deleteAdminSession",
+      )(function* (tokenHash: string) {
+        yield* Effect.annotateCurrentSpan("tokenHash", tokenHash);
         const result = yield* tryDb(
           () =>
             db
@@ -74,10 +83,13 @@ export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
               .run(tokenHash),
           "AdminSessionRepo.deleteAdminSession",
         );
-        return (yield* runChanges(result, "AdminSessionRepo.deleteAdminSession")) === 1; },
-      );
+        return (
+          (yield* runChanges(result, "AdminSessionRepo.deleteAdminSession")) ===
+          1
+        );
+      });
 
       return { create, get, deleteAdminSession };
     }),
-  }
+  },
 ) {}

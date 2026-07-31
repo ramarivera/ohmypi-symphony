@@ -1,4 +1,4 @@
-import { describe, expect, it, test } from "@effect/vitest"
+import { describe, expect, it, test } from "@effect/vitest";
 import { Schema } from "effect";
 import {
   type RunDetailModel,
@@ -371,9 +371,7 @@ describe("redaction invariants", () => {
       const redactedBearer = redact(bearer);
       expect(redactedBearer).toBe("Authorization: Bearer redacted");
 
-      const redactedQuery = redact(
-        `https://example.test/?${kind}=${secret}`,
-      );
+      const redactedQuery = redact(`https://example.test/?${kind}=${secret}`);
       const redactedQueryParams = new URL(redactedQuery).searchParams;
       expect(redactedQueryParams.get(kind)).toBe("redacted");
       expect(redactedQueryParams.get(kind)).not.toBe(secret);

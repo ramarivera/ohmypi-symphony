@@ -2,29 +2,29 @@ import { HttpServer } from "@effect/platform";
 import { BunHttpServer } from "@effect/platform-bun";
 import { Effect, Layer, Schedule } from "effect";
 import { router } from "./http/router.js";
+import { Admin } from "./services/admin.js";
+import { GatewayConfig } from "./services/config.js";
+import { LinearGateway } from "./services/linear-gateway.js";
+import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
+import { OAuth } from "./services/oauth.js";
+import { ActivityProjector } from "./services/projector.js";
+import { Reconciler } from "./services/reconciler.js";
+import { RpcWorker } from "./services/rpc-worker.js";
+import { SessionAuthority } from "./services/session-authority.js";
 import {
-  ActivityProjector,
   AdminSessionRepo,
-  Admin,
   DeliveryRepo,
   InstallationRepo,
-  LinearGateway,
-  OAuth,
   ProjectionRepo,
-  Reconciler,
-  RpcWorker,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
-  SessionAuthority,
-  WebhookPipeline,
-  Workspace,
   WorkspaceRepo,
-} from "./services/contracts.js";
-import { GatewayConfig } from "./services/config.js";
-import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
-import { TokenCrypto } from "./services/token-crypto.js";
+} from "./services/store/repositories.js";
 import { SqliteClientLive } from "./services/store/sqlite-client.js";
+import { TokenCrypto } from "./services/token-crypto.js";
+import { WebhookPipeline } from "./services/webhook.js";
+import { Workspace } from "./services/workspace.js";
 
 const sqliteClientLayer = Layer.unwrapEffect(
   Effect.gen(function* () {
@@ -53,10 +53,7 @@ const serviceLayers = GatewayConfig.Default.pipe(
   Layer.merge(Workspace.Default),
   Layer.merge(OAuth.Default),
   Layer.merge(Admin.Default),
-).pipe(
-  Layer.provide(sqliteClientLayer),
-  Layer.provide(GatewayConfig.Default),
-);
+).pipe(Layer.provide(sqliteClientLayer), Layer.provide(GatewayConfig.Default));
 
 const scheduledReconciler = Layer.unwrapEffect(
   Effect.gen(function* () {

@@ -34,7 +34,6 @@ const positiveInteger = (name: string, fallback: number) =>
     }),
   );
 
-
 const LOG_LEVELS: ReadonlySet<string> = new Set([
   "trace",
   "debug",
@@ -73,70 +72,76 @@ const GatewayConfigValues = Config.all({
   webhookReplayWindowMs: positiveInteger("WEBHOOK_REPLAY_WINDOW_MS", 60_000),
 });
 
-const requiredValue = Effect.fn("GatewayConfig.requiredValue")(
-  function* (name: string) {
-    const direct = yield* Config.option(Config.string(name));
-    if (Option.isSome(direct)) {
-      const value = direct.value.trim();
-      if (value.length > 0) return value;
-    }
+const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
+  name: string,
+) {
+  const direct = yield* Config.option(Config.string(name));
+  if (Option.isSome(direct)) {
+    const value = direct.value.trim();
+    if (value.length > 0) return value;
+  }
 
-    const filePath = yield* Config.option(Config.string(`${name}_FILE`));
-    if (Option.isSome(filePath) && filePath.value.trim().length > 0) {
-      const path = filePath.value.trim();
-      const value = yield* Effect.tryPromise({
-        try: () => Bun.file(path).text(),
-        catch: (error) =>
-          ConfigError.InvalidData(
-            [`${name}_FILE`],
-            `Could not read ${name} from ${path}: ${String(error)}`,
-          ),
-      });
-      const trimmed = value.trim();
-      if (trimmed.length > 0) return trimmed;
-    }
-
-    return yield* Effect.fail(
-      ConfigError.MissingData(
-        [name],
-        `Missing required environment variable ${name} or ${name}_FILE`,
-      ),
-    );
-  },
-);
-
-export class GatewayConfig extends Effect.Service<GatewayConfig>()("GatewayConfig", {
-  accessors: true,
-  effect: Effect.gen(function* () {
-    const values = yield* Config.unwrap(GatewayConfigValues);
-    const linearClientId = yield* requiredValue("LINEAR_CLIENT_ID");
-    const linearClientSecret = yield* requiredValue("LINEAR_CLIENT_SECRET");
-    const linearWebhookSecret = yield* requiredValue("LINEAR_WEBHOOK_SECRET");
-    const tokenEncryptionKey = yield* requiredValue("TOKEN_ENCRYPTION_KEY");
-    const publicUrlValue = yield* requiredValue("PUBLIC_URL");
-    const publicUrl = yield* Effect.try({
-      try: () => new URL(publicUrlValue),
-      catch: () =>
+  const filePath = yield* Config.option(Config.string(`${name}_FILE`));
+  if (Option.isSome(filePath) && filePath.value.trim().length > 0) {
+    const path = filePath.value.trim();
+    const value = yield* Effect.tryPromise({
+      try: () => Bun.file(path).text(),
+      catch: (error) =>
         ConfigError.InvalidData(
-          ["PUBLIC_URL"],
-          "PUBLIC_URL must be a valid URL",
+          [`${name}_FILE`],
+          `Could not read ${name} from ${path}: ${String(error)}`,
         ),
     });
-    if (publicUrl.protocol !== "https:" && publicUrl.hostname !== "localhost") {
-      return yield* Effect.fail(
-        ConfigError.InvalidData(
-          ["PUBLIC_URL"],
-          "PUBLIC_URL must use HTTPS except on localhost",
-        ),
-      );
-    }
-    return {
-      ...values,
-      linearClientId,
-      linearClientSecret: Redacted.make(linearClientSecret),
-      linearWebhookSecret: Redacted.make(linearWebhookSecret),
-      tokenEncryptionKey: Redacted.make(tokenEncryptionKey),
-      publicUrl,
-    };
-  }),
-}) {}
+    const trimmed = value.trim();
+    if (trimmed.length > 0) return trimmed;
+  }
+
+  return yield* Effect.fail(
+    ConfigError.MissingData(
+      [name],
+      `Missing required environment variable ${name} or ${name}_FILE`,
+    ),
+  );
+});
+
+export class GatewayConfig extends Effect.Service<GatewayConfig>()(
+  "GatewayConfig",
+  {
+    accessors: true,
+    effect: Effect.gen(function* () {
+      const values = yield* Config.unwrap(GatewayConfigValues);
+      const linearClientId = yield* requiredValue("LINEAR_CLIENT_ID");
+      const linearClientSecret = yield* requiredValue("LINEAR_CLIENT_SECRET");
+      const linearWebhookSecret = yield* requiredValue("LINEAR_WEBHOOK_SECRET");
+      const tokenEncryptionKey = yield* requiredValue("TOKEN_ENCRYPTION_KEY");
+      const publicUrlValue = yield* requiredValue("PUBLIC_URL");
+      const publicUrl = yield* Effect.try({
+        try: () => new URL(publicUrlValue),
+        catch: () =>
+          ConfigError.InvalidData(
+            ["PUBLIC_URL"],
+            "PUBLIC_URL must be a valid URL",
+          ),
+      });
+      if (
+        publicUrl.protocol !== "https:" &&
+        publicUrl.hostname !== "localhost"
+      ) {
+        return yield* Effect.fail(
+          ConfigError.InvalidData(
+            ["PUBLIC_URL"],
+            "PUBLIC_URL must use HTTPS except on localhost",
+          ),
+        );
+      }
+      return {
+        ...values,
+        linearClientId,
+        linearClientSecret: Redacted.make(linearClientSecret),
+        linearWebhookSecret: Redacted.make(linearWebhookSecret),
+        tokenEncryptionKey: Redacted.make(tokenEncryptionKey),
+        publicUrl,
+      };
+    }),
+  },
+) {}

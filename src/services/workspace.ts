@@ -1,18 +1,24 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import type { Stats } from "node:fs";
-import { join, relative, resolve, sep } from "node:path";
+import { join, relative, sep } from "node:path";
 import { Effect, Option } from "effect";
-import { DatabaseError, RowDecodeError, WorkspaceError } from "../domain/errors.js";
+import {
+  type DatabaseError,
+  type RowDecodeError,
+  WorkspaceError,
+} from "../domain/errors.js";
 import type { OrganizationId } from "../domain/ids.js";
-import { WorkspaceRepo } from "./store/repositories.js";
-import { GatewayConfig } from "./config.js";
 import type { RepositoryRecord } from "../domain/models.js";
+import { GatewayConfig } from "./config.js";
+import { WorkspaceRepo } from "./store/repositories.js";
 
 export type RepositoryResolution =
   | { readonly kind: "match"; readonly repository: RepositoryRecord }
   | { readonly kind: "none" }
-  | { readonly kind: "ambiguous"; readonly repositories: ReadonlyArray<RepositoryRecord> };
+  | {
+      readonly kind: "ambiguous";
+      readonly repositories: ReadonlyArray<RepositoryRecord>;
+    };
 
 interface WorkspaceMarker {
   readonly repositoryId: string;
@@ -30,7 +36,12 @@ interface ResolveContext {
 }
 
 export interface WorkspaceRepoShape {
-  readonly listRepositories: (organizationId: OrganizationId) => Effect.Effect<ReadonlyArray<RepositoryRecord>, DatabaseError | RowDecodeError>;
+  readonly listRepositories: (
+    organizationId: OrganizationId,
+  ) => Effect.Effect<
+    ReadonlyArray<RepositoryRecord>,
+    DatabaseError | RowDecodeError
+  >;
 }
 
 export function safeSessionKey(sessionId: string): string {
@@ -42,7 +53,10 @@ export function isWithin(root: string, candidate: string): boolean {
   return path === "" || (!path.startsWith(`..${sep}`) && path !== "..");
 }
 
-function hasIntersection(haystack: ReadonlyArray<string>, needles: ReadonlyArray<string>): boolean {
+function hasIntersection(
+  haystack: ReadonlyArray<string>,
+  needles: ReadonlyArray<string>,
+): boolean {
   const set = new Set(haystack);
   for (const needle of needles) {
     if (set.has(needle)) return true;
@@ -94,7 +108,14 @@ function parseContext(context: unknown): Option.Option<ResolveContext> {
   });
 }
 
-function resolveFromRepositories(context: ResolveContext, repositories: ReadonlyArray<RepositoryRecord>): RepositoryResolution {
+function onlyItem<A>(items: ReadonlyArray<A>): A | undefined {
+  return items.length === 1 ? items[0] : undefined;
+}
+
+function resolveFromRepositories(
+  context: ResolveContext,
+  repositories: ReadonlyArray<RepositoryRecord>,
+): RepositoryResolution {
   if (context.organizationId === null || repositories.length === 0) {
     return { kind: "none" };
   }
@@ -102,7 +123,8 @@ function resolveFromRepositories(context: ResolveContext, repositories: Readonly
   const repositoryId = context.repositoryId;
   if (repositoryId !== null) {
     const match = repositories.find(
-      (repository) => repository.id.toLowerCase() === repositoryId.toLowerCase(),
+      (repository) =>
+        repository.id.toLowerCase() === repositoryId.toLowerCase(),
     );
     return match ? { kind: "match", repository: match } : { kind: "none" };
   }
@@ -111,7 +133,8 @@ function resolveFromRepositories(context: ResolveContext, repositories: Readonly
     const matches = repositories.filter((repository) =>
       hasIntersection(repository.labels, context.issueLabels),
     );
-    if (matches.length === 1) return { kind: "match", repository: matches[0]! };
+    const match = onlyItem(matches);
+    if (match !== undefined) return { kind: "match", repository: match };
     if (matches.length > 1) return { kind: "ambiguous", repositories: matches };
   }
 
@@ -119,16 +142,19 @@ function resolveFromRepositories(context: ResolveContext, repositories: Readonly
     const matches = repositories.filter((repository) =>
       hasIntersection(repository.labels, context.projectLabels),
     );
-    if (matches.length === 1) return { kind: "match", repository: matches[0]! };
+    const match = onlyItem(matches);
+    if (match !== undefined) return { kind: "match", repository: match };
     if (matches.length > 1) return { kind: "ambiguous", repositories: matches };
   }
 
-  const projectId = context.projectId !== null ? context.projectId.toLowerCase() : null;
+  const projectId =
+    context.projectId !== null ? context.projectId.toLowerCase() : null;
   if (projectId !== null) {
     const matches = repositories.filter((repository) =>
       repository.projectIds.some((id) => id.toLowerCase() === projectId),
     );
-    if (matches.length === 1) return { kind: "match", repository: matches[0]! };
+    const match = onlyItem(matches);
+    if (match !== undefined) return { kind: "match", repository: match };
     if (matches.length > 1) return { kind: "ambiguous", repositories: matches };
   }
 
@@ -137,31 +163,37 @@ function resolveFromRepositories(context: ResolveContext, repositories: Readonly
     const matches = repositories.filter((repository) =>
       repository.teamIds.some((id) => id.toLowerCase() === teamId),
     );
-    if (matches.length === 1) return { kind: "match", repository: matches[0]! };
+    const match = onlyItem(matches);
+    if (match !== undefined) return { kind: "match", repository: match };
     if (matches.length > 1) return { kind: "ambiguous", repositories: matches };
   }
 
-  const defaultRepository = repositories.find((repository) => repository.isDefault);
-  if (defaultRepository) return { kind: "match", repository: defaultRepository };
+  const defaultRepository = repositories.find(
+    (repository) => repository.isDefault,
+  );
+  if (defaultRepository)
+    return { kind: "match", repository: defaultRepository };
   return { kind: "none" };
 }
 
 const enoent = (error: unknown): error is Error & { code: "ENOENT" } =>
   error instanceof Error && "code" in error && error.code === "ENOENT";
 
-const workspaceFailure = (
-  message: string,
-  reason: WorkspaceError["reason"],
-  sessionId: string,
-) => (cause: unknown) =>
-  new WorkspaceError({
-    message,
-    sessionId,
-    reason,
-    cause: cause instanceof Error ? cause.message : String(cause),
-  });
+const workspaceFailure =
+  (message: string, reason: WorkspaceError["reason"], sessionId: string) =>
+  (cause: unknown) =>
+    new WorkspaceError({
+      message,
+      sessionId,
+      reason,
+      cause: cause instanceof Error ? cause.message : String(cause),
+    });
 
-const runGit = (args: ReadonlyArray<string>, cwd: string | undefined, sessionId: string) =>
+const runGit = (
+  args: ReadonlyArray<string>,
+  cwd: string | undefined,
+  sessionId: string,
+) =>
   Effect.tryPromise({
     try: async () => {
       const process = Bun.spawn(["git", ...args], {
@@ -180,7 +212,11 @@ const runGit = (args: ReadonlyArray<string>, cwd: string | undefined, sessionId:
     catch: workspaceFailure("git command failed", "git_failed", sessionId),
   });
 
-const lstatOrMissing = (path: string, sessionId: string, reason: WorkspaceError["reason"]) =>
+const lstatOrMissing = (
+  path: string,
+  sessionId: string,
+  reason: WorkspaceError["reason"],
+) =>
   Effect.tryPromise({
     try: () =>
       lstat(path).then(
@@ -193,7 +229,11 @@ const lstatOrMissing = (path: string, sessionId: string, reason: WorkspaceError[
     catch: workspaceFailure(`lstat failed for ${path}`, reason, sessionId),
   });
 
-const realpathOrFail = (path: string, sessionId: string, reason: WorkspaceError["reason"]) =>
+const realpathOrFail = (
+  path: string,
+  sessionId: string,
+  reason: WorkspaceError["reason"],
+) =>
   Effect.tryPromise({
     try: () => realpath(path),
     catch: workspaceFailure(`realpath failed for ${path}`, reason, sessionId),
@@ -202,16 +242,28 @@ const realpathOrFail = (path: string, sessionId: string, reason: WorkspaceError[
 const mkdirOrFail = (path: string, sessionId: string) =>
   Effect.tryPromise({
     try: () => mkdir(path, { recursive: true }),
-    catch: workspaceFailure(`mkdir failed for ${path}`, "root_not_directory", sessionId),
+    catch: workspaceFailure(
+      `mkdir failed for ${path}`,
+      "root_not_directory",
+      sessionId,
+    ),
   });
 
 const readFileOrFail = (path: string, sessionId: string) =>
   Effect.tryPromise({
     try: () => readFile(path, "utf8"),
-    catch: workspaceFailure(`read marker failed for ${path}`, "marker_mismatch", sessionId),
+    catch: workspaceFailure(
+      `read marker failed for ${path}`,
+      "marker_mismatch",
+      sessionId,
+    ),
   });
 
-const writeMarker = (markerPath: string, repository: RepositoryRecord, sessionId: string) =>
+const writeMarker = (
+  markerPath: string,
+  repository: RepositoryRecord,
+  sessionId: string,
+) =>
   Effect.tryPromise({
     try: () =>
       writeFile(
@@ -223,12 +275,20 @@ const writeMarker = (markerPath: string, repository: RepositoryRecord, sessionId
         }),
         { encoding: "utf8", mode: 0o600, flag: "wx" },
       ),
-    catch: workspaceFailure("write workspace marker failed", "git_failed", sessionId),
+    catch: workspaceFailure(
+      "write workspace marker failed",
+      "git_failed",
+      sessionId,
+    ),
   });
 
 const ensureRoot = (root: string, sessionId: string) =>
   Effect.gen(function* () {
-    const existing = yield* lstatOrMissing(root, sessionId, "root_not_directory");
+    const existing = yield* lstatOrMissing(
+      root,
+      sessionId,
+      "root_not_directory",
+    );
     if (Option.isSome(existing)) {
       if (existing.value.isSymbolicLink() || !existing.value.isDirectory()) {
         return yield* Effect.fail(
@@ -251,7 +311,11 @@ const validateExistingTarget = (
   sessionId: string,
 ) =>
   Effect.gen(function* () {
-    const canonicalTarget = yield* realpathOrFail(target, sessionId, "path_escapes_root");
+    const canonicalTarget = yield* realpathOrFail(
+      target,
+      sessionId,
+      "path_escapes_root",
+    );
     if (!isWithin(canonicalRoot, canonicalTarget)) {
       return yield* Effect.fail(
         new WorkspaceError({
@@ -292,124 +356,162 @@ export const makeWorkspace = (input: {
   readonly repo: WorkspaceRepoShape;
 }) =>
   Effect.gen(function* () {
-    const resolve = Effect.fn("Workspace.resolve")(
-      function* (context: unknown): Effect.fn.Return<RepositoryResolution, DatabaseError | RowDecodeError> {
-        const parsed = parseContext(context);
-        if (Option.isNone(parsed)) {
-          yield* Effect.logWarning("Workspace resolve rejected: invalid context", {
+    const resolve = Effect.fn("Workspace.resolve")(function* (
+      context: unknown,
+    ): Effect.fn.Return<RepositoryResolution, DatabaseError | RowDecodeError> {
+      const parsed = parseContext(context);
+      if (Option.isNone(parsed)) {
+        yield* Effect.logWarning(
+          "Workspace resolve rejected: invalid context",
+          {
             reason: "invalid_context",
-          });
-          return { kind: "none" };
-        }
+          },
+        );
+        return { kind: "none" };
+      }
 
-        if (parsed.value.organizationId === null) {
-          return { kind: "none" };
-        }
+      if (parsed.value.organizationId === null) {
+        return { kind: "none" };
+      }
 
-        const repositories = yield* input.repo.listRepositories(parsed.value.organizationId as OrganizationId);
-        const resolution = resolveFromRepositories(parsed.value, repositories);
+      const repositories = yield* input.repo.listRepositories(
+        parsed.value.organizationId as OrganizationId,
+      );
+      const resolution = resolveFromRepositories(parsed.value, repositories);
 
-        yield* Effect.annotateCurrentSpan({
-          "workspace.organization_id": parsed.value.organizationId,
-          "workspace.resolution_kind": resolution.kind,
+      yield* Effect.annotateCurrentSpan({
+        "workspace.organization_id": parsed.value.organizationId,
+        "workspace.resolution_kind": resolution.kind,
+      });
+
+      if (resolution.kind === "match") {
+        yield* Effect.logInfo("Repository resolved", {
+          event: "repository.resolved",
+          organizationId: parsed.value.organizationId,
+          repositoryId: resolution.repository.id,
+          repositoryUrl: resolution.repository.url,
         });
-
-        if (resolution.kind === "match") {
-          yield* Effect.logInfo("Repository resolved", {
-            event: "repository.resolved",
-            organizationId: parsed.value.organizationId,
-            repositoryId: resolution.repository.id,
-            repositoryUrl: resolution.repository.url,
-          });
-        } else if (resolution.kind === "ambiguous") {
-          yield* Effect.logInfo("Repository resolution ambiguous", {
-            event: "repository.ambiguous",
-            organizationId: parsed.value.organizationId,
-            repositoryIds: resolution.repositories.map((r) => r.id),
-          });
-        }
-
-        return resolution;
-      },
-    );
-
-    const materialize = Effect.fn("Workspace.materialize")(
-      function* (sessionId: string, repository: RepositoryRecord): Effect.fn.Return<string, WorkspaceError> {
-        yield* Effect.annotateCurrentSpan({
-          "workspace.session_id": sessionId,
-          "workspace.repository_id": repository.id,
+      } else if (resolution.kind === "ambiguous") {
+        yield* Effect.logInfo("Repository resolution ambiguous", {
+          event: "repository.ambiguous",
+          organizationId: parsed.value.organizationId,
+          repositoryIds: resolution.repositories.map((r) => r.id),
         });
+      }
 
-        const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
-        const target = join(canonicalRoot, safeSessionKey(sessionId));
+      return resolution;
+    });
 
-        if (!isWithin(canonicalRoot, target)) {
+    const materialize = Effect.fn("Workspace.materialize")(function* (
+      sessionId: string,
+      repository: RepositoryRecord,
+    ): Effect.fn.Return<string, WorkspaceError> {
+      yield* Effect.annotateCurrentSpan({
+        "workspace.session_id": sessionId,
+        "workspace.repository_id": repository.id,
+      });
+
+      const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
+      const target = join(canonicalRoot, safeSessionKey(sessionId));
+
+      if (!isWithin(canonicalRoot, target)) {
+        return yield* Effect.fail(
+          new WorkspaceError({
+            message: "Workspace path escapes configured root",
+            sessionId,
+            reason: "path_escapes_root",
+          }),
+        );
+      }
+
+      const targetStats = yield* lstatOrMissing(
+        target,
+        sessionId,
+        "target_not_directory",
+      );
+      const markerPath = join(target, ".linear-gateway-workspace.json");
+
+      if (Option.isSome(targetStats)) {
+        if (
+          targetStats.value.isSymbolicLink() ||
+          !targetStats.value.isDirectory()
+        ) {
           return yield* Effect.fail(
             new WorkspaceError({
-              message: "Workspace path escapes configured root",
+              message: "Workspace target is not a real directory",
               sessionId,
-              reason: "path_escapes_root",
+              reason: "target_not_directory",
             }),
           );
         }
 
-        const targetStats = yield* lstatOrMissing(target, sessionId, "target_not_directory");
-        const markerPath = join(target, ".linear-gateway-workspace.json");
+        const canonicalTarget = yield* validateExistingTarget(
+          canonicalRoot,
+          target,
+          sessionId,
+        );
+        yield* validateMarker(markerPath, repository, sessionId);
 
-        if (Option.isSome(targetStats)) {
-          if (targetStats.value.isSymbolicLink() || !targetStats.value.isDirectory()) {
-            return yield* Effect.fail(
-              new WorkspaceError({
-                message: "Workspace target is not a real directory",
-                sessionId,
-                reason: "target_not_directory",
-              }),
-            );
-          }
-
-          const canonicalTarget = yield* validateExistingTarget(canonicalRoot, target, sessionId);
-          yield* validateMarker(markerPath, repository, sessionId);
-
-          yield* Effect.logInfo("Workspace ready (reused)", {
-            event: "workspace.ready",
-            repositoryId: repository.id,
-            path: canonicalTarget,
-            reused: true,
-          });
-
-          return canonicalTarget;
-        }
-
-        yield* runGit(["clone", "--no-checkout", "--filter=blob:none", repository.url, target], undefined, sessionId);
-        yield* runGit(["fetch", "--depth=1", "origin", repository.ref], target, sessionId);
-        yield* runGit(["checkout", "--detach", "--force", "FETCH_HEAD"], target, sessionId);
-        yield* writeMarker(markerPath, repository, sessionId);
-
-        const finalTarget = yield* realpathOrFail(target, sessionId, "path_escapes_root");
-        if (!isWithin(canonicalRoot, finalTarget)) {
-          return yield* Effect.fail(
-            new WorkspaceError({
-              message: "Materialized workspace resolves outside configured root",
-              sessionId,
-              reason: "path_escapes_root",
-            }),
-          );
-        }
-
-        yield* Effect.logInfo("Workspace ready", {
+        yield* Effect.logInfo("Workspace ready (reused)", {
           event: "workspace.ready",
           repositoryId: repository.id,
-          path: finalTarget,
-          reused: false,
+          path: canonicalTarget,
+          reused: true,
         });
 
-        return finalTarget;
-      },
-    );
+        return canonicalTarget;
+      }
+
+      yield* runGit(
+        [
+          "clone",
+          "--no-checkout",
+          "--filter=blob:none",
+          repository.url,
+          target,
+        ],
+        undefined,
+        sessionId,
+      );
+      yield* runGit(
+        ["fetch", "--depth=1", "origin", repository.ref],
+        target,
+        sessionId,
+      );
+      yield* runGit(
+        ["checkout", "--detach", "--force", "FETCH_HEAD"],
+        target,
+        sessionId,
+      );
+      yield* writeMarker(markerPath, repository, sessionId);
+
+      const finalTarget = yield* realpathOrFail(
+        target,
+        sessionId,
+        "path_escapes_root",
+      );
+      if (!isWithin(canonicalRoot, finalTarget)) {
+        return yield* Effect.fail(
+          new WorkspaceError({
+            message: "Materialized workspace resolves outside configured root",
+            sessionId,
+            reason: "path_escapes_root",
+          }),
+        );
+      }
+
+      yield* Effect.logInfo("Workspace ready", {
+        event: "workspace.ready",
+        repositoryId: repository.id,
+        path: finalTarget,
+        reused: false,
+      });
+
+      return finalTarget;
+    });
 
     return { resolve, materialize };
   });
-
 
 export class Workspace extends Effect.Service<Workspace>()("Workspace", {
   accessors: true,

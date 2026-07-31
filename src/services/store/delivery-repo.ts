@@ -1,10 +1,13 @@
 import { Clock, Effect, Schema } from "effect";
+import { DatabaseError } from "../../domain/errors.js";
 import type { DeliveryId } from "../../domain/ids.js";
 import {
-  DatabaseError,
-  RowDecodeError,
-} from "../../domain/errors.js";
-import { SqliteClient, tryDb, runChanges, decodeRow, transact } from "./sqlite-client.js";
+  decodeRow,
+  runChanges,
+  SqliteClient,
+  transact,
+  tryDb,
+} from "./sqlite-client.js";
 
 const DeliveryIdentityRow = Schema.Struct({
   payload_hash: Schema.String,
@@ -22,14 +25,14 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
     effect: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
-      const accept = Effect.fn("DeliveryRepo.accept")(
-        function* (input: {
-          readonly id: DeliveryId;
-          readonly organizationId: string;
-          readonly payloadHash: string;
-          readonly payload: unknown;
-          readonly receivedAt?: number;
-        }) { yield* Effect.annotateCurrentSpan("deliveryId", input.id);
+      const accept = Effect.fn("DeliveryRepo.accept")(function* (input: {
+        readonly id: DeliveryId;
+        readonly organizationId: string;
+        readonly payloadHash: string;
+        readonly payload: unknown;
+        readonly receivedAt?: number;
+      }) {
+        yield* Effect.annotateCurrentSpan("deliveryId", input.id);
         const now = input.receivedAt ?? (yield* Clock.currentTimeMillis);
         const result = yield* tryDb(
           () =>
@@ -47,17 +50,17 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
               ),
           "DeliveryRepo.accept",
         );
-        return (yield* runChanges(result, "DeliveryRepo.accept")) === 1; },
-      );
+        return (yield* runChanges(result, "DeliveryRepo.accept")) === 1;
+      });
 
-      const claim = Effect.fn("DeliveryRepo.claim")(
-        function* (input: {
-          readonly id: DeliveryId;
-          readonly organizationId: string;
-          readonly payloadHash: string;
-          readonly payload: unknown;
-          readonly receivedAt?: number;
-        }) { yield* Effect.annotateCurrentSpan("deliveryId", input.id);
+      const claim = Effect.fn("DeliveryRepo.claim")(function* (input: {
+        readonly id: DeliveryId;
+        readonly organizationId: string;
+        readonly payloadHash: string;
+        readonly payload: unknown;
+        readonly receivedAt?: number;
+      }) {
+        yield* Effect.annotateCurrentSpan("deliveryId", input.id);
 
         const tx = Effect.gen(function* () {
           const accepted = yield* accept(input);
@@ -73,7 +76,11 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
             "DeliveryRepo.claim.select",
           );
           if (existing === null) {
-            return yield* Effect.fail(new DatabaseError({ message: `Delivery ${input.id} disappeared` }))
+            return yield* Effect.fail(
+              new DatabaseError({
+                message: `Delivery ${input.id} disappeared`,
+              }),
+            );
           }
           const decoded = yield* decodeRow(
             DeliveryIdentityRow,
@@ -102,25 +109,32 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
             : "duplicate";
         });
 
-        return yield* transact(db, tx); },
-      );
+        return yield* transact(db, tx);
+      });
 
-      const mark = Effect.fn("DeliveryRepo.mark")(
-        function* (id: DeliveryId,
+      const mark = Effect.fn("DeliveryRepo.mark")(function* (
+        id: DeliveryId,
         status: "processed" | "failed",
-        error?: string,) { yield* Effect.annotateCurrentSpan("deliveryId", id);
-        yield* tryDb(() =>
-          db
-            .query(
-              "UPDATE webhook_delivery SET status=?, error=? WHERE delivery_id=?",
-            )
-            .run(status, error ?? null, id), "DeliveryRepo.mark"); },
-      );
+        error?: string,
+      ) {
+        yield* Effect.annotateCurrentSpan("deliveryId", id);
+        yield* tryDb(
+          () =>
+            db
+              .query(
+                "UPDATE webhook_delivery SET status=?, error=? WHERE delivery_id=?",
+              )
+              .run(status, error ?? null, id),
+          "DeliveryRepo.mark",
+        );
+      });
 
       const recoverPendingDeliveries = Effect.fn(
         "DeliveryRepo.recoverPendingDeliveries",
-      )(
-        function* (reason = "Gateway restarted before webhook processing completed",) { const result = yield* tryDb(
+      )(function* (
+        reason = "Gateway restarted before webhook processing completed",
+      ) {
+        const result = yield* tryDb(
           () =>
             db
               .query(
@@ -129,10 +143,13 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
               .run(reason),
           "DeliveryRepo.recoverPendingDeliveries",
         );
-        return yield* runChanges(result, "DeliveryRepo.recoverPendingDeliveries"); },
-      );
+        return yield* runChanges(
+          result,
+          "DeliveryRepo.recoverPendingDeliveries",
+        );
+      });
 
       return { accept, claim, mark, recoverPendingDeliveries };
     }),
-  }
+  },
 ) {}

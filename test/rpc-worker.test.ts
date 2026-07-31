@@ -1,4 +1,4 @@
-import { describe, it, expect } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import { Deferred, Effect, Option } from "effect";
 import { RpcWorker } from "../src/services/rpc-worker.js";
 
@@ -61,7 +61,9 @@ describe("RpcWorker", () => {
 
       yield* Deferred.await(seen);
 
-      const promptResult = events.find((event) => event.type === "prompt_result");
+      const promptResult = events.find(
+        (event) => event.type === "prompt_result",
+      );
       expect(promptResult).toMatchObject({
         type: "prompt_result",
         agentInvoked: false,

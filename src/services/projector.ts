@@ -1,8 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { AgentActivitySignal } from "@linear/sdk";
 import { Clock, Effect, Option, ParseResult, Ref, Schema } from "effect";
 import {
-  DatabaseError,
   type InstallationRevokedError,
   LinearApiError,
   type LinearRateLimitError,
@@ -11,20 +9,11 @@ import {
   type TokenRefreshError,
 } from "../domain/errors.js";
 import { ActivityId, SessionId, SourceKey } from "../domain/ids.js";
-import type {
-  ActivityType,
-  AgentRun,
-  Installation,
-  ProjectionJob,
-  RepositoryRecord,
-  RunEvent,
-  RunInput,
-} from "../domain/models.js";
+import type { ActivityType, ProjectionJob } from "../domain/models.js";
 import { LinearGateway } from "./linear-gateway.js";
 import {
   isActivitySignal,
   isActivityType,
-  isNumber,
   isRecord,
   isString,
 } from "./linear-helpers.js";
