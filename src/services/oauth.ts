@@ -1,21 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Effect, Redacted, Schema } from "effect";
-import type { AppUserId, OrganizationId } from "../domain/ids.js";
+import { LinearApiError, OAuthStateError } from "../domain/errors.js";
 import {
   Installation,
   type Installation as InstallationType,
 } from "../domain/models.js";
-import {
-  LinearApiError,
-  OAuthStateError,
-} from "../domain/errors.js";
+import { GatewayConfig } from "./config.js";
 import {
   buildInstallationRecord,
   discoverAppInstallation,
   parseTokenResponse,
   type TokenResponse,
-} from "../linear-client.js";
-import { GatewayConfig } from "./config.js";
+} from "./linear-oauth.js";
 import { InstallationRepo } from "./store/repositories.js";
 
 const DEFAULT_AUTHORIZE_REDIRECT_PATH = "oauth/callback";
@@ -46,10 +42,7 @@ const exchangeAuthorizationCode = (
   config: GatewayConfig,
   code: string,
   redirectUri: string,
-): Effect.Effect<
-  TokenResponse,
-  LinearApiError
-> =>
+): Effect.Effect<TokenResponse, LinearApiError> =>
   Effect.tryPromise({
     try: async () => {
       const body = new URLSearchParams();
@@ -86,7 +79,10 @@ const exchangeAuthorizationCode = (
 
 const discoverInstallation = (
   accessToken: string,
-): Effect.Effect<{ readonly organizationId: string; readonly appUserId: string }, LinearApiError> =>
+): Effect.Effect<
+  { readonly organizationId: string; readonly appUserId: string },
+  LinearApiError
+> =>
   Effect.tryPromise({
     try: () => discoverAppInstallation(accessToken),
     catch: (error) =>
