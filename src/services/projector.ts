@@ -1,1 +1,1 @@
-export { ActivityProjector } from "./contracts.js";
+export { ActivityProjector, projectionBackoff, rpcEventActivityType } from "./contracts.js";

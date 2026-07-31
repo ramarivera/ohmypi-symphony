@@ -101,17 +101,19 @@ export const RunInput = Schema.Struct({
 });
 export type RunInput = Schema.Schema.Type<typeof RunInput>;
 
+const RunEventStatus = Schema.Literal("observed", "pending", "completed", "failed");
 export const RunEvent = Schema.Struct({
   sourceKey: SourceKey,
   sessionId: SessionId,
   kind: Schema.String,
   level: Schema.Literal("debug", "info", "warn", "result", "error"),
-  status: Schema.Literal("observed", "pending", "completed", "failed"),
+  status: Schema.OptionFromNullOr(RunEventStatus),
   text: NullableString,
   payload: Schema.Unknown,
+  error: NullableString,
   createdAt: Schema.Number,
+  updatedAt: Schema.Number,
 });
-export type RunEvent = Schema.Schema.Type<typeof RunEvent>;
 
 export const ProjectionJob = Schema.Struct({
   sourceKey: SourceKey,
@@ -119,6 +121,7 @@ export const ProjectionJob = Schema.Struct({
   activityType: Schema.String,
   payload: Schema.Unknown,
   attempt: Schema.Number,
+  payloadHash: Schema.String,
   nextAttemptAt: Schema.Number,
   createdAt: Schema.Number,
 });

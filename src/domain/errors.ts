@@ -22,6 +22,6 @@ export class RunLeaseError extends Schema.TaggedError<RunLeaseError>()("@Gateway
 export class RpcSpawnError extends Schema.TaggedError<RpcSpawnError>()("@Gateway/RpcSpawnError", message) {}
 export class RpcProtocolError extends Schema.TaggedError<RpcProtocolError>()("@Gateway/RpcProtocolError", { ...message, method: Schema.String }) {}
 export class RpcTimeoutError extends Schema.TaggedError<RpcTimeoutError>()("@Gateway/RpcTimeoutError", { ...message, method: Schema.String }) {}
-export class WorkspaceError extends Schema.TaggedError<WorkspaceError>()("@Gateway/WorkspaceError", { ...message, sessionId: Schema.String }) {}
+export class WorkspaceError extends Schema.TaggedError<WorkspaceError>()("@Gateway/WorkspaceError", { ...message, sessionId: Schema.String, reason: Schema.Literal("root_not_directory", "root_is_symlink", "path_escapes_root", "target_is_symlink", "target_not_directory", "marker_mismatch", "git_failed") }) {}
 export class OAuthStateError extends Schema.TaggedError<OAuthStateError>()("@Gateway/OAuthStateError", message) {}
 export class InstallationRevokedError extends Schema.TaggedError<InstallationRevokedError>()("@Gateway/InstallationRevokedError", { ...message, organizationId: Schema.String }) {}
