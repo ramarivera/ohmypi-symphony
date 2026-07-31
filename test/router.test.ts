@@ -115,6 +115,47 @@ describe("HTTP router parity", () => {
     expect(triggerCalls).toBe(1);
   });
 
+  it.effect.prop(
+    "triggers reconciliation exactly for generated successful webhook statuses",
+    { status: Schema.Number.pipe(Schema.int(), Schema.between(200, 599)) },
+    ({ status }) => {
+      let triggerCalls = 0;
+      const pipeline: WebhookPipeline = {
+        _tag: "WebhookPipeline",
+        handle: () => Effect.succeed(new Response(null, { status })),
+      };
+      const reconciler: Reconciler = {
+        _tag: "Reconciler",
+        tick: () => Effect.void,
+        trigger: () =>
+          Effect.sync(() => {
+            triggerCalls += 1;
+          }),
+        awaitTrigger: () => Effect.never,
+        status: () =>
+          Effect.succeed({
+            running: false,
+            lastStartedAt: null,
+            lastCompletedAt: null,
+            lastError: null,
+          }),
+      };
+      return Effect.gen(function* () {
+        const response = yield* webhook;
+        expect(response.status).toBe(status);
+        expect(triggerCalls).toBe(status >= 200 && status < 300 ? 1 : 0);
+      }).pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          request("POST", "/webhooks/linear"),
+        ),
+        Effect.provideService(WebhookPipeline, pipeline),
+        Effect.provideService(Reconciler, reconciler),
+      );
+    },
+    { fastCheck: { numRuns: 20 } },
+  );
+
   it("adds legacy security headers and structured lifecycle logging to OAuth start", async () => {
     const logs: string[] = [];
     const logger = Logger.make(({ message }) => {

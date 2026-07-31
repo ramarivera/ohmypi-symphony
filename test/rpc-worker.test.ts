@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Option } from "effect";
+import { Deferred, Effect, Option, Schema } from "effect";
 import { RpcWorker } from "../src/services/rpc-worker.js";
 
 const fixture = new URL("./fixtures/fake-rpc.ts", import.meta.url).pathname;
@@ -164,5 +164,29 @@ describe("RpcWorker", () => {
 
       yield* worker.stop();
     }).pipe(Effect.provide(Live)),
+  );
+
+  it.scopedLive.prop(
+    "generated UI responses preserve protocol framing and worker state",
+    {
+      requestId: Schema.String.pipe(Schema.minLength(1)),
+      confirmed: Schema.Boolean,
+    },
+    ({ requestId, confirmed }) =>
+      Effect.gen(function* () {
+        const rpc = yield* RpcWorker;
+        const worker = yield* rpc.spawn({
+          command: ["bun", "run", fixture],
+          cwd: process.cwd(),
+        });
+        yield* worker.start();
+        return yield* Effect.gen(function* () {
+          yield* worker.respondToUi(requestId, { confirmed });
+          const state = yield* worker.getState();
+          expect(state.sessionId).toBe("omp-test");
+          expect(state.sessionFile).toBe("/safe/session.jsonl");
+        }).pipe(Effect.ensuring(worker.stop()));
+      }).pipe(Effect.provide(Live)),
+    { fastCheck: { numRuns: 20 }, timeout: 120_000 },
   );
 });

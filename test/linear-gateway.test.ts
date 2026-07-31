@@ -81,6 +81,7 @@ vi.mock("@linear/sdk", async () => {
   return { ...actual, LinearClient: sdkState.TestLinearClient };
 });
 
+import { it as effectIt } from "@effect/vitest";
 import { Effect, Exit, Fiber, Layer, Option, Redacted, Schema } from "effect";
 import { beforeEach, describe, expect, it } from "vitest";
 import { LinearRateLimitError } from "../src/domain/errors.js";
@@ -232,6 +233,24 @@ describe("LinearGateway parity", () => {
       signalMetadata: content.signalMetadata,
     });
   });
+
+  effectIt.effect.prop(
+    "forwards every generated activity body without mutation",
+    { body: Schema.String },
+    ({ body }) =>
+      Effect.gen(function* () {
+        sdkState.reset();
+        const gateway = yield* LinearGateway;
+        yield* gateway.createActivity({
+          sessionId,
+          content: { type: "thought", body },
+        });
+        expect(activityBody(sdkState.state.activities.at(-1)?.content)).toBe(
+          body,
+        );
+      }).pipe(Effect.provide(gatewayLayer)),
+    { fastCheck: { numRuns: 20 } },
+  );
 
   it("forwards persisted plan and external URL fields verbatim", async () => {
     const gateway = await getGateway();
