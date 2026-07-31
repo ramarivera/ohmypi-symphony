@@ -46,9 +46,14 @@ const serviceLayers = Layer.mergeAll(
   Admin.Default,
 );
 
-const scheduledReconciler = Layer.scopedDiscard(
-  Effect.repeat(Reconciler.tick(), Schedule.spaced("1 second")).pipe(Effect.forkScoped),
-);
+const scheduledReconciler = Layer.unwrapEffect(
+  Effect.gen(function* () {
+    const config = yield* GatewayConfig;
+    return Layer.scopedDiscard(
+      Effect.repeat(Reconciler.tick(), Schedule.spaced(config.reconcilerIntervalMs)).pipe(Effect.forkScoped),
+    );
+  }),
+).pipe(Layer.provide(serviceLayers));
 
 const serverLayer = Layer.unwrapEffect(
   Effect.map(GatewayConfig, ({ port }) => BunHttpServer.layer({ port })),

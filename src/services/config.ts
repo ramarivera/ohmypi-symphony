@@ -13,6 +13,7 @@ export interface GatewayConfigShape {
   readonly ompCliPath: string;
   readonly port: number;
   readonly leaseDurationMs: number;
+  readonly reconcilerIntervalMs: number;
   readonly webhookReplayWindowMs: number;
 }
 
@@ -55,6 +56,7 @@ const GatewayConfigValues = Config.all({
   ompCliPath: Config.string("OMP_CLI_PATH").pipe(Config.withDefault("omp")),
   port: positiveInteger("PORT", 3000),
   leaseDurationMs: positiveInteger("LEASE_DURATION_MS", 60_000),
+  reconcilerIntervalMs: positiveInteger("RECONCILER_INTERVAL_MS", 1_000),
   webhookReplayWindowMs: positiveInteger("WEBHOOK_REPLAY_WINDOW_MS", 60_000),
 });
 
