@@ -22,6 +22,7 @@ import type {
 } from "../src/domain/ids.js";
 import { type Installation, RunState } from "../src/domain/models.js";
 import {
+  AdminSessionRepo,
   DeliveryRepo,
   InstallationRepo,
   ProjectionRepo,
@@ -38,6 +39,7 @@ const configProvider = ConfigProvider.fromMap(
 );
 
 type RepoServices =
+  | AdminSessionRepo
   | InstallationRepo
   | DeliveryRepo
   | RunRepo
@@ -51,6 +53,7 @@ const withRepos = <A, E>(effect: Effect.Effect<A, E, RepoServices>) =>
     yield* Effect.scope;
     const sqlite = SqliteClientLive(":memory:");
     const repos = Layer.mergeAll(
+      AdminSessionRepo.Default,
       InstallationRepo.Default,
       DeliveryRepo.Default,
       RunRepo.Default,
@@ -1043,4 +1046,149 @@ describe("pure invariants", () => {
         }),
       ),
   );
+  it.scopedLive.prop(
+    "InstallationRepo persists generated installation records and replaces them",
+    {
+      organizationId: Schema.UUID,
+      appUserId: Schema.UUID,
+      accessToken: Schema.String.pipe(Schema.minLength(1)),
+      refreshToken: Schema.String.pipe(Schema.minLength(1)),
+      expiresAt: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+      scopes: Schema.Array(Schema.String),
+      revokedAt: Schema.NullOr(
+        Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+      ),
+      accessibleTeamIds: Schema.NullOr(Schema.Array(Schema.UUID)),
+      canAccessAllPublicTeams: Schema.NullOr(Schema.Boolean),
+    },
+    (input) =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* InstallationRepo;
+          const expected: Installation = {
+            organizationId: makeOrganizationId(input.organizationId),
+            appUserId: makeAppUserId(input.appUserId),
+            accessToken: input.accessToken,
+            refreshToken: input.refreshToken,
+            expiresAt: input.expiresAt,
+            scopes: input.scopes,
+            revokedAt:
+              input.revokedAt === null
+                ? Option.none()
+                : Option.some(input.revokedAt),
+            accessibleTeamIds:
+              input.accessibleTeamIds === null
+                ? Option.none()
+                : Option.some(input.accessibleTeamIds.map(makeTeamId)),
+            canAccessAllPublicTeams:
+              input.canAccessAllPublicTeams === null
+                ? Option.none()
+                : Option.some(input.canAccessAllPublicTeams),
+          };
+          yield* repo.put(expected);
+          expect(yield* repo.get(expected.organizationId)).toEqual(
+            Option.some(expected),
+          );
+
+          const replacement = { ...expected, accessToken: `${input.accessToken}-replacement` };
+          yield* repo.put(replacement);
+          expect(yield* repo.get(expected.organizationId)).toEqual(
+            Option.some(replacement),
+          );
+        }),
+      ),
+  );
+
+  it.scopedLive.prop(
+    "RunInputRepo keeps generated inputs pending exactly once until processed",
+    {
+      sessionId: Schema.UUID,
+      organizationId: Schema.UUID,
+      inputId: Schema.UUID,
+      kind: Schema.Literal("created", "prompted", "stop"),
+      body: Schema.String,
+      marker: Schema.String,
+      createdAt: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+    },
+    ({ sessionId, organizationId, inputId, kind, body, marker, createdAt }) =>
+      withRepos(
+        Effect.gen(function* () {
+          const runRepo = yield* RunRepo;
+          const repo = yield* RunInputRepo;
+          const sid = makeSessionId(sessionId);
+          yield* runRepo.create({
+            sessionId: sid,
+            organizationId: makeOrganizationId(organizationId),
+            issueId: Option.none(),
+            now: createdAt,
+          });
+
+          const input = {
+            id: makeInputId(inputId),
+            sessionId: sid,
+            kind,
+            body,
+            payload: { marker },
+            createdAt,
+          };
+          expect(yield* repo.enqueue(input)).toBe(true);
+          expect(yield* repo.enqueue(input)).toBe(false);
+
+          const pending = yield* repo.pending(sid);
+          expect(pending).toHaveLength(1);
+          expect(pending[0]).toEqual(input);
+          expect(yield* repo.listSessionsWithPendingInputs()).toContain(sid);
+
+          const latest = yield* repo.latestActionableInput(sid);
+          if (kind === "stop") {
+            expect(latest).toEqual(Option.none());
+          } else {
+            expect(latest).toEqual(Option.some({ body, kind }));
+          }
+
+          yield* repo.markProcessed(input.id, createdAt + 1);
+          expect(yield* repo.pending(sid)).toEqual([]);
+        }),
+      ),
+  );
+
+  it.scopedLive.prop(
+    "AdminSessionRepo enforces inclusive expiry and single deletion",
+    {
+      organizationId: Schema.UUID,
+      tokenHash: Schema.String.pipe(Schema.minLength(1)),
+      csrfTokenHash: Schema.String.pipe(Schema.minLength(1)),
+      now: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+      ttl: Schema.Number.pipe(Schema.int(), Schema.between(1, 1_000_000)),
+    },
+    ({ organizationId, tokenHash, csrfTokenHash, now, ttl }) =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* AdminSessionRepo;
+          const organization = makeOrganizationId(organizationId);
+          const expiresAt = now + ttl;
+          yield* repo.create({
+            organizationId: organization,
+            tokenHash,
+            csrfTokenHash,
+            expiresAt,
+            now,
+          });
+
+          expect(yield* repo.get(tokenHash, now)).toEqual(
+            Option.some({ organizationId: organization, csrfTokenHash }),
+          );
+          expect(yield* repo.get(tokenHash, expiresAt)).toEqual(
+            Option.some({ organizationId: organization, csrfTokenHash }),
+          );
+          expect(yield* repo.get(tokenHash, expiresAt + 1)).toEqual(
+            Option.none(),
+          );
+          expect(yield* repo.deleteAdminSession(tokenHash)).toBe(true);
+          expect(yield* repo.deleteAdminSession(tokenHash)).toBe(false);
+          expect(yield* repo.get(tokenHash, now)).toEqual(Option.none());
+        }),
+      ),
+  );
+
 });
