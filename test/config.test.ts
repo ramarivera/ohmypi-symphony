@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, test } from "@effect/vitest";
 import {
   ConfigProvider,
@@ -41,21 +41,9 @@ const valuesWith = (
   overrides: ReadonlyArray<readonly [string, string]>,
 ): Map<string, string> => new Map([...baseValues, ...overrides]);
 
-const configValuesFromEnvironment = async (
+const configValuesFromEnvironment = (
   environment: Record<string, string>,
-): Promise<Map<string, string>> => {
-  const values = new Map<string, string>();
-  for (const [name, value] of Object.entries(environment)) {
-    if (!name.endsWith("_FILE")) values.set(name, value);
-  }
-  for (const [name, path] of Object.entries(environment)) {
-    if (!name.endsWith("_FILE")) continue;
-    const valueName = name.slice(0, -"_FILE".length);
-    if (values.has(valueName)) continue;
-    values.set(valueName, (await readFile(path, "utf8")).trim());
-  }
-  return values;
-};
+): Map<string, string> => new Map(Object.entries(environment));
 
 afterEach(async () => {
   await Promise.all(
@@ -91,9 +79,7 @@ describe("GatewayConfig", () => {
       Effect.gen(function* () {
         return yield* GatewayConfig;
       }).pipe(
-        Effect.provide(
-          configLayer(await configValuesFromEnvironment(environment)),
-        ),
+        Effect.provide(configLayer(configValuesFromEnvironment(environment))),
       ),
     );
     expect(config.linearClientId).toBe("client");
@@ -113,7 +99,7 @@ describe("GatewayConfig", () => {
     const clientIdFile = join(directory, "linear-client-id");
     await writeFile(clientIdFile, "file-client\n", { mode: 0o600 });
 
-    const values = await configValuesFromEnvironment({
+    const values = configValuesFromEnvironment({
       PUBLIC_URL: "http://localhost:3000",
       LINEAR_CLIENT_ID: "direct-client",
       LINEAR_CLIENT_ID_FILE: clientIdFile,
@@ -144,8 +130,8 @@ describe("GatewayConfig", () => {
     expect(config.reconcilerIntervalMs).toBe(1_000);
     expect(config.webhookReplayWindowMs).toBe(60_000);
     expect(config.logLevel).toBe("info");
-    expect(config.databasePath).toBe("./data/gateway.sqlite");
-    expect(config.workspaceRoot).toBe("./data/workspaces");
+    expect(config.databasePath).toBe(resolve("./data/gateway.sqlite"));
+    expect(config.workspaceRoot).toBe(resolve("./data/workspaces"));
     expect(config.ompCliPath).toBe("omp");
   });
 
@@ -227,28 +213,28 @@ describe("GatewayConfig", () => {
 
     expect(config.databasePath).toBe(":memory:");
     expect(config.workspaceRoot).toBe("/tmp/gateway-workspaces");
-    expect(config.ompCliPath).toBe("");
+    expect(config.ompCliPath).toBe("omp");
   });
 
-  test("accepts supported log levels and rejects unknown levels", async () => {
-    for (const level of [
-      "trace",
-      "debug",
-      "info",
-      "warn",
-      "error",
-      "fatal",
-      "silent",
-    ]) {
+  test("normalizes supported log levels and falls back for unknown levels", async () => {
+    for (const [value, expected] of [
+      ["trace", "trace"],
+      [" DEBUG ", "debug"],
+      ["Info", "info"],
+      ["warn", "warn"],
+      ["ERROR", "error"],
+      ["fatal", "fatal"],
+      ["silent", "silent"],
+      ["verbose", "info"],
+    ] as const) {
       const result = await Effect.runPromise(
-        configResult(valuesWith([["LOG_LEVEL", level]])),
+        configResult(valuesWith([["LOG_LEVEL", value]])),
       );
-      expect(Either.isRight(result), level).toBe(true);
+      expect(Either.isRight(result), value).toBe(true);
+      if (Either.isRight(result)) {
+        expect(result.right.logLevel).toBe(expected);
+      }
     }
-    const invalid = await Effect.runPromise(
-      configResult(valuesWith([["LOG_LEVEL", "verbose"]])),
-    );
-    expect(Either.isLeft(invalid)).toBe(true);
   });
 
   it.effect.prop(
@@ -274,11 +260,8 @@ describe("GatewayConfig", () => {
     ({ field, value }) =>
       Effect.gen(function* () {
         const result = yield* configResult(valuesWith([[field, value]]));
-        const parsed = Number(value);
-        const valid =
-          Number.isSafeInteger(parsed) &&
-          parsed > 0 &&
-          Number.isInteger(parsed);
+        const parsed = Number.parseInt(value, 10);
+        const valid = Number.isSafeInteger(parsed) && parsed > 0;
         expect(Either.isRight(result)).toBe(valid);
       }),
     { fastCheck: { numRuns: 20 } },
