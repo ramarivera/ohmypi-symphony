@@ -72,7 +72,6 @@ describe("Reconciler", () => {
       const started = yield* Deferred.make<void>();
       const release = yield* Deferred.make<void>();
       const calls = yield* Ref.make(0);
-      const clock = yield* TestClock.testClock();
       const authority = SessionAuthority.make({
         ...noOpAuthority,
         processRunnable: () =>
@@ -87,12 +86,7 @@ describe("Reconciler", () => {
         const reconciler = yield* Reconciler;
         const first = yield* Effect.fork(reconciler.tick());
         yield* Deferred.await(started);
-        const second = yield* Effect.fork(
-          Effect.sleep(Duration.millis(1)).pipe(
-            Effect.zipRight(reconciler.tick()),
-          ),
-        );
-        yield* clock.adjust(Duration.millis(1));
+        const second = yield* Effect.fork(reconciler.tick());
         expect(Option.isNone(yield* Fiber.poll(second))).toBe(true);
         yield* Deferred.succeed(release, undefined);
         yield* Fiber.join(first);

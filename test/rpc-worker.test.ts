@@ -7,8 +7,8 @@ const uiResponseFixture = String.raw`
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 send({
   type: "ready",
-  protocolVersion: 1,
-  supportedProtocolVersions: [1],
+  protocolVersion: 2,
+  supportedProtocolVersions: [1, 2],
 });
 const reader = Bun.stdin.stream().getReader();
 const decoder = new TextDecoder();
@@ -23,7 +23,9 @@ while (true) {
     buffer = buffer.slice(newline + 1);
     if (line) {
       const input = JSON.parse(line);
-      if (
+      if (input.type === "negotiate_protocol" && typeof input.id === "string") {
+        send({ type: "response", id: input.id, success: true });
+      } else if (
         input.type === "extension_ui_response" &&
         typeof input.id === "string"
       ) {
