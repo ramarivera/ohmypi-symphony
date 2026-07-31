@@ -58,11 +58,11 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
           readonly payload: unknown;
           readonly receivedAt?: number;
         }) { yield* Effect.annotateCurrentSpan("deliveryId", input.id);
-        
+
         const tx = Effect.gen(function* () {
           const accepted = yield* accept(input);
           if (accepted) return "claimed" as const;
-        
+
           const existing = yield* tryDb(
             () =>
               db
@@ -80,14 +80,14 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
             existing,
             "Delivery",
           );
-        
+
           if (decoded.payload_hash !== input.payloadHash) {
             return "conflict" as const;
           }
           if (decoded.status !== "failed") {
             return "duplicate" as const;
           }
-        
+
           const result = yield* tryDb(
             () =>
               db
@@ -101,7 +101,7 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
             ? "claimed"
             : "duplicate";
         });
-        
+
         return yield* transact(db, tx); },
       );
 

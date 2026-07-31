@@ -221,7 +221,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
         }) { yield* Effect.annotateCurrentSpan("repositoryId", input.id);
         const now = input.now ?? (yield* Clock.currentTimeMillis);
         const record = yield* validateRepository(input, now);
-        
+
         const tx = Effect.gen(function* () {
           const existing = yield* tryDb(
             () =>
@@ -235,7 +235,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           if (existing !== null) {
             return yield* Effect.fail(new DatabaseError({ message: `Repository ${record.id} already exists for ${record.organizationId}` }))
           }
-        
+
           if (record.isDefault) {
             yield* tryDb(
               () =>
@@ -247,7 +247,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
               "WorkspaceRepo.createRepository.default",
             );
           }
-        
+
           yield* tryDb(
             () =>
               db
@@ -270,10 +270,10 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
                 ),
             "WorkspaceRepo.createRepository.insert",
           );
-        
+
           return record;
         });
-        
+
         return yield* transact(db, tx); },
       );
 
@@ -295,7 +295,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
         }
         const existing = current.value;
         const now = input.now ?? (yield* Clock.currentTimeMillis);
-        
+
         const patch = yield* validateRepository(
           {
             organizationId,
@@ -309,7 +309,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           },
           now,
         );
-        
+
         const tx = Effect.gen(function* () {
           if (patch.isDefault && !existing.isDefault) {
             yield* tryDb(
@@ -322,7 +322,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
               "WorkspaceRepo.updateRepository.default",
             );
           }
-        
+
           yield* tryDb(
             () =>
               db
@@ -344,7 +344,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
                 ),
             "WorkspaceRepo.updateRepository.update",
           );
-        
+
           return yield* decodeRow(
             RepositoryRecord,
             {
@@ -355,7 +355,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
             "RepositoryRecord",
           );
         });
-        
+
         return yield* transact(db, tx); },
       );
 

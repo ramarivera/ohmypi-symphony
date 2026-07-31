@@ -88,7 +88,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
           readonly firstWriteWins?: boolean;
         }) { yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
         const now = input.now ?? (yield* Clock.currentTimeMillis);
-        
+
         const tx = Effect.gen(function* () {
           const reserved = yield* tryDb(
             () =>
@@ -109,7 +109,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
                 ),
             "ProjectionRepo.enqueue.reserve",
           );
-        
+
           if ((yield* runChanges(reserved, "ProjectionRepo.enqueue.reserve")) === 1) {
             yield* tryDb(
               () =>
@@ -134,7 +134,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
             yield* upsertProjectionEvent(input, now);
             return true;
           }
-        
+
           const existingBySource = yield* tryDb(
             () =>
               db
@@ -156,30 +156,30 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
                   .get(input.sessionId, input.activityType, input.payloadHash),
               "ProjectionRepo.enqueue.existingByHash",
             ));
-        
+
           if (existing === null) {
             return yield* Effect.fail(new DatabaseError({ message: `Projection ${input.sourceKey} reservation disappeared` }))
           }
-        
+
           const decoded = yield* decodeRow(
             ProjectionIdentityRow,
             existing,
             "Projection",
           );
-        
+
           if (decoded.source_key !== input.sourceKey) {
             return false;
           }
-        
+
           if (decoded.payload_hash !== input.payloadHash) {
             if (input.firstWriteWins) return false;
             return yield* Effect.fail(new DatabaseError({ message: `Projection ${input.sourceKey} was reused with a different payload` }))
           }
-        
+
           if (decoded.status === "completed") {
             return false;
           }
-        
+
           yield* tryDb(
             () =>
               db
@@ -204,7 +204,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
           yield* upsertProjectionEvent(input, now);
           return false;
         });
-        
+
         return yield* transact(db, tx); },
       );
 
@@ -214,7 +214,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         leaseDurationMs: number,
         now?: number,) { yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
         const at = now ?? (yield* Clock.currentTimeMillis);
-        
+
         const tx = Effect.gen(function* () {
           const claimed = yield* tryDb(
             () =>
@@ -232,11 +232,11 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
                 .run(owner, at + leaseDurationMs, at, sourceKey, at, at),
             "ProjectionRepo.claimProjection",
           );
-        
+
           if ((yield* runChanges(claimed, "ProjectionRepo.claimProjection")) !== 1) {
             return Option.none();
           }
-        
+
           const row = yield* tryDb(
             () =>
               db
@@ -253,7 +253,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
           if (row === null) {
             return yield* Effect.fail(new DatabaseError({ message: `Projection ${sourceKey} disappeared after claim` }))
           }
-        
+
           yield* tryDb(
             () =>
               db
@@ -263,12 +263,12 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
                 .run(at, sourceKey),
             "ProjectionRepo.claimProjection.event",
           );
-        
+
           const decoded = yield* decodeRow(ProjectionJobRow, row, "ProjectionJob");
           const job = yield* rowToProjectionJob(decoded);
           return Option.some(job);
         });
-        
+
         return yield* transact(db, tx); },
       );
 
@@ -304,7 +304,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         error: string,
         nextAttemptAt: number,) { yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
         const now = yield* Clock.currentTimeMillis;
-        
+
         const tx = Effect.gen(function* () {
           yield* tryDb(
             () =>
@@ -337,7 +337,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
             "ProjectionRepo.failProjection.event",
           );
         });
-        
+
         return yield* transact(db, tx); },
       );
 
@@ -346,7 +346,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         owner: string,
         activityId: Option.Option<ActivityId>,) { yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
         const now = yield* Clock.currentTimeMillis;
-        
+
         const tx = Effect.gen(function* () {
           const completed = yield* tryDb(
             () =>
@@ -360,7 +360,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
                 .run(now, sourceKey, owner),
             "ProjectionRepo.completeProjection.outbox",
           );
-        
+
           if ((yield* runChanges(completed, "ProjectionRepo.completeProjection.outbox")) !== 1) {
             return yield* Effect.fail(
               new RunLeaseError({
@@ -369,7 +369,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
               }),
             );
           }
-        
+
           yield* tryDb(
             () =>
               db
@@ -390,7 +390,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
             "ProjectionRepo.completeProjection.event",
           );
         });
-        
+
         return yield* transact(db, tx); },
       );
 

@@ -99,7 +99,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
           [tokenCrypto.encrypt(record.accessToken), tokenCrypto.encrypt(record.refreshToken)],
           { concurrency: 2 },
         );
-        
+
         const accessibleTeamIds = Option.match(record.accessibleTeamIds, {
           onNone: () => null,
           onSome: (ids) => JSON.stringify(ids),
@@ -115,7 +115,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
           onNone: () => null,
           onSome: (value) => value,
         });
-        
+
         yield* tryDb(() =>
           db
             .query(`
@@ -190,7 +190,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
         removedTeamIds: ReadonlyArray<TeamId>,
         canAccessAllPublicTeams: boolean,
         at: number,) { yield* Effect.annotateCurrentSpan("organizationId", organizationId);
-        
+
         const tx = Effect.gen(function* () {
           const row = yield* tryDb(
             () =>
@@ -202,7 +202,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
             "InstallationRepo.applyPermissionChange.select",
           );
           if (row === null) return false;
-        
+
           const teamIdsArray = yield* (row.accessible_team_ids_json === null
             ? Effect.succeed([] as Array<string>)
             : parseStringArray(
@@ -212,7 +212,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
           const teamIds = new Set(teamIdsArray);
           for (const teamId of addedTeamIds) teamIds.add(teamId);
           for (const teamId of removedTeamIds) teamIds.delete(teamId);
-        
+
           yield* tryDb(
             () =>
               db
@@ -229,7 +229,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
                 ),
             "InstallationRepo.applyPermissionChange.update",
           );
-        
+
           for (const teamId of removedTeamIds) {
             yield* tryDb(
               () =>
@@ -242,10 +242,10 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
               "InstallationRepo.applyPermissionChange.cancel",
             );
           }
-        
+
           return true;
         });
-        
+
         return yield* transact(db, tx); },
       );
 

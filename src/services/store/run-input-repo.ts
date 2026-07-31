@@ -85,7 +85,7 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           readonly payload: unknown;
           readonly createdAt?: number;
         }) { yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
-        
+
         const tx = Effect.gen(function* () {
           const run = yield* getRunState(input.sessionId);
           if (Option.isNone(run)) {
@@ -94,7 +94,7 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           if (input.kind !== "stop" && run.value.desired_state === "canceled") {
             return false;
           }
-        
+
           const createdAt = input.createdAt ?? (yield* Clock.currentTimeMillis);
           const insertResult = yield* tryDb(
             () =>
@@ -129,7 +129,7 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
               now: createdAt,
             });
           }
-        
+
           if (inserted && input.kind !== "stop") {
             yield* tryDb(
               () =>
@@ -144,7 +144,7 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
               "RunInputRepo.enqueue.restart",
             );
           }
-        
+
           if (input.kind === "stop") {
             yield* tryDb(
               () =>
@@ -158,10 +158,10 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
               "RunInputRepo.enqueue.stop",
             );
           }
-        
+
           return inserted;
         });
-        
+
         return yield* transact(db, tx); },
       );
 

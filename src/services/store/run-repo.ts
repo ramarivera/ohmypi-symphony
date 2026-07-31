@@ -144,7 +144,7 @@ export class RunRepo extends Effect.Service<RunRepo>()(
         return yield* Effect.fail(new DatabaseError({ message: `Unknown run ${sessionId}` }))
       }
       const run = current.value;
-      
+
       if (
         TERMINAL_STATES.includes(run.state) &&
         patch.state !== undefined &&
@@ -152,11 +152,11 @@ export class RunRepo extends Effect.Service<RunRepo>()(
       ) {
         return yield* Effect.fail(new DatabaseError({ message: "Terminal run state is immutable" }))
       }
-      
+
       const state = patch.state ?? run.state;
       const attempt = run.attempt + (patch.incrementAttempt ? 1 : 0);
       const now = yield* Clock.currentTimeMillis;
-      
+
       const repositoryId = getNullable(run.repositoryId, patch.repositoryId);
       const workspacePath = getNullable(run.workspacePath, patch.workspacePath);
       const ompSessionId = getNullable(run.ompSessionId, patch.ompSessionId);
@@ -164,7 +164,7 @@ export class RunRepo extends Effect.Service<RunRepo>()(
       const terminalReason = getNullable(run.terminalReason, patch.terminalReason);
       const lastActivityAt = getNullable(run.lastActivityAt, patch.lastActivityAt);
       const nextAttemptAt = getNullable(run.nextAttemptAt, patch.nextAttemptAt);
-      
+
       yield* tryDb(
         () =>
           db

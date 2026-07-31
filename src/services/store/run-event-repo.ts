@@ -158,7 +158,7 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
         const payloadJson = JSON.stringify(input.payload ?? null);
         const status = input.status ?? null;
         const error = input.error ?? null;
-        
+
         yield* tryDb(() =>
           db
             .query(`

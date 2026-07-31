@@ -221,7 +221,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         let kind = type;
         let level: "debug" | "info" | "warn" | "result" | "error" = "info";
         let text: string | null = type;
-        
+
         switch (type) {
           case "agent_start":
             kind = "agent";
@@ -290,7 +290,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           default:
             text = type;
         }
-        
+
         const now = yield* Clock.currentTimeMillis;
         yield* runEventRepo
           .upsert({
@@ -311,28 +311,28 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         worker: RpcWorkerHandle,) { const state = yield* worker.getState().pipe(
           Effect.orElseSucceed(() => ({} as Record<string, unknown>)),
         );
-        
+
         const fromStateSessionId = isString(state.sessionId)
           ? Option.some(state.sessionId)
           : Option.none<string>();
         const fromStateSessionFile = isString(state.sessionFile)
           ? Option.some(state.sessionFile)
           : Option.none<string>();
-        
+
         const workerSessionId = yield* worker.sessionId;
         const workerSessionFile = yield* worker.sessionFile;
-        
+
         const ompSessionId = Option.isSome(fromStateSessionId)
           ? fromStateSessionId
           : workerSessionId;
         const ompSessionFile = Option.isSome(fromStateSessionFile)
           ? fromStateSessionFile
           : workerSessionFile;
-        
+
         yield* runRepo
           .update(sessionId, { ompSessionId, ompSessionFile })
           .pipe(Effect.ignore);
-        
+
         if (Array.isArray(state.todoPhases)) {
           const items = planItems(state.todoPhases);
           if (items.length > 0) {
@@ -379,13 +379,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             return next;
           });
         }
-        
+
         yield* Ref.update(pendingUiRef, (pending) => {
           const next = new Map(pending);
           next.delete(run.sessionId);
           return next;
         });
-        
+
         if (
           run.state !== "succeeded" &&
           run.state !== "failed" &&
@@ -411,14 +411,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             )
             .pipe(Effect.ignore);
         }
-        
+
         yield* runRepo.releaseLease(run.sessionId, owner).pipe(Effect.ignore); },
       );
 
       const handleFailure = Effect.fn("SessionAuthority.handleFailure")(
         function* (sessionId: SessionId,
         error: unknown,) { const message = error instanceof Error ? error.message : String(error);
-        
+
         const worker = yield* getWorker(sessionId);
         if (Option.isSome(worker)) {
           yield* worker.value.worker.stop();
@@ -428,17 +428,17 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             return next;
           });
         }
-        
+
         yield* Effect.logWarning("authority.failure", {
           event: "authority.failure",
           sessionId,
           error: message,
         });
-        
+
         const current = yield* runRepo
           .get(sessionId)
           .pipe(Effect.orElseSucceed(() => Option.none<AgentRun>()));
-        
+
         if (
           Option.isNone(current) ||
           current.value.state === "succeeded" ||
@@ -446,14 +446,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         ) {
           return;
         }
-        
+
         const run = current.value;
-        
+
         if (run.desiredState === "canceled") {
           yield* cancel(run);
           return;
         }
-        
+
         if (run.attempt >= maxAttempts) {
           const correlationId = failureCorrelationId(
             sessionId,
@@ -484,7 +484,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             .pipe(Effect.ignore);
           return;
         }
-        
+
         const delay = Math.min(
           300_000,
           10_000 * 2 ** Math.min(run.attempt, 5),
@@ -494,7 +494,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         );
         const now = yield* Clock.currentTimeMillis;
         const nextAttemptAt = now + delay + jitter;
-        
+
         yield* runRepo
           .update(run.sessionId, {
             state: "orphaned",
@@ -516,7 +516,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         event: RpcEvent,) { const current = yield* runRepo
           .get(sessionId)
           .pipe(Effect.orElseSucceed(() => Option.none<AgentRun>()));
-        
+
         if (
           Option.isNone(current) ||
           current.value.desiredState === "canceled" ||
@@ -524,7 +524,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         ) {
           return;
         }
-        
+
         const run = current.value;
         const sequence = yield* Ref.modify(eventSequenceRef, (m) => {
           const next = new Map(m);
@@ -532,9 +532,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           next.set(sessionId, value);
           return [value, next] as const;
         });
-        
+
         yield* recordRunEvent(sessionId, sequence, event);
-        
+
         if (event.type === "extension_ui_request") {
           const id = event.id;
           const method = event.method;
@@ -548,7 +548,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               next.set(sessionId, { id, method });
               return next;
             });
-        
+
           const title =
             typeof event.title === "string" ? event.title : "Input required";
           const message =
@@ -558,7 +558,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 typeof option === "string",
               )
             : [];
-        
+
           yield* projector
             .elicitation(
               sessionId,
@@ -573,7 +573,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           return;
         }
         }
-        
+
         if (event.type === "prompt_result" && event.agentInvoked === false) {
           const worker = yield* getWorker(sessionId);
           if (Option.isSome(worker)) {
@@ -587,7 +587,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           }
           return;
         }
-        
+
         if (event.type === "error") {
           return yield* Effect.fail(
             new RpcProtocolError({
@@ -599,11 +599,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             }),
           );
         }
-        
+
         const worker = yield* getWorker(sessionId);
         const terminalAgentEnd =
           event.type === "agent_end" && event.willContinue !== true;
-        
+
         if (
           Option.isSome(worker) &&
           (event.type === "agent_start" ||
@@ -614,7 +614,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             Effect.ignore,
           );
         }
-        
+
         if (terminalAgentEnd) {
           yield* Effect.logInfo("run.completed", {
             event: "run.completed",
@@ -627,7 +627,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               nextAttemptAt: Option.none(),
             })
             .pipe(Effect.ignore);
-        
+
           const project = projector
             .projectRpcEvent(sessionId, sequence, event)
             .pipe(
@@ -647,11 +647,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 }),
               ),
             );
-        
+
           yield* project;
           return;
         }
-        
+
         yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
           Effect.ignore,
         ); },
@@ -663,18 +663,18 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         if (Option.isSome(run.ompSessionFile)) {
           command.push("--session", run.ompSessionFile.value);
         }
-        
+
         const worker = yield* rpc.spawn({
           command,
           cwd,
         });
-        
+
         const queue = yield* Queue.unbounded<RpcEvent>();
-        
+
         const unsubscribe = yield* worker.onEvent((event) => {
           Queue.unsafeOffer(queue, event);
         });
-        
+
         const consumer = yield* Effect.fork(
           Effect.forever(
             Queue.take(queue).pipe(
@@ -686,7 +686,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             ),
           ),
         );
-        
+
         yield* Ref.update(workersRef, (workers) => {
           const next = new Map(workers);
           next.set(run.sessionId, {
@@ -697,16 +697,16 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           });
           return next;
         });
-        
+
         yield* worker.start();
         yield* runRepo
           .update(run.sessionId, { state: "running" })
           .pipe(Effect.ignore);
         yield* captureWorkerState(run.sessionId, worker).pipe(Effect.ignore);
-        
+
         const ompSessionId = yield* worker.sessionId;
         const ompSessionFile = yield* worker.sessionFile;
-        
+
         yield* Effect.logInfo("work.ready", {
           event: "work.ready",
           sessionId: run.sessionId,
@@ -715,7 +715,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           ompSessionId: Option.getOrElse(ompSessionId, () => null),
           ompSessionFile: Option.getOrElse(ompSessionFile, () => null),
         });
-        
+
         return worker; },
       );
 
@@ -724,7 +724,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           const initial = yield* runRepo
             .get(sessionId)
             .pipe(Effect.orElseSucceed(() => Option.none<AgentRun>()));
-        
+
           if (
             Option.isSome(initial) &&
             initial.value.desiredState === "canceled"
@@ -732,7 +732,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             yield* cancel(initial.value);
             return;
           }
-        
+
           const workerState = yield* getWorker(sessionId);
           if (Option.isSome(workerState)) {
             const renewed = yield* runRepo.renewLease(
@@ -753,29 +753,29 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               return;
             }
           }
-        
+
           const runOption = yield* runRepo.get(sessionId);
           if (Option.isNone(runOption)) {
             return;
           }
           const run = runOption.value;
-        
+
           yield* Effect.logInfo("work.assigned", {
             event: "work.assigned",
             sessionId,
             attempt: run.attempt,
             state: run.state,
           });
-        
+
           if (run.desiredState === "canceled") {
             yield* cancel(run);
             return;
           }
-        
+
           const installation = yield* installationRepo
             .get(run.organizationId)
             .pipe(Effect.orElseSucceed(() => Option.none<Installation>()));
-        
+
           if (
             Option.isNone(installation) ||
             Option.isSome(installation.value.revokedAt)
@@ -796,7 +796,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               .pipe(Effect.ignore);
             return;
           }
-        
+
           const teamAccess = Option.match(
             installation.value.accessibleTeamIds,
             { onNone: () => [] as ReadonlyArray<string>, onSome: (ids) => ids },
@@ -806,7 +806,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               onNone: () => false,
               onSome: (value) => value,
             });
-        
+
           if (
             Option.isSome(run.teamId) &&
             !canAccessAll &&
@@ -828,17 +828,17 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               .pipe(Effect.ignore);
             return;
           }
-        
+
           const inputs = yield* runInputRepo
             .pending(sessionId)
             .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<RunInput>));
-        
+
           let worker: RpcWorkerHandle | undefined =
             Option.getOrElse(
               Option.map(workerState, (state) => state.worker),
               () => undefined,
             );
-        
+
           if (inputs.length === 0) {
             if (
               worker === undefined &&
@@ -852,19 +852,19 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   nextAttemptAt: Option.none(),
                 })
                 .pipe(Effect.ignore);
-        
+
               const resumedOption = yield* runRepo.get(sessionId);
               const resumed = Option.getOrElse(resumedOption, () => run);
-        
+
               yield* Effect.logInfo("run.retried", {
                 event: "run.retried",
                 sessionId,
                 attempt: resumed.attempt,
                 workspacePath: run.workspacePath.value,
               });
-        
+
               worker = yield* startWorker(resumed, run.workspacePath.value);
-        
+
               yield* projector
                 .thought(
                   sessionId,
@@ -872,7 +872,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   `Retrying the interrupted OhMyPi run (attempt ${resumed.attempt}).`,
                 )
                 .pipe(Effect.ignore);
-        
+
               if (Option.isSome(run.ompSessionFile)) {
                 yield* worker
                   .followUp(
@@ -883,13 +883,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 const latestActionable = yield* runInputRepo
                   .latestActionableInput(sessionId)
                   .pipe(Effect.orElseSucceed(() => Option.none()));
-        
+
                 if (Option.isNone(latestActionable)) {
                   return yield* Effect.fail(
                     new Error("Interrupted run has no input to resume"),
                   );
                 }
-        
+
                 const agentInvoked = yield* worker.prompt(
                   latestActionable.value.body,
                 );
@@ -904,13 +904,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             }
             return;
           }
-        
+
           for (const input of inputs) {
             const latestOption = yield* runRepo
               .get(sessionId)
               .pipe(Effect.orElseSucceed(() => Option.none<AgentRun>()));
             const latest = Option.getOrElse(latestOption, () => run);
-        
+
             if (
               latest.desiredState === "canceled" ||
               input.kind === "stop"
@@ -919,7 +919,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               yield* runInputRepo.markProcessed(input.id).pipe(Effect.ignore);
               break;
             }
-        
+
             if (worker === undefined) {
               if (runUrlForSession !== null) {
                 yield* projector
@@ -931,7 +931,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   ])
                   .pipe(Effect.ignore);
               }
-        
+
               yield* projector
                 .thought(
                   sessionId,
@@ -939,7 +939,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   "Request accepted; preparing the OhMyPi worker.",
                 )
                 .pipe(Effect.ignore);
-        
+
               const baseContext = inputContext(input.payload);
               const resolvedContext = {
                 ...baseContext,
@@ -947,7 +947,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   baseContext.organizationId ??
                   (run.organizationId as string),
               };
-        
+
               const context =
                 input.kind === "prompted" &&
                 latest.state === "waiting" &&
@@ -957,9 +957,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       repositoryId: input.body.trim(),
                     }
                   : resolvedContext;
-        
+
               const resolution = yield* workspace.resolve(context);
-        
+
               if (resolution.kind === "none") {
                 yield* projector
                   .elicitation(
@@ -973,7 +973,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   .pipe(Effect.ignore);
                 return;
               }
-        
+
               if (resolution.kind === "ambiguous") {
                 yield* projector
                   .elicitation(
@@ -988,12 +988,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   .pipe(Effect.ignore);
                 return;
               }
-        
+
               const workspacePath = yield* workspace.materialize(
                 sessionId,
                 resolution.repository,
               );
-        
+
               yield* runRepo
                 .update(sessionId, {
                   state: "starting",
@@ -1002,12 +1002,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   incrementAttempt: true,
                 })
                 .pipe(Effect.ignore);
-        
+
               const updatedOption = yield* runRepo.get(sessionId);
               const updated = Option.getOrElse(updatedOption, () => run);
-        
+
               worker = yield* startWorker(updated, workspacePath);
-        
+
               const agentInvoked = yield* worker.prompt(input.body);
               if (!agentInvoked) {
                 yield* finishLocalCommand(sessionId, worker, input.id);
@@ -1016,7 +1016,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               const pendingUi = yield* Ref.get(pendingUiRef).pipe(
                 Effect.map((m) => m.get(sessionId)),
               );
-        
+
               if (pendingUi !== undefined) {
                 const normalized = input.body.trim().toLowerCase();
                 const response =
@@ -1044,12 +1044,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   yield* worker.followUp(input.body).pipe(Effect.ignore);
                 }
               }
-        
+
               yield* runRepo
                 .update(sessionId, { state: "running" })
                 .pipe(Effect.ignore);
             }
-        
+
             yield* runInputRepo.markProcessed(input.id).pipe(Effect.ignore);
           }
         }).pipe(
@@ -1063,9 +1063,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
       const processRunnable = Effect.fn("SessionAuthority.processRunnable")(
         function* () { yield* projector.flushPending().pipe(Effect.ignore);
-        
+
         const now = yield* Clock.currentTimeMillis;
-        
+
         const workers = yield* Ref.get(workersRef);
         for (const [sessionId, workerState] of workers) {
           const run = yield* runRepo
@@ -1077,7 +1077,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           ) {
             continue;
           }
-        
+
           const renewed = yield* runRepo.renewLease(
             sessionId,
             owner,
@@ -1093,42 +1093,42 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             });
           }
         }
-        
+
         const cancellationPending =
           yield* runRepo.listCancellationPending();
         for (const run of cancellationPending) {
           yield* cancel(run);
         }
-        
+
         const runnable = yield* runRepo.listRunnable(now);
         const sessionsWithInputs =
           yield* runInputRepo.listSessionsWithPendingInputs();
-        
+
         const sessionIds = new Set<SessionId>([
           ...sessionsWithInputs,
           ...runnable.map((r) => r.sessionId),
         ]);
-        
+
         for (const sessionId of sessionIds) {
           yield* processSession(sessionId);
         }
-        
+
         yield* projector.flushPending().pipe(Effect.ignore); },
       );
 
       const shutdown = Effect.fn("SessionAuthority.shutdown")(
         function* () { const workers = yield* Ref.get(workersRef);
-        
+
         for (const [, workerState] of workers) {
           yield* Fiber.interrupt(workerState.consumer);
           yield* workerState.unsubscribe();
           yield* workerState.worker.stop();
         }
-        
+
         yield* Ref.set(workersRef, new Map());
         yield* Ref.set(eventSequenceRef, new Map());
         yield* Ref.set(pendingUiRef, new Map());
-        
+
         yield* projector.flushPending().pipe(Effect.ignore); },
       );
 

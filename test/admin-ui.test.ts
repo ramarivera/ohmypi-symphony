@@ -371,15 +371,15 @@ describe("redaction invariants", () => {
       const redactedBearer = redact(bearer);
       expect(redactedBearer).toBe("Authorization: Bearer redacted");
 
-      const query = `https://example.test/?${kind}=${secret}`;
-      const redactedQuery = redact(query);
-      expect(redactedQuery).not.toContain(`${kind}=${secret}`);
-      expect(redactedQuery).toContain(`?${kind}=redacted`);
+      const redactedQuery = redact(
+        `https://example.test/?${kind}=${secret}`,
+      );
+      const redactedQueryParams = new URL(redactedQuery).searchParams;
+      expect(redactedQueryParams.get(kind)).toBe("redacted");
+      expect(redactedQueryParams.get(kind)).not.toBe(secret);
 
-      const json = `{"${kind}": "${secret}"}`;
-      const redactedJson = redact(json);
-      expect(redactedJson).not.toContain(`"${kind}": "${secret}"`);
-      expect(redactedJson).toContain(`"redacted"`);
+      const redactedJson = redact(`{"${kind}": "${secret}"}`);
+      expect(JSON.parse(redactedJson)).toStrictEqual({ [kind]: "redacted" });
     },
   );
 });
