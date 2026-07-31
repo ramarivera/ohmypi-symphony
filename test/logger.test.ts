@@ -1,129 +1,248 @@
-import { describe, expect, it, test } from "@effect/vitest"
 import { Writable } from "node:stream";
-import { Schema } from "effect";
-import type pino from "pino";
-import { createLogger, validLogLevel } from "../src/logger";
+import { describe, expect, it } from "@effect/vitest";
+import { ConfigProvider, Effect, Layer, Schema } from "effect";
+import pino from "pino";
+import { GatewayConfig } from "../src/services/config.js";
+import {
+  GatewayLogger,
+  PinoLoggerLive,
+  redactionPaths,
+} from "../src/services/logger.js";
 
-function captureStream(): {
-  stream: pino.DestinationStream;
-  chunks: string[];
-  last(): Record<string, unknown> | null;
-} {
+const LOG_LEVELS = [
+  "trace",
+  "debug",
+  "info",
+  "warn",
+  "error",
+  "fatal",
+  "silent",
+] as const;
+type LogLevel = (typeof LOG_LEVELS)[number];
+
+const baseConfigValues = new Map<string, string>([
+  ["LINEAR_CLIENT_ID", "client"],
+  ["LINEAR_CLIENT_SECRET", "client-secret"],
+  ["LINEAR_WEBHOOK_SECRET", "webhook-secret"],
+  [
+    "TOKEN_ENCRYPTION_KEY",
+    Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),
+  ],
+  ["PUBLIC_URL", "http://localhost:3000"],
+]);
+
+type CapturedMessage = Record<string, unknown>;
+
+type Capture = {
+  readonly chunks: string[];
+  last(): CapturedMessage | null;
+};
+
+function makeCapture(): Capture {
   const chunks: string[] = [];
-  const stream = new Writable({
-    write(chunk, _encoding, callback) {
-      chunks.push(chunk.toString());
-      callback();
-    },
-  }) as pino.DestinationStream;
   return {
-    stream,
     chunks,
     last() {
-      if (chunks.length === 0) return null;
       const line = chunks.at(-1);
-      return line ? (JSON.parse(line) as Record<string, unknown>) : null;
+      return line ? (JSON.parse(line) as CapturedMessage) : null;
     },
   };
 }
 
-describe("createLogger", () => {
-  test("gates messages by level", () => {
-    const { stream, chunks } = captureStream();
-    const logger = createLogger({ level: "info", stream });
-    logger.trace({ event: "trace.ignored" });
-    logger.info({ event: "info.kept" });
-    logger.error({ event: "error.kept" });
-    expect(chunks).toHaveLength(2);
-    expect(JSON.parse(chunks[0] ?? "{}").event).toBe("info.kept");
-    expect(JSON.parse(chunks[1] ?? "{}").event).toBe("error.kept");
+function makeConfigLayer(logLevel?: string) {
+  const values =
+    logLevel === undefined
+      ? baseConfigValues
+      : new Map([...baseConfigValues, ["LOG_LEVEL", logLevel]]);
+  return GatewayConfig.Default.pipe(
+    Layer.provide(Layer.setConfigProvider(ConfigProvider.fromMap(values))),
+  );
+}
+
+function makeLoggerLayer(logLevel: string, capture: Capture) {
+  const configLayer = makeConfigLayer(logLevel);
+  const gatewayLayer = Layer.scoped(
+    GatewayLogger,
+    Effect.gen(function* () {
+      const config = yield* GatewayConfig;
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          capture.chunks.push(chunk.toString());
+          callback();
+        },
+      });
+      const logger = yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          pino(
+            {
+              name: "gateway",
+              level: config.logLevel,
+              redact: { paths: redactionPaths, censor: "[REDACTED]" },
+            },
+            stream,
+          ),
+        ),
+        (logger) =>
+          Effect.sync(() => {
+            logger.flush();
+            stream.end();
+          }),
+      );
+      return new GatewayLogger({ logger });
+    }),
+  );
+  return PinoLoggerLive.pipe(
+    Layer.provide(gatewayLayer),
+    Layer.provide(configLayer),
+  );
+}
+
+describe("GatewayLogger and PinoLoggerLive", () => {
+  it.effect("gates messages by level", () => {
+    const capture = makeCapture();
+    return Effect.gen(function* () {
+      yield* Effect.logTrace("trace").pipe(
+        Effect.annotateLogs("event", "trace.ignored"),
+      );
+      yield* Effect.logInfo("info").pipe(
+        Effect.annotateLogs("event", "info.kept"),
+      );
+      yield* Effect.logError("error").pipe(
+        Effect.annotateLogs("event", "error.kept"),
+      );
+      expect(capture.chunks).toHaveLength(2);
+      expect(
+        capture.chunks[0] ? JSON.parse(capture.chunks[0]).event : undefined,
+      ).toBe("info.kept");
+      expect(
+        capture.chunks[1] ? JSON.parse(capture.chunks[1]).event : undefined,
+      ).toBe("error.kept");
+    }).pipe(Effect.provide(makeLoggerLayer("info", capture)));
   });
 
-  test("redacts sensitive keys", () => {
-    const { stream, last } = captureStream();
-    const logger = createLogger({ level: "info", stream });
-    logger.info({
-      authorization: "Bearer abc",
-      cookie: "session=secret",
-      accessToken: "at",
-      refreshToken: "rt",
-      clientSecret: "cs",
-      webhookSecret: "ws",
-      token: "t",
-      nested: { token: "inner", deep: { authorization: "auth" } },
-    });
-    const message = last();
-    expect(message).not.toBeNull();
-    expect(message?.authorization).toBe("[REDACTED]");
-    expect(message?.cookie).toBe("[REDACTED]");
-    expect(message?.accessToken).toBe("[REDACTED]");
-    expect(message?.refreshToken).toBe("[REDACTED]");
-    expect(message?.clientSecret).toBe("[REDACTED]");
-    expect(message?.webhookSecret).toBe("[REDACTED]");
-    expect(message?.token).toBe("[REDACTED]");
-    expect(message?.nested).toMatchObject({
-      token: "[REDACTED]",
-      deep: { authorization: "[REDACTED]" },
-    });
+  it.effect("redacts sensitive keys", () => {
+    const capture = makeCapture();
+    return Effect.logInfo("redaction-check").pipe(
+      Effect.annotateLogs({
+        authorization: "Bearer abc",
+        cookie: "session=secret",
+        accessToken: "at",
+        refreshToken: "rt",
+        clientSecret: "cs",
+        webhookSecret: "ws",
+        token: "t",
+        nested: { token: "inner", deep: { authorization: "auth" } },
+      }),
+      Effect.tap(() => {
+        const message = capture.last();
+        expect(message).not.toBeNull();
+        expect(message?.authorization).toBe("[REDACTED]");
+        expect(message?.cookie).toBe("[REDACTED]");
+        expect(message?.accessToken).toBe("[REDACTED]");
+        expect(message?.refreshToken).toBe("[REDACTED]");
+        expect(message?.clientSecret).toBe("[REDACTED]");
+        expect(message?.webhookSecret).toBe("[REDACTED]");
+        expect(message?.token).toBe("[REDACTED]");
+        expect(message?.nested).toMatchObject({
+          token: "[REDACTED]",
+          deep: { authorization: "[REDACTED]" },
+        });
+      }),
+      Effect.provide(makeLoggerLayer("info", capture)),
+    );
   });
 
-  test("does not redact unrelated fields", () => {
-    const { stream, last } = captureStream();
-    const logger = createLogger({ level: "info", stream });
-    logger.info({ event: "ok", public: "visible" });
-    const message = last();
-    expect(message).not.toBeNull();
-    expect(message?.public).toBe("visible");
+  it.effect("does not redact unrelated fields", () => {
+    const capture = makeCapture();
+    return Effect.logInfo("public-check").pipe(
+      Effect.annotateLogs({ event: "ok", public: "visible" }),
+      Effect.tap(() => {
+        const message = capture.last();
+        expect(message).not.toBeNull();
+        expect(message?.public).toBe("visible");
+      }),
+      Effect.provide(makeLoggerLayer("info", capture)),
+    );
   });
 
-  test("children include base bindings", () => {
-    const { stream, last } = captureStream();
-    const logger = createLogger({ level: "info", stream });
-    const child = logger.child({ component: "test" });
-    child.info({ event: "child.log" });
-    const message = last();
-    expect(message).not.toBeNull();
-    expect(message?.component).toBe("test");
-    expect(message?.event).toBe("child.log");
+  it.effect("children include base bindings", () => {
+    const capture = makeCapture();
+    return Effect.logInfo("child.log").pipe(
+      Effect.annotateLogs({ component: "test", event: "child.log" }),
+      Effect.tap(() => {
+        const message = capture.last();
+        expect(message).not.toBeNull();
+        expect(message?.component).toBe("test");
+        expect(message?.event).toBe("child.log");
+      }),
+      Effect.provide(makeLoggerLayer("info", capture)),
+    );
   });
 });
 
-describe("validLogLevel", () => {
-  test("returns valid lowercased values", () => {
-    expect(validLogLevel("TRACE")).toBe("trace");
-    expect(validLogLevel("  Info ")).toBe("info");
-    expect(validLogLevel("error")).toBe("error");
-  });
-
-  test("returns the fallback for unknown or empty values", () => {
-    expect(validLogLevel(undefined)).toBe("info");
-    expect(validLogLevel("")).toBe("info");
-    expect(validLogLevel("verbose", "debug")).toBe("debug");
-  });
-});
-
-describe("validLogLevel invariants", () => {
-  const VALID_LEVELS: Record<string, true> = {
-    trace: true,
-    debug: true,
-    info: true,
-    warn: true,
-    error: true,
-    fatal: true,
-    silent: true,
-  };
-
-  it.prop(
-    "returns the normalized value for valid levels and the fallback otherwise",
-    {
-      value: Schema.String,
-      fallback: Schema.Literal("trace", "debug", "info", "warn", "error", "fatal", "silent"),
-    },
-    ({ value, fallback }) => {
-      const normalized = value.trim().toLowerCase();
-      const expected = VALID_LEVELS[normalized] === true ? normalized : fallback;
-      expect(validLogLevel(value, fallback)).toBe(expected);
-    },
+describe("GatewayConfig log-level normalization", () => {
+  it.effect("uses info as the fallback when LOG_LEVEL is absent", () =>
+    Effect.gen(function* () {
+      const config = yield* GatewayConfig;
+      expect(config.logLevel).toBe("info");
+    }).pipe(Effect.provide(makeConfigLayer())),
   );
 
+  it.effect.prop(
+    "accepts every canonical valid level and rejects generated invalid levels",
+    {
+      valid: Schema.Literal(...LOG_LEVELS),
+      invalid: Schema.String.pipe(
+        Schema.minLength(1),
+        Schema.filter((value) => !LOG_LEVELS.includes(value as LogLevel)),
+      ),
+    },
+    ({ valid, invalid }) =>
+      Effect.gen(function* () {
+        const validResult = yield* Effect.either(
+          Effect.gen(function* () {
+            return yield* GatewayConfig;
+          }).pipe(Effect.provide(makeConfigLayer(valid))),
+        );
+        expect(validResult._tag).toBe("Right");
+        if (validResult._tag === "Right")
+          expect(validResult.right.logLevel).toBe(valid);
+
+        const invalidResult = yield* Effect.either(
+          Effect.gen(function* () {
+            return yield* GatewayConfig;
+          }).pipe(Effect.provide(makeConfigLayer(invalid))),
+        );
+        expect(invalidResult._tag).toBe("Left");
+      }),
+    { fastCheck: { numRuns: 20 } },
+  );
+});
+
+describe("redaction invariants", () => {
+  it.effect.prop(
+    "redacts generated token values while preserving unrelated annotations",
+    {
+      secret: Schema.String.pipe(Schema.minLength(1)),
+      public: Schema.String.pipe(Schema.minLength(1)),
+    },
+    ({ secret, public: publicValue }) => {
+      const capture = makeCapture();
+      return Effect.gen(function* () {
+        yield* Effect.logInfo("redaction-property").pipe(
+          Effect.annotateLogs({
+            token: secret,
+            nested: { authorization: secret },
+            public: publicValue,
+          }),
+        );
+        const message = capture.last();
+        expect(message).not.toBeNull();
+        expect(message?.token).toBe("[REDACTED]");
+        expect(message?.nested).toMatchObject({ authorization: "[REDACTED]" });
+        expect(message?.public).toBe(publicValue);
+      }).pipe(Effect.provide(makeLoggerLayer("info", capture)));
+    },
+    { fastCheck: { numRuns: 20 } },
+  );
 });
