@@ -301,6 +301,88 @@ describe("ActivityProjector", () => {
         ]);
       }),
     );
+    it.effect("forwards persisted activity and session payloads verbatim", () =>
+      Effect.gen(function* () {
+        resetMock();
+        const projector = yield* ActivityProjector;
+        const projectionRepo = yield* ProjectionRepo;
+        const runRepo = yield* RunRepo;
+        yield* runRepo.create({
+          sessionId: makeSessionId("session"),
+          organizationId: "org" as never,
+          issueId: Option.none(),
+          now: 0,
+        });
+
+        const activityPayload = {
+          request: {
+            sessionId: "session",
+            content: {
+              type: "elicitation",
+              body: "Bearer activity-secret",
+            },
+            ephemeral: true,
+            signal: "select",
+            signalMetadata: {
+              options: ["Approve", "Reject"],
+              detail: "preserve exactly",
+            },
+          },
+        };
+        const plan = [{ content: "Keep exact plan", status: "inProgress" }];
+        const externalUrls = [
+          { label: "Run", url: "https://gateway.example/run?token=keep" },
+        ];
+        const jobs = [
+          {
+            sourceKey: "activity:verbatim",
+            activityType: "elicitation",
+            payload: activityPayload,
+          },
+          {
+            sourceKey: "plan:verbatim",
+            activityType: "plan",
+            payload: { request: { sessionId: "session", plan } },
+          },
+          {
+            sourceKey: "urls:verbatim",
+            activityType: "externalUrls",
+            payload: { request: { sessionId: "session", externalUrls } },
+          },
+        ] as const;
+        for (const job of jobs) {
+          const serialized = JSON.stringify(job.payload);
+          yield* projectionRepo.enqueue({
+            sourceKey: makeSourceKey(job.sourceKey),
+            sessionId: makeSessionId("session"),
+            activityType: job.activityType,
+            payloadHash: sha256(serialized),
+            payload: job.payload,
+          });
+        }
+
+        expect(yield* projector.flushPending()).toBe(3);
+        expect(mockState.activities).toEqual([
+          {
+            sessionId: "session",
+            content: {
+              type: "elicitation",
+              body: "Bearer activity-secret",
+              ephemeral: true,
+              signal: "select",
+              signalMetadata: {
+                options: ["Approve", "Reject"],
+                detail: "preserve exactly",
+              },
+            },
+          },
+        ]);
+        expect(mockState.updates).toEqual([
+          { sessionId: "session", plan },
+          { sessionId: "session", externalUrls },
+        ]);
+      }),
+    );
 
     it.effect.prop(
       "enqueue is idempotent under duplicate sourceKey",

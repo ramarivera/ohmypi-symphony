@@ -5,14 +5,19 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { Cause, Clock, Effect, Either, Option, Schema } from "effect";
+import { redact } from "../admin-ui/run-detail.js";
+import {
+  type RunDetailModel,
+  renderAdminPage,
+  renderLandingPage,
+  renderRunDetailPage,
+} from "../admin-ui.js";
 import {
   DatabaseError,
   RowDecodeError,
-  WorkspaceError,
+  type WorkspaceError,
 } from "../domain/errors.js";
-import type {
-  OrganizationId,
-} from "../domain/ids.js";
+import type { OrganizationId } from "../domain/ids.js";
 import { ProjectId, SessionId, TeamId, WorkspaceId } from "../domain/ids.js";
 import type {
   AgentRun,
@@ -20,14 +25,8 @@ import type {
   RepositoryRecord,
   RunEvent,
 } from "../domain/models.js";
-import {
-  renderAdminPage,
-  renderLandingPage,
-  renderRunDetailPage,
-  type RunDetailModel,
-} from "../admin-ui.js";
-import { redact } from "../admin-ui/run-detail.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
+import { Reconciler, Workspace } from "./contracts.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
@@ -35,7 +34,6 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
-import { Reconciler, Workspace } from "./contracts.js";
 import type { RepositoryResolution } from "./workspace.js";
 
 const ADMIN_COOKIE = "omp_gateway_admin";
@@ -86,12 +84,13 @@ export interface AdminDeps {
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
 }
-
 interface Session {
   readonly organizationId: OrganizationId;
   readonly rawToken: string;
   readonly csrfTokenHash: string;
 }
+
+
 
 interface RepositoryPayload {
   readonly id: string;
@@ -103,10 +102,13 @@ interface RepositoryPayload {
   readonly isDefault: boolean | undefined;
 }
 
-class AdminError extends Schema.TaggedError<AdminError>()("@Gateway/AdminError", {
-  message: Schema.String,
-  status: Schema.Literal(400, 401, 403, 404, 409, 500),
-}) {}
+class AdminError extends Schema.TaggedError<AdminError>()(
+  "@Gateway/AdminError",
+  {
+    message: Schema.String,
+    status: Schema.Literal(400, 401, 403, 404, 409, 500),
+  },
+) {}
 
 function isSecure(config: { publicUrl: URL }): boolean {
   return config.publicUrl.protocol === "https:";
@@ -191,25 +193,24 @@ function optionalString(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-function stringArray(value: unknown, field: string): Either.Either<ReadonlyArray<string>, string> {
+function stringArray(
+  value: unknown,
+  field: string,
+): Either.Either<ReadonlyArray<string>, string> {
   if (!Array.isArray(value)) return Either.left(`${field} must be an array`);
   if (value.some((item) => typeof item !== "string"))
     return Either.left(`${field} must contain only strings`);
   return Either.right(
-    value
-      .map((item) => String(item).trim().toLowerCase())
-      .filter(Boolean),
+    value.map((item) => String(item).trim().toLowerCase()).filter(Boolean),
   );
 }
 
 function optionalStringArray(
   value: unknown,
   field: string,
-): ReadonlyArray<string> {
-  if (value === undefined || value === null) return [];
-  const result = stringArray(value, field);
-  if (Either.isLeft(result)) return [];
-  return result.right;
+): Either.Either<ReadonlyArray<string>, string> {
+  if (value === undefined || value === null) return Either.right([]);
+  return stringArray(value, field);
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -226,13 +227,19 @@ function repositoryPayload(
   if (id === null) return Either.left("id is required");
   if (url === null) return Either.left("url is required");
   if (ref === null) return Either.left("ref is required");
+  const teamIds = optionalStringArray(body.teamIds, "teamIds");
+  if (Either.isLeft(teamIds)) return Either.left(teamIds.left);
+  const projectIds = optionalStringArray(body.projectIds, "projectIds");
+  if (Either.isLeft(projectIds)) return Either.left(projectIds.left);
+  const labels = optionalStringArray(body.labels, "labels");
+  if (Either.isLeft(labels)) return Either.left(labels.left);
   return Either.right({
     id,
     url,
     ref,
-    teamIds: optionalStringArray(body.teamIds, "teamIds"),
-    projectIds: optionalStringArray(body.projectIds, "projectIds"),
-    labels: optionalStringArray(body.labels, "labels"),
+    teamIds: teamIds.right,
+    projectIds: projectIds.right,
+    labels: labels.right,
     isDefault: optionalBoolean(body.isDefault),
   });
 }
@@ -411,7 +418,10 @@ function redirect(
   });
 }
 
-function emptyResponse(status: number, extraHeaders: Record<string, string> = {}): Response {
+function emptyResponse(
+  status: number,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(null, {
     status,
     headers: { ...SECURITY_HEADERS, ...extraHeaders },
@@ -439,8 +449,7 @@ function parseJsonBody(request: Request) {
 
     const parsed = yield* Effect.try({
       try: () => JSON.parse(body),
-      catch: () =>
-        new AdminError({ message: "Invalid JSON", status: 400 }),
+      catch: () => new AdminError({ message: "Invalid JSON", status: 400 }),
     });
 
     if (Array.isArray(parsed) || !record(parsed)) {
@@ -456,7 +465,9 @@ function parseJsonBody(request: Request) {
   });
 }
 
-function mapCauseToResponse(cause: Cause.Cause<unknown>): Option.Option<Response> {
+function mapCauseToResponse(
+  cause: Cause.Cause<unknown>,
+): Option.Option<Response> {
   const typed = Array.from(Cause.failures(cause));
   const defects = Array.from(Cause.defects(cause));
   const all = [...typed, ...defects];
@@ -564,9 +575,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const encodedRunId = url.pathname.slice("/runs/".length);
         const isJsonPath = encodedRunId.endsWith(".json");
         const rawSessionId = decodeURIComponent(
-          isJsonPath
-            ? encodedRunId.slice(0, -".json".length)
-            : encodedRunId,
+          isJsonPath ? encodedRunId.slice(0, -".json".length) : encodedRunId,
         );
         const sessionId = yield* Schema.decodeUnknown(SessionId)(
           rawSessionId,
@@ -601,10 +610,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
       }
 
-      if (
-        url.pathname === "/api/admin/bootstrap" &&
-        request.method === "GET"
-      ) {
+      if (url.pathname === "/api/admin/bootstrap" && request.method === "GET") {
         const session = yield* requireSession(request);
         const installation = yield* deps.installationRepo.get(
           session.organizationId,
@@ -656,9 +662,39 @@ export const createAdminHandle = (deps: AdminDeps) =>
           return Option.some(text(payloadEither.left, 400));
         }
         const payload = payloadEither.right;
-        const repositoryId = yield* Schema.decodeUnknown(WorkspaceId)(payload.id).pipe(Effect.catchTags({ ParseError: () => Effect.fail(new AdminError({ message: "Invalid repository id", status: 400 })) }));
-        const teamIds = yield* Schema.decodeUnknown(Schema.Array(TeamId))(payload.teamIds).pipe(Effect.catchTags({ ParseError: () => Effect.fail(new AdminError({ message: "Invalid team ids", status: 400 })) }));
-        const projectIds = yield* Schema.decodeUnknown(Schema.Array(ProjectId))(payload.projectIds).pipe(Effect.catchTags({ ParseError: () => Effect.fail(new AdminError({ message: "Invalid project ids", status: 400 })) }));
+        const repositoryId = yield* Schema.decodeUnknown(WorkspaceId)(
+          payload.id,
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid repository id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        const teamIds = yield* Schema.decodeUnknown(Schema.Array(TeamId))(
+          payload.teamIds,
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({ message: "Invalid team ids", status: 400 }),
+              ),
+          }),
+        );
+        const projectIds = yield* Schema.decodeUnknown(Schema.Array(ProjectId))(
+          payload.projectIds,
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({ message: "Invalid project ids", status: 400 }),
+              ),
+          }),
+        );
         const repository = yield* deps.workspaceRepo.createRepository({
           organizationId: session.organizationId,
           id: repositoryId,
@@ -679,7 +715,17 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const rawId = decodeURIComponent(
           url.pathname.slice("/api/admin/repositories/".length),
         );
-        const id = yield* Schema.decodeUnknown(WorkspaceId)(rawId).pipe(Effect.catchTags({ ParseError: () => Effect.fail(new AdminError({ message: "Invalid repository id", status: 400 })) }));
+        const id = yield* Schema.decodeUnknown(WorkspaceId)(rawId).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid repository id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
 
         if (request.method === "PUT") {
           const session = yield* requireMutation(request);
@@ -694,8 +740,29 @@ export const createAdminHandle = (deps: AdminDeps) =>
               text("Repository id in body does not match path", 400),
             );
           }
-          const teamIds = yield* Schema.decodeUnknown(Schema.Array(TeamId))(payload.teamIds).pipe(Effect.catchTags({ ParseError: () => Effect.fail(new AdminError({ message: "Invalid team ids", status: 400 })) }));
-          const projectIds = yield* Schema.decodeUnknown(Schema.Array(ProjectId))(payload.projectIds).pipe(Effect.catchTags({ ParseError: () => Effect.fail(new AdminError({ message: "Invalid project ids", status: 400 })) }));
+          const teamIds = yield* Schema.decodeUnknown(Schema.Array(TeamId))(
+            payload.teamIds,
+          ).pipe(
+            Effect.catchTags({
+              ParseError: () =>
+                Effect.fail(
+                  new AdminError({ message: "Invalid team ids", status: 400 }),
+                ),
+            }),
+          );
+          const projectIds = yield* Schema.decodeUnknown(
+            Schema.Array(ProjectId),
+          )(payload.projectIds).pipe(
+            Effect.catchTags({
+              ParseError: () =>
+                Effect.fail(
+                  new AdminError({
+                    message: "Invalid project ids",
+                    status: 400,
+                  }),
+                ),
+            }),
+          );
           const repository = yield* deps.workspaceRepo.updateRepository(
             session.organizationId,
             id,
@@ -711,9 +778,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
               now,
             },
           );
-          return Option.some(
-            json({ repository: toApiRepository(repository) }),
-          );
+          return Option.some(json({ repository: toApiRepository(repository) }));
         }
 
         if (request.method === "DELETE") {
@@ -729,22 +794,30 @@ export const createAdminHandle = (deps: AdminDeps) =>
         }
       }
 
-      if (
-        url.pathname === "/api/admin/preview" &&
-        request.method === "POST"
-      ) {
+      if (url.pathname === "/api/admin/preview" && request.method === "POST") {
         const session = yield* requireMutation(request);
         const body = yield* parseJsonBody(request);
+        const issueLabels = optionalStringArray(
+          body.issueLabels,
+          "issueLabels",
+        );
+        if (Either.isLeft(issueLabels)) {
+          return Option.some(text(issueLabels.left, 400));
+        }
+        const projectLabels = optionalStringArray(
+          body.projectLabels,
+          "projectLabels",
+        );
+        if (Either.isLeft(projectLabels)) {
+          return Option.some(text(projectLabels.left, 400));
+        }
         const resolution = yield* deps.workspace.resolve({
           organizationId: session.organizationId,
           teamId: optionalString(body.teamId),
           projectId: optionalString(body.projectId),
           repositoryId: optionalString(body.repositoryId),
-          issueLabels: optionalStringArray(body.issueLabels, "issueLabels"),
-          projectLabels: optionalStringArray(
-            body.projectLabels,
-            "projectLabels",
-          ),
+          issueLabels: issueLabels.right,
+          projectLabels: projectLabels.right,
         });
         return Option.some(
           json({
@@ -761,10 +834,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
       }
 
-      if (
-        url.pathname === "/api/admin/logout" &&
-        request.method === "POST"
-      ) {
+      if (url.pathname === "/api/admin/logout" && request.method === "POST") {
         const session = yield* requireMutation(request);
         yield* deps.adminSessionRepo.deleteAdminSession(
           tokenHash(session.rawToken),

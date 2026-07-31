@@ -1,4 +1,4 @@
-import { Cause, Clock, Deferred, Effect, Option, Ref } from "effect";
+import { Cause, Clock, Deferred, Effect, Option, Queue, Ref } from "effect";
 import { SessionAuthority } from "./session-authority.js";
 
 export interface ReconcilerStatus {
@@ -20,6 +20,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
     });
     const inFlight = yield* Ref.make<Option.Option<Deferred.Deferred<void, never>>>(Option.none());
     const authority = yield* SessionAuthority;
+    const triggers = yield* Queue.dropping<void>(1);
 
     const tick = Effect.fn("Reconciler.tick")(
       function* () {
@@ -66,12 +67,24 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
       },
     );
 
+    const trigger = Effect.fn("Reconciler.trigger")(
+      function* () {
+        yield* Queue.offer(triggers, undefined);
+      },
+    );
+
+    const awaitTrigger = Effect.fn("Reconciler.awaitTrigger")(
+      function* () {
+        yield* Queue.take(triggers);
+      },
+    );
+
     const status = Effect.fn("Reconciler.status")(
       function* () {
         return yield* Ref.get(statusRef);
       },
     );
 
-    return { tick, status };
+    return { tick, trigger, awaitTrigger, status };
   }),
 }) {}

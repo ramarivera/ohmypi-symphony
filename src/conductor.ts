@@ -61,8 +61,18 @@ const serviceLayers = GatewayConfig.Default.pipe(
 const scheduledReconciler = Layer.unwrapEffect(
   Effect.gen(function* () {
     const config = yield* GatewayConfig;
+    const periodic = Effect.repeat(
+      Reconciler.tick(),
+      Schedule.spaced(config.reconcilerIntervalMs),
+    );
+    const triggered = Effect.forever(
+      Reconciler.awaitTrigger().pipe(Effect.zipRight(Reconciler.tick())),
+    );
     return Layer.scopedDiscard(
-      Effect.repeat(Reconciler.tick(), Schedule.spaced(config.reconcilerIntervalMs)).pipe(Effect.forkScoped),
+      Effect.all([periodic, triggered], {
+        concurrency: "unbounded",
+        discard: true,
+      }).pipe(Effect.forkScoped),
     );
   }),
 );

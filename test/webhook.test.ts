@@ -1,5 +1,12 @@
-import { afterEach, beforeEach, describe, expect, it, test } from "@effect/vitest"
 import { createHmac } from "node:crypto";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  test,
+} from "@effect/vitest";
 import { Effect, Schema } from "effect";
 import type { GatewayConfig } from "../src/domain";
 import { GatewayStore } from "../src/store";
@@ -802,9 +809,18 @@ describe("replay window invariants", () => {
   it.effect.prop(
     "acceptance strictly matches abs(now - timestamp) <= window",
     {
-      now: Schema.Number.pipe(Schema.int(), Schema.between(1, 1_000_000_000_000)),
-      timestamp: Schema.Number.pipe(Schema.int(), Schema.between(1, 1_000_000_000_000)),
-      window: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+      now: Schema.Number.pipe(
+        Schema.int(),
+        Schema.between(1, 1_000_000_000_000),
+      ),
+      timestamp: Schema.Number.pipe(
+        Schema.int(),
+        Schema.between(1, 1_000_000_000_000),
+      ),
+      window: Schema.Number.pipe(
+        Schema.int(),
+        Schema.between(0, 1_000_000_000),
+      ),
     },
     ({ now, timestamp, window }) =>
       Effect.gen(function* () {
