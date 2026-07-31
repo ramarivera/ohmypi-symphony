@@ -74,6 +74,8 @@ const reconcilerLayer = Layer.succeed(Reconciler, {
       lastError: null,
     }),
   tick: () => Effect.void,
+  trigger: () => Effect.void,
+  awaitTrigger: () => Effect.void,
 });
 
 const withApp = <A, E>(
