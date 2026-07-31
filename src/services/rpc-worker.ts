@@ -545,14 +545,16 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
                   return;
                 }
 
-                yield* Effect.logTrace("rpc frame", {
-                  event: "rpc.frame",
-                  component: "omp-rpc",
-                  direction: "inbound",
-                  workerPid: process.pid,
-                  correlationId: frameId(parsed),
-                  frame: parsed,
-                });
+                yield* Effect.logTrace("rpc.frame").pipe(
+                  Effect.annotateLogs({
+                    event: "rpc.frame",
+                    component: "omp-rpc",
+                    direction: "inbound",
+                    workerPid: process.pid,
+                    correlationId: frameId(parsed),
+                    frame: parsed,
+                  }),
+                );
 
                 if (!readySeen && parsed.type === "ready") {
                   readySeen = true;
@@ -619,14 +621,16 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         Effect.gen(function* () {
           const process = yield* getProcess;
 
-          yield* Effect.logTrace("rpc frame", {
-            event: "rpc.frame",
-            component: "omp-rpc",
-            direction: "outbound",
-            workerPid: process.pid,
-            correlationId: frameId(frame),
-            frame,
-          });
+          yield* Effect.logTrace("rpc.frame").pipe(
+            Effect.annotateLogs({
+              event: "rpc.frame",
+              component: "omp-rpc",
+              direction: "outbound",
+              workerPid: process.pid,
+              correlationId: frameId(frame),
+              frame,
+            }),
+          );
 
           const line = `${JSON.stringify(frame)}\n`;
 
