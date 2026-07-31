@@ -194,7 +194,13 @@ describe("GatewayConfig log-level normalization", () => {
       valid: Schema.Literal(...LOG_LEVELS),
       invalid: Schema.String.pipe(
         Schema.minLength(1),
-        Schema.filter((value) => !LOG_LEVELS.includes(value as LogLevel)),
+        Schema.filter((value) => {
+          const normalized = value.trim().toLowerCase();
+          return (
+            normalized.length > 0 &&
+            !LOG_LEVELS.includes(normalized as LogLevel)
+          );
+        }),
       ),
     },
     ({ valid, invalid }) =>
@@ -213,7 +219,10 @@ describe("GatewayConfig log-level normalization", () => {
             return yield* GatewayConfig;
           }).pipe(Effect.provide(makeConfigLayer(invalid))),
         );
-        expect(invalidResult._tag).toBe("Left");
+        expect(invalidResult._tag).toBe("Right");
+        if (invalidResult._tag === "Right") {
+          expect(invalidResult.right.logLevel).toBe("info");
+        }
       }),
     { fastCheck: { numRuns: 20 } },
   );

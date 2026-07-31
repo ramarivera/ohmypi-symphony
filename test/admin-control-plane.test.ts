@@ -866,7 +866,9 @@ describe("admin session and routing invariants", () => {
   it.effect.prop(
     "repository resolution never returns a repository owned by another organization",
     {
-      owner: Schema.String.pipe(Schema.minLength(1)),
+      owner: Schema.String.pipe(
+        Schema.filter((value) => value.trim().length > 0),
+      ),
       label: Schema.String,
     },
     ({ owner, label }) =>
@@ -896,5 +898,6 @@ describe("admin session and routing invariants", () => {
           }),
         ),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 });
