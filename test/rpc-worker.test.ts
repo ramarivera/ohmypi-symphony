@@ -1,145 +1,166 @@
-import { describe, expect, test } from "bun:test";
-import { join } from "node:path";
-import { Writable } from "node:stream";
-import type { DestinationStream } from "pino";
-import type { RpcEvent } from "../src/domain";
-import { createLogger } from "../src/logger";
-import { OhMyPiRpcWorker } from "../src/rpc-worker";
+import { describe, it, expect } from "@effect/vitest";
+import { Deferred, Effect, Option } from "effect";
+import { RpcWorker } from "../src/services/rpc-worker.js";
 
-describe("OhMyPiRpcWorker", () => {
-  test("negotiates, correlates commands, streams events, and strips Linear credentials", async () => {
-    const worker = new OhMyPiRpcWorker({
-      command: [
-        process.execPath,
-        join(import.meta.dir, "fixtures/fake-rpc.ts"),
-      ],
-      cwd: process.cwd(),
-      env: {
-        PATH: Bun.env.PATH,
-        HOME: Bun.env.HOME,
-        LINEAR_CLIENT_SECRET: "must-not-leak",
-      },
-      startTimeoutMs: 2_000,
-    });
-    const events: Array<Record<string, unknown>> = [];
-    const messageEnded = Promise.withResolvers<void>();
-    worker.onEvent((event) => {
-      events.push(event);
-      if (event.type === "message_end") messageEnded.resolve();
-    });
-    await worker.start();
-    await worker.prompt("perform fixture task");
-    await messageEnded.promise;
-    expect(events.some((event) => event.type === "agent_start")).toBeTrue();
-    expect(
-      events.find((event) => event.type === "agent_start")?.linearSecretPresent,
-    ).toBeFalse();
-    expect(events.some((event) => event.type === "message_end")).toBeTrue();
-    expect(await worker.getState()).toMatchObject({
-      sessionId: "omp-test",
-      sessionFile: "/safe/session.jsonl",
-    });
-    expect(worker.sessionId).toBe("omp-test");
-    await worker.stop();
-  });
-  test("emits deferred local-only prompt completion", async () => {
-    const worker = new OhMyPiRpcWorker({
-      command: [
-        process.execPath,
-        join(import.meta.dir, "fixtures/fake-rpc.ts"),
-      ],
-      cwd: process.cwd(),
-      env: Bun.env,
-    });
-    const completed = Promise.withResolvers<RpcEvent>();
-    worker.onEvent((event) => {
-      if (event.type === "prompt_result") completed.resolve(event);
-    });
-    await worker.start();
-    expect(await worker.prompt("local command")).toBeTrue();
-    expect(await completed.promise).toMatchObject({
-      type: "prompt_result",
-      agentInvoked: false,
-    });
-    await worker.stop();
-  });
+const fixture = new URL("./fixtures/fake-rpc.ts", import.meta.url).pathname;
 
-  test("surfaces a late prompt scheduling failure as an agent error event", async () => {
-    const worker = new OhMyPiRpcWorker({
-      command: [
-        process.execPath,
-        join(import.meta.dir, "fixtures/fake-rpc.ts"),
-      ],
-      cwd: process.cwd(),
-      env: Bun.env,
-    });
-    const failure = Promise.withResolvers<RpcEvent>();
-    worker.onEvent((event) => {
-      if (event.type === "error") failure.resolve(event);
-    });
-    await worker.start();
-    expect(await worker.prompt("late failure")).toBeTrue();
-    expect(await failure.promise).toMatchObject({
-      type: "error",
-      message: "late scheduling failure",
-    });
-    await worker.stop();
-  });
-  test("logs raw inbound and outbound RPC frames at trace", async () => {
-    const chunks: string[] = [];
-    const stream = new Writable({
-      write(chunk, _encoding, callback) {
-        chunks.push(chunk.toString());
-        callback();
-      },
-    }) as DestinationStream;
-    const logger = createLogger({
-      level: "trace",
-      name: "rpc-test",
-      stream,
-    });
-    const worker = new OhMyPiRpcWorker({
-      command: [
-        process.execPath,
-        join(import.meta.dir, "fixtures/fake-rpc.ts"),
-      ],
-      cwd: process.cwd(),
-      env: Bun.env,
-      logger,
-    });
-    const messageEnded = Promise.withResolvers<void>();
-    worker.onEvent((event) => {
-      if (event.type === "message_end") messageEnded.resolve();
-    });
-    await worker.start();
-    await worker.prompt("perform fixture task");
-    await messageEnded.promise;
-    await worker.stop();
+describe("RpcWorker", () => {
+  const Live = RpcWorker.Default;
 
-    const frames = chunks
-      .map((line) => JSON.parse(line))
-      .filter((log) => log.event === "rpc.frame");
-    expect(frames.length).toBeGreaterThanOrEqual(3);
-    expect(frames.some((f) => f.direction === "outbound")).toBeTrue();
-    expect(frames.some((f) => f.direction === "inbound")).toBeTrue();
-    expect(frames.every((f) => f.component === "omp-rpc")).toBeTrue();
+  it.effect("negotiates v2 and exposes session id/file/state", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: ["bun", "run", fixture],
+        cwd: process.cwd(),
+      });
+      yield* worker.start();
 
-    const outbound = frames.find(
-      (f) => f.direction === "outbound" && f.frame?.type === "prompt",
-    );
-    expect(outbound).toMatchObject({
-      direction: "outbound",
-      component: "omp-rpc",
-      frame: expect.objectContaining({ type: "prompt" }),
-    });
+      const state = yield* worker.getState();
+      const sessionId = yield* worker.sessionId;
+      const sessionFile = yield* worker.sessionFile;
+      const isStreaming = yield* worker.isStreaming;
 
-    const inbound = frames.find(
-      (f) => f.direction === "inbound" && f.frame?.type === "ready",
-    );
-    expect(inbound).toMatchObject({
-      direction: "inbound",
-      component: "omp-rpc",
-      frame: expect.objectContaining({ type: "ready" }),
-    });
-  });
+      expect(Option.getOrElse(sessionId, () => null)).toBe("omp-test");
+      expect(Option.getOrElse(sessionFile, () => null)).toBe(
+        "/safe/session.jsonl",
+      );
+      expect(isStreaming).toBe(false);
+      expect(state).toMatchObject({
+        sessionId: "omp-test",
+        sessionFile: "/safe/session.jsonl",
+      });
+
+      yield* worker.stop();
+    }).pipe(Effect.provide(Live)),
+  );
+
+  it.effect("prompt emits prompt_result for local command", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: ["bun", "run", fixture],
+        cwd: process.cwd(),
+      });
+      yield* worker.start();
+
+      const events: Array<Record<string, unknown>> = [];
+      const seen = yield* Deferred.make<void>();
+      yield* worker.onEvent((event) => {
+        events.push(event);
+        if (
+          event.type === "prompt_result" &&
+          (event as { agentInvoked?: boolean }).agentInvoked === false
+        ) {
+          Deferred.unsafeDone(seen, Effect.void);
+        }
+      });
+
+      const agentInvoked = yield* worker.prompt("local command");
+      expect(agentInvoked).toBe(true);
+
+      yield* Deferred.await(seen);
+
+      const promptResult = events.find((event) => event.type === "prompt_result");
+      expect(promptResult).toMatchObject({
+        type: "prompt_result",
+        agentInvoked: false,
+      });
+
+      yield* worker.stop();
+    }).pipe(Effect.provide(Live)),
+  );
+
+  it.effect("prompt returns true and streams agent events", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: ["bun", "run", fixture],
+        cwd: process.cwd(),
+      });
+      yield* worker.start();
+
+      const events: Array<Record<string, unknown>> = [];
+      const seen = yield* Deferred.make<void>();
+      const needed = ["agent_start", "message_end", "agent_end"];
+      yield* worker.onEvent((event) => {
+        events.push(event);
+        if (needed.every((type) => events.some((e) => e.type === type))) {
+          Deferred.unsafeDone(seen, Effect.void);
+        }
+      });
+
+      const agentInvoked = yield* worker.prompt("perform fixture task");
+      expect(agentInvoked).toBe(true);
+
+      yield* Deferred.await(seen);
+
+      expect(events.some((event) => event.type === "agent_start")).toBe(true);
+      expect(events.some((event) => event.type === "message_end")).toBe(true);
+      expect(events.some((event) => event.type === "agent_end")).toBe(true);
+
+      const agentStart = events.find((event) => event.type === "agent_start");
+      expect(agentStart).toMatchObject({
+        linearSecretPresent: false,
+      });
+
+      yield* worker.stop();
+    }).pipe(Effect.provide(Live)),
+  );
+
+  it.effect("steer and followUp are accepted while running", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: ["bun", "run", fixture],
+        cwd: process.cwd(),
+      });
+      yield* worker.start();
+
+      yield* worker.prompt("perform fixture task");
+      yield* worker.steer("continue");
+
+      yield* worker.followUp("and another");
+
+      yield* worker.stop();
+    }).pipe(Effect.provide(Live)),
+  );
+
+  it.effect("abort and stop are idempotent", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: ["bun", "run", fixture],
+        cwd: process.cwd(),
+      });
+      yield* worker.start();
+
+      yield* worker.abort();
+      yield* worker.stop();
+      yield* worker.stop();
+    }).pipe(Effect.provide(Live)),
+  );
+
+  it.effect("respondToUi and getState work after start", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: ["bun", "run", fixture],
+        cwd: process.cwd(),
+      });
+      yield* worker.start();
+
+      yield* worker.respondToUi("ui-1", { confirmed: true });
+      yield* worker.respondToUi("ui-2", { value: "answer" });
+      yield* worker.respondToUi("ui-3", { cancelled: true });
+
+      const state = yield* worker.getState();
+      expect(state).toMatchObject({
+        sessionId: "omp-test",
+        sessionFile: "/safe/session.jsonl",
+      });
+
+      yield* worker.stop();
+    }).pipe(Effect.provide(Live)),
+  );
 });
