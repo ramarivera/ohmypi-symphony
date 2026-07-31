@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Clock, Effect, Option, ParseResult, Ref, Schema } from "effect";
 import {
+  type DatabaseError,
   type InstallationRevokedError,
   LinearApiError,
   type LinearRateLimitError,
@@ -10,6 +11,12 @@ import {
 } from "../domain/errors.js";
 import { ActivityId, SessionId, SourceKey } from "../domain/ids.js";
 import type { ActivityType, ProjectionJob } from "../domain/models.js";
+
+export interface LinearPlanItem {
+  readonly content: string;
+  readonly status: "pending" | "inProgress" | "completed" | "canceled";
+}
+
 import { LinearGateway } from "./linear-gateway.js";
 import {
   isActivitySignal,
@@ -185,11 +192,6 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         return { sessionId: job.sessionId, content };
       };
 
-      interface LinearPlanItem {
-        readonly content: string;
-        readonly status: "pending" | "inProgress" | "completed" | "canceled";
-      }
-
       const decodeSessionUpdate = (
         job: ProjectionJob,
       ): {
@@ -254,7 +256,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
       const dispatch = Effect.fn("ActivityProjector.dispatch")(function* (
         sourceKey: SourceKey,
         now?: number,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         const at = now ?? (yield* Clock.currentTimeMillis);
         const jobOption = yield* projectionRepo.claim(
           sourceKey,
@@ -279,11 +281,13 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
               message,
               nextAttemptAt,
             );
-            yield* Effect.logWarning("projector.dispatch.failed", {
-              sourceKey,
-              error: message,
-              nextAttemptAt,
-            });
+            yield* Effect.logWarning("projector.dispatch.failed").pipe(
+              Effect.annotateLogs({
+                sourceKey,
+                error: message,
+                nextAttemptAt,
+              }),
+            );
           });
 
         return yield* Effect.gen(function* () {
@@ -395,7 +399,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         activityType: string,
         payload: unknown,
         firstWriteWins = false,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         const serialized = yield* stringify(payload);
         const payloadHash = yield* sha256(serialized);
         const decodedSourceKey = yield* decodeSourceKey(sourceKey);
@@ -409,10 +413,12 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
           firstWriteWins,
         });
         if (!enqueued) {
-          yield* Effect.logDebug("projector.enqueue.duplicate", {
-            sourceKey,
-            payloadHash,
-          });
+          yield* Effect.logDebug("projector.enqueue.duplicate").pipe(
+            Effect.annotateLogs({
+              sourceKey,
+              payloadHash,
+            }),
+          );
         }
         return yield* dispatch(decodedSourceKey, undefined);
       });
@@ -425,7 +431,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         signal?: "auth" | "continue" | "select" | "stop",
         signalMetadata?: Record<string, unknown>,
         firstWriteWins = false,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         const request: Record<string, unknown> = {
           sessionId,
           content,
@@ -460,7 +466,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
                   readonly url: string;
                 }>;
               },
-        ) {
+        ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
           return yield* enqueueAndDispatch(sessionId, sourceKey, activityType, {
             request,
           });
@@ -472,7 +478,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         sourceKey: string,
         body: string,
         ephemeral = true,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         yield* Effect.annotateCurrentSpan({
           "projector.sessionId": sessionId,
           "projector.sourceKey": sourceKey,
@@ -490,7 +496,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         sourceKey: string,
         body: string,
         options?: ReadonlyArray<string>,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         const signalMetadata = options ? { options: [...options] } : undefined;
         const signal: "select" | undefined = options ? "select" : undefined;
         return yield* activity(
@@ -508,7 +514,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         sourceKey: string,
         type: "response" | "error",
         body: string,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         return yield* activity(
           sessionId,
           `terminal:${sessionId}:${sourceKey}`,
@@ -524,7 +530,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         sessionId: string,
         sourceKey: string,
         items: ReadonlyArray<LinearPlanItem>,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         if (items.length === 0) return false;
         const normalized = items.map((item) => ({
           content: item.content,
@@ -541,7 +547,10 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
           sessionId: string,
           sourceKey: string,
           urls: ReadonlyArray<{ readonly label: string; readonly url: string }>,
-        ) {
+        ): Effect.fn.Return<
+          boolean,
+          DatabaseError | LinearApiError | RowDecodeError
+        > {
           const normalized = yield* Effect.forEach(urls, (entry) =>
             Effect.try({
               try: () => {
@@ -572,7 +581,10 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
       );
 
       const flushPending = Effect.fn("ActivityProjector.flushPending")(
-        function* (limit = 50, now?: number) {
+        function* (
+          limit = 50,
+          now?: number,
+        ): Effect.fn.Return<number, DatabaseError | RowDecodeError> {
           const at = now ?? (yield* Clock.currentTimeMillis);
           const keys = yield* projectionRepo.due(at, limit);
           let completed = 0;
@@ -586,7 +598,11 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
       );
 
       const projectRpcEvent = Effect.fn("ActivityProjector.projectRpcEvent")(
-        function* (sessionId: string, sequence: number, event: unknown) {
+        function* (
+          sessionId: string,
+          sequence: number,
+          event: unknown,
+        ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
           if (!isRecord(event)) return;
           yield* Effect.annotateCurrentSpan({
             "projector.sessionId": sessionId,

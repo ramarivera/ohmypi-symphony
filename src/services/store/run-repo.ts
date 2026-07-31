@@ -96,7 +96,12 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
   effect: Effect.gen(function* () {
     const { db } = yield* SqliteClient;
     const runEventRepo = yield* RunEventRepo;
-    const get = Effect.fn("RunRepo.get")(function* (sessionId: SessionId) {
+    const get = Effect.fn("RunRepo.get")(function* (
+      sessionId: SessionId,
+    ): Effect.fn.Return<
+      Option.Option<AgentRun>,
+      DatabaseError | RowDecodeError
+    > {
       yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const row = yield* tryDb(
         () =>
@@ -120,7 +125,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       readonly teamId?: Option.Option<TeamId>;
       readonly projectId?: Option.Option<ProjectId>;
       readonly now?: number;
-    }) {
+    }): Effect.fn.Return<AgentRun, DatabaseError | RowDecodeError> {
       yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
       const now = input.now ?? (yield* Clock.currentTimeMillis);
       yield* tryDb(
@@ -168,7 +173,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
         readonly nextAttemptAt?: Option.Option<number>;
         readonly incrementAttempt?: boolean;
       },
-    ) {
+    ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
       yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const current = yield* get(sessionId);
       if (Option.isNone(current)) {
@@ -251,7 +256,10 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
 
     const listRunnable = Effect.fn("RunRepo.listRunnable")(function* (
       now: number,
-    ) {
+    ): Effect.fn.Return<
+      ReadonlyArray<AgentRun>,
+      DatabaseError | RowDecodeError
+    > {
       const rows = yield* tryDb(
         () =>
           db
@@ -269,7 +277,10 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
 
     const listCancellationPending = Effect.fn(
       "RunRepo.listCancellationPending",
-    )(function* () {
+    )(function* (): Effect.fn.Return<
+      ReadonlyArray<AgentRun>,
+      DatabaseError | RowDecodeError
+    > {
       const rows = yield* tryDb(
         () =>
           db
@@ -288,7 +299,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       owner: string,
       leaseDurationMs: number,
       now?: number,
-    ) {
+    ): Effect.fn.Return<boolean, DatabaseError> {
       yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const at = now ?? (yield* Clock.currentTimeMillis);
       const result = yield* tryDb(
@@ -310,7 +321,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       owner: string,
       leaseDurationMs: number,
       now?: number,
-    ) {
+    ): Effect.fn.Return<boolean, DatabaseError> {
       yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const at = now ?? (yield* Clock.currentTimeMillis);
       const result = yield* tryDb(
@@ -328,7 +339,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
     const releaseLease = Effect.fn("RunRepo.releaseLease")(function* (
       sessionId: SessionId,
       owner: string,
-    ) {
+    ): Effect.fn.Return<void, DatabaseError> {
       yield* Effect.annotateCurrentSpan("sessionId", sessionId);
       const now = yield* Clock.currentTimeMillis;
       yield* tryDb(
@@ -343,7 +354,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
     });
 
     const recoverInterruptedRuns = Effect.fn("RunRepo.recoverInterruptedRuns")(
-      function* (now?: number) {
+      function* (now?: number): Effect.fn.Return<number, DatabaseError> {
         const at = now ?? (yield* Clock.currentTimeMillis);
         const result = yield* tryDb(
           () =>

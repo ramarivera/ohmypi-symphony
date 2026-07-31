@@ -59,6 +59,7 @@ const testConfig: GatewayConfigShape = {
   reconcilerIntervalMs: 1_000,
   webhookReplayWindowMs: 60_000,
   logLevel: "info",
+  logFile: Option.none(),
 };
 
 interface StoredOAuthState {

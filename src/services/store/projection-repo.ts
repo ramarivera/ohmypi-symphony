@@ -89,7 +89,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
         readonly payload: unknown;
         readonly now?: number;
         readonly firstWriteWins?: boolean;
-      }) {
+      }): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
         const now = input.now ?? (yield* Clock.currentTimeMillis);
 
@@ -229,7 +229,10 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
           owner: string,
           leaseDurationMs: number,
           now?: number,
-        ) {
+        ): Effect.fn.Return<
+          Option.Option<ProjectionJob>,
+          DatabaseError | RowDecodeError
+        > {
           yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
           const at = now ?? (yield* Clock.currentTimeMillis);
 
@@ -304,7 +307,13 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
 
       const listDueProjectionKeys = Effect.fn(
         "ProjectionRepo.listDueProjectionKeys",
-      )(function* (now?: number, limit = 50) {
+      )(function* (
+        now?: number,
+        limit = 50,
+      ): Effect.fn.Return<
+        ReadonlyArray<string>,
+        DatabaseError | RowDecodeError
+      > {
         const at = now ?? (yield* Clock.currentTimeMillis);
         const rows = yield* tryDb(
           () =>
@@ -333,7 +342,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
           owner: string,
           error: string,
           nextAttemptAt: number,
-        ) {
+        ): Effect.fn.Return<void, DatabaseError> {
           yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
           const now = yield* Clock.currentTimeMillis;
 
@@ -379,7 +388,7 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
           sourceKey: SourceKey,
           owner: string,
           activityId: Option.Option<ActivityId>,
-        ) {
+        ): Effect.fn.Return<void, DatabaseError | RunLeaseError> {
           yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
           const now = yield* Clock.currentTimeMillis;
 
@@ -437,7 +446,10 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
       );
 
       const projectionCount = Effect.fn("ProjectionRepo.projectionCount")(
-        function* (sessionId: SessionId, activityType?: string) {
+        function* (
+          sessionId: SessionId,
+          activityType?: string,
+        ): Effect.fn.Return<number, DatabaseError> {
           const row =
             activityType === undefined
               ? yield* tryDb(
@@ -485,7 +497,10 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
 
       const get = Effect.fn("ProjectionRepo.get")(function* (
         sourceKey: SourceKey,
-      ) {
+      ): Effect.fn.Return<
+        Option.Option<ProjectionJob>,
+        DatabaseError | RowDecodeError
+      > {
         yield* Effect.annotateCurrentSpan("sourceKey", sourceKey);
         const row = yield* tryDb(
           () =>

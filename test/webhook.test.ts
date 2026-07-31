@@ -1,14 +1,17 @@
 import { createHmac } from "node:crypto";
+import { Writable } from "node:stream";
 import { it } from "@effect/vitest";
 import {
   Clock,
   ConfigProvider,
   Effect,
   Layer,
+  Logger,
   Option,
   Redacted,
   Schema,
 } from "effect";
+import pino from "pino";
 import { describe, expect } from "vitest";
 import {
   AppUserId,
@@ -23,6 +26,7 @@ import {
   GatewayConfig,
   type GatewayConfigShape,
 } from "../src/services/config.js";
+import { makePinoEffectLogger } from "../src/services/logger.js";
 import {
   DeliveryRepo,
   InstallationRepo,
@@ -50,6 +54,7 @@ const config: GatewayConfigShape = {
   reconcilerIntervalMs: 1_000,
   webhookReplayWindowMs: 60_000,
   logLevel: "silent",
+  logFile: Option.none(),
 };
 const configProviderFor = (gatewayConfig: GatewayConfigShape) =>
   ConfigProvider.fromMap(
@@ -306,8 +311,65 @@ const currentTime = Clock.currentTimeMillis;
 
 const expectSome = <A>(value: Option.Option<A>): A | undefined => {
   expect(Option.isSome(value)).toBe(true);
+
   return Option.isSome(value) ? value.value : undefined;
 };
+describe("WebhookPipeline Pino lifecycle logs", () => {
+  it.scopedLive(
+    "emits correlated success and controlled-rejection logs through the gateway graph",
+    () => {
+      const chunks: string[] = [];
+      const stream = new Writable({
+        write(chunk, _encoding, callback) {
+          chunks.push(chunk.toString());
+          callback();
+        },
+      });
+      const pinoLoggerLive = Logger.replace(
+        Logger.defaultLogger,
+        makePinoEffectLogger(pino({ base: null, level: "info" }, stream)),
+      );
+
+      return withWebhook(
+        Effect.gen(function* () {
+          const now = yield* currentTime;
+          yield* install();
+          const accepted = yield* WebhookPipeline.handle(
+            signedRequest(createdPayload(now)),
+          );
+          const rejected = yield* WebhookPipeline.handle(
+            signedRequest(createdPayload(now), { method: "GET" }),
+          );
+          expect(accepted.status).toBe(200);
+          expect(rejected.status).toBe(405);
+
+          const lines = chunks.map(
+            (chunk) => JSON.parse(chunk) as Record<string, unknown>,
+          );
+          const success = lines.find(
+            (line) => line.msg === "webhook.processed",
+          );
+          const failure = lines.find(
+            (line) =>
+              line.msg === "webhook.rejected" &&
+              line.reason === "method not allowed",
+          );
+          expect(success).toMatchObject({
+            level: 30,
+            span_name: "WebhookPipeline.handle",
+          });
+          expect(failure).toMatchObject({
+            level: 40,
+            span_name: "WebhookPipeline.handle",
+            reason: "method not allowed",
+          });
+          expect(typeof success?.trace_id).toBe("string");
+          expect(typeof failure?.trace_id).toBe("string");
+        }),
+      ).pipe(Effect.provide(pinoLoggerLive));
+    },
+  );
+});
 
 describe("Linear webhook input correctness", () => {
   it.scopedLive("created event is durably stored and acknowledged", () =>

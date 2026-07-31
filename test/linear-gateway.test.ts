@@ -173,6 +173,7 @@ const gatewayDependencies = Layer.mergeAll(
       tokenEncryptionKey: Redacted.make("token-key"),
       publicUrl: new URL("https://localhost/"),
       logLevel: "info",
+      logFile: Option.none(),
       databasePath: ":memory:",
       workspaceRoot: "/tmp/workspaces",
       ompCliPath: "omp",

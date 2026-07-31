@@ -22,7 +22,8 @@
     "@linear/sdk": "88.3.0",
     "@oh-my-pi/pi-coding-agent": "17.1.8",
     "effect": "^3.22.1",
-    "pino": "^10.3.1"
+    "pino": "^10.3.1",
+    "pino-roll": "^4.0.0"
   },
   "trustedDependencies": [
     "onnxruntime-node",

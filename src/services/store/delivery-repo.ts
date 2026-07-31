@@ -1,5 +1,5 @@
 import { Clock, Effect, Schema } from "effect";
-import { DatabaseError } from "../../domain/errors.js";
+import { DatabaseError, type RowDecodeError } from "../../domain/errors.js";
 import type { DeliveryId } from "../../domain/ids.js";
 import {
   decodeRow,
@@ -31,7 +31,7 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
         readonly payloadHash: string;
         readonly payload: unknown;
         readonly receivedAt?: number;
-      }) {
+      }): Effect.fn.Return<boolean, DatabaseError> {
         yield* Effect.annotateCurrentSpan("deliveryId", input.id);
         const now = input.receivedAt ?? (yield* Clock.currentTimeMillis);
         const result = yield* tryDb(
@@ -59,7 +59,10 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
         readonly payloadHash: string;
         readonly payload: unknown;
         readonly receivedAt?: number;
-      }) {
+      }): Effect.fn.Return<
+        DeliveryClaimResult,
+        DatabaseError | RowDecodeError
+      > {
         yield* Effect.annotateCurrentSpan("deliveryId", input.id);
 
         const tx = Effect.gen(function* () {
@@ -116,7 +119,7 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
         id: DeliveryId,
         status: "processed" | "failed",
         error?: string,
-      ) {
+      ): Effect.fn.Return<void, DatabaseError> {
         yield* Effect.annotateCurrentSpan("deliveryId", id);
         yield* tryDb(
           () =>
@@ -133,7 +136,7 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
         "DeliveryRepo.recoverPendingDeliveries",
       )(function* (
         reason = "Gateway restarted before webhook processing completed",
-      ) {
+      ): Effect.fn.Return<number, DatabaseError> {
         const result = yield* tryDb(
           () =>
             db

@@ -69,9 +69,9 @@ const reconcilerLayer = Layer.succeed(Reconciler, {
   status: () =>
     Effect.succeed({
       running: false,
-      lastStartedAt: null,
-      lastCompletedAt: null,
-      lastError: null,
+      lastStartedAt: Option.none(),
+      lastCompletedAt: Option.none(),
+      lastError: Option.none(),
     }),
   tick: () => Effect.void,
   trigger: () => Effect.void,

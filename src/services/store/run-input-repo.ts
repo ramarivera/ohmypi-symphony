@@ -104,7 +104,7 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
         readonly body: string;
         readonly payload: unknown;
         readonly createdAt?: number;
-      }) {
+      }): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
 
         const tx = Effect.gen(function* () {
@@ -192,7 +192,10 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
 
       const pending = Effect.fn("RunInputRepo.pending")(function* (
         sessionId: SessionId,
-      ) {
+      ): Effect.fn.Return<
+        ReadonlyArray<RunInput>,
+        DatabaseError | RowDecodeError
+      > {
         yield* Effect.annotateCurrentSpan("sessionId", sessionId);
         const rows = yield* tryDb(
           () =>
@@ -209,7 +212,12 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
 
       const latestActionableInput = Effect.fn(
         "RunInputRepo.latestActionableInput",
-      )(function* (sessionId: SessionId) {
+      )(function* (
+        sessionId: SessionId,
+      ): Effect.fn.Return<
+        Option.Option<{ readonly body: string; readonly kind: InputKind }>,
+        DatabaseError
+      > {
         yield* Effect.annotateCurrentSpan("sessionId", sessionId);
         const row = yield* tryDb(
           () =>
@@ -229,7 +237,10 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
 
       const listSessionsWithPendingInputs = Effect.fn(
         "RunInputRepo.listSessionsWithPendingInputs",
-      )(function* () {
+      )(function* (): Effect.fn.Return<
+        ReadonlyArray<SessionId>,
+        DatabaseError | RowDecodeError
+      > {
         const rows = yield* tryDb(
           () =>
             db
@@ -251,7 +262,7 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
       const markProcessed = Effect.fn("RunInputRepo.markProcessed")(function* (
         id: InputId,
         at?: number,
-      ) {
+      ): Effect.fn.Return<void, DatabaseError> {
         yield* Effect.annotateCurrentSpan("inputId", id);
         const processedAt = at ?? (yield* Clock.currentTimeMillis);
         yield* tryDb(

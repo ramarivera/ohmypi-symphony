@@ -57,9 +57,9 @@ describe("HTTP router parity", () => {
       status: () =>
         Effect.succeed({
           running: false,
-          lastStartedAt: null,
-          lastCompletedAt: null,
-          lastError: null,
+          lastStartedAt: Option.none(),
+          lastCompletedAt: Option.none(),
+          lastError: Option.none(),
         }),
     };
     const response = await Effect.runPromise(
@@ -95,9 +95,9 @@ describe("HTTP router parity", () => {
       status: () =>
         Effect.succeed({
           running: false,
-          lastStartedAt: null,
-          lastCompletedAt: null,
-          lastError: null,
+          lastStartedAt: Option.none(),
+          lastCompletedAt: Option.none(),
+          lastError: Option.none(),
         }),
     };
     const response = await Effect.runPromise(
@@ -135,9 +135,9 @@ describe("HTTP router parity", () => {
         status: () =>
           Effect.succeed({
             running: false,
-            lastStartedAt: null,
-            lastCompletedAt: null,
-            lastError: null,
+            lastStartedAt: Option.none(),
+            lastCompletedAt: Option.none(),
+            lastError: Option.none(),
           }),
       };
       return Effect.gen(function* () {
@@ -241,6 +241,7 @@ describe("HTTP router parity", () => {
       tokenEncryptionKey: Redacted.make("key"),
       publicUrl: new URL("https://gateway.example"),
       logLevel: "silent",
+      logFile: Option.none(),
       databasePath: ":memory:",
       workspaceRoot: "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/router-test",
       ompCliPath: "omp",
@@ -318,6 +319,7 @@ describe("HTTP router parity", () => {
           tokenEncryptionKey: Redacted.make("key"),
           publicUrl: new URL("https://gateway.example"),
           logLevel: "silent",
+          logFile: Option.none(),
           databasePath: ":memory:",
           workspaceRoot: "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/router-test",
           ompCliPath: "omp",

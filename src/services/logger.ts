@@ -13,6 +13,7 @@ import {
 } from "effect";
 import * as Tracer from "effect/Tracer";
 import pino from "pino";
+import type { LogFileConfig } from "./config.js";
 import { GatewayConfig } from "./config.js";
 
 const secretKeys = [
@@ -67,6 +68,54 @@ export const redactionPaths = secretKeys.flatMap((key) =>
   ),
 );
 
+export interface PinoLoggerInput {
+  readonly logLevel: string;
+  readonly logFile: Option.Option<LogFileConfig>;
+}
+
+export interface PinoLoggerPlan {
+  readonly options: pino.LoggerOptions;
+  readonly transport: pino.TransportMultiOptions<unknown> | undefined;
+}
+
+/**
+ * Builds the stdout-only or stdout-plus-rotated-file topology. Pino applies
+ * `redact` before serializing each NDJSON line to either destination.
+ */
+export const buildPinoLoggerPlan = ({
+  logLevel,
+  logFile,
+}: PinoLoggerInput): PinoLoggerPlan => ({
+  options: {
+    name: "gateway",
+    level: logLevel,
+    redact: { paths: redactionPaths, censor: "[REDACTED]" },
+  },
+  transport: Option.match(logFile, {
+    onNone: () => undefined,
+    onSome: (file): pino.TransportMultiOptions<unknown> => ({
+      targets: [
+        {
+          target: "pino/file",
+          level: logLevel,
+          options: { destination: 1 },
+        },
+        {
+          target: "pino-roll",
+          level: logLevel,
+          options: {
+            file: file.path,
+            frequency: file.frequency,
+            size: file.size,
+            limit: { count: file.limit },
+            mkdir: true,
+          },
+        },
+      ],
+    }),
+  }),
+});
+
 export const makePinoEffectLogger = (
   logger: pino.Logger,
 ): Logger.Logger<unknown, void> =>
@@ -111,12 +160,24 @@ export class GatewayLogger extends Effect.Service<GatewayLogger>()(
     dependencies: [GatewayConfig.Default],
     effect: Effect.gen(function* () {
       const config = yield* GatewayConfig;
-      const logger = pino({
-        name: "gateway",
-        level: config.logLevel,
-        redact: { paths: redactionPaths, censor: "[REDACTED]" },
-      });
-      return { logger };
+      const plan = buildPinoLoggerPlan(config);
+      const resource = yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const transport =
+            plan.transport === undefined
+              ? undefined
+              : pino.transport(plan.transport);
+          return { logger: pino(plan.options, transport), transport };
+        }),
+        ({ logger, transport }) =>
+          Effect.sync(() => {
+            if (transport !== undefined) {
+              transport.flushSync();
+              transport.end();
+            } else logger.flush();
+          }),
+      );
+      return { logger: resource.logger };
     }),
   },
 ) {}

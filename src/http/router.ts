@@ -4,7 +4,7 @@ import {
   HttpServerResponse,
 } from "@effect/platform";
 import { BunHttpServerRequest } from "@effect/platform-bun";
-import { Clock, Effect } from "effect";
+import { Clock, Effect, Option } from "effect";
 import {
   Admin,
   createAdminSession,
@@ -25,13 +25,19 @@ const SECURITY_HEADERS: Record<string, string> = {
 
 const health = Effect.gen(function* () {
   const status = yield* Reconciler.status();
-  const degraded = status.lastError !== null;
+  const degraded = Option.isSome(status.lastError);
   const body = {
     status: degraded ? "degraded" : "ok",
     reconciler: {
       running: status.running,
-      lastStartedAt: status.lastStartedAt,
-      lastCompletedAt: status.lastCompletedAt,
+      lastStartedAt: Option.match(status.lastStartedAt, {
+        onNone: () => null,
+        onSome: (value) => value,
+      }),
+      lastCompletedAt: Option.match(status.lastCompletedAt, {
+        onNone: () => null,
+        onSome: (value) => value,
+      }),
     },
   };
   return yield* HttpServerResponse.json(body, { status: degraded ? 503 : 200 });
@@ -49,10 +55,12 @@ export const webhook = Effect.gen(function* () {
 });
 
 export const oauthStart = Effect.gen(function* () {
-  yield* Effect.logInfo("oauth.started", {
-    event: "oauth.started",
-    path: "/oauth/start",
-  });
+  yield* Effect.logInfo("oauth.started").pipe(
+    Effect.annotateLogs({
+      event: "oauth.started",
+      path: "/oauth/start",
+    }),
+  );
   const { url } = yield* OAuth.startAuthorization();
   return HttpServerResponse.redirect(url, {
     status: 302,
@@ -66,10 +74,12 @@ export const oauthCallback = Effect.gen(function* () {
     const installation = yield* OAuth.completeAuthorization(
       new URL(request.url, "http://localhost"),
     );
-    yield* Effect.logInfo("oauth.completed", {
-      event: "oauth.completed",
-      organizationId: installation.organizationId,
-    });
+    yield* Effect.logInfo("oauth.completed").pipe(
+      Effect.annotateLogs({
+        event: "oauth.completed",
+        organizationId: installation.organizationId,
+      }),
+    );
     const config = yield* GatewayConfig;
     const adminSessionRepo = yield* AdminSessionRepo;
     const now = yield* Clock.currentTimeMillis;
@@ -88,10 +98,12 @@ export const oauthCallback = Effect.gen(function* () {
   });
   return yield* callback.pipe(
     Effect.tapError((error) =>
-      Effect.logError("oauth.failed", {
-        event: "oauth.failed",
-        error: String(error),
-      }),
+      Effect.logError("oauth.failed").pipe(
+        Effect.annotateLogs({
+          event: "oauth.failed",
+          error: String(error),
+        }),
+      ),
     ),
   );
 });

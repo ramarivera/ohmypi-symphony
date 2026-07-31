@@ -230,19 +230,25 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           if (!workers.has(sessionId)) {
             yield* runRepo.releaseLease(sessionId, owner).pipe(
               Effect.catchTag("@Gateway/DatabaseError", (error) =>
-                Effect.logWarning("authority.cleanup_failed", {
-                  event: "authority.cleanup_failed",
-                  sessionId,
-                  operation: "releaseLease",
-                  error: error.message,
-                }),
+                Effect.logWarning("authority.cleanup_failed").pipe(
+                  Effect.annotateLogs({
+                    event: "authority.cleanup_failed",
+                    sessionId,
+                    operation: "releaseLease",
+                    error: error.message,
+                  }),
+                ),
               ),
             );
           }
         });
 
       const recordRunEvent = Effect.fn("SessionAuthority.recordRunEvent")(
-        function* (sessionId: SessionId, sequence: number, event: RpcEvent) {
+        function* (
+          sessionId: SessionId,
+          sequence: number,
+          event: RpcEvent,
+        ): Effect.fn.Return<void, DatabaseError> {
           const type = event.type;
           let sourceKey = `rpc:${sessionId}:${sequence}:${type}`;
           let kind = type;
@@ -336,7 +342,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
       const captureWorkerState = Effect.fn(
         "SessionAuthority.captureWorkerState",
-      )(function* (sessionId: SessionId, worker: RpcWorkerHandle) {
+      )(function* (
+        sessionId: SessionId,
+        worker: RpcWorkerHandle,
+      ): Effect.fn.Return<
+        void,
+        DatabaseError | RowDecodeError | RpcProtocolError
+      > {
         const state = yield* worker.getState();
         const fromStateSessionId = isString(state.sessionId)
           ? Option.some(state.sessionId)
@@ -378,12 +390,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         worker.abort().pipe(
           Effect.catchTags({
             "@Gateway/RpcProtocolError": (error) =>
-              Effect.logWarning("authority.cleanup_failed", {
-                event: "authority.cleanup_failed",
-                sessionId,
-                operation: "abort",
-                error: error.message,
-              }),
+              Effect.logWarning("authority.cleanup_failed").pipe(
+                Effect.annotateLogs({
+                  event: "authority.cleanup_failed",
+                  sessionId,
+                  operation: "abort",
+                  error: error.message,
+                }),
+              ),
           }),
         );
 
@@ -393,7 +407,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         sessionId: SessionId,
         worker: RpcWorkerHandle,
         sourceId: string,
-      ) {
+      ): Effect.fn.Return<
+        void,
+        DatabaseError | RowDecodeError | RpcProtocolError
+      > {
         yield* captureWorkerState(sessionId, worker);
         yield* runRepo.update(sessionId, {
           state: "waiting",
@@ -408,7 +425,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
       const cancel = Effect.fn("SessionAuthority.cancel")(function* (
         run: AgentRun,
-      ) {
+      ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
         const state = yield* getWorker(run.sessionId);
         if (Option.isSome(state)) {
           yield* abortForCleanup(run.sessionId, state.value.worker);
@@ -433,11 +450,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             state: "canceled",
             terminalReason: Option.some("Stopped by Linear user"),
           });
-          yield* Effect.logInfo("run.canceled", {
-            event: "run.canceled",
-            sessionId: run.sessionId,
-            attempt: run.attempt,
-          });
+          yield* Effect.logInfo("run.canceled").pipe(
+            Effect.annotateLogs({
+              event: "run.canceled",
+              sessionId: run.sessionId,
+              attempt: run.attempt,
+            }),
+          );
           yield* projector.terminal(
             run.sessionId,
             `stop:${run.sessionId}`,
@@ -449,7 +468,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       });
 
       const handleFailure = Effect.fn("SessionAuthority.handleFailure")(
-        function* (sessionId: SessionId, error: AuthorityError) {
+        function* (
+          sessionId: SessionId,
+          error: AuthorityError,
+        ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
           const message = error.message;
           const worker = yield* getWorker(sessionId);
           if (Option.isSome(worker)) {
@@ -462,11 +484,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             });
           }
 
-          yield* Effect.logWarning("authority.failure", {
-            event: "authority.failure",
-            sessionId,
-            error: message,
-          });
+          yield* Effect.logWarning("authority.failure").pipe(
+            Effect.annotateLogs({
+              event: "authority.failure",
+              sessionId,
+              error: message,
+            }),
+          );
 
           const current = yield* runRepo.get(sessionId);
           if (
@@ -494,13 +518,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               terminalReason: Option.some(`${message} [${correlationId}]`),
               nextAttemptAt: Option.none(),
             });
-            yield* Effect.logInfo("run.failed", {
-              event: "run.failed",
-              sessionId,
-              attempt: run.attempt,
-              correlationId,
-              terminalReason: `${message} [${correlationId}]`,
-            });
+            yield* Effect.logInfo("run.failed").pipe(
+              Effect.annotateLogs({
+                event: "run.failed",
+                sessionId,
+                attempt: run.attempt,
+                correlationId,
+                terminalReason: `${message} [${correlationId}]`,
+              }),
+            );
             yield* projector.terminal(
               sessionId,
               `failure:${correlationId}`,
@@ -524,20 +550,25 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             terminalReason: Option.some(message),
             nextAttemptAt: Option.some(nextAttemptAt),
           });
-          yield* Effect.logInfo("run.retried", {
-            event: "run.retried",
-            sessionId,
-            attempt: run.attempt,
-            delay,
-            nextAttemptAt,
-          });
+          yield* Effect.logInfo("run.retried").pipe(
+            Effect.annotateLogs({
+              event: "run.retried",
+              sessionId,
+              attempt: run.attempt,
+              delay,
+              nextAttemptAt,
+            }),
+          );
         },
       );
 
       const handleEvent = Effect.fn("SessionAuthority.handleEvent")(function* (
         sessionId: SessionId,
         event: RpcEvent,
-      ) {
+      ): Effect.fn.Return<
+        void,
+        DatabaseError | RowDecodeError | RpcProtocolError
+      > {
         const current = yield* runRepo.get(sessionId);
         if (
           Option.isNone(current) ||
@@ -626,11 +657,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
 
         if (terminalAgentEnd) {
-          yield* Effect.logInfo("run.completed", {
-            event: "run.completed",
-            sessionId,
-            attempt: run.attempt,
-          });
+          yield* Effect.logInfo("run.completed").pipe(
+            Effect.annotateLogs({
+              event: "run.completed",
+              sessionId,
+              attempt: run.attempt,
+            }),
+          );
           yield* runRepo.update(sessionId, {
             state: "succeeded",
             nextAttemptAt: Option.none(),
@@ -659,7 +692,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const startWorker = Effect.fn("SessionAuthority.startWorker")(function* (
         run: AgentRun,
         cwd: string,
-      ) {
+      ): Effect.fn.Return<
+        RpcWorkerHandle,
+        | DatabaseError
+        | RowDecodeError
+        | RpcProtocolError
+        | RpcSpawnError
+        | RpcTimeoutError
+      > {
         const command: string[] = [config.ompCliPath];
         if (Option.isSome(run.ompSessionFile)) {
           command.push("--session", run.ompSessionFile.value);
@@ -710,14 +750,16 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         const ompSessionId = yield* worker.sessionId;
         const ompSessionFile = yield* worker.sessionFile;
 
-        yield* Effect.logInfo("work.ready", {
-          event: "work.ready",
-          sessionId: run.sessionId,
-          attempt: run.attempt,
-          cwd,
-          ompSessionId: Option.getOrElse(ompSessionId, () => null),
-          ompSessionFile: Option.getOrElse(ompSessionFile, () => null),
-        });
+        yield* Effect.logInfo("work.ready").pipe(
+          Effect.annotateLogs({
+            event: "work.ready",
+            sessionId: run.sessionId,
+            attempt: run.attempt,
+            cwd,
+            ompSessionId: Option.getOrElse(ompSessionId, () => null),
+            ompSessionFile: Option.getOrElse(ompSessionFile, () => null),
+          }),
+        );
 
         return worker;
       });
@@ -744,12 +786,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             const runOption = yield* runRepo.get(sessionId);
             if (Option.isNone(runOption)) return;
             const run = runOption.value;
-            yield* Effect.logInfo("work.assigned", {
-              event: "work.assigned",
-              sessionId,
-              attempt: run.attempt,
-              state: run.state,
-            });
+            yield* Effect.logInfo("work.assigned").pipe(
+              Effect.annotateLogs({
+                event: "work.assigned",
+                sessionId,
+                attempt: run.attempt,
+                state: run.state,
+              }),
+            );
             if (run.desiredState === "canceled") {
               yield* cancel(run);
               return;
@@ -825,12 +869,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 const resumedOption = yield* runRepo.get(sessionId);
                 if (Option.isNone(resumedOption)) return;
                 const resumed = resumedOption.value;
-                yield* Effect.logInfo("run.retried", {
-                  event: "run.retried",
-                  sessionId,
-                  attempt: resumed.attempt,
-                  workspacePath: run.workspacePath.value,
-                });
+                yield* Effect.logInfo("run.retried").pipe(
+                  Effect.annotateLogs({
+                    event: "run.retried",
+                    sessionId,
+                    attempt: resumed.attempt,
+                    workspacePath: run.workspacePath.value,
+                  }),
+                );
                 worker = yield* startWorker(resumed, run.workspacePath.value);
                 yield* projector.thought(
                   sessionId,

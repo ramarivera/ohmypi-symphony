@@ -1,6 +1,11 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Effect, Redacted, Schema } from "effect";
-import { LinearApiError, OAuthStateError } from "../domain/errors.js";
+import {
+  type DatabaseError,
+  LinearApiError,
+  OAuthStateError,
+  type TokenCipherError,
+} from "../domain/errors.js";
 import {
   Installation,
   type Installation as InstallationType,
@@ -118,7 +123,10 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
     const installationRepo = yield* InstallationRepo;
 
     const startAuthorization = Effect.fn("OAuth.startAuthorization")(
-      function* () {
+      function* (): Effect.fn.Return<
+        { readonly state: string; readonly url: URL },
+        DatabaseError
+      > {
         const state = yield* Effect.sync(() =>
           randomBytes(32).toString("base64url"),
         );
@@ -126,10 +134,12 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
         const now = yield* Effect.clockWith((clock) => clock.currentTimeMillis);
         const expiresAt = now + DEFAULT_STATE_TTL_MS;
 
-        yield* Effect.logInfo("oauth.startAuthorization", {
-          stateHash,
-          expiresAt,
-        });
+        yield* Effect.logInfo("oauth.startAuthorization").pipe(
+          Effect.annotateLogs({
+            stateHash,
+            expiresAt,
+          }),
+        );
 
         yield* installationRepo.createOAuthState(stateHash, expiresAt, now);
 
@@ -151,7 +161,12 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
     );
 
     const completeAuthorization = Effect.fn("OAuth.completeAuthorization")(
-      function* (callbackUrl: URL) {
+      function* (
+        callbackUrl: URL,
+      ): Effect.fn.Return<
+        InstallationType,
+        DatabaseError | LinearApiError | OAuthStateError | TokenCipherError
+      > {
         const code = callbackUrl.searchParams.get("code");
         const state = callbackUrl.searchParams.get("state");
         if (!code || !state) {
@@ -204,11 +219,13 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
           now,
         );
 
-        yield* Effect.logInfo("oauth.completeAuthorization", {
-          organizationId: installation.organizationId,
-          appUserId: installation.appUserId,
-          scopes: installation.scopes,
-        });
+        yield* Effect.logInfo("oauth.completeAuthorization").pipe(
+          Effect.annotateLogs({
+            organizationId: installation.organizationId,
+            appUserId: installation.appUserId,
+            scopes: installation.scopes,
+          }),
+        );
 
         yield* installationRepo.put(installation);
 

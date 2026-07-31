@@ -363,9 +363,10 @@ export const makeWorkspace = (input: {
       if (Option.isNone(parsed)) {
         yield* Effect.logWarning(
           "Workspace resolve rejected: invalid context",
-          {
+        ).pipe(
+          Effect.annotateLogs({
             reason: "invalid_context",
-          },
+          }),
         );
         return { kind: "none" };
       }
@@ -385,18 +386,22 @@ export const makeWorkspace = (input: {
       });
 
       if (resolution.kind === "match") {
-        yield* Effect.logInfo("Repository resolved", {
-          event: "repository.resolved",
-          organizationId: parsed.value.organizationId,
-          repositoryId: resolution.repository.id,
-          repositoryUrl: resolution.repository.url,
-        });
+        yield* Effect.logInfo("Repository resolved").pipe(
+          Effect.annotateLogs({
+            event: "repository.resolved",
+            organizationId: parsed.value.organizationId,
+            repositoryId: resolution.repository.id,
+            repositoryUrl: resolution.repository.url,
+          }),
+        );
       } else if (resolution.kind === "ambiguous") {
-        yield* Effect.logInfo("Repository resolution ambiguous", {
-          event: "repository.ambiguous",
-          organizationId: parsed.value.organizationId,
-          repositoryIds: resolution.repositories.map((r) => r.id),
-        });
+        yield* Effect.logInfo("Repository resolution ambiguous").pipe(
+          Effect.annotateLogs({
+            event: "repository.ambiguous",
+            organizationId: parsed.value.organizationId,
+            repositoryIds: resolution.repositories.map((r) => r.id),
+          }),
+        );
       }
 
       return resolution;
@@ -452,12 +457,14 @@ export const makeWorkspace = (input: {
         );
         yield* validateMarker(markerPath, repository, sessionId);
 
-        yield* Effect.logInfo("Workspace ready (reused)", {
-          event: "workspace.ready",
-          repositoryId: repository.id,
-          path: canonicalTarget,
-          reused: true,
-        });
+        yield* Effect.logInfo("Workspace ready (reused)").pipe(
+          Effect.annotateLogs({
+            event: "workspace.ready",
+            repositoryId: repository.id,
+            path: canonicalTarget,
+            reused: true,
+          }),
+        );
 
         return canonicalTarget;
       }
@@ -500,12 +507,14 @@ export const makeWorkspace = (input: {
         );
       }
 
-      yield* Effect.logInfo("Workspace ready", {
-        event: "workspace.ready",
-        repositoryId: repository.id,
-        path: finalTarget,
-        reused: false,
-      });
+      yield* Effect.logInfo("Workspace ready").pipe(
+        Effect.annotateLogs({
+          event: "workspace.ready",
+          repositoryId: repository.id,
+          path: finalTarget,
+          reused: false,
+        }),
+      );
 
       return finalTarget;
     });

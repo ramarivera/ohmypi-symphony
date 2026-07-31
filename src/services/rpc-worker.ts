@@ -216,11 +216,13 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             const stderr = (yield* Ref.get(stderrTailRef)).trim();
             const normalized = stderr ? `${base}: ${stderr}` : base;
 
-            yield* Effect.logError("worker.failed", {
-              event: "worker.failed",
-              workerPid: process.value.pid,
-              error: normalized,
-            });
+            yield* Effect.logError("worker.failed").pipe(
+              Effect.annotateLogs({
+                event: "worker.failed",
+                workerPid: process.value.pid,
+                error: normalized,
+              }),
+            );
 
             yield* rejectPending(
               new RpcProtocolError({
@@ -710,11 +712,13 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           );
         }
 
-        yield* Effect.logInfo("worker.starting", {
-          event: "worker.starting",
-          command,
-          cwd,
-        });
+        yield* Effect.logInfo("worker.starting").pipe(
+          Effect.annotateLogs({
+            event: "worker.starting",
+            command,
+            cwd,
+          }),
+        );
 
         const process = yield* Effect.try({
           try: () =>
@@ -782,11 +786,13 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           }
         }
 
-        yield* Effect.logInfo("worker.ready", {
-          event: "worker.ready",
-          workerPid: process.pid,
-          protocolVersion: supportsV2 ? 2 : 1,
-        });
+        yield* Effect.logInfo("worker.ready").pipe(
+          Effect.annotateLogs({
+            event: "worker.ready",
+            workerPid: process.pid,
+            protocolVersion: supportsV2 ? 2 : 1,
+          }),
+        );
       });
 
       const stop = Effect.fn("RpcWorker.stop")(function* (): Effect.fn.Return<
@@ -836,10 +842,12 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           }),
         );
 
-        yield* Effect.logInfo("worker.stopped", {
-          event: "worker.stopped",
-          workerPid: process.value.pid,
-        });
+        yield* Effect.logInfo("worker.stopped").pipe(
+          Effect.annotateLogs({
+            event: "worker.stopped",
+            workerPid: process.value.pid,
+          }),
+        );
       });
 
       const prompt = Effect.fn("RpcWorker.prompt")(function* (

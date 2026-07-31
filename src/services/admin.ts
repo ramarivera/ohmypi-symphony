@@ -15,6 +15,7 @@ import {
 import {
   DatabaseError,
   RowDecodeError,
+  type TokenCipherError,
   type WorkspaceError,
 } from "../domain/errors.js";
 import type { OrganizationId } from "../domain/ids.js";
@@ -26,7 +27,7 @@ import type {
   RunEvent,
 } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
-import { Reconciler } from "./reconciler.js";
+import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
@@ -61,13 +62,6 @@ export interface WorkspaceShape {
     sessionId: string,
     repository: RepositoryRecord,
   ) => Effect.Effect<string, WorkspaceError>;
-}
-
-export interface ReconcilerStatus {
-  readonly running: boolean;
-  readonly lastStartedAt: number | null;
-  readonly lastCompletedAt: number | null;
-  readonly lastError: string | null;
 }
 
 export interface ReconcilerShape {
@@ -491,7 +485,12 @@ function mapCauseToResponse(
 
 export const createAdminHandle = (deps: AdminDeps) =>
   Effect.fn("Admin.handle")(
-    function* (request: Request) {
+    function* (
+      request: Request,
+    ): Effect.fn.Return<
+      Option.Option<Response>,
+      AdminError | DatabaseError | RowDecodeError | TokenCipherError
+    > {
       const now = yield* Clock.currentTimeMillis;
       const url = new URL(request.url);
 
@@ -853,7 +852,10 @@ export const createAdminSession = (
   deps: Pick<AdminDeps, "config" | "adminSessionRepo">,
   organizationId: OrganizationId,
   now = Date.now(),
-) =>
+): Effect.Effect<
+  { readonly token: string; readonly csrf: string; readonly expiresAt: number },
+  DatabaseError
+> =>
   Effect.gen(function* () {
     const token = randomBytes(32).toString("base64url");
     const csrf = deriveCsrfToken(token);

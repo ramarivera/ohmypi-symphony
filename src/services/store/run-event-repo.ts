@@ -1,5 +1,5 @@
 import { Clock, Effect, Schema } from "effect";
-import { RowDecodeError } from "../../domain/errors.js";
+import { type DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type { SessionId, SourceKey } from "../../domain/ids.js";
 import { RunEvent } from "../../domain/models.js";
 import { decodeRow, decodeRows, SqliteClient, tryDb } from "./sqlite-client.js";
@@ -160,7 +160,7 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
           | null;
         readonly error?: string | null;
         readonly now?: number;
-      }) {
+      }): Effect.fn.Return<void, DatabaseError> {
         yield* Effect.annotateCurrentSpan("sourceKey", input.sourceKey);
         const now = input.now ?? (yield* Clock.currentTimeMillis);
         const text = input.text ?? null;
@@ -211,7 +211,10 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
 
       const list = Effect.fn("RunEventRepo.list")(function* (
         sessionId: SessionId,
-      ) {
+      ): Effect.fn.Return<
+        ReadonlyArray<RunEvent>,
+        DatabaseError | RowDecodeError
+      > {
         yield* Effect.annotateCurrentSpan("sessionId", sessionId);
         const rows = yield* tryDb(
           () =>

@@ -1,4 +1,5 @@
 import { Clock, Effect, Option, Schema } from "effect";
+import type { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import { OrganizationId } from "../../domain/ids.js";
 import { decodeRow, runChanges, SqliteClient, tryDb } from "./sqlite-client.js";
 
@@ -25,7 +26,7 @@ export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
         readonly csrfTokenHash: string;
         readonly expiresAt: number;
         readonly now?: number;
-      }) {
+      }): Effect.fn.Return<void, DatabaseError> {
         yield* Effect.annotateCurrentSpan(
           "organizationId",
           input.organizationId,
@@ -52,7 +53,13 @@ export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
       const get = Effect.fn("AdminSessionRepo.get")(function* (
         tokenHash: string,
         now?: number,
-      ) {
+      ): Effect.fn.Return<
+        Option.Option<{
+          readonly organizationId: OrganizationId;
+          readonly csrfTokenHash: string;
+        }>,
+        DatabaseError | RowDecodeError
+      > {
         yield* Effect.annotateCurrentSpan("tokenHash", tokenHash);
         const at = now ?? (yield* Clock.currentTimeMillis);
         const row = yield* tryDb(
@@ -74,7 +81,9 @@ export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
 
       const deleteAdminSession = Effect.fn(
         "AdminSessionRepo.deleteAdminSession",
-      )(function* (tokenHash: string) {
+      )(function* (
+        tokenHash: string,
+      ): Effect.fn.Return<boolean, DatabaseError> {
         yield* Effect.annotateCurrentSpan("tokenHash", tokenHash);
         const result = yield* tryDb(
           () =>

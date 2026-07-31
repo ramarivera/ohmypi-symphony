@@ -3,9 +3,9 @@ import { SessionAuthority } from "./session-authority.js";
 
 export interface ReconcilerStatus {
   readonly running: boolean;
-  readonly lastStartedAt: number | null;
-  readonly lastCompletedAt: number | null;
-  readonly lastError: string | null;
+  readonly lastStartedAt: Option.Option<number>;
+  readonly lastCompletedAt: Option.Option<number>;
+  readonly lastError: Option.Option<string>;
 }
 
 export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
@@ -14,9 +14,9 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
   effect: Effect.gen(function* () {
     const statusRef = yield* Ref.make<ReconcilerStatus>({
       running: true,
-      lastStartedAt: null,
-      lastCompletedAt: null,
-      lastError: null,
+      lastStartedAt: Option.none(),
+      lastCompletedAt: Option.none(),
+      lastError: Option.none(),
     });
     const inFlight = yield* Ref.make<
       Option.Option<Deferred.Deferred<void, never>>
@@ -24,7 +24,10 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
     const authority = yield* SessionAuthority;
     const triggers = yield* Queue.dropping<void>(1);
 
-    const tick = Effect.fn("Reconciler.tick")(function* () {
+    const tick = Effect.fn("Reconciler.tick")(function* (): Effect.fn.Return<
+      void,
+      never
+    > {
       const myDeferred = yield* Deferred.make<void, never>();
       const claim = yield* Ref.modify(inFlight, (current) => {
         if (Option.isSome(current)) return [current, current] as const;
@@ -39,7 +42,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
       yield* Ref.update(statusRef, (s) => ({
         ...s,
         running: true,
-        lastStartedAt: now,
+        lastStartedAt: Option.some(now),
       }));
 
       const perform = authority.processRunnable().pipe(
@@ -49,8 +52,8 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
               const completedAt = yield* Clock.currentTimeMillis;
               return yield* Ref.update(statusRef, (s) => ({
                 ...s,
-                lastCompletedAt: completedAt,
-                lastError: null,
+                lastCompletedAt: Option.some(completedAt),
+                lastError: Option.none(),
               }));
             }),
           onFailure: (cause) =>
@@ -58,11 +61,13 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
               const message = Cause.pretty(cause);
               yield* Ref.update(statusRef, (s) => ({
                 ...s,
-                lastError: message,
+                lastError: Option.some(message),
               }));
-              yield* Effect.logWarning("reconciler.tick.error", {
-                error: message,
-              });
+              yield* Effect.logWarning("reconciler.tick.error").pipe(
+                Effect.annotateLogs({
+                  error: message,
+                }),
+              );
             }),
         }),
         Effect.ensuring(
@@ -76,17 +81,23 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
       yield* perform;
     });
 
-    const trigger = Effect.fn("Reconciler.trigger")(function* () {
-      yield* Queue.offer(triggers, undefined);
-    });
+    const trigger = Effect.fn("Reconciler.trigger")(
+      function* (): Effect.fn.Return<void, never> {
+        yield* Queue.offer(triggers, undefined);
+      },
+    );
 
-    const awaitTrigger = Effect.fn("Reconciler.awaitTrigger")(function* () {
-      yield* Queue.take(triggers);
-    });
+    const awaitTrigger = Effect.fn("Reconciler.awaitTrigger")(
+      function* (): Effect.fn.Return<void, never> {
+        yield* Queue.take(triggers);
+      },
+    );
 
-    const status = Effect.fn("Reconciler.status")(function* () {
-      return yield* Ref.get(statusRef);
-    });
+    const status = Effect.fn("Reconciler.status")(
+      function* (): Effect.fn.Return<ReconcilerStatus, never> {
+        return yield* Ref.get(statusRef);
+      },
+    );
 
     return { tick, trigger, awaitTrigger, status };
   }),

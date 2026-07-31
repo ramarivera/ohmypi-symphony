@@ -208,7 +208,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           readonly url: string;
           readonly ref: string;
           readonly state: string;
-        }) {
+        }): Effect.fn.Return<void, DatabaseError> {
           yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
           const now = yield* Clock.currentTimeMillis;
           yield* tryDb(
@@ -246,7 +246,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           readonly labels?: ReadonlyArray<string>;
           readonly isDefault?: boolean;
           readonly now?: number;
-        }) {
+        }): Effect.fn.Return<RepositoryRecord, DatabaseError | RowDecodeError> {
           yield* Effect.annotateCurrentSpan("repositoryId", input.id);
           const now = input.now ?? (yield* Clock.currentTimeMillis);
           const record = yield* validateRepository(input, now);
@@ -324,7 +324,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
             readonly isDefault?: boolean;
             readonly now?: number;
           },
-        ) {
+        ): Effect.fn.Return<RepositoryRecord, DatabaseError | RowDecodeError> {
           yield* Effect.annotateCurrentSpan("repositoryId", id);
           const current = yield* getRepository(organizationId, id);
           if (Option.isNone(current)) {
@@ -402,7 +402,10 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
       );
 
       const deleteRepository = Effect.fn("WorkspaceRepo.deleteRepository")(
-        function* (organizationId: OrganizationId, id: WorkspaceId) {
+        function* (
+          organizationId: OrganizationId,
+          id: WorkspaceId,
+        ): Effect.fn.Return<boolean, DatabaseError> {
           yield* Effect.annotateCurrentSpan("repositoryId", id);
           const result = yield* tryDb(
             () =>
@@ -422,7 +425,10 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
       const getRepository = Effect.fn("WorkspaceRepo.getRepository")(function* (
         organizationId: OrganizationId,
         id: WorkspaceId,
-      ) {
+      ): Effect.fn.Return<
+        Option.Option<RepositoryRecord>,
+        DatabaseError | RowDecodeError
+      > {
         yield* Effect.annotateCurrentSpan("repositoryId", id);
         const row = yield* tryDb(
           () =>
@@ -444,7 +450,12 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
       });
 
       const listRepositories = Effect.fn("WorkspaceRepo.listRepositories")(
-        function* (organizationId: OrganizationId) {
+        function* (
+          organizationId: OrganizationId,
+        ): Effect.fn.Return<
+          ReadonlyArray<RepositoryRecord>,
+          DatabaseError | RowDecodeError
+        > {
           yield* Effect.annotateCurrentSpan("organizationId", organizationId);
           const rows = yield* tryDb(
             () =>
@@ -466,7 +477,12 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
 
       const getDefaultRepository = Effect.fn(
         "WorkspaceRepo.getDefaultRepository",
-      )(function* (organizationId: OrganizationId) {
+      )(function* (
+        organizationId: OrganizationId,
+      ): Effect.fn.Return<
+        Option.Option<RepositoryRecord>,
+        DatabaseError | RowDecodeError
+      > {
         yield* Effect.annotateCurrentSpan("organizationId", organizationId);
         const row = yield* tryDb(
           () =>

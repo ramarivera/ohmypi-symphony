@@ -30,6 +30,7 @@ const config: GatewayConfigShape = {
   tokenEncryptionKey: Redacted.make("key"),
   publicUrl: new URL("http://localhost:3000"),
   logLevel: "silent",
+  logFile: Option.none(),
   databasePath: ":memory:",
   workspaceRoot: "/tmp/workspaces",
   ompCliPath: "omp",
@@ -100,9 +101,9 @@ const deps: AdminDeps = {
     status: () =>
       Effect.succeed({
         running: false,
-        lastStartedAt: null,
-        lastCompletedAt: null,
-        lastError: null,
+        lastStartedAt: Option.none(),
+        lastCompletedAt: Option.none(),
+        lastError: Option.none(),
       }),
   },
 };

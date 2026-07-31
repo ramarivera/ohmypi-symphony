@@ -1,5 +1,9 @@
 import { Effect, Option, Schema } from "effect";
-import { RowDecodeError, type TokenCipherError } from "../../domain/errors.js";
+import {
+  type DatabaseError,
+  RowDecodeError,
+  type TokenCipherError,
+} from "../../domain/errors.js";
 import type { AppUserId, OrganizationId, TeamId } from "../../domain/ids.js";
 import {
   type Installation,
@@ -111,7 +115,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
 
       const put = Effect.fn("InstallationRepo.put")(function* (
         record: Installation,
-      ) {
+      ): Effect.fn.Return<void, DatabaseError | TokenCipherError> {
         yield* Effect.annotateCurrentSpan(
           "organizationId",
           record.organizationId,
@@ -175,7 +179,10 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
 
       const get = Effect.fn("InstallationRepo.get")(function* (
         organizationId: OrganizationId,
-      ) {
+      ): Effect.fn.Return<
+        Option.Option<Installation>,
+        DatabaseError | RowDecodeError | TokenCipherError
+      > {
         yield* Effect.annotateCurrentSpan("organizationId", organizationId);
         const row = yield* tryDb(
           () =>
@@ -195,7 +202,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
       const revoke = Effect.fn("InstallationRepo.revoke")(function* (
         organizationId: OrganizationId,
         at: number,
-      ) {
+      ): Effect.fn.Return<void, DatabaseError> {
         yield* Effect.annotateCurrentSpan("organizationId", organizationId);
         yield* tryDb(() => {
           db.query(
@@ -216,7 +223,7 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
         removedTeamIds: ReadonlyArray<TeamId>,
         canAccessAllPublicTeams: boolean,
         at: number,
-      ) {
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
         yield* Effect.annotateCurrentSpan("organizationId", organizationId);
 
         const tx = Effect.gen(function* () {
@@ -282,7 +289,9 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
 
       const getRawEncryptedAccessToken = Effect.fn(
         "InstallationRepo.getRawEncryptedAccessToken",
-      )(function* (organizationId: OrganizationId) {
+      )(function* (
+        organizationId: OrganizationId,
+      ): Effect.fn.Return<Option.Option<string>, DatabaseError> {
         yield* Effect.annotateCurrentSpan("organizationId", organizationId);
         const row = yield* tryDb(
           () =>
@@ -297,7 +306,11 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
       });
 
       const createOAuthState = Effect.fn("InstallationRepo.createOAuthState")(
-        function* (hash: string, expiresAt: number, now: number) {
+        function* (
+          hash: string,
+          expiresAt: number,
+          now: number,
+        ): Effect.fn.Return<void, DatabaseError> {
           yield* Effect.annotateCurrentSpan("hash", hash);
           yield* tryDb(
             () =>
@@ -312,7 +325,10 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
       );
 
       const consumeOAuthState = Effect.fn("InstallationRepo.consumeOAuthState")(
-        function* (hash: string, now: number) {
+        function* (
+          hash: string,
+          now: number,
+        ): Effect.fn.Return<boolean, DatabaseError> {
           yield* Effect.annotateCurrentSpan("hash", hash);
           return yield* transact(
             db,

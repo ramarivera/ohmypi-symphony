@@ -147,4 +147,22 @@ describe("Reconciler", () => {
       ),
     { fastCheck: { numRuns: 20 } },
   );
+
+  it.scopedLive(
+    "models absent reconciliation lifecycle values as Options",
+    () =>
+      Effect.gen(function* () {
+        const reconciler = yield* Reconciler;
+        const initial = yield* reconciler.status();
+        expect(initial.lastStartedAt._tag).toBe("None");
+        expect(initial.lastCompletedAt._tag).toBe("None");
+        expect(initial.lastError._tag).toBe("None");
+
+        yield* reconciler.tick();
+        const completed = yield* reconciler.status();
+        expect(completed.lastStartedAt._tag).toBe("Some");
+        expect(completed.lastCompletedAt._tag).toBe("Some");
+        expect(completed.lastError._tag).toBe("None");
+      }).pipe(Effect.provide(Live)),
+  );
 });

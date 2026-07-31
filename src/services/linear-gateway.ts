@@ -235,10 +235,15 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         });
 
       const performRefresh = Effect.fn("LinearGateway.performRefresh")(
-        function* (record: Installation, now: number) {
-          yield* Effect.logInfo("linear.token.refresh", {
-            organizationId: record.organizationId,
-          });
+        function* (
+          record: Installation,
+          now: number,
+        ): Effect.fn.Return<Installation, TokenRefreshError> {
+          yield* Effect.logInfo("linear.token.refresh").pipe(
+            Effect.annotateLogs({
+              organizationId: record.organizationId,
+            }),
+          );
           const response = yield* exchangeToken(
             { grantType: "refresh_token", refreshToken: record.refreshToken },
             record.organizationId,
@@ -267,10 +272,12 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
                 ),
             }),
           );
-          yield* Effect.logInfo("linear.token.refreshed", {
-            organizationId: record.organizationId,
-            expiresAt: updated.expiresAt,
-          });
+          yield* Effect.logInfo("linear.token.refreshed").pipe(
+            Effect.annotateLogs({
+              organizationId: record.organizationId,
+              expiresAt: updated.expiresAt,
+            }),
+          );
           return updated;
         },
       );
@@ -278,7 +285,7 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
       const refreshTokens = Effect.fn("LinearGateway.refreshTokens")(function* (
         record: Installation,
         now: number,
-      ) {
+      ): Effect.fn.Return<Installation, TokenRefreshError> {
         const myDeferred = yield* Deferred.make<
           Installation,
           TokenRefreshError
@@ -309,7 +316,10 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
 
       const ensureToken = Effect.fn("LinearGateway.ensureToken")(function* (
         organizationId: string,
-      ) {
+      ): Effect.fn.Return<
+        Installation,
+        InstallationRevokedError | TokenRefreshError
+      > {
         const now = yield* Clock.currentTimeMillis;
         const orgId = yield* Schema.decodeUnknown(OrganizationId)(
           organizationId,
@@ -394,9 +404,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
               }
               return Option.some(
                 Effect.gen(function* () {
-                  yield* Effect.logDebug("linear.api.rateLimited", {
-                    retryAfterMs: error.retryAfterMs,
-                  });
+                  yield* Effect.logDebug("linear.api.rateLimited").pipe(
+                    Effect.annotateLogs({
+                      retryAfterMs: error.retryAfterMs,
+                    }),
+                  );
                   yield* Effect.sleep(error.retryAfterMs ?? 1_000);
                   return yield* run(retriesRemaining - 1);
                 }),
@@ -442,7 +454,13 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         function* (input: {
           readonly sessionId: string;
           readonly content: unknown;
-        }) {
+        }): Effect.fn.Return<
+          string,
+          | InstallationRevokedError
+          | LinearApiError
+          | LinearRateLimitError
+          | TokenRefreshError
+        > {
           const sessionId = yield* Schema.decodeUnknown(SessionId)(
             input.sessionId,
           ).pipe(
@@ -456,10 +474,12 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           );
           yield* Effect.annotateCurrentSpan({ "linear.sessionId": sessionId });
           if (!isRecord(input.content)) {
-            yield* Effect.logWarning("linear.createActivity.invalid", {
-              sessionId,
-              reason: "content_not_record",
-            });
+            yield* Effect.logWarning("linear.createActivity.invalid").pipe(
+              Effect.annotateLogs({
+                sessionId,
+                reason: "content_not_record",
+              }),
+            );
             return yield* Effect.fail(
               new LinearApiError({
                 operation: "createActivity",
@@ -553,10 +573,12 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
             }),
           );
 
-          yield* Effect.logInfo("linear.createActivity", {
-            sessionId,
-            activityId: id,
-          });
+          yield* Effect.logInfo("linear.createActivity").pipe(
+            Effect.annotateLogs({
+              sessionId,
+              activityId: id,
+            }),
+          );
           return id;
         },
       );
@@ -572,7 +594,13 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
             readonly label: string;
             readonly url: string;
           }>;
-        }) {
+        }): Effect.fn.Return<
+          void,
+          | InstallationRevokedError
+          | LinearApiError
+          | LinearRateLimitError
+          | TokenRefreshError
+        > {
           const sessionId = yield* Schema.decodeUnknown(SessionId)(
             input.sessionId,
           ).pipe(
@@ -652,18 +680,27 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
             }),
           );
 
-          yield* Effect.logInfo("linear.updateSession", { sessionId });
+          yield* Effect.logInfo("linear.updateSession").pipe(
+            Effect.annotateLogs({ sessionId }),
+          );
         },
       );
 
       const refreshInstallation = Effect.fn(
         "LinearGateway.refreshInstallation",
-      )(function* (organizationId: string) {
+      )(function* (
+        organizationId: string,
+      ): Effect.fn.Return<
+        string,
+        InstallationRevokedError | TokenRefreshError
+      > {
         yield* Effect.annotateCurrentSpan({
           "linear.organizationId": organizationId,
         });
         const installation = yield* ensureToken(organizationId);
-        yield* Effect.logInfo("linear.refreshInstallation", { organizationId });
+        yield* Effect.logInfo("linear.refreshInstallation").pipe(
+          Effect.annotateLogs({ organizationId }),
+        );
         return installation.accessToken;
       });
 

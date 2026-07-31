@@ -33,27 +33,30 @@ const sqliteClientLayer = Layer.unwrapEffect(
   }),
 );
 
-export const GatewayServicesLive = GatewayConfig.Default.pipe(
-  Layer.merge(GatewayLogger.Default),
-  Layer.merge(TokenCrypto.Default),
-  Layer.merge(AdminSessionRepo.Default),
-  Layer.merge(InstallationRepo.Default),
-  Layer.merge(DeliveryRepo.Default),
-  Layer.merge(RunRepo.Default),
-  Layer.merge(RunInputRepo.Default),
-  Layer.merge(RunEventRepo.Default),
-  Layer.merge(ProjectionRepo.Default),
-  Layer.merge(WorkspaceRepo.Default),
-  Layer.merge(LinearGateway.Default),
-  Layer.merge(WebhookPipeline.Default),
-  Layer.merge(ActivityProjector.Default),
-  Layer.merge(SessionAuthority.Default),
-  Layer.merge(RpcWorker.Default),
-  Layer.merge(Reconciler.Default),
-  Layer.merge(Workspace.Default),
-  Layer.merge(OAuth.Default),
-  Layer.merge(Admin.Default),
-).pipe(Layer.provide(sqliteClientLayer), Layer.provide(GatewayConfig.Default));
+export const GatewayServicesLive = Layer.mergeAll(
+  GatewayLogger.Default,
+  TokenCrypto.Default,
+  AdminSessionRepo.Default,
+  InstallationRepo.Default,
+  DeliveryRepo.Default,
+  RunRepo.Default,
+  RunInputRepo.Default,
+  RunEventRepo.Default,
+  ProjectionRepo.Default,
+  WorkspaceRepo.Default,
+  LinearGateway.Default,
+  WebhookPipeline.Default,
+  ActivityProjector.Default,
+  SessionAuthority.Default,
+  RpcWorker.Default,
+  Reconciler.Default,
+  Workspace.Default,
+  OAuth.Default,
+  Admin.Default,
+).pipe(
+  Layer.provideMerge(sqliteClientLayer),
+  Layer.provideMerge(GatewayConfig.Default),
+);
 
 const scheduledReconciler = Layer.unwrapEffect(
   Effect.gen(function* () {

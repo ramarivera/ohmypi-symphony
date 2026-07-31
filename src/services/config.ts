@@ -1,7 +1,18 @@
 import { resolve } from "node:path";
 import { Config, ConfigError, Effect, Either, Option, Redacted } from "effect";
 import type { LogLevel } from "../domain/models.js";
+export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
+export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
 
+const isLogFileFrequency = (value: string): value is LogFileFrequency =>
+  LOG_FILE_FREQUENCIES.some((frequency) => frequency === value);
+
+export interface LogFileConfig {
+  readonly path: string;
+  readonly frequency: LogFileFrequency;
+  readonly size: string;
+  readonly limit: number;
+}
 export interface GatewayConfigShape {
   readonly linearClientId: string;
   readonly linearClientSecret: Redacted.Redacted<string>;
@@ -9,6 +20,7 @@ export interface GatewayConfigShape {
   readonly tokenEncryptionKey: Redacted.Redacted<string>;
   readonly publicUrl: URL;
   readonly logLevel: LogLevel;
+  readonly logFile: Option.Option<LogFileConfig>;
   readonly databasePath: string;
   readonly workspaceRoot: string;
   readonly ompCliPath: string;
@@ -52,8 +64,68 @@ const logLevel = Config.string("LOG_LEVEL").pipe(
   }),
 );
 
+const logFilePath = Config.string("LOG_FILE").pipe(
+  Config.withDefault(""),
+  Config.map((value) => {
+    const trimmed = value.trim();
+    return trimmed.length === 0
+      ? Option.none<LogFileConfig["path"]>()
+      : Option.some(resolve(trimmed));
+  }),
+);
+
+const logFileFrequency = Config.string("LOG_FILE_FREQUENCY").pipe(
+  Config.withDefault("daily"),
+  Config.mapOrFail((value) => {
+    const normalized = value.trim().toLowerCase();
+    return isLogFileFrequency(normalized)
+      ? Either.right(normalized)
+      : Either.left(
+          ConfigError.InvalidData(
+            ["LOG_FILE_FREQUENCY"],
+            "LOG_FILE_FREQUENCY must be daily or hourly",
+          ),
+        );
+  }),
+);
+
+const logFileSize = Config.string("LOG_FILE_SIZE").pipe(
+  Config.withDefault("25m"),
+  Config.mapOrFail((value) => {
+    const normalized = value.trim().toLowerCase();
+    const match = /^(\d+(?:\.\d+)?)([bkmg]?)$/.exec(normalized);
+    return match !== null && Number(match[1]) > 0
+      ? Either.right(normalized)
+      : Either.left(
+          ConfigError.InvalidData(
+            ["LOG_FILE_SIZE"],
+            "LOG_FILE_SIZE must be a positive number with an optional b, k, m, or g suffix",
+          ),
+        );
+  }),
+);
+
+const logFileLimit = positiveInteger("LOG_FILE_LIMIT", 14);
+
+const logFile = Config.all({
+  path: logFilePath,
+  frequency: logFileFrequency,
+  size: logFileSize,
+  limit: logFileLimit,
+}).pipe(
+  Config.map(({ path, frequency, size, limit }) =>
+    Option.map(path, (filePath) => ({
+      path: filePath,
+      frequency,
+      size,
+      limit,
+    })),
+  ),
+);
+
 const GatewayConfigValues = Config.all({
   logLevel,
+  logFile,
   databasePath: Config.string("DATABASE_PATH").pipe(
     Config.withDefault("./data/gateway.sqlite"),
     Config.map((value) => (value === ":memory:" ? value : resolve(value))),
@@ -74,7 +146,7 @@ const GatewayConfigValues = Config.all({
 
 const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
   name: string,
-) {
+): Effect.fn.Return<string, ConfigError.ConfigError> {
   const direct = yield* Config.option(Config.string(name));
   if (Option.isSome(direct)) {
     const value = direct.value.trim();
