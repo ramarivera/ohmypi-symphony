@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Either, Layer, Option, Redacted, Schema } from "effect";
 import { afterEach, beforeEach, vi } from "vitest";
-import { DatabaseError } from "../src/domain/errors.js";
+import { DatabaseError, TenantNotAllowedError } from "../src/domain/errors.js";
 import type { Installation } from "../src/domain/models.js";
 import type { GatewayConfigShape } from "../src/services/config.js";
 import { GatewayConfig } from "../src/services/config.js";
@@ -58,7 +58,9 @@ const testConfig: GatewayConfigShape = {
   leaseDurationMs: 60_000,
   reconcilerIntervalMs: 1_000,
   webhookReplayWindowMs: 60_000,
+  allowedOrganizationIds: new Set(["org"]),
   logLevel: "info",
+  githubApp: undefined,
 };
 
 interface StoredOAuthState {
@@ -75,6 +77,8 @@ const testState = {
 const resetTestState = (): void => {
   testState.failCreateOAuthState = false;
   testState.installations.length = 0;
+  testConfig.allowedOrganizationIds.clear();
+  testConfig.allowedOrganizationIds.add("org");
   testState.oauthStates.clear();
   linearTestDouble.viewer = {
     id: "app-user",
@@ -345,6 +349,30 @@ describe("OAuth", () => {
       _tag: "@Gateway/LinearApiError",
       operation: "discoverAppInstallation",
     });
+    expect(testState.installations).toHaveLength(0);
+  });
+
+  it("rejects an unauthorized discovered organization before installation persistence", async () => {
+    testConfig.allowedOrganizationIds.clear();
+    testConfig.allowedOrganizationIds.add("other-org");
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify(tokenResponse()), { status: 200 }),
+    );
+    const authorization = await Effect.runPromise(startAuthorization());
+    const result = await Effect.runPromise(
+      Effect.either(completeAuthorization(callbackUrl(authorization.state))),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+    if (Either.isLeft(result)) {
+      const error = result.left;
+      expect(error).toBeInstanceOf(TenantNotAllowedError);
+      if (!(error instanceof TenantNotAllowedError)) {
+        throw new Error("expected unauthorized tenant error");
+      }
+      expect(error._tag).toBe("@Gateway/TenantNotAllowedError");
+      expect(error.status).toBe(403);
+      expect(error.message).not.toContain("access");
+    }
     expect(testState.installations).toHaveLength(0);
   });
 

@@ -3,6 +3,7 @@ import { Effect, Option, Redacted, Schema } from "effect";
 import {
   type DatabaseError,
   type RowDecodeError,
+  TenantNotAllowedError,
   type TokenCipherError,
   WebhookIdentityError,
   WebhookPayloadError,
@@ -45,6 +46,7 @@ type WebhookProcessingError =
   | DatabaseError
   | RowDecodeError
   | TokenCipherError
+  | TenantNotAllowedError
   | WebhookIdentityError
   | WebhookPayloadError;
 
@@ -782,6 +784,15 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                 { status: 400 },
               );
             }
+            if (!config.allowedOrganizationIds.has(organizationId)) {
+              return yield* Effect.fail(
+                new TenantNotAllowedError({
+                  message: "Organization is not allowed",
+                  organizationId,
+                  status: 403,
+                }),
+              );
+            }
 
             const hash = payloadHash(rawBody);
             const rawDeliveryId =
@@ -942,6 +953,16 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
 
         return yield* process.pipe(
           Effect.catchTags({
+            "@Gateway/TenantNotAllowedError": (error) =>
+              Effect.gen(function* () {
+                yield* markDelivery(
+                  deliveryRepo,
+                  deliveryId,
+                  "failed",
+                  error.message,
+                );
+                return new Response(error.message, { status: error.status });
+              }),
             "@Gateway/WebhookPayloadError": (error) =>
               Effect.gen(function* () {
                 yield* markDelivery(

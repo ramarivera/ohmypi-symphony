@@ -1,6 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
 import { Effect, Redacted, Schema } from "effect";
-import { LinearApiError, OAuthStateError } from "../domain/errors.js";
+import {
+  LinearApiError,
+  OAuthStateError,
+  TenantNotAllowedError,
+} from "../domain/errors.js";
 import {
   Installation,
   type Installation as InstallationType,
@@ -196,6 +200,15 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
         const { organizationId, appUserId } = yield* discoverInstallation(
           token.accessToken,
         );
+        if (!config.allowedOrganizationIds.has(organizationId)) {
+          return yield* Effect.fail(
+            new TenantNotAllowedError({
+              message: "Organization is not allowed",
+              organizationId,
+              status: 403,
+            }),
+          );
+        }
 
         const installation = yield* buildInstallation(
           token,

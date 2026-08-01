@@ -4,6 +4,7 @@ import { Effect, Layer, Schedule } from "effect";
 import { router } from "./http/router.js";
 import { Admin } from "./services/admin.js";
 import { GatewayConfig } from "./services/config.js";
+import { GitHubApp } from "./services/github-app.js";
 import { LinearGateway } from "./services/linear-gateway.js";
 import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
 import { OAuth } from "./services/oauth.js";
@@ -45,6 +46,7 @@ export const GatewayServicesLive = GatewayConfig.Default.pipe(
   Layer.merge(ProjectionRepo.Default),
   Layer.merge(WorkspaceRepo.Default),
   Layer.merge(LinearGateway.Default),
+  Layer.merge(GitHubApp.Default),
   Layer.merge(WebhookPipeline.Default),
   Layer.merge(ActivityProjector.Default),
   Layer.merge(SessionAuthority.Default),

@@ -29,6 +29,7 @@ import {
   makeWorkspace,
   safeSessionKey,
   Workspace,
+  workspaceBranchName,
 } from "../src/services/workspace.js";
 
 const MARKER_FILE = ".linear-gateway-workspace.json";
@@ -119,6 +120,7 @@ const gatewayConfigLayer = (workspaceRoot: string) =>
             ["LINEAR_CLIENT_ID", "workspace-test-client"],
             ["LINEAR_CLIENT_SECRET", "workspace-test-client-secret"],
             ["LINEAR_WEBHOOK_SECRET", "workspace-test-webhook-secret"],
+            ["LINEAR_ALLOWED_ORGANIZATION_IDS", "workspace-org"],
             ["TOKEN_ENCRYPTION_KEY", TEST_KEY_BASE64],
             ["PUBLIC_URL", "http://localhost:3000"],
             ["WORKSPACE_ROOT", workspaceRoot],
@@ -356,7 +358,7 @@ describe("Workspace", () => {
   );
 
   it.scopedLive(
-    "materializes a detached checkout once and safely reuses its repository-bound target",
+    "materializes a deterministic branch once and safely reuses its repository-bound target",
     () =>
       Effect.gen(function* () {
         const fixture = yield* gitFixture;
@@ -405,7 +407,28 @@ describe("Workspace", () => {
                   throw new Error("workspace HEAD is not inspectable");
                 return stdout;
               }),
-            ).toContain("# branch.head (detached)");
+            ).toContain(`# branch.head ${workspaceBranchName(id)}`);
+            expect(
+              yield* fixtureIo("workspace publication base", async () => {
+                const process = Bun.spawn(
+                  ["git", "rev-list", "--count", "FETCH_HEAD..HEAD"],
+                  {
+                    cwd: first,
+                    stdout: "pipe",
+                    stderr: "pipe",
+                  },
+                );
+                const [exitCode, stdout] = await Promise.all([
+                  process.exited,
+                  new Response(process.stdout).text(),
+                ]);
+                if (exitCode !== 0)
+                  throw new Error(
+                    "workspace publication base is not inspectable",
+                  );
+                return stdout;
+              }),
+            ).toBe("0\n");
           }),
         );
       }),

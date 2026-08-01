@@ -1053,7 +1053,10 @@ describe("pure invariants", () => {
       appUserId: Schema.UUID,
       accessToken: Schema.String.pipe(Schema.minLength(1)),
       refreshToken: Schema.String.pipe(Schema.minLength(1)),
-      expiresAt: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+      expiresAt: Schema.Number.pipe(
+        Schema.int(),
+        Schema.between(0, 1_000_000_000),
+      ),
       scopes: Schema.Array(Schema.String),
       revokedAt: Schema.NullOr(
         Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
@@ -1090,7 +1093,10 @@ describe("pure invariants", () => {
             Option.some(expected),
           );
 
-          const replacement = { ...expected, accessToken: `${input.accessToken}-replacement` };
+          const replacement = {
+            ...expected,
+            accessToken: `${input.accessToken}-replacement`,
+          };
           yield* repo.put(replacement);
           expect(yield* repo.get(expected.organizationId)).toEqual(
             Option.some(replacement),
@@ -1108,7 +1114,10 @@ describe("pure invariants", () => {
       kind: Schema.Literal("created", "prompted", "stop"),
       body: Schema.String,
       marker: Schema.String,
-      createdAt: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
+      createdAt: Schema.Number.pipe(
+        Schema.int(),
+        Schema.between(0, 1_000_000_000),
+      ),
     },
     ({ sessionId, organizationId, inputId, kind, body, marker, createdAt }) =>
       withRepos(
@@ -1190,5 +1199,4 @@ describe("pure invariants", () => {
         }),
       ),
   );
-
 });

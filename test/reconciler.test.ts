@@ -25,77 +25,81 @@ const reconcilerLayer = (authority: SessionAuthority) =>
   );
 
 describe("Reconciler", () => {
-  it.effect("records deterministic success timestamps and clears failures", () =>
-    Effect.gen(function* () {
-      const started = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      const authority = SessionAuthority.make({
-        ...noOpAuthority,
-        processRunnable: () =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(started, undefined);
-            yield* Deferred.await(release);
-          }),
-      });
-      const clock = yield* TestClock.testClock();
+  it.effect(
+    "records deterministic success timestamps and clears failures",
+    () =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const authority = SessionAuthority.make({
+          ...noOpAuthority,
+          processRunnable: () =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(started, undefined);
+              yield* Deferred.await(release);
+            }),
+        });
+        const clock = yield* TestClock.testClock();
 
-      const status = yield* Effect.gen(function* () {
-        const reconciler = yield* Reconciler;
-        yield* clock.adjust(Duration.seconds(5));
-        const tick = yield* Effect.fork(reconciler.tick());
+        const status = yield* Effect.gen(function* () {
+          const reconciler = yield* Reconciler;
+          yield* clock.adjust(Duration.seconds(5));
+          const tick = yield* Effect.fork(reconciler.tick());
 
-        yield* Deferred.await(started);
-        expect(yield* reconciler.status()).toMatchObject({
+          yield* Deferred.await(started);
+          expect(yield* reconciler.status()).toMatchObject({
+            running: true,
+            lastStartedAt: 5_000,
+            lastCompletedAt: null,
+            lastError: null,
+          });
+
+          yield* clock.adjust(Duration.seconds(7));
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(tick);
+          return yield* reconciler.status();
+        }).pipe(Effect.provide(reconcilerLayer(authority)));
+
+        expect(status).toMatchObject({
           running: true,
           lastStartedAt: 5_000,
-          lastCompletedAt: null,
+          lastCompletedAt: 12_000,
           lastError: null,
         });
-
-        yield* clock.adjust(Duration.seconds(7));
-        yield* Deferred.succeed(release, undefined);
-        yield* Fiber.join(tick);
-        return yield* reconciler.status();
-      }).pipe(Effect.provide(reconcilerLayer(authority)));
-
-      expect(status).toMatchObject({
-        running: true,
-        lastStartedAt: 5_000,
-        lastCompletedAt: 12_000,
-        lastError: null,
-      });
-    }),
+      }),
   );
 
-  it.effect("coalesces overlapping ticks behind one in-flight reconciliation", () =>
-    Effect.gen(function* () {
-      const started = yield* Deferred.make<void>();
-      const release = yield* Deferred.make<void>();
-      const calls = yield* Ref.make(0);
-      const authority = SessionAuthority.make({
-        ...noOpAuthority,
-        processRunnable: () =>
-          Effect.gen(function* () {
-            yield* Ref.update(calls, (count) => count + 1);
-            yield* Deferred.succeed(started, undefined);
-            yield* Deferred.await(release);
-          }),
-      });
+  it.effect(
+    "coalesces overlapping ticks behind one in-flight reconciliation",
+    () =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const calls = yield* Ref.make(0);
+        const authority = SessionAuthority.make({
+          ...noOpAuthority,
+          processRunnable: () =>
+            Effect.gen(function* () {
+              yield* Ref.update(calls, (count) => count + 1);
+              yield* Deferred.succeed(started, undefined);
+              yield* Deferred.await(release);
+            }),
+        });
 
-      const callCount = yield* Effect.gen(function* () {
-        const reconciler = yield* Reconciler;
-        const first = yield* Effect.fork(reconciler.tick());
-        yield* Deferred.await(started);
-        const second = yield* Effect.fork(reconciler.tick());
-        expect(Option.isNone(yield* Fiber.poll(second))).toBe(true);
-        yield* Deferred.succeed(release, undefined);
-        yield* Fiber.join(first);
-        yield* Fiber.join(second);
-        return yield* Ref.get(calls);
-      }).pipe(Effect.provide(reconcilerLayer(authority)));
+        const callCount = yield* Effect.gen(function* () {
+          const reconciler = yield* Reconciler;
+          const first = yield* Effect.fork(reconciler.tick());
+          yield* Deferred.await(started);
+          const second = yield* Effect.fork(reconciler.tick());
+          expect(Option.isNone(yield* Fiber.poll(second))).toBe(true);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(first);
+          yield* Fiber.join(second);
+          return yield* Ref.get(calls);
+        }).pipe(Effect.provide(reconcilerLayer(authority)));
 
-      expect(callCount).toBe(1);
-    }),
+        expect(callCount).toBe(1);
+      }),
   );
   it.effect("records a failure without failing the tick", () =>
     Effect.gen(function* () {

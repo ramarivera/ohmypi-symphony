@@ -248,6 +248,8 @@ describe("HTTP router parity", () => {
       leaseDurationMs: 60_000,
       reconcilerIntervalMs: 1_000,
       webhookReplayWindowMs: 60_000,
+      allowedOrganizationIds: new Set(["org"]),
+      githubApp: undefined,
     };
     const adminSessionRepo: AdminSessionRepo = {
       _tag: "AdminSessionRepo",
@@ -316,6 +318,8 @@ describe("HTTP router parity", () => {
           linearClientSecret: Redacted.make("secret"),
           linearWebhookSecret: Redacted.make("webhook"),
           tokenEncryptionKey: Redacted.make("key"),
+          githubApp: undefined,
+          allowedOrganizationIds: new Set(["org"]),
           publicUrl: new URL("https://gateway.example"),
           logLevel: "silent",
           databasePath: ":memory:",

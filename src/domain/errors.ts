@@ -59,6 +59,11 @@ export class WebhookIdentityError extends Schema.TaggedError<WebhookIdentityErro
   "@Gateway/WebhookIdentityError",
   message,
 ) {}
+
+export class TenantNotAllowedError extends Schema.TaggedError<TenantNotAllowedError>()(
+  "@Gateway/TenantNotAllowedError",
+  { ...message, organizationId: Schema.String, status: Schema.Literal(403) },
+) {}
 export class DeliveryConflictError extends Schema.TaggedError<DeliveryConflictError>()(
   "@Gateway/DeliveryConflictError",
   { ...message, deliveryId: Schema.String },
@@ -106,4 +111,23 @@ export class InstallationRevokedError extends Schema.TaggedError<InstallationRev
 export class InterruptedRunNoActionableInputError extends Schema.TaggedError<InterruptedRunNoActionableInputError>()(
   "@Gateway/InterruptedRunNoActionableInputError",
   { sessionId: Schema.String, message: Schema.String },
+) {}
+export class GitHubAppConfigurationError extends Schema.TaggedError<GitHubAppConfigurationError>()(
+  "@Gateway/GitHubAppConfigurationError",
+  {
+    ...message,
+    missing: Schema.Array(Schema.String),
+  },
+) {}
+export class GitHubAppRemoteError extends Schema.TaggedError<GitHubAppRemoteError>()(
+  "@Gateway/GitHubAppRemoteError",
+  message,
+) {}
+export class GitHubAppApiError extends Schema.TaggedError<GitHubAppApiError>()(
+  "@Gateway/GitHubAppApiError",
+  {
+    ...message,
+    operation: Schema.String,
+    status: Schema.optional(Schema.Number),
+  },
 ) {}

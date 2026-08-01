@@ -18,6 +18,7 @@ const baseValues = new Map<string, string>([
   ["LINEAR_CLIENT_ID", "client"],
   ["LINEAR_CLIENT_SECRET", "secret"],
   ["LINEAR_WEBHOOK_SECRET", "webhook"],
+  ["LINEAR_ALLOWED_ORGANIZATION_IDS", "allowed-org"],
   [
     "TOKEN_ENCRYPTION_KEY",
     Buffer.from(new Uint8Array(32).fill(4)).toString("base64"),
@@ -61,6 +62,7 @@ describe("GatewayConfig", () => {
       LINEAR_CLIENT_ID: "client",
       LINEAR_CLIENT_SECRET: "secret",
       LINEAR_WEBHOOK_SECRET: "webhook",
+      LINEAR_ALLOWED_ORGANIZATION_IDS: "allowed-org",
       TOKEN_ENCRYPTION_KEY: Buffer.from(new Uint8Array(32).fill(4)).toString(
         "base64",
       ),
@@ -105,6 +107,7 @@ describe("GatewayConfig", () => {
       LINEAR_CLIENT_ID_FILE: clientIdFile,
       LINEAR_CLIENT_SECRET: "secret",
       LINEAR_WEBHOOK_SECRET: "webhook",
+      LINEAR_ALLOWED_ORGANIZATION_IDS: "allowed-org",
       TOKEN_ENCRYPTION_KEY: Buffer.from(new Uint8Array(32).fill(5)).toString(
         "base64",
       ),
@@ -135,18 +138,64 @@ describe("GatewayConfig", () => {
     expect(config.ompCliPath).toBe("omp");
   });
 
+  test("treats the GitHub App settings as an optional group", async () => {
+    const disabled = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(Effect.provide(configLayer(baseValues))),
+    );
+    expect(disabled.githubApp).toBeUndefined();
+
+    const partial = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(
+        Effect.provide(configLayer(valuesWith([["GITHUB_APP_ID", "123"]]))),
+      ),
+    );
+    expect(partial.githubApp?.appId).toBe("123");
+    expect(
+      Redacted.value(partial.githubApp?.privateKey ?? Redacted.make("")),
+    ).toBe("");
+  });
+
   test("requires every mandatory setting", async () => {
     for (const name of [
       "LINEAR_CLIENT_ID",
       "LINEAR_CLIENT_SECRET",
       "LINEAR_WEBHOOK_SECRET",
       "TOKEN_ENCRYPTION_KEY",
+      "LINEAR_ALLOWED_ORGANIZATION_IDS",
       "PUBLIC_URL",
     ]) {
       const values = new Map(baseValues);
       values.delete(name);
       const result = await Effect.runPromise(configResult(values));
       expect(Either.isLeft(result), name).toBe(true);
+    }
+  });
+
+  test("parses and validates the allowed organization set", async () => {
+    const config = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(
+        Effect.provide(
+          configLayer(
+            valuesWith([
+              ["LINEAR_ALLOWED_ORGANIZATION_IDS", " org-a,org-b,org-a "],
+            ]),
+          ),
+        ),
+      ),
+    );
+    expect([...config.allowedOrganizationIds]).toEqual(["org-a", "org-b"]);
+
+    for (const value of ["", "org-a,,org-b", "org a"]) {
+      const result = await Effect.runPromise(
+        configResult(valuesWith([["LINEAR_ALLOWED_ORGANIZATION_IDS", value]])),
+      );
+      expect(Either.isLeft(result), value).toBe(true);
     }
   });
 
