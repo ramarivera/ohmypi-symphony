@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Layer } from "effect";
+import { ConfigProvider, Effect, Layer, Option } from "effect";
 import { GatewayServicesLive } from "../src/conductor.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { Reconciler } from "../src/services/reconciler.js";
@@ -23,14 +23,16 @@ const Live = GatewayServicesLive.pipe(
 );
 
 describe("Conductor", () => {
-  it.scopedLive("composes the production services without opening a listener", () =>
-    Effect.gen(function* () {
-      const config = yield* GatewayConfig;
-      const reconciler = yield* Reconciler;
+  it.scopedLive(
+    "composes the production services without opening a listener",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* GatewayConfig;
+        const reconciler = yield* Reconciler;
 
-      expect(config.databasePath).toBe(":memory:");
-      expect(config.port).toBe(3000);
-      expect((yield* reconciler.status()).lastError).toBeNull();
-    }).pipe(Effect.provide(Live)),
+        expect(config.databasePath).toBe(":memory:");
+        expect(config.port).toBe(3000);
+        expect((yield* reconciler.status()).lastError).toEqual(Option.none());
+      }).pipe(Effect.provide(Live)),
   );
 });

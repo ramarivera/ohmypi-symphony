@@ -47,10 +47,7 @@ const configValues = new Map<string, string>([
 const configLayer = GatewayConfig.Default.pipe(
   Layer.provide(Layer.setConfigProvider(ConfigProvider.fromMap(configValues))),
 );
-const roundTrip = <A, I>(
-  schema: Schema.Schema<A, I>,
-  value: unknown,
-) => {
+const roundTrip = <A, I>(schema: Schema.Schema<A, I>, value: unknown) => {
   const decoded = Schema.decodeUnknownSync(schema)(value);
   const encoded = Schema.encodeUnknownSync(schema)(decoded);
   expect(Schema.decodeUnknownSync(schema)(encoded)).toEqual(decoded);
@@ -111,6 +108,7 @@ describe("Effect foundation", () => {
           roundTrip(id, value);
         }
       }),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.prop(

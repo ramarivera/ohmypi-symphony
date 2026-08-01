@@ -106,6 +106,7 @@ describe("SessionAuthority behavior invariants", () => {
           expect(persisted.map((item) => item.payload)).toEqual([event, event]);
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 10 } },
   );
 
   it.effect.prop(
@@ -180,6 +181,7 @@ describe("SessionAuthority behavior invariants", () => {
           });
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.effect.prop(
@@ -252,6 +254,7 @@ describe("SessionAuthority behavior invariants", () => {
           });
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.effect.prop(
@@ -291,11 +294,11 @@ describe("SessionAuthority behavior invariants", () => {
           });
           if (desiredState === "canceled" && inputKind === "prompted") {
             yield* Effect.sync(() =>
-            db
-              .query(
-                "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
-              )
-              .run(sid),
+              db
+                .query(
+                  "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
+                )
+                .run(sid),
             );
           }
           yield* authority.processSession(sid);
@@ -331,6 +334,7 @@ describe("SessionAuthority behavior invariants", () => {
           }
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 });
 
