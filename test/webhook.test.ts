@@ -823,7 +823,9 @@ describe("Linear webhook input correctness", () => {
       Effect.gen(function* () {
         const now = yield* currentTime;
         const response = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now, { webhookId: "logged-unauthorized" })),
+          signedRequest(
+            createdPayload(now, { webhookId: "logged-unauthorized" }),
+          ),
         );
         expect(response.status).toBe(403);
         expect(yield* Effect.promise(() => response.text())).toBe(

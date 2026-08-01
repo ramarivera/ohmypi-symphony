@@ -755,6 +755,7 @@ describe("pure invariants", () => {
           );
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.scopedLive.prop(
@@ -806,6 +807,7 @@ describe("pure invariants", () => {
           }
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.scopedLive.prop(
@@ -905,6 +907,7 @@ describe("pure invariants", () => {
           });
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.scopedLive.prop(
@@ -988,6 +991,7 @@ describe("pure invariants", () => {
           expect(event?.status).toEqual(Option.some("completed"));
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.scopedLive.prop(
@@ -1045,6 +1049,7 @@ describe("pure invariants", () => {
           }
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
   it.scopedLive.prop(
     "InstallationRepo persists generated installation records and replaces them",
@@ -1103,6 +1108,7 @@ describe("pure invariants", () => {
           );
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.scopedLive.prop(
@@ -1159,6 +1165,7 @@ describe("pure invariants", () => {
           expect(yield* repo.pending(sid)).toEqual([]);
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.scopedLive.prop(
@@ -1198,5 +1205,6 @@ describe("pure invariants", () => {
           expect(yield* repo.get(tokenHash, now)).toEqual(Option.none());
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 });

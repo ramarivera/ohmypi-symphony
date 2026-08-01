@@ -642,7 +642,8 @@ export const makeWorkspace = (input: {
         if (!isWithin(canonicalRoot, finalTarget)) {
           return yield* Effect.fail(
             new WorkspaceError({
-              message: "Materialized workspace resolves outside configured root",
+              message:
+                "Materialized workspace resolves outside configured root",
               sessionId,
               reason: "path_escapes_root",
             }),
@@ -650,7 +651,12 @@ export const makeWorkspace = (input: {
         }
         yield* ignoreMarker(finalTarget, sessionId);
         yield* writeMarker(markerPath, repository, sessionId);
-        yield* writeBaseMetadata(finalTarget, repository, baseCommit, sessionId);
+        yield* writeBaseMetadata(
+          finalTarget,
+          repository,
+          baseCommit,
+          sessionId,
+        );
 
         yield* Effect.logInfo("Workspace ready", {
           event: "workspace.ready",
@@ -677,43 +683,41 @@ export const makeWorkspace = (input: {
       return snapshot.path;
     });
 
-    const readMaterialized = Effect.fn("Workspace.readMaterialized")(
-      function* (
-        sessionId: string,
-        workspacePath: string,
-      ): Effect.fn.Return<MaterializedWorkspace, WorkspaceError> {
-        const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
-        const canonicalTarget = yield* validateExistingTarget(
-          canonicalRoot,
-          workspacePath,
-          sessionId,
-        );
-        const metadata = yield* readBaseMetadata(canonicalTarget, sessionId);
-        const marker = parseMarker(
-          JSON.parse(
-            yield* readFileOrFail(
-              join(canonicalTarget, ".linear-gateway-workspace.json"),
-              sessionId,
-            ),
+    const readMaterialized = Effect.fn("Workspace.readMaterialized")(function* (
+      sessionId: string,
+      workspacePath: string,
+    ): Effect.fn.Return<MaterializedWorkspace, WorkspaceError> {
+      const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
+      const canonicalTarget = yield* validateExistingTarget(
+        canonicalRoot,
+        workspacePath,
+        sessionId,
+      );
+      const metadata = yield* readBaseMetadata(canonicalTarget, sessionId);
+      const marker = parseMarker(
+        JSON.parse(
+          yield* readFileOrFail(
+            join(canonicalTarget, ".linear-gateway-workspace.json"),
+            sessionId,
           ),
+        ),
+      );
+      if (
+        Option.isNone(marker) ||
+        marker.value.repositoryId !== metadata.repositoryId ||
+        marker.value.url !== metadata.repositoryUrl ||
+        marker.value.ref !== metadata.base
+      ) {
+        return yield* Effect.fail(
+          new WorkspaceError({
+            message: "Workspace repository identity mismatch",
+            sessionId,
+            reason: "marker_mismatch",
+          }),
         );
-        if (
-          Option.isNone(marker) ||
-          marker.value.repositoryId !== metadata.repositoryId ||
-          marker.value.url !== metadata.repositoryUrl ||
-          marker.value.ref !== metadata.base
-        ) {
-          return yield* Effect.fail(
-            new WorkspaceError({
-              message: "Workspace repository identity mismatch",
-              sessionId,
-              reason: "marker_mismatch",
-            }),
-          );
-        }
-        return { path: canonicalTarget, ...metadata };
-      },
-    );
+      }
+      return { path: canonicalTarget, ...metadata };
+    });
 
     return { resolve, materialize, materializeSnapshot, readMaterialized };
   });

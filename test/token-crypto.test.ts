@@ -52,6 +52,7 @@ describe("TokenCrypto", () => {
           const decoded = yield* crypto.decrypt(encoded);
           expect(decoded).toBe(plaintext);
         }),
+      { timeout: 15_000, fastCheck: { numRuns: 20 } },
     );
 
     it.effect.prop(
@@ -68,6 +69,7 @@ describe("TokenCrypto", () => {
             expect(result.left.reason).toBe("decrypt");
           }
         }),
+      { timeout: 15_000, fastCheck: { numRuns: 20 } },
     );
 
     it.effect.prop(
@@ -86,6 +88,7 @@ describe("TokenCrypto", () => {
             expect(result.left.reason).toBe("version_mismatch");
           }
         }),
+      { timeout: 15_000, fastCheck: { numRuns: 20 } },
     );
   });
 

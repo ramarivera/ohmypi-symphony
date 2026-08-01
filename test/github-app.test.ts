@@ -199,13 +199,10 @@ describe("GitHubApp", () => {
     const result = await Effect.runPromise(
       app.publishPullRequest(publishInput),
     );
+    expect(result).toBeUndefined();
     expect(commands.map((command) => command.slice(1))).toEqual([
       ["status", "--porcelain"],
-      [
-        "rev-list",
-        "--count",
-        "0000000000000000000000000000000000000000..HEAD",
-      ],
+      ["rev-list", "--count", "0000000000000000000000000000000000000000..HEAD"],
     ]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -512,11 +509,7 @@ describe("GitHubApp", () => {
     ).toMatchObject({ iss: 123 });
     expect(commands.map((command) => command.slice(1))).toEqual([
       ["status", "--porcelain"],
-      [
-        "rev-list",
-        "--count",
-        "0000000000000000000000000000000000000000..HEAD",
-      ],
+      ["rev-list", "--count", "0000000000000000000000000000000000000000..HEAD"],
     ]);
   });
 

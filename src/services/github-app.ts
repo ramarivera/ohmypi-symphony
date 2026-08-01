@@ -121,7 +121,7 @@ const isGitBranchRef = (value: string): boolean =>
   !value.endsWith(".") &&
   !value.includes("..") &&
   !value.includes("@{") &&
-  !/[ ~^:?*\[\\]/u.test(value) &&
+  !/[ ~^:?*[\\]/u.test(value) &&
   !value.includes("//");
 
 const base64Url = (bytes: Uint8Array): string => {
@@ -455,7 +455,8 @@ const publishWorkspace = (
     ) {
       return yield* Effect.fail(
         new GitHubAppRemoteError({
-          message: "GitHub pull request base must be a branch and workspace snapshot must be a commit",
+          message:
+            "GitHub pull request base must be a branch and workspace snapshot must be a commit",
         }),
       );
     }

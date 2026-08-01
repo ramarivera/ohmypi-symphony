@@ -1,7 +1,10 @@
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit, Logger, Option, Redacted, Schema } from "effect";
-import { OAuthStateError, TenantNotAllowedError } from "../src/domain/errors.js";
+import {
+  OAuthStateError,
+  TenantNotAllowedError,
+} from "../src/domain/errors.js";
 import { AppUserId, OrganizationId, type TeamId } from "../src/domain/ids.js";
 import {
   oauthCallback,

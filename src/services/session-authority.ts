@@ -739,7 +739,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             if (materialized.repositoryId !== repositoryId.value) {
               return yield* Effect.fail(
                 new GitHubAppRemoteError({
-                  message: "Materialized workspace repository identity mismatch",
+                  message:
+                    "Materialized workspace repository identity mismatch",
                 }),
               );
             }
@@ -782,9 +783,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             sessionId,
             attempt: run.attempt,
           });
-          yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
-            Effect.ensuring(cleanupWorker(sessionId)),
-          );
+          yield* projector
+            .projectRpcEvent(sessionId, sequence, event)
+            .pipe(Effect.ensuring(cleanupWorker(sessionId)));
           return;
         }
 

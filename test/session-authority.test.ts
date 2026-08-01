@@ -1,5 +1,5 @@
-import { describe, expect, it } from "@effect/vitest";
 import { mkdir, writeFile } from "node:fs/promises";
+import { describe, expect, it } from "@effect/vitest";
 import {
   ConfigProvider,
   Context,
@@ -57,6 +57,7 @@ import {
   safeSessionKey,
   workspaceBranchName,
 } from "../src/services/workspace.js";
+
 describe("SessionAuthority behavior invariants", () => {
   it.effect.prop(
     "persists each worker event once with distinct sequence keys",
@@ -583,148 +584,159 @@ const install = (organizationId: OrganizationId): Installation => ({
 });
 
 describe("SessionAuthority GitHub publication", () => {
-  it.scopedLive("publishes before succeeding and projects the PR URL", () => {
-    const published: PublishPullRequestInput[] = [];
-    const githubApp = makeGitHubApp(true, (input) =>
-      Effect.sync(() => {
-        published.push(input);
-        return {
-          url: "https://github.com/octo/example/pull/7",
-          number: 7,
-        };
-      }),
-    );
-    return withAuthority(
-      () =>
-        Effect.gen(function* () {
-          const authority = yield* SessionAuthority;
-          const runRepo = yield* RunRepo;
-          const installationRepo = yield* InstallationRepo;
-          const workspaceRepo = yield* WorkspaceRepo;
-          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
-            "authority-repository",
-          );
-
-          yield* installationRepo.put(install(testOrganizationId));
-          yield* workspaceRepo.createRepository({
-            organizationId: testOrganizationId,
-            id: repositoryId,
-            url: "git@github.com:octo/example.git",
-            ref: "main",
-          });
-          yield* runRepo.create({
-            sessionId: testSessionId,
-            organizationId: testOrganizationId,
-            issueId: Option.none(),
-          });
-          yield* runRepo.update(testSessionId, {
-            state: "orphaned",
-            repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some(TEST_WORKSPACE_PATH),
-            ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
-          });
-          yield* prepareMaterializedWorkspace;
-          yield* authority.processSession(testSessionId);
-          yield* workspaceRepo.updateRepository(
-            testOrganizationId,
-            repositoryId,
-            { url: "https://example.invalid/replaced.git", ref: "release-tag" },
-          );
-
-          const projected = yield* Deferred.make<void>();
-          projectionWaiter = projected;
-          projectionExpected = 1;
-          yield* Effect.sync(() => {
-            if (workerEventListener === undefined)
-              throw new Error("worker event listener was not registered");
-            workerEventListener({ type: "agent_end" });
-          });
-          yield* Deferred.await(projected);
-
-          const run = yield* runRepo.get(testSessionId);
-          expect(Option.isSome(run) && run.value.state).toBe("succeeded");
-          expect(published[0]).toMatchObject({
-            repositoryUrl: "git@github.com:octo/example.git",
-            base: "main",
-            branch: workspaceBranchName(testSessionId),
-          });
-          expect(projectorExternalUrls).toContainEqual({
-            sessionId: testSessionId,
-            sourceKey: `github-pr:${testSessionId}`,
-            urls: [
-              {
-                label: "GitHub pull request",
-                url: "https://github.com/octo/example/pull/7",
-              },
-            ],
-          });
-        }),
-      githubApp,
-    );
-  });
-
-  it.scopedLive("marks the run failed when GitHub publication fails", () => {
-    let publishCalls = 0;
-    const githubApp = makeGitHubApp(true, () => {
-      publishCalls += 1;
-      return Effect.fail(
-        new GitHubAppApiError({
-          message: "GitHub pull request creation failed",
-          operation: "pull request creation",
+  it.scopedLive(
+    "publishes before succeeding and projects the PR URL",
+    () => {
+      const published: PublishPullRequestInput[] = [];
+      const githubApp = makeGitHubApp(true, (input) =>
+        Effect.sync(() => {
+          published.push(input);
+          return {
+            url: "https://github.com/octo/example/pull/7",
+            number: 7,
+          };
         }),
       );
-    });
-    return withAuthority(
-      () =>
-        Effect.gen(function* () {
-          const authority = yield* SessionAuthority;
-          const runRepo = yield* RunRepo;
-          const installationRepo = yield* InstallationRepo;
-          const workspaceRepo = yield* WorkspaceRepo;
-          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
-            "authority-repository",
-          );
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runRepo = yield* RunRepo;
+            const installationRepo = yield* InstallationRepo;
+            const workspaceRepo = yield* WorkspaceRepo;
+            const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+              "authority-repository",
+            );
 
-          yield* installationRepo.put(install(testOrganizationId));
-          yield* workspaceRepo.createRepository({
-            organizationId: testOrganizationId,
-            id: repositoryId,
-            url: "https://github.com/octo/example",
-            ref: "main",
-          });
-          yield* runRepo.create({
-            sessionId: testSessionId,
-            organizationId: testOrganizationId,
-            issueId: Option.none(),
-          });
-          for (let attempt = 0; attempt < 6; attempt += 1) {
-            yield* runRepo.update(testSessionId, { incrementAttempt: true });
-          }
-          yield* runRepo.update(testSessionId, {
-            state: "orphaned",
-            repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some(TEST_WORKSPACE_PATH),
-            ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
-          });
-          yield* prepareMaterializedWorkspace;
-          yield* authority.processSession(testSessionId);
+            yield* installationRepo.put(install(testOrganizationId));
+            yield* workspaceRepo.createRepository({
+              organizationId: testOrganizationId,
+              id: repositoryId,
+              url: "git@github.com:octo/example.git",
+              ref: "main",
+            });
+            yield* runRepo.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            yield* runRepo.update(testSessionId, {
+              state: "orphaned",
+              repositoryId: Option.some(repositoryId),
+              workspacePath: Option.some(TEST_WORKSPACE_PATH),
+              ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
+            });
+            yield* prepareMaterializedWorkspace;
+            yield* authority.processSession(testSessionId);
+            yield* workspaceRepo.updateRepository(
+              testOrganizationId,
+              repositoryId,
+              {
+                url: "https://example.invalid/replaced.git",
+                ref: "release-tag",
+              },
+            );
 
-          const terminal = yield* Deferred.make<void>();
-          terminalWaiter = terminal;
-          yield* Effect.sync(() => {
-            if (workerEventListener === undefined)
-              throw new Error("worker event listener was not registered");
-            workerEventListener({ type: "agent_end" });
-          });
-          yield* Deferred.await(terminal);
+            const projected = yield* Deferred.make<void>();
+            projectionWaiter = projected;
+            projectionExpected = 1;
+            yield* Effect.sync(() => {
+              if (workerEventListener === undefined)
+                throw new Error("worker event listener was not registered");
+              workerEventListener({ type: "agent_end" });
+            });
+            yield* Deferred.await(projected);
 
-          expect(publishCalls).toBe(1);
-          const run = yield* runRepo.get(testSessionId);
-          expect(Option.isSome(run) && run.value.state).toBe("failed");
-        }),
-      githubApp,
-    );
-  });
+            const run = yield* runRepo.get(testSessionId);
+            expect(Option.isSome(run) && run.value.state).toBe("succeeded");
+            expect(published[0]).toMatchObject({
+              repositoryUrl: "git@github.com:octo/example.git",
+              base: "main",
+              branch: workspaceBranchName(testSessionId),
+            });
+            expect(projectorExternalUrls).toContainEqual({
+              sessionId: testSessionId,
+              sourceKey: `github-pr:${testSessionId}`,
+              urls: [
+                {
+                  label: "GitHub pull request",
+                  url: "https://github.com/octo/example/pull/7",
+                },
+              ],
+            });
+          }),
+        githubApp,
+      );
+    },
+    15_000,
+  );
+
+  it.scopedLive(
+    "marks the run failed when GitHub publication fails",
+    () => {
+      let publishCalls = 0;
+      const githubApp = makeGitHubApp(true, () => {
+        publishCalls += 1;
+        return Effect.fail(
+          new GitHubAppApiError({
+            message: "GitHub pull request creation failed",
+            operation: "pull request creation",
+          }),
+        );
+      });
+      return withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const runRepo = yield* RunRepo;
+            const installationRepo = yield* InstallationRepo;
+            const workspaceRepo = yield* WorkspaceRepo;
+            const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+              "authority-repository",
+            );
+
+            yield* installationRepo.put(install(testOrganizationId));
+            yield* workspaceRepo.createRepository({
+              organizationId: testOrganizationId,
+              id: repositoryId,
+              url: "https://github.com/octo/example",
+              ref: "main",
+            });
+            yield* runRepo.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            for (let attempt = 0; attempt < 6; attempt += 1) {
+              yield* runRepo.update(testSessionId, { incrementAttempt: true });
+            }
+            yield* runRepo.update(testSessionId, {
+              state: "orphaned",
+              repositoryId: Option.some(repositoryId),
+              workspacePath: Option.some(TEST_WORKSPACE_PATH),
+              ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
+            });
+            yield* prepareMaterializedWorkspace;
+            yield* authority.processSession(testSessionId);
+
+            const terminal = yield* Deferred.make<void>();
+            terminalWaiter = terminal;
+            yield* Effect.sync(() => {
+              if (workerEventListener === undefined)
+                throw new Error("worker event listener was not registered");
+              workerEventListener({ type: "agent_end" });
+            });
+            yield* Deferred.await(terminal);
+
+            expect(publishCalls).toBe(1);
+            const run = yield* runRepo.get(testSessionId);
+            expect(Option.isSome(run) && run.value.state).toBe("failed");
+          }),
+        githubApp,
+      );
+    },
+    15_000,
+  );
 });
 
 describe("SessionAuthority infrastructure failures", () => {

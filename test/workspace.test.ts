@@ -410,10 +410,11 @@ describe("Workspace", () => {
             ).toContain(`# branch.head ${workspaceBranchName(id)}`);
             expect(
               yield* fixtureIo("workspace status", async () => {
-                const process = Bun.spawn(
-                  ["git", "status", "--porcelain"],
-                  { cwd: first, stdout: "pipe", stderr: "pipe" },
-                );
+                const process = Bun.spawn(["git", "status", "--porcelain"], {
+                  cwd: first,
+                  stdout: "pipe",
+                  stderr: "pipe",
+                });
                 const [exitCode, stdout] = await Promise.all([
                   process.exited,
                   new Response(process.stdout).text(),

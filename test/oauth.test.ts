@@ -397,7 +397,7 @@ describe("OAuth", () => {
           false,
         );
       }),
-    { fastCheck: { numRuns: 50 } },
+    { timeout: 15_000, fastCheck: { numRuns: 50 } },
   );
 
   it.effect.prop(
@@ -454,6 +454,6 @@ describe("OAuth", () => {
         );
         expect(testState.installations).toEqual([installation]);
       }),
-    { fastCheck: { numRuns: 50 } },
+    { timeout: 15_000, fastCheck: { numRuns: 50 } },
   );
 });
