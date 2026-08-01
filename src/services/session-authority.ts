@@ -3,7 +3,7 @@ import { Clock, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
   type DatabaseError,
   GitHubAppApiError,
-  type GitHubAppConfigurationError,
+  GitHubAppConfigurationError,
   GitHubAppRemoteError,
   type InstallationRevokedError,
   InterruptedRunNoActionableInputError,
@@ -456,6 +456,76 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
         yield* releaseIfNoWorker(run.sessionId);
       });
+      const cleanupWorker = Effect.fn("SessionAuthority.cleanupWorker")(
+        function* (sessionId: SessionId) {
+          const state = yield* getWorker(sessionId);
+          if (Option.isSome(state)) {
+            yield* state.value.worker.stop();
+            yield* Ref.update(workersRef, (workers) => {
+              const next = new Map(workers);
+              next.delete(sessionId);
+              return next;
+            });
+          }
+          yield* releaseIfNoWorker(sessionId);
+        },
+      );
+
+      const checkPublicationAdmission = Effect.fn(
+        "SessionAuthority.checkPublicationAdmission",
+      )(function* (
+        sessionId: SessionId,
+        organizationId: AgentRun["organizationId"],
+        teamId: AgentRun["teamId"],
+      ) {
+        const current = yield* runRepo.get(sessionId);
+        if (
+          Option.isNone(current) ||
+          current.value.desiredState === "canceled" ||
+          current.value.state === "canceled"
+        ) {
+          if (Option.isSome(current)) yield* cancel(current.value);
+          return false;
+        }
+        const installation = yield* installationRepo.get(organizationId);
+        if (
+          Option.isNone(installation) ||
+          Option.isSome(installation.value.revokedAt)
+        ) {
+          yield* runRepo.update(sessionId, {
+            state: "failed",
+            terminalReason: Option.some("Linear installation is unavailable"),
+            nextAttemptAt: Option.none(),
+          });
+          yield* projector.terminal(
+            sessionId,
+            `installation-unavailable:${organizationId}`,
+            "error",
+            "The Linear installation is unavailable. Reinstall or reauthorize the app, then try again.",
+          );
+          return false;
+        }
+        const accessibleTeamIds = Option.match(
+          installation.value.accessibleTeamIds,
+          {
+            onNone: () => [] as ReadonlyArray<string>,
+            onSome: (ids) => ids,
+          },
+        );
+        const canAccessAll = Option.match(
+          installation.value.canAccessAllPublicTeams,
+          { onNone: () => false, onSome: (value) => value },
+        );
+        if (
+          Option.isSome(teamId) &&
+          !canAccessAll &&
+          !accessibleTeamIds.includes(teamId.value)
+        ) {
+          yield* cancel(current.value);
+          return false;
+        }
+        return true;
+      });
 
       const handleFailure = Effect.fn("SessionAuthority.handleFailure")(
         function* (sessionId: SessionId, error: AuthorityError) {
@@ -492,7 +562,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             return;
           }
 
-          if (run.attempt >= maxAttempts) {
+          const permanent =
+            error instanceof GitHubAppConfigurationError ||
+            error instanceof GitHubAppRemoteError;
+          if (permanent || run.attempt >= maxAttempts) {
             const correlationId = failureCorrelationId(
               sessionId,
               run.attempt,
@@ -509,12 +582,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               attempt: run.attempt,
               correlationId,
               terminalReason: `${message} [${correlationId}]`,
+              permanent,
             });
             yield* projector.terminal(
               sessionId,
               `failure:${correlationId}`,
               "error",
-              `The OhMyPi run failed after ${run.attempt} attempts. Reference: ${correlationId}`,
+              permanent
+                ? message
+                : `The OhMyPi run failed after ${run.attempt} attempts. Reference: ${correlationId}`,
             );
             return;
           }
@@ -647,16 +723,23 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 }),
               );
             }
-            const repositoryOption = yield* workspaceRepo.getRepository(
+            const admitted = yield* checkPublicationAdmission(
+              sessionId,
               run.organizationId,
-              repositoryId.value,
+              run.teamId,
             );
-            if (Option.isNone(repositoryOption)) {
+            if (!admitted) {
+              yield* cleanupWorker(sessionId);
+              return;
+            }
+            const materialized = yield* workspace.readMaterialized(
+              sessionId,
+              workspacePath.value,
+            );
+            if (materialized.repositoryId !== repositoryId.value) {
               return yield* Effect.fail(
-                new GitHubAppApiError({
-                  message:
-                    "GitHub workspace publication repository is unavailable",
-                  operation: "workspace publication",
+                new GitHubAppRemoteError({
+                  message: "Materialized workspace repository identity mismatch",
                 }),
               );
             }
@@ -664,24 +747,24 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               onNone: () => sessionId,
               onSome: (issueId) => issueId,
             });
-            const pullRequest = yield* githubApp
-              .publishPullRequest({
-                repositoryUrl: repositoryOption.value.url,
-                base: repositoryOption.value.ref,
-                branch: workspaceBranchName(sessionId),
-                workspacePath: workspacePath.value,
-                title: `OhMyPi changes for ${issueReference}`,
-                body: `Automated workspace changes for session ${sessionId}.`,
-              })
-              .pipe(
-                Effect.mapError((error) =>
-                  error instanceof GitHubAppRemoteError
-                    ? new GitHubAppRemoteError({
-                        message: `GitHub publication rejected configured repository ${repositoryOption.value.id}`,
-                      })
-                    : error,
-                ),
-              );
+            const pullRequest = yield* githubApp.publishPullRequest({
+              repositoryUrl: materialized.repositoryUrl,
+              base: materialized.base,
+              baseCommit: materialized.baseCommit,
+              branch: workspaceBranchName(sessionId),
+              workspacePath: materialized.path,
+              title: `OhMyPi changes for ${issueReference}`,
+              body: `Automated workspace changes for session ${sessionId}.`,
+            });
+            const admittedAfterPublication = yield* checkPublicationAdmission(
+              sessionId,
+              run.organizationId,
+              run.teamId,
+            );
+            if (!admittedAfterPublication) {
+              yield* cleanupWorker(sessionId);
+              return;
+            }
             if (pullRequest !== undefined) {
               yield* projector.externalUrls(
                 sessionId,
@@ -700,19 +783,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             attempt: run.attempt,
           });
           yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
-            Effect.ensuring(
-              Effect.gen(function* () {
-                if (Option.isSome(worker)) {
-                  yield* worker.value.worker.stop();
-                }
-                yield* Ref.update(workersRef, (workers) => {
-                  const next = new Map(workers);
-                  next.delete(sessionId);
-                  return next;
-                });
-                yield* releaseIfNoWorker(sessionId);
-              }),
-            ),
+            Effect.ensuring(cleanupWorker(sessionId)),
           );
           return;
         }
@@ -993,19 +1064,22 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   yield* runRepo.update(sessionId, { state: "waiting" });
                   return;
                 }
-                const workspacePath = yield* workspace.materialize(
+                const materialized = yield* workspace.materializeSnapshot(
                   sessionId,
                   resolution.repository,
                 );
                 yield* runRepo.update(sessionId, {
                   state: "starting",
                   repositoryId: Option.some(resolution.repository.id),
-                  workspacePath: Option.some(workspacePath),
+                  workspacePath: Option.some(materialized.path),
                   incrementAttempt: true,
                 });
                 const updatedOption = yield* runRepo.get(sessionId);
                 if (Option.isNone(updatedOption)) return;
-                worker = yield* startWorker(updatedOption.value, workspacePath);
+                worker = yield* startWorker(
+                  updatedOption.value,
+                  materialized.path,
+                );
                 const agentInvoked = yield* worker.prompt(input.body);
                 if (!agentInvoked) {
                   yield* finishLocalCommand(sessionId, worker, input.id);

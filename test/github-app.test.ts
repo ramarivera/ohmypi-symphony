@@ -40,6 +40,7 @@ const createInput = {
 const publishInput = {
   repositoryUrl: "git@github.com:octo/example.git",
   base: "main",
+  baseCommit: "0000000000000000000000000000000000000000",
   branch: "gateway/00000000000000000000000000000000",
   workspacePath: "/workspace",
   title: "Open a pull request",
@@ -139,6 +140,7 @@ describe("GitHubApp", () => {
       app.publishPullRequest({
         repositoryUrl: "https://github.com/octo/example.git",
         base: "main",
+        baseCommit: "0000000000000000000000000000000000000000",
         branch: "gateway/00000000000000000000000000000000",
         workspacePath: "/path-that-must-not-be-read",
         title: "unused",
@@ -197,17 +199,20 @@ describe("GitHubApp", () => {
     const result = await Effect.runPromise(
       app.publishPullRequest(publishInput),
     );
-    expect(result).toBeUndefined();
     expect(commands.map((command) => command.slice(1))).toEqual([
       ["status", "--porcelain"],
-      ["rev-list", "--count", "FETCH_HEAD..HEAD"],
+      [
+        "rev-list",
+        "--count",
+        "0000000000000000000000000000000000000000..HEAD",
+      ],
     ]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("commits residual work with gateway identity before pushing", async () => {
     const app = await configuredApp();
-    const { commands } = stubGit([
+    const { commands, spawn } = stubGit([
       { stdout: " M file.txt\n" },
       { stdout: "0\n" },
       {},
@@ -257,6 +262,12 @@ describe("GitHubApp", () => {
       "Gateway workspace changes",
     ]);
     expect(commit).not.toContain("--no-verify");
+    const statusEnv = spawn.mock.calls[0]?.[1];
+    const pushEnv = spawn.mock.calls.at(-1)?.[1];
+    expect(statusEnv?.env).not.toHaveProperty("GITHUB_APP_INSTALLATION_TOKEN");
+    expect(pushEnv?.env).toMatchObject({
+      GITHUB_APP_INSTALLATION_TOKEN: "installation-secret",
+    });
   });
 
   it("pushes an existing agent commit and reuses an open pull request", async () => {
@@ -501,7 +512,11 @@ describe("GitHubApp", () => {
     ).toMatchObject({ iss: 123 });
     expect(commands.map((command) => command.slice(1))).toEqual([
       ["status", "--porcelain"],
-      ["rev-list", "--count", "FETCH_HEAD..HEAD"],
+      [
+        "rev-list",
+        "--count",
+        "0000000000000000000000000000000000000000..HEAD",
+      ],
     ]);
   });
 

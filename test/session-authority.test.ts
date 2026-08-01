@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { mkdir, writeFile } from "node:fs/promises";
 import {
   ConfigProvider,
   Context,
@@ -52,8 +53,10 @@ import {
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
-import { workspaceBranchName } from "../src/services/workspace.js";
-
+import {
+  safeSessionKey,
+  workspaceBranchName,
+} from "../src/services/workspace.js";
 describe("SessionAuthority behavior invariants", () => {
   it.effect.prop(
     "persists each worker event once with distinct sequence keys",
@@ -357,12 +360,22 @@ const testConfigProvider = ConfigProvider.fromMap(
     ["LINEAR_ALLOWED_ORGANIZATION_IDS", "authority-organization"],
     ["TOKEN_ENCRYPTION_KEY", "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="],
     ["PUBLIC_URL", "http://localhost:3000"],
-    [
-      "WORKSPACE_ROOT",
-      "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/authority-tests",
-    ],
+    ["WORKSPACE_ROOT", "/tmp/authority-tests"],
   ]),
 );
+const TEST_WORKSPACE_PATH = `/tmp/authority-tests/${safeSessionKey("authority-session")}`;
+const prepareMaterializedWorkspace = Effect.tryPromise(async () => {
+  await mkdir(`${TEST_WORKSPACE_PATH}/.git`, { recursive: true });
+  await writeFile(
+    `${TEST_WORKSPACE_PATH}/.git/linear-gateway-base.json`,
+    JSON.stringify({
+      repositoryId: "authority-repository",
+      repositoryUrl: "git@github.com:octo/example.git",
+      base: "main",
+      baseCommit: "0000000000000000000000000000000000000000",
+    }),
+  );
+});
 let workerEventListener: ((event: RpcEvent) => void) | undefined;
 let projectionWaiter: Deferred.Deferred<void, never> | undefined;
 let terminalWaiter: Deferred.Deferred<void, never> | undefined;
@@ -599,10 +612,16 @@ describe("SessionAuthority GitHub publication", () => {
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some("/workspace/authority-session"),
+            workspacePath: Option.some(TEST_WORKSPACE_PATH),
             ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
           });
+          yield* prepareMaterializedWorkspace;
           yield* authority.processSession(testSessionId);
+          yield* workspaceRepo.updateRepository(
+            testOrganizationId,
+            repositoryId,
+            { url: "https://example.invalid/replaced.git", ref: "release-tag" },
+          );
 
           const projected = yield* Deferred.make<void>();
           projectionWaiter = projected;
@@ -637,14 +656,16 @@ describe("SessionAuthority GitHub publication", () => {
   });
 
   it.scopedLive("marks the run failed when GitHub publication fails", () => {
-    const githubApp = makeGitHubApp(true, () =>
-      Effect.fail(
+    let publishCalls = 0;
+    const githubApp = makeGitHubApp(true, () => {
+      publishCalls += 1;
+      return Effect.fail(
         new GitHubAppApiError({
           message: "GitHub pull request creation failed",
           operation: "pull request creation",
         }),
-      ),
-    );
+      );
+    });
     return withAuthority(
       () =>
         Effect.gen(function* () {
@@ -668,15 +689,16 @@ describe("SessionAuthority GitHub publication", () => {
             organizationId: testOrganizationId,
             issueId: Option.none(),
           });
-          for (let attempt = 0; attempt < 5; attempt += 1) {
+          for (let attempt = 0; attempt < 6; attempt += 1) {
             yield* runRepo.update(testSessionId, { incrementAttempt: true });
           }
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some("/workspace/authority-session"),
+            workspacePath: Option.some(TEST_WORKSPACE_PATH),
             ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
           });
+          yield* prepareMaterializedWorkspace;
           yield* authority.processSession(testSessionId);
 
           const terminal = yield* Deferred.make<void>();
@@ -688,6 +710,7 @@ describe("SessionAuthority GitHub publication", () => {
           });
           yield* Deferred.await(terminal);
 
+          expect(publishCalls).toBe(1);
           const run = yield* runRepo.get(testSessionId);
           expect(Option.isSome(run) && run.value.state).toBe("failed");
         }),

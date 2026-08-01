@@ -409,6 +409,20 @@ describe("Workspace", () => {
               }),
             ).toContain(`# branch.head ${workspaceBranchName(id)}`);
             expect(
+              yield* fixtureIo("workspace status", async () => {
+                const process = Bun.spawn(
+                  ["git", "status", "--porcelain"],
+                  { cwd: first, stdout: "pipe", stderr: "pipe" },
+                );
+                const [exitCode, stdout] = await Promise.all([
+                  process.exited,
+                  new Response(process.stdout).text(),
+                ]);
+                if (exitCode !== 0) throw new Error("workspace status failed");
+                return stdout;
+              }),
+            ).toBe("");
+            expect(
               yield* fixtureIo("workspace publication base", async () => {
                 const process = Bun.spawn(
                   ["git", "rev-list", "--count", "FETCH_HEAD..HEAD"],

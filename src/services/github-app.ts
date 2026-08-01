@@ -33,6 +33,7 @@ export interface CreatedPullRequest {
 export interface PublishPullRequestInput {
   readonly repositoryUrl: string;
   readonly base: string;
+  readonly baseCommit: string;
   readonly branch: string;
   readonly workspacePath: string;
   readonly title: string;
@@ -111,6 +112,16 @@ export const parseGitHubRemote = (remote: string): GitHubRepository => {
   }
   return repositoryFromParts(parts[1], parts[2]);
 };
+const isGitBranchRef = (value: string): boolean =>
+  value.length > 0 &&
+  !value.startsWith("refs/") &&
+  !value.startsWith("/") &&
+  !value.endsWith("/") &&
+  !value.endsWith(".") &&
+  !value.includes("..") &&
+  !value.includes("@{") &&
+  !/[ ~^:?*\[\\]/u.test(value) &&
+  !value.includes("//");
 
 const base64Url = (bytes: Uint8Array): string => {
   let binary = "";
@@ -388,6 +399,14 @@ interface GitResult {
   readonly stderr: string;
 }
 
+const BASE_GIT_ENV: Record<string, string> = {
+  PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+  HOME: "/nonexistent",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+};
+
 const runGit = (
   args: ReadonlyArray<string>,
   cwd: string,
@@ -395,14 +414,9 @@ const runGit = (
 ): Effect.Effect<GitResult, GitHubAppApiError> =>
   Effect.tryPromise({
     try: async () => {
-      const processEnv = Object.fromEntries(
-        Object.entries(process.env).filter(
-          (entry): entry is [string, string] => entry[1] !== undefined,
-        ),
-      );
       const child = Bun.spawn(["git", ...args], {
         cwd,
-        env: { ...processEnv, ...env },
+        env: { ...BASE_GIT_ENV, ...env },
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -433,8 +447,16 @@ const publishWorkspace = (
                 "Repository URL must be a canonical github.com repository",
             }),
     });
-    if (!/^gateway\/[a-f0-9]{32}$/.test(input.branch)) {
-      return yield* Effect.fail(apiError("workspace publication"));
+    if (
+      !/^gateway\/[a-f0-9]{32}$/u.test(input.branch) ||
+      !isGitBranchRef(input.base) ||
+      !/^[0-9a-f]{40}$/u.test(input.baseCommit)
+    ) {
+      return yield* Effect.fail(
+        new GitHubAppRemoteError({
+          message: "GitHub pull request base must be a branch and workspace snapshot must be a commit",
+        }),
+      );
     }
 
     const status = yield* runGit(
@@ -443,7 +465,7 @@ const publishWorkspace = (
     );
     yield* requireGitSuccess(status);
     let ahead = yield* runGit(
-      ["rev-list", "--count", "FETCH_HEAD..HEAD"],
+      ["rev-list", "--count", `${input.baseCommit}..HEAD`],
       input.workspacePath,
     );
     yield* requireGitSuccess(ahead);
@@ -479,7 +501,7 @@ const publishWorkspace = (
         yield* requireGitSuccess(staged);
       }
       ahead = yield* runGit(
-        ["rev-list", "--count", "FETCH_HEAD..HEAD"],
+        ["rev-list", "--count", `${input.baseCommit}..HEAD`],
         input.workspacePath,
       );
       yield* requireGitSuccess(ahead);
@@ -597,7 +619,13 @@ const requireGitSuccess = (
 ): Effect.Effect<void, GitHubAppApiError> =>
   result.exitCode === 0
     ? Effect.succeed(undefined)
-    : Effect.fail(apiError("workspace publication"));
+    : Effect.fail(
+        new GitHubAppApiError({
+          message: "GitHub workspace publication git command failed",
+          operation: "workspace publication",
+          cause: result.stderr.trim() || `exit code ${result.exitCode}`,
+        }),
+      );
 
 export class GitHubApp extends Effect.Service<GitHubApp>()("GitHubApp", {
   accessors: true,

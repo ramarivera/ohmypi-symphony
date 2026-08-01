@@ -26,6 +26,14 @@ interface WorkspaceMarker {
   readonly ref: string;
 }
 
+export interface MaterializedWorkspace {
+  readonly path: string;
+  readonly repositoryId: string;
+  readonly repositoryUrl: string;
+  readonly base: string;
+  readonly baseCommit: string;
+}
+
 interface ResolveContext {
   readonly organizationId: string | null;
   readonly teamId: string | null;
@@ -80,6 +88,37 @@ function parseMarker(value: unknown): Option.Option<WorkspaceMarker> {
       repositoryId: record.repositoryId,
       url: record.url,
       ref: record.ref,
+    });
+  }
+  return Option.none();
+}
+
+const BASE_METADATA_FILE = ".git/linear-gateway-base.json";
+const MARKER_EXCLUDE = "/.linear-gateway-workspace.json";
+
+function parseMaterializedWorkspace(
+  value: unknown,
+): Option.Option<
+  Pick<
+    MaterializedWorkspace,
+    "repositoryId" | "repositoryUrl" | "base" | "baseCommit"
+  >
+> {
+  if (typeof value !== "object" || value === null) return Option.none();
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.repositoryId === "string" &&
+    typeof record.repositoryUrl === "string" &&
+    typeof record.base === "string" &&
+    /^[0-9a-f]{40}$/u.test(
+      typeof record.baseCommit === "string" ? record.baseCommit : "",
+    )
+  ) {
+    return Option.some({
+      repositoryId: record.repositoryId,
+      repositoryUrl: record.repositoryUrl,
+      base: record.base,
+      baseCommit: record.baseCommit as string,
     });
   }
   return Option.none();
@@ -205,13 +244,15 @@ const runGit = (
         stdout: "pipe",
         stderr: "pipe",
       });
-      const [exitCode, stderr] = await Promise.all([
+      const [exitCode, stdout, stderr] = await Promise.all([
         process.exited,
+        new Response(process.stdout).text(),
         new Response(process.stderr).text(),
       ]);
       if (exitCode !== 0) {
         throw new Error(`git ${args[0] ?? "command"} failed: ${stderr.trim()}`);
       }
+      return stdout;
     },
     catch: workspaceFailure("git command failed", "git_failed", sessionId),
   });
@@ -284,6 +325,75 @@ const writeMarker = (
       "git_failed",
       sessionId,
     ),
+  });
+
+const ignoreMarker = (target: string, sessionId: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const path = join(target, ".git/info/exclude");
+      let existing = "";
+      try {
+        existing = await readFile(path, "utf8");
+      } catch (error) {
+        if (!enoent(error)) throw error;
+      }
+      if (!existing.split(/\r?\n/u).includes(MARKER_EXCLUDE)) {
+        await writeFile(
+          path,
+          `${existing}${existing.endsWith("\n") || existing.length === 0 ? "" : "\n"}${MARKER_EXCLUDE}\n`,
+          { encoding: "utf8", mode: 0o600 },
+        );
+      }
+    },
+    catch: workspaceFailure(
+      "ignore workspace marker failed",
+      "git_failed",
+      sessionId,
+    ),
+  });
+
+const writeBaseMetadata = (
+  target: string,
+  repository: RepositoryRecord,
+  baseCommit: string,
+  sessionId: string,
+) =>
+  Effect.tryPromise({
+    try: () =>
+      writeFile(
+        join(target, BASE_METADATA_FILE),
+        JSON.stringify({
+          repositoryId: repository.id,
+          repositoryUrl: repository.url,
+          base: repository.ref,
+          baseCommit,
+        }),
+        { encoding: "utf8", mode: 0o600 },
+      ),
+    catch: workspaceFailure(
+      "write workspace base metadata failed",
+      "git_failed",
+      sessionId,
+    ),
+  });
+
+const readBaseMetadata = (target: string, sessionId: string) =>
+  Effect.gen(function* () {
+    const raw = yield* readFileOrFail(
+      join(target, BASE_METADATA_FILE),
+      sessionId,
+    );
+    const parsed = parseMaterializedWorkspace(JSON.parse(raw));
+    if (Option.isNone(parsed)) {
+      return yield* Effect.fail(
+        new WorkspaceError({
+          message: "Workspace base metadata is invalid",
+          sessionId,
+          reason: "marker_mismatch",
+        }),
+      );
+    }
+    return parsed.value;
   });
 
 const ensureRoot = (root: string, sessionId: string) =>
@@ -406,116 +516,184 @@ export const makeWorkspace = (input: {
       return resolution;
     });
 
-    const materialize = Effect.fn("Workspace.materialize")(function* (
-      sessionId: string,
-      repository: RepositoryRecord,
-    ): Effect.fn.Return<string, WorkspaceError> {
-      yield* Effect.annotateCurrentSpan({
-        "workspace.session_id": sessionId,
-        "workspace.repository_id": repository.id,
-      });
-      const branch = workspaceBranchName(sessionId);
+    const materializeSnapshot = Effect.fn("Workspace.materializeSnapshot")(
+      function* (
+        sessionId: string,
+        repository: RepositoryRecord,
+      ): Effect.fn.Return<MaterializedWorkspace, WorkspaceError> {
+        yield* Effect.annotateCurrentSpan({
+          "workspace.session_id": sessionId,
+          "workspace.repository_id": repository.id,
+        });
+        const branch = workspaceBranchName(sessionId);
 
-      const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
-      const target = join(canonicalRoot, safeSessionKey(sessionId));
+        const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
+        const target = join(canonicalRoot, safeSessionKey(sessionId));
 
-      if (!isWithin(canonicalRoot, target)) {
-        return yield* Effect.fail(
-          new WorkspaceError({
-            message: "Workspace path escapes configured root",
-            sessionId,
-            reason: "path_escapes_root",
-          }),
-        );
-      }
-
-      const targetStats = yield* lstatOrMissing(
-        target,
-        sessionId,
-        "target_not_directory",
-      );
-      const markerPath = join(target, ".linear-gateway-workspace.json");
-
-      if (Option.isSome(targetStats)) {
-        if (
-          targetStats.value.isSymbolicLink() ||
-          !targetStats.value.isDirectory()
-        ) {
+        if (!isWithin(canonicalRoot, target)) {
           return yield* Effect.fail(
             new WorkspaceError({
-              message: "Workspace target is not a real directory",
+              message: "Workspace path escapes configured root",
               sessionId,
-              reason: "target_not_directory",
+              reason: "path_escapes_root",
             }),
           );
         }
 
-        const canonicalTarget = yield* validateExistingTarget(
-          canonicalRoot,
+        const targetStats = yield* lstatOrMissing(
+          target,
+          sessionId,
+          "target_not_directory",
+        );
+        const markerPath = join(target, ".linear-gateway-workspace.json");
+
+        if (Option.isSome(targetStats)) {
+          if (
+            targetStats.value.isSymbolicLink() ||
+            !targetStats.value.isDirectory()
+          ) {
+            return yield* Effect.fail(
+              new WorkspaceError({
+                message: "Workspace target is not a real directory",
+                sessionId,
+                reason: "target_not_directory",
+              }),
+            );
+          }
+
+          const canonicalTarget = yield* validateExistingTarget(
+            canonicalRoot,
+            target,
+            sessionId,
+          );
+          yield* validateMarker(markerPath, repository, sessionId);
+          yield* ignoreMarker(canonicalTarget, sessionId);
+          const metadata = yield* readBaseMetadata(canonicalTarget, sessionId);
+          if (
+            metadata.repositoryId !== repository.id ||
+            metadata.repositoryUrl !== repository.url ||
+            metadata.base !== repository.ref
+          ) {
+            return yield* Effect.fail(
+              new WorkspaceError({
+                message: "Workspace base identity mismatch",
+                sessionId,
+                reason: "marker_mismatch",
+              }),
+            );
+          }
+
+          yield* Effect.logInfo("Workspace ready (reused)", {
+            event: "workspace.ready",
+            repositoryId: repository.id,
+            path: canonicalTarget,
+            reused: true,
+          });
+
+          return {
+            path: canonicalTarget,
+            repositoryId: metadata.repositoryId,
+            repositoryUrl: metadata.repositoryUrl,
+            base: metadata.base,
+            baseCommit: metadata.baseCommit,
+          };
+        }
+
+        yield* runGit(
+          [
+            "clone",
+            "--no-checkout",
+            "--filter=blob:none",
+            repository.url,
+            target,
+          ],
+          undefined,
+          sessionId,
+        );
+        yield* runGit(
+          ["fetch", "--depth=1", "origin", repository.ref],
           target,
           sessionId,
         );
-        yield* validateMarker(markerPath, repository, sessionId);
+        const baseCommit = (yield* runGit(
+          ["rev-parse", "FETCH_HEAD"],
+          target,
+          sessionId,
+        )).trim();
+        if (!/^[0-9a-f]{40}$/u.test(baseCommit)) {
+          return yield* Effect.fail(
+            new WorkspaceError({
+              message: "Materialized workspace base is not a commit",
+              sessionId,
+              reason: "git_failed",
+            }),
+          );
+        }
+        yield* runGit(
+          ["checkout", "--force", "-B", branch, baseCommit],
+          target,
+          sessionId,
+        );
+        const finalTarget = yield* realpathOrFail(
+          target,
+          sessionId,
+          "path_escapes_root",
+        );
+        if (!isWithin(canonicalRoot, finalTarget)) {
+          return yield* Effect.fail(
+            new WorkspaceError({
+              message: "Materialized workspace resolves outside configured root",
+              sessionId,
+              reason: "path_escapes_root",
+            }),
+          );
+        }
+        yield* ignoreMarker(finalTarget, sessionId);
+        yield* writeMarker(markerPath, repository, sessionId);
+        yield* writeBaseMetadata(finalTarget, repository, baseCommit, sessionId);
 
-        yield* Effect.logInfo("Workspace ready (reused)", {
+        yield* Effect.logInfo("Workspace ready", {
           event: "workspace.ready",
           repositoryId: repository.id,
-          path: canonicalTarget,
-          reused: true,
+          path: finalTarget,
+          reused: false,
         });
 
-        return canonicalTarget;
-      }
+        return {
+          path: finalTarget,
+          repositoryId: repository.id,
+          repositoryUrl: repository.url,
+          base: repository.ref,
+          baseCommit,
+        };
+      },
+    );
 
-      yield* runGit(
-        [
-          "clone",
-          "--no-checkout",
-          "--filter=blob:none",
-          repository.url,
-          target,
-        ],
-        undefined,
-        sessionId,
-      );
-      yield* runGit(
-        ["fetch", "--depth=1", "origin", repository.ref],
-        target,
-        sessionId,
-      );
-      yield* runGit(
-        ["checkout", "--force", "-B", branch, "FETCH_HEAD"],
-        target,
-        sessionId,
-      );
-      yield* writeMarker(markerPath, repository, sessionId);
-
-      const finalTarget = yield* realpathOrFail(
-        target,
-        sessionId,
-        "path_escapes_root",
-      );
-      if (!isWithin(canonicalRoot, finalTarget)) {
-        return yield* Effect.fail(
-          new WorkspaceError({
-            message: "Materialized workspace resolves outside configured root",
-            sessionId,
-            reason: "path_escapes_root",
-          }),
-        );
-      }
-
-      yield* Effect.logInfo("Workspace ready", {
-        event: "workspace.ready",
-        repositoryId: repository.id,
-        path: finalTarget,
-        reused: false,
-      });
-
-      return finalTarget;
+    const materialize = Effect.fn("Workspace.materialize")(function* (
+      sessionId: string,
+      repository: RepositoryRecord,
+    ): Effect.fn.Return<string, WorkspaceError> {
+      const snapshot = yield* materializeSnapshot(sessionId, repository);
+      return snapshot.path;
     });
 
-    return { resolve, materialize };
+    const readMaterialized = Effect.fn("Workspace.readMaterialized")(
+      function* (
+        sessionId: string,
+        workspacePath: string,
+      ): Effect.fn.Return<MaterializedWorkspace, WorkspaceError> {
+        const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
+        const canonicalTarget = yield* validateExistingTarget(
+          canonicalRoot,
+          workspacePath,
+          sessionId,
+        );
+        const metadata = yield* readBaseMetadata(canonicalTarget, sessionId);
+        return { path: canonicalTarget, ...metadata };
+      },
+    );
+
+    return { resolve, materialize, materializeSnapshot, readMaterialized };
   });
 
 export class Workspace extends Effect.Service<Workspace>()("Workspace", {
