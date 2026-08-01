@@ -77,9 +77,7 @@ describe("SessionAuthority behavior invariants", () => {
       withAuthority(() =>
         Effect.gen(function* () {
           const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
-          );
+          const organizationId = testOrganizationId;
           const authority = yield* SessionAuthority;
           const runRepo = yield* RunRepo;
           const installationRepo = yield* InstallationRepo;
@@ -134,9 +132,7 @@ describe("SessionAuthority behavior invariants", () => {
       withAuthority(() =>
         Effect.gen(function* () {
           const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
-          );
+          const organizationId = testOrganizationId;
           const authority = yield* SessionAuthority;
           const runRepo = yield* RunRepo;
           const installationRepo = yield* InstallationRepo;
@@ -218,9 +214,7 @@ describe("SessionAuthority behavior invariants", () => {
       withAuthority(() =>
         Effect.gen(function* () {
           const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
-          );
+          const organizationId = testOrganizationId;
           const authority = yield* SessionAuthority;
           const runRepo = yield* RunRepo;
           const installationRepo = yield* InstallationRepo;
@@ -283,9 +277,7 @@ describe("SessionAuthority behavior invariants", () => {
       withAuthority((db) =>
         Effect.gen(function* () {
           const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
-          );
+          const organizationId = testOrganizationId;
           const authority = yield* SessionAuthority;
           const runRepo = yield* RunRepo;
           const runInputRepo = yield* RunInputRepo;
@@ -350,6 +342,52 @@ describe("SessionAuthority behavior invariants", () => {
         }),
       ),
     { timeout: 15_000, fastCheck: { numRuns: 20 } },
+  );
+  it.scopedLive(
+    "cancels a removed tenant before resuming its persisted worker",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const sessionId = Schema.decodeUnknownSync(SessionId)(
+            "removed-tenant-session",
+          );
+          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+            "removed-tenant-organization",
+          );
+          yield* installationRepo.put(install(organizationId));
+          yield* runRepo.create({
+            sessionId,
+            organizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(sessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/removed-tenant-workspace"),
+            ompSessionFile: Option.some("/tmp/removed-tenant-session.jsonl"),
+          });
+
+          yield* authority.processSession(sessionId);
+
+          const run = yield* runRepo.get(sessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.state).toBe("canceled");
+            expect(run.value.terminalReason).toEqual(
+              Option.some("Linear organization is no longer allowed"),
+            );
+          }
+          expect(workerEventListener).toBeUndefined();
+          expect(projectorTerminals).toContainEqual({
+            sessionId,
+            sourceKey: `organization-not-allowed:${organizationId}`,
+            kind: "response",
+            text: "Stopped because this Linear organization is no longer allowed.",
+          });
+        }),
+      ),
   );
 });
 

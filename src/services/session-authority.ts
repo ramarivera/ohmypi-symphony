@@ -470,6 +470,36 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* releaseIfNoWorker(sessionId);
         },
       );
+      const checkOrganizationAdmission = Effect.fn(
+        "SessionAuthority.checkOrganizationAdmission",
+      )(function* (
+        sessionId: SessionId,
+        organizationId: AgentRun["organizationId"],
+      ) {
+        if (config.allowedOrganizationIds.has(organizationId)) return true;
+        const current = yield* runRepo.get(sessionId);
+        if (
+          Option.isSome(current) &&
+          current.value.state !== "succeeded" &&
+          current.value.state !== "failed" &&
+          current.value.state !== "canceled"
+        ) {
+          yield* runRepo.update(sessionId, {
+            state: "canceled",
+            terminalReason: Option.some(
+              "Linear organization is no longer allowed",
+            ),
+            nextAttemptAt: Option.none(),
+          });
+          yield* projector.terminal(
+            sessionId,
+            `organization-not-allowed:${organizationId}`,
+            "response",
+            "Stopped because this Linear organization is no longer allowed.",
+          );
+        }
+        return false;
+      });
 
       const checkPublicationAdmission = Effect.fn(
         "SessionAuthority.checkPublicationAdmission",
@@ -485,6 +515,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           current.value.state === "canceled"
         ) {
           if (Option.isSome(current)) yield* cancel(current.value);
+          return false;
+        }
+        if (!(yield* checkOrganizationAdmission(sessionId, organizationId))) {
           return false;
         }
         const installation = yield* installationRepo.get(organizationId);
@@ -896,6 +929,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             });
             if (run.desiredState === "canceled") {
               yield* cancel(run);
+              return;
+            }
+            if (
+              !(yield* checkOrganizationAdmission(
+                sessionId,
+                run.organizationId,
+              ))
+            ) {
               return;
             }
             const installation = yield* installationRepo.get(
