@@ -3,6 +3,45 @@ import { Deferred, Effect, Option, Schema } from "effect";
 import { RpcWorker } from "../src/services/rpc-worker.js";
 
 const fixture = new URL("./fixtures/fake-rpc.ts", import.meta.url).pathname;
+const uiResponseFixture = String.raw`
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
+send({
+  type: "ready",
+  protocolVersion: 2,
+  supportedProtocolVersions: [1, 2],
+});
+const reader = Bun.stdin.stream().getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+while (true) {
+  const result = await reader.read();
+  if (result.done) break;
+  buffer += decoder.decode(result.value, { stream: true });
+  let newline = buffer.indexOf("\n");
+  while (newline >= 0) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    if (line) {
+      const input = JSON.parse(line);
+      if (input.type === "negotiate_protocol" && typeof input.id === "string") {
+        send({ type: "response", id: input.id, success: true });
+      } else if (
+        input.type === "extension_ui_response" &&
+        typeof input.id === "string"
+      ) {
+        send({
+          type: "extension_ui_response_ack",
+          id: input.id,
+          confirmed: input.confirmed,
+          value: input.value,
+          cancelled: input.cancelled,
+        });
+      }
+    }
+    newline = buffer.indexOf("\n");
+  }
+}
+`;
 
 describe("RpcWorker", () => {
   const Live = RpcWorker.Default;
@@ -167,7 +206,7 @@ describe("RpcWorker", () => {
   );
 
   it.scopedLive.prop(
-    "generated UI responses preserve protocol framing and worker state",
+    "generated UI responses are emitted and acknowledged over the protocol",
     {
       requestId: Schema.String.pipe(Schema.minLength(1)),
       confirmed: Schema.Boolean,
@@ -176,15 +215,41 @@ describe("RpcWorker", () => {
       Effect.gen(function* () {
         const rpc = yield* RpcWorker;
         const worker = yield* rpc.spawn({
-          command: ["bun", "run", fixture],
+          command: ["bun", "-e", uiResponseFixture],
           cwd: process.cwd(),
         });
         yield* worker.start();
         return yield* Effect.gen(function* () {
+          const acknowledged = yield* Deferred.make<{
+            readonly type: string;
+            readonly id: string;
+            readonly confirmed: boolean;
+          }>();
+          yield* worker.onEvent((event) => {
+            if (
+              event.type === "extension_ui_response_ack" &&
+              event.id === requestId &&
+              typeof event.confirmed === "boolean"
+            ) {
+              Deferred.unsafeDone(
+                acknowledged,
+                Effect.succeed(
+                  event as {
+                    readonly type: string;
+                    readonly id: string;
+                    readonly confirmed: boolean;
+                  },
+                ),
+              );
+            }
+          });
           yield* worker.respondToUi(requestId, { confirmed });
-          const state = yield* worker.getState();
-          expect(state.sessionId).toBe("omp-test");
-          expect(state.sessionFile).toBe("/safe/session.jsonl");
+          const event = yield* Deferred.await(acknowledged);
+          expect(event).toEqual({
+            type: "extension_ui_response_ack",
+            id: requestId,
+            confirmed,
+          });
         }).pipe(Effect.ensuring(worker.stop()));
       }).pipe(Effect.provide(Live)),
     { fastCheck: { numRuns: 20 }, timeout: 120_000 },

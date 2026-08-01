@@ -2,6 +2,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   ConfigProvider,
   Context,
+  Deferred,
   Effect,
   Either,
   Layer,
@@ -14,6 +15,7 @@ import {
 } from "../src/domain/errors.js";
 import {
   AppUserId,
+  InputId,
   OrganizationId,
   SessionId,
   SourceKey,
@@ -41,51 +43,11 @@ import {
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 
-const rpcSourceKey = (
-  sessionId: string,
-  sequence: number,
-  event: RpcEvent,
-): string => {
-  if (event.type === "extension_ui_request" && typeof event.id === "string") {
-    return `rpc-ui:${event.id}`;
-  }
-  return `rpc:${sessionId}:${sequence}:${event.type}`;
-};
-
-const rpcEventLevel = (
-  event: RpcEvent,
-): "debug" | "info" | "warn" | "result" | "error" => {
-  switch (event.type) {
-    case "agent_start":
-    case "turn_start":
-    case "turn_end":
-    case "tool_execution_start":
-    case "message_end":
-      return "info";
-    case "agent_end":
-      return "result";
-    case "tool_execution_end":
-      return event.error ? "error" : "result";
-    case "prompt_result":
-      return event.agentInvoked === false ? "result" : "info";
-    case "error":
-      return "error";
-    case "extension_ui_request":
-      return "warn";
-    default:
-      return "info";
-  }
-};
-
-const cancelDominates = (desiredState: string, inputKind: string): boolean =>
-  desiredState === "canceled" || inputKind === "stop";
-
 describe("SessionAuthority behavior invariants", () => {
   it.effect.prop(
-    "source key is deterministic and unique per (session, sequence, type)",
+    "persists each worker event once with distinct sequence keys",
     {
       sessionId: Schema.UUID,
-      sequence: Schema.Int,
       type: Schema.Literal(
         "agent_start",
         "turn_start",
@@ -94,79 +56,281 @@ describe("SessionAuthority behavior invariants", () => {
         "tool_execution_end",
         "message_end",
         "prompt_result",
-        "error",
       ),
     },
-    ({ sessionId, sequence, type }) =>
-      Effect.gen(function* () {
-        const event: RpcEvent = { type };
-        const key = rpcSourceKey(sessionId, sequence, event);
-        const key2 = rpcSourceKey(sessionId, sequence, event);
-        expect(key).toBe(key2);
-        expect(key).toBe(`rpc:${sessionId}:${sequence}:${type}`);
-        yield* Effect.void;
-      }),
+    ({ sessionId, type }) =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+            `organization-${sessionId}`,
+          );
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const runEventRepo = yield* RunEventRepo;
+          yield* runRepo.create({
+            sessionId: sid,
+            organizationId,
+            issueId: Option.none(),
+          });
+          yield* installationRepo.put(install(organizationId));
+          yield* runRepo.update(sid, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp"),
+            ompSessionFile: Option.some("/tmp/session.jsonl"),
+          });
+          yield* authority.processSession(sid);
+
+          const projected = yield* Deferred.make<void>();
+          projectionWaiter = projected;
+          projectionExpected = 2;
+          const event: RpcEvent = { type };
+          yield* Effect.sync(() => {
+            if (workerEventListener === undefined)
+              throw new Error("worker event listener was not registered");
+            workerEventListener(event);
+            workerEventListener(event);
+          });
+          yield* Deferred.await(projected);
+
+          const persisted = (yield* runEventRepo.list(sid)).filter(
+            (item) =>
+              typeof item.payload === "object" &&
+              item.payload !== null &&
+              "type" in item.payload &&
+              item.payload.type === type,
+          );
+          expect(persisted).toHaveLength(2);
+          expect(new Set(persisted.map((item) => item.sourceKey)).size).toBe(2);
+          expect(persisted.map((item) => item.payload)).toEqual([event, event]);
+        }),
+      ),
   );
 
   it.effect.prop(
-    "extension_ui_request source keys use the request id",
+    "records UI requests and transitions the run to waiting",
     {
       sessionId: Schema.UUID,
-      sequence: Schema.Int,
-      requestId: Schema.String,
+      requestId: Schema.String.pipe(Schema.minLength(1)),
     },
-    ({ sessionId, sequence, requestId }) =>
-      Effect.gen(function* () {
-        const event: RpcEvent = {
-          type: "extension_ui_request",
-          id: requestId,
-        };
-        const key = rpcSourceKey(sessionId, sequence, event);
-        expect(key).toBe(`rpc-ui:${requestId}`);
-        yield* Effect.void;
-      }),
+    ({ sessionId, requestId }) =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+            `organization-${sessionId}`,
+          );
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const runEventRepo = yield* RunEventRepo;
+          yield* runRepo.create({
+            sessionId: sid,
+            organizationId,
+            issueId: Option.none(),
+          });
+          yield* installationRepo.put(install(organizationId));
+          yield* runRepo.update(sid, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp"),
+            ompSessionFile: Option.some("/tmp/session.jsonl"),
+          });
+          yield* authority.processSession(sid);
+
+          const elicitationObserved = yield* Deferred.make<void>();
+          elicitationWaiter = elicitationObserved;
+          const event: RpcEvent = {
+            type: "extension_ui_request",
+            id: requestId,
+            method: "confirm",
+            title: "Continue?",
+            message: "Proceed with the task?",
+            options: ["yes", "no"],
+          };
+          yield* Effect.sync(() => {
+            if (workerEventListener === undefined)
+              throw new Error("worker event listener was not registered");
+            workerEventListener(event);
+          });
+          yield* Deferred.await(elicitationObserved);
+
+          const run = yield* runRepo.get(sid);
+          const persisted = yield* runEventRepo.list(sid);
+          const uiEvent = persisted.find(
+            (item) =>
+              typeof item.payload === "object" &&
+              item.payload !== null &&
+              "type" in item.payload &&
+              item.payload.type === "extension_ui_request",
+          );
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) expect(run.value.state).toBe("waiting");
+          expect(uiEvent).toMatchObject({
+            sourceKey: `rpc-ui:${requestId}`,
+            kind: "extension_ui_request",
+            level: "warn",
+            payload: event,
+          });
+          expect(projectorElicitations).toContainEqual({
+            sessionId: sid,
+            sourceKey: `rpc-ui:${requestId}`,
+            text: "Continue?\n\nProceed with the task?",
+            options: ["yes", "no"],
+          });
+        }),
+      ),
   );
 
   it.effect.prop(
-    "level mapping is total for known event types",
+    "round-trips generated worker events through event and projector layers",
     {
+      sessionId: Schema.UUID,
       type: Schema.Literal(
         "agent_start",
         "turn_start",
         "turn_end",
         "agent_end",
         "tool_execution_start",
-        "tool_execution_end",
         "message_end",
         "prompt_result",
-        "error",
-        "extension_ui_request",
         "progress",
       ),
     },
-    ({ type }) =>
-      Effect.gen(function* () {
-        const event: RpcEvent = { type };
-        const level = rpcEventLevel(event);
-        expect(["debug", "info", "warn", "result", "error"]).toContain(level);
-        yield* Effect.void;
-      }),
+    ({ sessionId, type }) =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+            `organization-${sessionId}`,
+          );
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const runEventRepo = yield* RunEventRepo;
+          yield* runRepo.create({
+            sessionId: sid,
+            organizationId,
+            issueId: Option.none(),
+          });
+          yield* installationRepo.put(install(organizationId));
+          yield* runRepo.update(sid, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp"),
+            ompSessionFile: Option.some("/tmp/session.jsonl"),
+          });
+          yield* authority.processSession(sid);
+
+          const projected = yield* Deferred.make<void>();
+          projectionWaiter = projected;
+          projectionExpected = 1;
+          const event: RpcEvent = { type };
+          yield* Effect.sync(() => {
+            if (workerEventListener === undefined)
+              throw new Error("worker event listener was not registered");
+            workerEventListener(event);
+          });
+          yield* Deferred.await(projected);
+
+          const persisted = (yield* runEventRepo.list(sid)).filter(
+            (item) =>
+              typeof item.payload === "object" &&
+              item.payload !== null &&
+              "type" in item.payload &&
+              item.payload.type === type,
+          );
+          expect(persisted).toHaveLength(1);
+          expect(persisted[0]?.payload).toEqual(event);
+          expect(persisted[0]?.sessionId).toBe(sid);
+          expect(persisted[0]?.level).toMatch(
+            /^(debug|info|warn|result|error)$/,
+          );
+          expect(projectorEvents).toContainEqual({
+            sessionId: sid,
+            sequence: expect.any(Number),
+            event,
+          });
+        }),
+      ),
   );
 
   it.effect.prop(
-    "abort/cancel dominates queued prompts and stop inputs",
+    "persists cancellation outcomes for both stop and canceled desired state",
     {
+      sessionId: Schema.UUID,
       desiredState: Schema.Literal("running", "canceled"),
       inputKind: Schema.Literal("prompted", "stop"),
     },
-    ({ desiredState, inputKind }) =>
-      Effect.gen(function* () {
-        const shouldCancel = cancelDominates(desiredState, inputKind);
-        expect(shouldCancel).toBe(
-          desiredState === "canceled" || inputKind === "stop",
-        );
-        yield* Effect.void;
-      }),
+    ({ sessionId, desiredState, inputKind }) =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+            `organization-${sessionId}`,
+          );
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          const runEventRepo = yield* RunEventRepo;
+          const installationRepo = yield* InstallationRepo;
+          const inputId = Schema.decodeUnknownSync(InputId)(
+            `input-${sessionId}`,
+          );
+          yield* runRepo.create({
+            sessionId: sid,
+            organizationId,
+            issueId: Option.none(),
+          });
+          yield* installationRepo.put(install(organizationId));
+          yield* runInputRepo.enqueue({
+            id: inputId,
+            sessionId: sid,
+            kind: inputKind,
+            body: inputKind === "stop" ? "stop" : "cancel this run",
+            payload: { source: "property" },
+          });
+          if (desiredState === "canceled" && inputKind === "prompted") {
+            yield* Effect.sync(() =>
+            db
+              .query(
+                "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
+              )
+              .run(sid),
+            );
+          }
+          yield* authority.processSession(sid);
+
+          const run = yield* runRepo.get(sid);
+          const persisted = yield* runEventRepo.list(sid);
+          const shouldCancel =
+            desiredState === "canceled" || inputKind === "stop";
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.state).toBe(shouldCancel ? "canceled" : "waiting");
+            expect(run.value.desiredState).toBe(
+              shouldCancel ? "canceled" : "running",
+            );
+          }
+          expect(
+            persisted.some(
+              (item) =>
+                item.kind === "state" &&
+                typeof item.payload === "object" &&
+                item.payload !== null &&
+                "to" in item.payload &&
+                item.payload.to === (shouldCancel ? "canceled" : "waiting"),
+            ),
+          ).toBe(true);
+          if (shouldCancel) {
+            expect(projectorTerminals).toContainEqual({
+              sessionId: sid,
+              sourceKey: `stop:${sid}`,
+              kind: "response",
+              text: "Stopped as requested.",
+            });
+          }
+        }),
+      ),
   );
 });
 
@@ -183,18 +347,68 @@ const testConfigProvider = ConfigProvider.fromMap(
     ],
   ]),
 );
+let workerEventListener: ((event: RpcEvent) => void) | undefined;
+let projectionWaiter: Deferred.Deferred<void, never> | undefined;
+let projectionExpected = 0;
+const projectorEvents: Array<{
+  readonly sessionId: string;
+  readonly sequence: number;
+  readonly event: RpcEvent;
+}> = [];
+const projectorElicitations: Array<{
+  readonly sessionId: string;
+  readonly sourceKey: string;
+  readonly text: string;
+  readonly options: ReadonlyArray<string> | undefined;
+}> = [];
+const projectorTerminals: Array<{
+  readonly sessionId: string;
+  readonly sourceKey: string;
+  readonly kind: string;
+  readonly text: string;
+}> = [];
+let elicitationWaiter: Deferred.Deferred<void, never> | undefined;
+
+const signalProjection = (): void => {
+  if (
+    projectionWaiter !== undefined &&
+    projectorEvents.length >= projectionExpected
+  ) {
+    Deferred.unsafeDone(projectionWaiter, Effect.void);
+    projectionWaiter = undefined;
+  }
+};
+
+const signalElicitation = (): void => {
+  if (elicitationWaiter !== undefined) {
+    Deferred.unsafeDone(elicitationWaiter, Effect.void);
+    elicitationWaiter = undefined;
+  }
+};
+
 let terminalFailure: DatabaseError | undefined;
 const mockProjector = ActivityProjector.make({
   thought: () => Effect.succeed(true),
-  elicitation: () => Effect.succeed(true),
-  terminal: () =>
-    terminalFailure === undefined
-      ? Effect.succeed(true)
-      : Effect.fail(terminalFailure),
+  elicitation: (sessionId, sourceKey, text, options) =>
+    Effect.sync(() => {
+      projectorElicitations.push({ sessionId, sourceKey, text, options });
+      signalElicitation();
+      return true;
+    }),
+  terminal: (sessionId, sourceKey, kind, text) =>
+    Effect.gen(function* () {
+      projectorTerminals.push({ sessionId, sourceKey, kind, text });
+      if (terminalFailure !== undefined) yield* Effect.fail(terminalFailure);
+      return true;
+    }),
   plan: () => Effect.succeed(true),
   externalUrls: () => Effect.succeed(true),
   flushPending: () => Effect.succeed(0),
-  projectRpcEvent: () => Effect.void,
+  projectRpcEvent: (sessionId, sequence, event) =>
+    Effect.sync(() => {
+      projectorEvents.push({ sessionId, sequence, event: event as RpcEvent });
+      signalProjection();
+    }),
 });
 
 const mockWorker: RpcWorkerHandle = {
@@ -209,7 +423,14 @@ const mockWorker: RpcWorkerHandle = {
   abort: () => Effect.void,
   getState: () => Effect.succeed({}),
   respondToUi: () => Effect.void,
-  onEvent: () => Effect.succeed(() => Effect.void),
+  onEvent: (listener) =>
+    Effect.sync(() => {
+      workerEventListener = listener;
+      return () =>
+        Effect.sync(() => {
+          if (workerEventListener === listener) workerEventListener = undefined;
+        });
+    }),
 };
 
 const mockRpcWorker = RpcWorker.make({
@@ -228,6 +449,13 @@ const withAuthority = <A, E>(
   Effect.scoped(
     Effect.gen(function* () {
       terminalFailure = undefined;
+      workerEventListener = undefined;
+      projectionWaiter = undefined;
+      elicitationWaiter = undefined;
+      projectionExpected = 0;
+      projectorEvents.length = 0;
+      projectorElicitations.length = 0;
+      projectorTerminals.length = 0;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
       const dependencies = Layer.mergeAll(
@@ -261,12 +489,12 @@ const testSessionId = Schema.decodeUnknownSync(SessionId)("authority-session");
 const testOrganizationId = Schema.decodeUnknownSync(OrganizationId)(
   "authority-organization",
 );
-const install = (): Installation => ({
-  organizationId: testOrganizationId,
+const install = (organizationId: OrganizationId): Installation => ({
+  organizationId,
   appUserId: Schema.decodeUnknownSync(AppUserId)("authority-app-user"),
   accessToken: "access-token",
   refreshToken: "refresh-token",
-  expiresAt: 1_000_000,
+  expiresAt: Date.now() + 3_600_000,
   scopes: ["read"],
   revokedAt: Option.none(),
   accessibleTeamIds: Option.none(),
@@ -355,7 +583,7 @@ describe("SessionAuthority infrastructure failures", () => {
           const authority = yield* SessionAuthority;
           const installationRepo = yield* InstallationRepo;
           const runRepo = yield* RunRepo;
-          yield* installationRepo.put(install());
+          yield* installationRepo.put(install(testOrganizationId));
           yield* runRepo.create({
             sessionId: testSessionId,
             organizationId: testOrganizationId,

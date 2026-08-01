@@ -235,19 +235,21 @@ describe("LinearGateway parity", () => {
   });
 
   effectIt.effect.prop(
-    "forwards every generated activity body without mutation",
+    "creates every generated thought activity and returns its SDK id",
     { body: Schema.String },
     ({ body }) =>
       Effect.gen(function* () {
         sdkState.reset();
         const gateway = yield* LinearGateway;
-        yield* gateway.createActivity({
+        const activityId = yield* gateway.createActivity({
           sessionId,
           content: { type: "thought", body },
         });
-        expect(activityBody(sdkState.state.activities.at(-1)?.content)).toBe(
+        expect(activityId).toBe("activity-id");
+        expect(sdkState.state.activities.at(-1)?.content).toEqual({
+          type: "thought",
           body,
-        );
+        });
       }).pipe(Effect.provide(gatewayLayer)),
     { fastCheck: { numRuns: 20 } },
   );

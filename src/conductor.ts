@@ -33,7 +33,7 @@ const sqliteClientLayer = Layer.unwrapEffect(
   }),
 );
 
-const serviceLayers = GatewayConfig.Default.pipe(
+export const GatewayServicesLive = GatewayConfig.Default.pipe(
   Layer.merge(GatewayLogger.Default),
   Layer.merge(TokenCrypto.Default),
   Layer.merge(AdminSessionRepo.Default),
@@ -78,7 +78,7 @@ const serverLayer = Layer.unwrapEffect(
   Effect.map(GatewayConfig, ({ port }) => BunHttpServer.layer({ port })),
 );
 
-const servicesWithServer = Layer.provideMerge(serverLayer, serviceLayers);
+const servicesWithServer = Layer.provideMerge(serverLayer, GatewayServicesLive);
 const servicesWithHttp = Layer.provideMerge(
   HttpServer.serve(router),
   servicesWithServer,
