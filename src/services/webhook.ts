@@ -785,6 +785,11 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
               );
             }
             if (!config.allowedOrganizationIds.has(organizationId)) {
+              yield* Effect.logWarning("webhook.rejected", {
+                reason: "tenant not allowed",
+                organizationId,
+                status: 403,
+              });
               return yield* Effect.fail(
                 new TenantNotAllowedError({
                   message: "Organization is not allowed",

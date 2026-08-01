@@ -1,7 +1,7 @@
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Exit, Logger, Option, Redacted, Schema } from "effect";
-import { OAuthStateError } from "../src/domain/errors.js";
+import { OAuthStateError, TenantNotAllowedError } from "../src/domain/errors.js";
 import { AppUserId, OrganizationId, type TeamId } from "../src/domain/ids.js";
 import {
   oauthCallback,
@@ -286,6 +286,64 @@ describe("HTTP router parity", () => {
       true,
     );
   });
+  it("returns OAuth tenant rejections as credential-free 403 responses", async () => {
+    const oauth: OAuth = {
+      _tag: "OAuth",
+      startAuthorization: () =>
+        Effect.succeed({
+          state: "test-state",
+          url: new URL("https://linear.example/authorize"),
+        }),
+      completeAuthorization: (_url: URL) =>
+        Effect.fail(
+          new TenantNotAllowedError({
+            message: "Organization is not allowed",
+            organizationId: "unauthorized-org",
+            status: 403,
+          }),
+        ),
+    };
+    const response = await Effect.runPromise(
+      oauthCallback.pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          request("GET", "/oauth/callback"),
+        ),
+        Effect.provideService(OAuth, oauth),
+        Effect.provideService(GatewayConfig, {
+          _tag: "GatewayConfig",
+          linearClientId: "client",
+          linearClientSecret: Redacted.make("secret"),
+          linearWebhookSecret: Redacted.make("webhook"),
+          tokenEncryptionKey: Redacted.make("key"),
+          githubApp: undefined,
+          allowedOrganizationIds: new Set(["org"]),
+          publicUrl: new URL("https://gateway.example"),
+          logLevel: "silent",
+          databasePath: ":memory:",
+          workspaceRoot: "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/router-test",
+          ompCliPath: "omp",
+          port: 3000,
+          leaseDurationMs: 60_000,
+          reconcilerIntervalMs: 1_000,
+          webhookReplayWindowMs: 60_000,
+        }),
+        Effect.provideService(AdminSessionRepo, {
+          _tag: "AdminSessionRepo",
+          create: (_input) => Effect.void,
+          get: (_tokenHash, _now) => Effect.succeed(Option.none()),
+          deleteAdminSession: (_tokenHash) => Effect.succeed(false),
+        }),
+      ),
+    );
+    const webResponse = HttpServerResponse.toWeb(response);
+
+    expect(webResponse.status).toBe(403);
+    expect(await webResponse.text()).toBe("Organization is not allowed");
+    expect(webResponse.headers.get("set-cookie")).toBeNull();
+    expect(webResponse.headers.get("location")).toBeNull();
+  });
+
   it("logs OAuth callback failures without erasing the failure", async () => {
     const logs: string[] = [];
     const logger = Logger.make(({ message }) => {

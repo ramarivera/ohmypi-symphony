@@ -94,20 +94,13 @@ const GatewayConfigValues = Config.all({
   reconcilerIntervalMs: positiveInteger("RECONCILER_INTERVAL_MS", 1_000),
   webhookReplayWindowMs: positiveInteger("WEBHOOK_REPLAY_WINDOW_MS", 60_000),
 });
-const GitHubAppConfigValues = Config.all({
-  appId: Config.option(Config.string("GITHUB_APP_ID")).pipe(
-    Config.map(Option.map((value) => value.trim())),
-  ),
-  privateKey: Config.option(Config.string("GITHUB_APP_PRIVATE_KEY")),
-});
-
-const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
+const optionalValue = Effect.fn("GatewayConfig.optionalValue")(function* (
   name: string,
 ) {
   const direct = yield* Config.option(Config.string(name));
   if (Option.isSome(direct)) {
     const value = direct.value.trim();
-    if (value.length > 0) return value;
+    if (value.length > 0) return Option.some(value);
   }
 
   const filePath = yield* Config.option(Config.string(`${name}_FILE`));
@@ -122,8 +115,17 @@ const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
         ),
     });
     const trimmed = value.trim();
-    if (trimmed.length > 0) return trimmed;
+    if (trimmed.length > 0) return Option.some(trimmed);
   }
+
+  return Option.none<string>();
+});
+
+const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
+  name: string,
+) {
+  const value = yield* optionalValue(name);
+  if (Option.isSome(value)) return value.value;
 
   return yield* Effect.fail(
     ConfigError.MissingData(
@@ -139,7 +141,10 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
     accessors: true,
     effect: Effect.gen(function* () {
       const values = yield* Config.unwrap(GatewayConfigValues);
-      const githubAppValues = yield* Config.unwrap(GitHubAppConfigValues);
+      const githubAppValues = {
+        appId: yield* optionalValue("GITHUB_APP_ID"),
+        privateKey: yield* optionalValue("GITHUB_APP_PRIVATE_KEY"),
+      };
       const githubAppConfigured = Object.values(githubAppValues).some((value) =>
         Option.isSome(value),
       );

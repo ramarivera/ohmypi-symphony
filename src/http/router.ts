@@ -5,6 +5,7 @@ import {
 } from "@effect/platform";
 import { BunHttpServerRequest } from "@effect/platform-bun";
 import { Clock, Effect } from "effect";
+import { TenantNotAllowedError } from "../domain/errors.js";
 import {
   Admin,
   createAdminSession,
@@ -92,6 +93,9 @@ export const oauthCallback = Effect.gen(function* () {
         event: "oauth.failed",
         error: String(error),
       }),
+    ),
+    Effect.catchTag(TenantNotAllowedError._tag, (error) =>
+      HttpServerResponse.text(error.message, { status: error.status }),
     ),
   );
 });

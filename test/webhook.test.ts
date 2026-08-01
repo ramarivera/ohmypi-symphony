@@ -5,6 +5,7 @@ import {
   ConfigProvider,
   Effect,
   Layer,
+  Logger,
   Option,
   Redacted,
   Schema,
@@ -808,6 +809,36 @@ describe("Linear webhook input correctness", () => {
         },
       ),
   );
+
+  it.scopedLive("logs structured tenant rejection warnings", () => {
+    const logs: string[] = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(
+        Array.isArray(message)
+          ? message.map(String).join(" ")
+          : String(message),
+      );
+    });
+    return withWebhook(
+      Effect.gen(function* () {
+        const now = yield* currentTime;
+        const response = yield* WebhookPipeline.handle(
+          signedRequest(createdPayload(now, { webhookId: "logged-unauthorized" })),
+        );
+        expect(response.status).toBe(403);
+        expect(yield* Effect.promise(() => response.text())).toBe(
+          "Organization is not allowed",
+        );
+        expect(
+          logs.some((message) => message.startsWith("webhook.rejected")),
+        ).toBe(true);
+      }),
+      {
+        ...config,
+        allowedOrganizationIds: new Set(["other-org"]),
+      },
+    ).pipe(Effect.provide(Logger.replace(Logger.defaultLogger, logger)));
+  });
 
   it.scopedLive("rejects absent and revoked installations", () =>
     withWebhook(

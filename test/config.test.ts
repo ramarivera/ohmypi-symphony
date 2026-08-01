@@ -146,6 +146,22 @@ describe("GatewayConfig", () => {
     );
     expect(disabled.githubApp).toBeUndefined();
 
+    const blank = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(
+        Effect.provide(
+          configLayer(
+            valuesWith([
+              ["GITHUB_APP_ID", " \t"],
+              ["GITHUB_APP_PRIVATE_KEY", "\n"],
+            ]),
+          ),
+        ),
+      ),
+    );
+    expect(blank.githubApp).toBeUndefined();
+
     const partial = await Effect.runPromise(
       Effect.gen(function* () {
         return yield* GatewayConfig;
@@ -157,6 +173,51 @@ describe("GatewayConfig", () => {
     expect(
       Redacted.value(partial.githubApp?.privateKey ?? Redacted.make("")),
     ).toBe("");
+  });
+
+  test("loads optional GitHub App settings from direct or file values", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "gateway-github-app-"));
+    temporaryDirectories.push(directory);
+    const appIdFile = join(directory, "app-id");
+    const privateKeyFile = join(directory, "private-key");
+    await writeFile(appIdFile, "456\n", { mode: 0o600 });
+    await writeFile(privateKeyFile, "file-private-key\n", { mode: 0o600 });
+    const fromFiles = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(
+        Effect.provide(
+          configLayer(
+            valuesWith([
+              ["GITHUB_APP_ID", " \t"],
+              ["GITHUB_APP_PRIVATE_KEY", "\n"],
+              ["GITHUB_APP_ID_FILE", appIdFile],
+              ["GITHUB_APP_PRIVATE_KEY_FILE", privateKeyFile],
+            ]),
+          ),
+        ),
+      ),
+    );
+    expect(fromFiles.githubApp?.appId).toBe("456");
+    expect(
+      Redacted.value(fromFiles.githubApp?.privateKey ?? Redacted.make("")),
+    ).toBe("file-private-key");
+
+    const directValues = valuesWith([
+      ["GITHUB_APP_ID", "789"],
+      ["GITHUB_APP_PRIVATE_KEY", " direct-private-key "],
+      ["GITHUB_APP_ID_FILE", appIdFile],
+      ["GITHUB_APP_PRIVATE_KEY_FILE", privateKeyFile],
+    ]);
+    const direct = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(Effect.provide(configLayer(directValues))),
+    );
+    expect(direct.githubApp?.appId).toBe("789");
+    expect(
+      Redacted.value(direct.githubApp?.privateKey ?? Redacted.make("")),
+    ).toBe("direct-private-key");
   });
 
   test("requires every mandatory setting", async () => {
