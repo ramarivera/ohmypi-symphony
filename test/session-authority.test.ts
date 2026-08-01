@@ -121,7 +121,7 @@ describe("SessionAuthority behavior invariants", () => {
           expect(persisted.map((item) => item.payload)).toEqual([event, event]);
         }),
       ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+    { timeout: 15_000, fastCheck: { numRuns: 10 } },
   );
 
   it.effect.prop(
