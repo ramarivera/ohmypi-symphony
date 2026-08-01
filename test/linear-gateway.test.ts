@@ -180,6 +180,8 @@ const gatewayDependencies = Layer.mergeAll(
       leaseDurationMs: 60_000,
       reconcilerIntervalMs: 1_000,
       webhookReplayWindowMs: 60_000,
+      allowedOrganizationIds: new Set(["org"]),
+      githubApp: undefined,
     }),
   ),
 );

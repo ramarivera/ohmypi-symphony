@@ -53,6 +53,7 @@ const configProvider = ConfigProvider.fromMap(
     ["LINEAR_CLIENT_ID", "client"],
     ["LINEAR_CLIENT_SECRET", "secret"],
     ["LINEAR_WEBHOOK_SECRET", "webhook"],
+    ["LINEAR_ALLOWED_ORGANIZATION_IDS", "admin-org"],
     ["TOKEN_ENCRYPTION_KEY", TEST_KEY],
     ["DATABASE_PATH", ":memory:"],
     ["WORKSPACE_ROOT", "/tmp/gateway-admin-workspaces"],

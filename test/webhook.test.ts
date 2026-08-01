@@ -49,13 +49,19 @@ const config: GatewayConfigShape = {
   leaseDurationMs: 60_000,
   reconcilerIntervalMs: 1_000,
   webhookReplayWindowMs: 60_000,
+  allowedOrganizationIds: new Set(["org", "org-2"]),
   logLevel: "silent",
+  githubApp: undefined,
 };
 const configProviderFor = (gatewayConfig: GatewayConfigShape) =>
   ConfigProvider.fromMap(
     new Map([
       ["LINEAR_CLIENT_ID", gatewayConfig.linearClientId],
       ["LINEAR_CLIENT_SECRET", "client-secret"],
+      [
+        "LINEAR_ALLOWED_ORGANIZATION_IDS",
+        [...gatewayConfig.allowedOrganizationIds].join(","),
+      ],
       ["LINEAR_WEBHOOK_SECRET", secret],
       ["TOKEN_ENCRYPTION_KEY", tokenEncryptionKey],
       ["PUBLIC_URL", gatewayConfig.publicUrl.toString()],
@@ -766,6 +772,41 @@ describe("Linear webhook input correctness", () => {
         );
       }),
     ),
+  );
+
+  it.scopedLive(
+    "rejects a signed unauthorized tenant before webhook persistence",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          const now = yield* currentTime;
+          yield* install();
+          const payload = createdPayload(now, {
+            webhookId: "unauthorized-webhook",
+          });
+          const response = yield* WebhookPipeline.handle(
+            signedRequest(payload, { delivery: "unauthorized-delivery" }),
+          );
+          expect(response.status).toBe(403);
+          expect(yield* Effect.promise(() => response.text())).toBe(
+            "Organization is not allowed",
+          );
+          expect(yield* RunRepo.get(sessionId("session-1"))).toEqual(
+            Option.none(),
+          );
+          expect(
+            yield* RunInputRepo.pending(sessionId("session-1")),
+          ).toHaveLength(0);
+          const repeated = yield* WebhookPipeline.handle(
+            signedRequest(payload, { delivery: "unauthorized-delivery" }),
+          );
+          expect(repeated.status).toBe(403);
+        }),
+        {
+          ...config,
+          allowedOrganizationIds: new Set(["other-org"]),
+        },
+      ),
   );
 
   it.scopedLive("rejects absent and revoked installations", () =>

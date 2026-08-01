@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { Config, ConfigError, Effect, Either, Option, Redacted } from "effect";
+import type { ConfigError as ConfigErrorType } from "effect/ConfigError";
 import type { LogLevel } from "../domain/models.js";
 
 export interface GatewayConfigShape {
@@ -15,7 +16,13 @@ export interface GatewayConfigShape {
   readonly port: number;
   readonly leaseDurationMs: number;
   readonly reconcilerIntervalMs: number;
+  readonly githubApp: GitHubAppConfigShape | undefined;
+  readonly allowedOrganizationIds: Set<string>;
   readonly webhookReplayWindowMs: number;
+}
+export interface GitHubAppConfigShape {
+  readonly appId: string;
+  readonly privateKey: Redacted.Redacted<string>;
 }
 
 const positiveInteger = (name: string, fallback: number) =>
@@ -33,6 +40,22 @@ const positiveInteger = (name: string, fallback: number) =>
           );
     }),
   );
+
+const parseAllowedOrganizationIds = (
+  value: string,
+): Either.Either<Set<string>, ConfigErrorType> => {
+  const ids = value.split(",").map((id) => id.trim());
+  return ids.some(
+    (id) => id.length === 0 || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(id),
+  )
+    ? Either.left(
+        ConfigError.InvalidData(
+          ["LINEAR_ALLOWED_ORGANIZATION_IDS"],
+          "LINEAR_ALLOWED_ORGANIZATION_IDS must contain non-empty organization IDs",
+        ),
+      )
+    : Either.right(new Set(ids));
+};
 
 const LOG_LEVELS: ReadonlySet<string> = new Set([
   "trace",
@@ -70,6 +93,12 @@ const GatewayConfigValues = Config.all({
   leaseDurationMs: positiveInteger("LEASE_DURATION_MS", 60_000),
   reconcilerIntervalMs: positiveInteger("RECONCILER_INTERVAL_MS", 1_000),
   webhookReplayWindowMs: positiveInteger("WEBHOOK_REPLAY_WINDOW_MS", 60_000),
+});
+const GitHubAppConfigValues = Config.all({
+  appId: Config.option(Config.string("GITHUB_APP_ID")).pipe(
+    Config.map(Option.map((value) => value.trim())),
+  ),
+  privateKey: Config.option(Config.string("GITHUB_APP_PRIVATE_KEY")),
 });
 
 const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
@@ -110,7 +139,26 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
     accessors: true,
     effect: Effect.gen(function* () {
       const values = yield* Config.unwrap(GatewayConfigValues);
+      const githubAppValues = yield* Config.unwrap(GitHubAppConfigValues);
+      const githubAppConfigured = Object.values(githubAppValues).some((value) =>
+        Option.isSome(value),
+      );
+      const githubApp = githubAppConfigured
+        ? {
+            appId: Option.getOrElse(githubAppValues.appId, () => ""),
+            privateKey: Redacted.make(
+              Option.getOrElse(githubAppValues.privateKey, () => ""),
+            ),
+          }
+        : undefined;
       const linearClientId = yield* requiredValue("LINEAR_CLIENT_ID");
+      const parsedAllowedOrganizationIds = parseAllowedOrganizationIds(
+        yield* requiredValue("LINEAR_ALLOWED_ORGANIZATION_IDS"),
+      );
+      if (Either.isLeft(parsedAllowedOrganizationIds)) {
+        return yield* Effect.fail(parsedAllowedOrganizationIds.left);
+      }
+      const allowedOrganizationIds = parsedAllowedOrganizationIds.right;
       const linearClientSecret = yield* requiredValue("LINEAR_CLIENT_SECRET");
       const linearWebhookSecret = yield* requiredValue("LINEAR_WEBHOOK_SECRET");
       const tokenEncryptionKey = yield* requiredValue("TOKEN_ENCRYPTION_KEY");
@@ -141,6 +189,8 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
         linearWebhookSecret: Redacted.make(linearWebhookSecret),
         tokenEncryptionKey: Redacted.make(tokenEncryptionKey),
         publicUrl,
+        githubApp,
+        allowedOrganizationIds,
       };
     }),
   },

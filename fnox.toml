@@ -11,13 +11,15 @@ LINEAR_CLIENT_SECRET= { provider = "age", value = "YWdlLWVuY3J5cHRpb24ub3JnL3YxC
 LINEAR_WEBHOOK_SECRET= { provider = "age", value = "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBYU0VPTHRsNUYxc2NZcThtYkh2TzgvRTVlTFFaTVNsMG9TN21pMC9qSHo0Ci9iQjN4ZlZSUjZTRFBjTFJKVnRnV2pQOFNCa25NTDNTWGtqYlRSYmRtbm8KLT4gUlI5Z3QpaS1ncmVhc2UgLiBXX1Qgd31ycGxDZApDQmt5T1lMbU93b0pQd3pmcmxSb2d3MS9BMXFoamM0QXpzRTRzMW1sL0xxcEJvUzVXNVl1MlRZCi0tLSAzaUU5djNOVVdkWWV6OGUwVFArUmd6ZDRVbG55TmhjWjRtazVhRzJ0Yy9FCp74S8ntwaYqSi8zt3/HXd18qfp6XmXIfeDKfx1raXYFNCwIv4JXnoug4aow37mOIhKf0j+zRwOedJ5qPrAMjDv6KBJehkZVCrgRA4uhmgzaGGAs" }
 TOKEN_ENCRYPTION_KEY= { provider = "age", value = "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSB2U3BPU0xXQllDRFFYRXJRcVRMME5NVGF4Y2Y3L09zcXF5VzU0SzZoUnhVCkwxanRmU2tmZTdxTHFiQi9HV1FvdWlCamp6R2ZINUFpTjI5SndXRGY2UzgKLT4gTy1ncmVhc2UgV1lBQ2okSgpvb2tQeCtVVzhmampVbEh2OWh5Qm55L25pRHRyVXRzOUkvejgyZWpUeDlWOS9KL3NISlFmcHYrOHZpcU5ZdUhDCmg2OEYyNW9tdzd0alptbXFWc1ZiazJ3bTFBCi0tLSBNSTJscXFleXJqVDNuUE05dk4wdlZyenJRQjBuc2VURERyQmE0cVR3QU5VCkV2wKDYZk2KTOFs8OUpxFwKMZN2Hmm8y6RQzB27mda4Dj2PQM1kkF3qF3I67n5NnrHFLxdUSAoA/tJF+MR56gA+PBFykoRhcRuJfBQ=" }
 PUBLIC_URL= { provider = "age", value = "YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBLeUYwZ2NBam9PQzBJQ0l5MkxtSEg2MGdzRUJvMVdyRk56dThUb1hYRkZBCi9HTHhzSkQ1TFNXeENxN0hhcDREK0M3WnFNRVU1b2djZjZPajhiY0cvVWcKLT4gZi50VmtfV2EtZ3JlYXNlIDJaLmV0IHxrR080c0NPIEMhICcKSHl6ZWxPRXhZYzkzeTh6S2Jqb1lsay9WeGhURzNyYWZOcmZIK1NGOU9WK0E3M2R1Ci0tLSBYVkVaRldGQVY4UzU0aDBUNlJncWpQbmxUVy8zY1BLY01MZzlWSDRkTHhnCg3IQwGj5uek1DCk8ZUdCS7wMEehvUP4j4W08GYzH11KnZa1YagN6Q5Na4UUVwKSdYLtd8tC" }
-# Encrypted Linear gateway secrets. `fnox set <KEY>` adds ciphertext here
-# using the configured default age provider; plaintext is only exposed to
-# child processes launched through `fnox exec`.
+# Encrypted gateway secrets. `fnox set <KEY>` adds ciphertext here using the
+# configured age provider; plaintext is only exposed to child processes launched
+# through `fnox exec`.
 #
-# Required runtime values:
+# Required encrypted runtime values once GitHub publication is enabled:
 # - LINEAR_CLIENT_ID
 # - LINEAR_CLIENT_SECRET
 # - LINEAR_WEBHOOK_SECRET
 # - TOKEN_ENCRYPTION_KEY
 # - PUBLIC_URL
+# - GITHUB_APP_ID
+# - GITHUB_APP_PRIVATE_KEY

@@ -24,6 +24,7 @@ const baseConfigValues = new Map<string, string>([
   ["LINEAR_CLIENT_ID", "client"],
   ["LINEAR_CLIENT_SECRET", "client-secret"],
   ["LINEAR_WEBHOOK_SECRET", "webhook-secret"],
+  ["LINEAR_ALLOWED_ORGANIZATION_IDS", "client-org"],
   [
     "TOKEN_ENCRYPTION_KEY",
     Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),

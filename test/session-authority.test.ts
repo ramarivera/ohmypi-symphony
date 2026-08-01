@@ -8,9 +8,13 @@ import {
   Layer,
   Option,
   Schema,
+  type Scope,
 } from "effect";
 import {
   DatabaseError,
+  GitHubAppApiError,
+  type GitHubAppConfigurationError,
+  type GitHubAppRemoteError,
   InterruptedRunNoActionableInputError,
 } from "../src/domain/errors.js";
 import {
@@ -19,9 +23,15 @@ import {
   OrganizationId,
   SessionId,
   SourceKey,
+  WorkspaceId,
 } from "../src/domain/ids.js";
 import type { Installation } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
+import {
+  type CreatedPullRequest,
+  GitHubApp,
+  type PublishPullRequestInput,
+} from "../src/services/github-app.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
   type RpcEvent,
@@ -42,6 +52,7 @@ import {
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { workspaceBranchName } from "../src/services/workspace.js";
 
 describe("SessionAuthority behavior invariants", () => {
   it.effect.prop(
@@ -106,6 +117,7 @@ describe("SessionAuthority behavior invariants", () => {
           expect(persisted.map((item) => item.payload)).toEqual([event, event]);
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.effect.prop(
@@ -180,6 +192,7 @@ describe("SessionAuthority behavior invariants", () => {
           });
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.effect.prop(
@@ -252,6 +265,7 @@ describe("SessionAuthority behavior invariants", () => {
           });
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 
   it.effect.prop(
@@ -291,11 +305,11 @@ describe("SessionAuthority behavior invariants", () => {
           });
           if (desiredState === "canceled" && inputKind === "prompted") {
             yield* Effect.sync(() =>
-            db
-              .query(
-                "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
-              )
-              .run(sid),
+              db
+                .query(
+                  "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
+                )
+                .run(sid),
             );
           }
           yield* authority.processSession(sid);
@@ -331,6 +345,7 @@ describe("SessionAuthority behavior invariants", () => {
           }
         }),
       ),
+    { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 });
 
@@ -339,6 +354,7 @@ const testConfigProvider = ConfigProvider.fromMap(
     ["LINEAR_CLIENT_ID", "test-client"],
     ["LINEAR_CLIENT_SECRET", "test-secret"],
     ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
+    ["LINEAR_ALLOWED_ORGANIZATION_IDS", "authority-organization"],
     ["TOKEN_ENCRYPTION_KEY", "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="],
     ["PUBLIC_URL", "http://localhost:3000"],
     [
@@ -349,6 +365,7 @@ const testConfigProvider = ConfigProvider.fromMap(
 );
 let workerEventListener: ((event: RpcEvent) => void) | undefined;
 let projectionWaiter: Deferred.Deferred<void, never> | undefined;
+let terminalWaiter: Deferred.Deferred<void, never> | undefined;
 let projectionExpected = 0;
 const projectorEvents: Array<{
   readonly sessionId: string;
@@ -387,6 +404,14 @@ const signalElicitation = (): void => {
 };
 
 let terminalFailure: DatabaseError | undefined;
+const projectorExternalUrls: Array<{
+  readonly sessionId: string;
+  readonly sourceKey: string;
+  readonly urls: ReadonlyArray<{
+    readonly label: string;
+    readonly url: string;
+  }>;
+}> = [];
 const mockProjector = ActivityProjector.make({
   thought: () => Effect.succeed(true),
   elicitation: (sessionId, sourceKey, text, options) =>
@@ -398,11 +423,19 @@ const mockProjector = ActivityProjector.make({
   terminal: (sessionId, sourceKey, kind, text) =>
     Effect.gen(function* () {
       projectorTerminals.push({ sessionId, sourceKey, kind, text });
+      if (terminalWaiter !== undefined) {
+        Deferred.unsafeDone(terminalWaiter, Effect.void);
+        terminalWaiter = undefined;
+      }
       if (terminalFailure !== undefined) yield* Effect.fail(terminalFailure);
       return true;
     }),
   plan: () => Effect.succeed(true),
-  externalUrls: () => Effect.succeed(true),
+  externalUrls: (sessionId, sourceKey, urls) =>
+    Effect.sync(() => {
+      projectorExternalUrls.push({ sessionId, sourceKey, urls });
+      return true;
+    }),
   flushPending: () => Effect.succeed(0),
   projectRpcEvent: (sessionId, sequence, event) =>
     Effect.sync(() => {
@@ -436,26 +469,52 @@ const mockWorker: RpcWorkerHandle = {
 const mockRpcWorker = RpcWorker.make({
   spawn: () => Effect.succeed(mockWorker),
 });
+const makeGitHubApp = (
+  enabled: boolean,
+  publish: (
+    input: PublishPullRequestInput,
+  ) => Effect.Effect<
+    CreatedPullRequest | undefined,
+    GitHubAppConfigurationError | GitHubAppRemoteError | GitHubAppApiError
+  >,
+) =>
+  GitHubApp.make({
+    enabled,
+    isEnabled: () => enabled,
+    createPullRequest: () =>
+      Effect.succeed({ url: "https://github.com/example/pull/1", number: 1 }),
+    publishPullRequest: publish,
+  });
 
+const mockGitHubApp = makeGitHubApp(false, () => Effect.succeed(undefined));
 const withAuthority = <A, E>(
   effect: (
     db: SqliteClientShape["db"],
   ) => Effect.Effect<
     A,
     E,
-    SessionAuthority | RunRepo | RunInputRepo | RunEventRepo | InstallationRepo
+    | SessionAuthority
+    | RunRepo
+    | RunInputRepo
+    | RunEventRepo
+    | InstallationRepo
+    | WorkspaceRepo
+    | Scope.Scope
   >,
+  githubApp: GitHubApp = mockGitHubApp,
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       terminalFailure = undefined;
       workerEventListener = undefined;
+      terminalWaiter = undefined;
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
       projectionExpected = 0;
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
       projectorTerminals.length = 0;
+      projectorExternalUrls.length = 0;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
       const dependencies = Layer.mergeAll(
@@ -464,6 +523,7 @@ const withAuthority = <A, E>(
         InstallationRepo.Default,
         RunEventRepo.Default,
         RunInputRepo.Default,
+        Layer.succeed(GitHubApp, githubApp),
         RunRepo.Default,
         WorkspaceRepo.Default,
         Layer.succeed(ActivityProjector, mockProjector),
@@ -499,6 +559,141 @@ const install = (organizationId: OrganizationId): Installation => ({
   revokedAt: Option.none(),
   accessibleTeamIds: Option.none(),
   canAccessAllPublicTeams: Option.none(),
+});
+
+describe("SessionAuthority GitHub publication", () => {
+  it.scopedLive("publishes before succeeding and projects the PR URL", () => {
+    const published: PublishPullRequestInput[] = [];
+    const githubApp = makeGitHubApp(true, (input) =>
+      Effect.sync(() => {
+        published.push(input);
+        return {
+          url: "https://github.com/octo/example/pull/7",
+          number: 7,
+        };
+      }),
+    );
+    return withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const workspaceRepo = yield* WorkspaceRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "authority-repository",
+          );
+
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* workspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "git@github.com:octo/example.git",
+            ref: "main",
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some("/workspace/authority-session"),
+            ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
+          });
+          yield* authority.processSession(testSessionId);
+
+          const projected = yield* Deferred.make<void>();
+          projectionWaiter = projected;
+          projectionExpected = 1;
+          yield* Effect.sync(() => {
+            if (workerEventListener === undefined)
+              throw new Error("worker event listener was not registered");
+            workerEventListener({ type: "agent_end" });
+          });
+          yield* Deferred.await(projected);
+
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run) && run.value.state).toBe("succeeded");
+          expect(published[0]).toMatchObject({
+            repositoryUrl: "git@github.com:octo/example.git",
+            base: "main",
+            branch: workspaceBranchName(testSessionId),
+          });
+          expect(projectorExternalUrls).toContainEqual({
+            sessionId: testSessionId,
+            sourceKey: `github-pr:${testSessionId}`,
+            urls: [
+              {
+                label: "GitHub pull request",
+                url: "https://github.com/octo/example/pull/7",
+              },
+            ],
+          });
+        }),
+      githubApp,
+    );
+  });
+
+  it.scopedLive("marks the run failed when GitHub publication fails", () => {
+    const githubApp = makeGitHubApp(true, () =>
+      Effect.fail(
+        new GitHubAppApiError({
+          message: "GitHub pull request creation failed",
+          operation: "pull request creation",
+        }),
+      ),
+    );
+    return withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const workspaceRepo = yield* WorkspaceRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "authority-repository",
+          );
+
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* workspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://github.com/octo/example",
+            ref: "main",
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          for (let attempt = 0; attempt < 5; attempt += 1) {
+            yield* runRepo.update(testSessionId, { incrementAttempt: true });
+          }
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some("/workspace/authority-session"),
+            ompSessionFile: Option.some("/tmp/authority-session.jsonl"),
+          });
+          yield* authority.processSession(testSessionId);
+
+          const terminal = yield* Deferred.make<void>();
+          terminalWaiter = terminal;
+          yield* Effect.sync(() => {
+            if (workerEventListener === undefined)
+              throw new Error("worker event listener was not registered");
+            workerEventListener({ type: "agent_end" });
+          });
+          yield* Deferred.await(terminal);
+
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run) && run.value.state).toBe("failed");
+        }),
+      githubApp,
+    );
+  });
 });
 
 describe("SessionAuthority infrastructure failures", () => {

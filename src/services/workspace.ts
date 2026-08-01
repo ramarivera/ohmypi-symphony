@@ -48,6 +48,10 @@ export function safeSessionKey(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 32);
 }
 
+export function workspaceBranchName(sessionId: string): string {
+  return `gateway/${safeSessionKey(sessionId)}`;
+}
+
 export function isWithin(root: string, candidate: string): boolean {
   const path = relative(root, candidate);
   return path === "" || (!path.startsWith(`..${sep}`) && path !== "..");
@@ -410,6 +414,7 @@ export const makeWorkspace = (input: {
         "workspace.session_id": sessionId,
         "workspace.repository_id": repository.id,
       });
+      const branch = workspaceBranchName(sessionId);
 
       const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
       const target = join(canonicalRoot, safeSessionKey(sessionId));
@@ -479,7 +484,7 @@ export const makeWorkspace = (input: {
         sessionId,
       );
       yield* runGit(
-        ["checkout", "--detach", "--force", "FETCH_HEAD"],
+        ["checkout", "--force", "-B", branch, "FETCH_HEAD"],
         target,
         sessionId,
       );

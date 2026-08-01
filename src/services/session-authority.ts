@@ -2,6 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { Clock, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
   type DatabaseError,
+  GitHubAppApiError,
+  type GitHubAppConfigurationError,
+  GitHubAppRemoteError,
   type InstallationRevokedError,
   InterruptedRunNoActionableInputError,
   type LinearApiError,
@@ -16,6 +19,7 @@ import {
 import type { SessionId, SourceKey } from "../domain/ids.js";
 import type { AgentRun } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
+import { GitHubApp } from "./github-app.js";
 import { ActivityProjector } from "./projector.js";
 import type { RpcEvent, RpcWorkerHandle } from "./rpc-worker.js";
 import { RpcWorker } from "./rpc-worker.js";
@@ -26,7 +30,7 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
-import { makeWorkspace } from "./workspace.js";
+import { makeWorkspace, workspaceBranchName } from "./workspace.js";
 
 interface InputContext {
   readonly organizationId: string | null;
@@ -158,6 +162,9 @@ type AuthorityError =
   | RpcTimeoutError
   | RunLeaseError
   | TokenCipherError
+  | GitHubAppApiError
+  | GitHubAppConfigurationError
+  | GitHubAppRemoteError
   | WorkspaceError
   | LinearApiError
   | InstallationRevokedError
@@ -174,6 +181,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       RunInputRepo.Default,
       RunRepo.Default,
       WorkspaceRepo.Default,
+      GitHubApp.Default,
       GatewayConfig.Default,
       RpcWorker.Default,
     ],
@@ -184,6 +192,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const runEventRepo = yield* RunEventRepo;
       const workspaceRepo = yield* WorkspaceRepo;
       const projector = yield* ActivityProjector;
+      const githubApp = yield* GitHubApp;
       const rpc = yield* RpcWorker;
       const config = yield* GatewayConfig;
 
@@ -542,7 +551,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         if (
           Option.isNone(current) ||
           current.value.desiredState === "canceled" ||
-          current.value.state === "canceled"
+          current.value.state === "canceled" ||
+          current.value.state === "succeeded"
         ) {
           return;
         }
@@ -626,14 +636,68 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
 
         if (terminalAgentEnd) {
+          const repositoryId = run.repositoryId;
+          const workspacePath = run.workspacePath;
+          if (githubApp.isEnabled()) {
+            if (Option.isNone(repositoryId) || Option.isNone(workspacePath)) {
+              return yield* Effect.fail(
+                new GitHubAppApiError({
+                  message: "GitHub workspace publication has no repository",
+                  operation: "workspace publication",
+                }),
+              );
+            }
+            const repositoryOption = yield* workspaceRepo.getRepository(
+              run.organizationId,
+              repositoryId.value,
+            );
+            if (Option.isNone(repositoryOption)) {
+              return yield* Effect.fail(
+                new GitHubAppApiError({
+                  message:
+                    "GitHub workspace publication repository is unavailable",
+                  operation: "workspace publication",
+                }),
+              );
+            }
+            const issueReference = Option.match(run.issueId, {
+              onNone: () => sessionId,
+              onSome: (issueId) => issueId,
+            });
+            const pullRequest = yield* githubApp
+              .publishPullRequest({
+                repositoryUrl: repositoryOption.value.url,
+                base: repositoryOption.value.ref,
+                branch: workspaceBranchName(sessionId),
+                workspacePath: workspacePath.value,
+                title: `OhMyPi changes for ${issueReference}`,
+                body: `Automated workspace changes for session ${sessionId}.`,
+              })
+              .pipe(
+                Effect.mapError((error) =>
+                  error instanceof GitHubAppRemoteError
+                    ? new GitHubAppRemoteError({
+                        message: `GitHub publication rejected configured repository ${repositoryOption.value.id}`,
+                      })
+                    : error,
+                ),
+              );
+            if (pullRequest !== undefined) {
+              yield* projector.externalUrls(
+                sessionId,
+                `github-pr:${sessionId}`,
+                [{ label: "GitHub pull request", url: pullRequest.url }],
+              );
+            }
+          }
+          yield* runRepo.update(sessionId, {
+            state: "succeeded",
+            nextAttemptAt: Option.none(),
+          });
           yield* Effect.logInfo("run.completed", {
             event: "run.completed",
             sessionId,
             attempt: run.attempt,
-          });
-          yield* runRepo.update(sessionId, {
-            state: "succeeded",
-            nextAttemptAt: Option.none(),
           });
           yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
             Effect.ensuring(
@@ -686,6 +750,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 "@Gateway/RowDecodeError": (error) =>
                   handleFailure(run.sessionId, error),
                 "@Gateway/RpcProtocolError": (error) =>
+                  handleFailure(run.sessionId, error),
+                "@Gateway/GitHubAppApiError": (error) =>
+                  handleFailure(run.sessionId, error),
+                "@Gateway/GitHubAppConfigurationError": (error) =>
+                  handleFailure(run.sessionId, error),
+                "@Gateway/GitHubAppRemoteError": (error) =>
                   handleFailure(run.sessionId, error),
               }),
             ),
