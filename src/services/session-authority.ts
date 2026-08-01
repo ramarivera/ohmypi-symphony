@@ -828,6 +828,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   handleFailure(run.sessionId, error),
                 "@Gateway/GitHubAppRemoteError": (error) =>
                   handleFailure(run.sessionId, error),
+                "@Gateway/WorkspaceError": (error) =>
+                  handleFailure(run.sessionId, error),
               }),
             ),
           ),

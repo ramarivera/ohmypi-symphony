@@ -689,6 +689,28 @@ export const makeWorkspace = (input: {
           sessionId,
         );
         const metadata = yield* readBaseMetadata(canonicalTarget, sessionId);
+        const marker = parseMarker(
+          JSON.parse(
+            yield* readFileOrFail(
+              join(canonicalTarget, ".linear-gateway-workspace.json"),
+              sessionId,
+            ),
+          ),
+        );
+        if (
+          Option.isNone(marker) ||
+          marker.value.repositoryId !== metadata.repositoryId ||
+          marker.value.url !== metadata.repositoryUrl ||
+          marker.value.ref !== metadata.base
+        ) {
+          return yield* Effect.fail(
+            new WorkspaceError({
+              message: "Workspace repository identity mismatch",
+              sessionId,
+              reason: "marker_mismatch",
+            }),
+          );
+        }
         return { path: canonicalTarget, ...metadata };
       },
     );

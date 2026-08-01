@@ -114,6 +114,7 @@ export const parseGitHubRemote = (remote: string): GitHubRepository => {
 };
 const isGitBranchRef = (value: string): boolean =>
   value.length > 0 &&
+  !/^[0-9a-f]{40}$/u.test(value) &&
   !value.startsWith("refs/") &&
   !value.startsWith("/") &&
   !value.endsWith("/") &&
@@ -535,7 +536,7 @@ const publishWorkspace = (
         GIT_TERMINAL_PROMPT: "0",
       },
     );
-    yield* requireGitSuccess(push);
+    yield* requireGitSuccess(push, installationToken);
 
     const headers = {
       Accept: "application/vnd.github+json",
@@ -616,16 +617,22 @@ const publishWorkspace = (
 
 const requireGitSuccess = (
   result: GitResult,
-): Effect.Effect<void, GitHubAppApiError> =>
-  result.exitCode === 0
-    ? Effect.succeed(undefined)
-    : Effect.fail(
-        new GitHubAppApiError({
-          message: "GitHub workspace publication git command failed",
-          operation: "workspace publication",
-          cause: result.stderr.trim() || `exit code ${result.exitCode}`,
-        }),
-      );
+  sensitive?: string,
+): Effect.Effect<void, GitHubAppApiError> => {
+  if (result.exitCode === 0) return Effect.succeed(undefined);
+  const detail = result.stderr.trim() || `exit code ${result.exitCode}`;
+  const safeDetail =
+    sensitive === undefined || sensitive.length === 0
+      ? detail
+      : detail.split(sensitive).join("[REDACTED]");
+  return Effect.fail(
+    new GitHubAppApiError({
+      message: "GitHub workspace publication git command failed",
+      operation: "workspace publication",
+      cause: safeDetail,
+    }),
+  );
+};
 
 export class GitHubApp extends Effect.Service<GitHubApp>()("GitHubApp", {
   accessors: true,

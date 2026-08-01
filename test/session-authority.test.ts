@@ -375,6 +375,14 @@ const prepareMaterializedWorkspace = Effect.tryPromise(async () => {
       baseCommit: "0000000000000000000000000000000000000000",
     }),
   );
+  await writeFile(
+    `${TEST_WORKSPACE_PATH}/.linear-gateway-workspace.json`,
+    JSON.stringify({
+      repositoryId: "authority-repository",
+      url: "git@github.com:octo/example.git",
+      ref: "main",
+    }),
+  );
 });
 let workerEventListener: ((event: RpcEvent) => void) | undefined;
 let projectionWaiter: Deferred.Deferred<void, never> | undefined;
