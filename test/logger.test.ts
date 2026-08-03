@@ -1,7 +1,9 @@
+import { EventEmitter } from "node:events";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@effect/vitest";
 import {
   Cause,
@@ -21,6 +23,7 @@ import pino from "pino";
 import { GatewayConfig } from "../src/services/config.js";
 import {
   buildPinoLoggerPlan,
+  closePinoTransport,
   GatewayLogger,
   makePinoEffectLogger,
   PinoLoggerLive,
@@ -267,6 +270,31 @@ describe("Pino logger plan", () => {
     });
   });
 
+  it.effect("waits for transport close after flushing", () =>
+    Effect.gen(function* () {
+      class DelayedTransport extends EventEmitter {
+        flushed = false;
+        ended = false;
+
+        flushSync() {
+          this.flushed = true;
+        }
+
+        end() {
+          queueMicrotask(() => {
+            this.ended = true;
+            this.emit("close");
+          });
+        }
+      }
+
+      const transport = new DelayedTransport();
+      yield* closePinoTransport(transport);
+      expect(transport.flushed).toBe(true);
+      expect(transport.ended).toBe(true);
+    }),
+  );
+
   it("fans the same NDJSON line to stdout and pino-roll when configured", () => {
     const plan = buildPinoLoggerPlan({
       logLevel: "warn",
@@ -279,12 +307,12 @@ describe("Pino logger plan", () => {
     });
     expect(plan.transport?.targets).toEqual([
       {
-        target: "pino/file",
+        target: fileURLToPath(import.meta.resolve("pino/file")),
         level: "warn",
         options: { destination: 1 },
       },
       {
-        target: "pino-roll",
+        target: fileURLToPath(import.meta.resolve("pino-roll")),
         level: "warn",
         options: {
           file: "/var/log/gateway.ndjson",
@@ -399,7 +427,7 @@ describe("Pino logger plan", () => {
         });
         const rollTarget = plan.transport?.targets[1];
         expect(rollTarget).toMatchObject({
-          target: "pino-roll",
+          target: fileURLToPath(import.meta.resolve("pino-roll")),
           options: {
             frequency,
             size,

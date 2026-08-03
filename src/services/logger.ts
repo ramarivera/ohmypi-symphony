@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import {
   Cause,
   Context,
@@ -15,6 +16,9 @@ import * as Tracer from "effect/Tracer";
 import pino from "pino";
 import type { LogFileConfig } from "./config.js";
 import { GatewayConfig } from "./config.js";
+
+const pinoFileTarget = fileURLToPath(import.meta.resolve("pino/file"));
+const pinoRollTarget = fileURLToPath(import.meta.resolve("pino-roll"));
 
 const secretKeys = [
   "Authorization",
@@ -96,12 +100,12 @@ export const buildPinoLoggerPlan = ({
     onSome: (file): pino.TransportMultiOptions<unknown> => ({
       targets: [
         {
-          target: "pino/file",
+          target: pinoFileTarget,
           level: logLevel,
           options: { destination: 1 },
         },
         {
-          target: "pino-roll",
+          target: pinoRollTarget,
           level: logLevel,
           options: {
             file: file.path,
@@ -153,6 +157,49 @@ export const makePinoEffectLogger = (
     else logger.trace(fields, text);
   });
 
+export interface ManagedPinoTransport {
+  readonly flushSync: () => void;
+  readonly end: () => void;
+  readonly once: {
+    (event: "close", listener: () => void): unknown;
+    (event: "error", listener: (error: Error) => void): unknown;
+  };
+  readonly off: {
+    (event: "close", listener: () => void): unknown;
+    (event: "error", listener: (error: Error) => void): unknown;
+  };
+}
+
+export const closePinoTransport = (
+  transport: ManagedPinoTransport,
+): Effect.Effect<void> =>
+  Effect.async<void>((resume) => {
+    let completed = false;
+    const cleanup = () => {
+      transport.off("close", onClose);
+      transport.off("error", onError);
+    };
+    const complete = (effect: Effect.Effect<void>) => {
+      if (completed) return;
+      completed = true;
+      cleanup();
+      resume(effect);
+    };
+    const onClose = () => complete(Effect.void);
+    const onError = (error: Error) => complete(Effect.die(error));
+
+    transport.once("close", onClose);
+    transport.once("error", onError);
+    try {
+      transport.flushSync();
+      transport.end();
+    } catch (error) {
+      onError(error instanceof Error ? error : new Error(String(error)));
+    }
+
+    return Effect.sync(cleanup);
+  });
+
 export class GatewayLogger extends Effect.Service<GatewayLogger>()(
   "GatewayLogger",
   {
@@ -170,12 +217,9 @@ export class GatewayLogger extends Effect.Service<GatewayLogger>()(
           return { logger: pino(plan.options, transport), transport };
         }),
         ({ logger, transport }) =>
-          Effect.sync(() => {
-            if (transport !== undefined) {
-              transport.flushSync();
-              transport.end();
-            } else logger.flush();
-          }),
+          transport === undefined
+            ? Effect.sync(() => logger.flush())
+            : closePinoTransport(transport),
       );
       return { logger: resource.logger };
     }),
@@ -184,6 +228,10 @@ export class GatewayLogger extends Effect.Service<GatewayLogger>()(
 
 export const PinoLoggerLive = Layer.unwrapEffect(
   Effect.map(GatewayLogger, ({ logger }) =>
-    Logger.replace(Logger.defaultLogger, makePinoEffectLogger(logger)),
+    Layer.mergeAll(
+      Logger.remove(Logger.defaultLogger),
+      Logger.remove(Logger.prettyLoggerDefault),
+      Logger.add(makePinoEffectLogger(logger)),
+    ),
   ),
 );

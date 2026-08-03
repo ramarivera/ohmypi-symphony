@@ -34,7 +34,6 @@ const sqliteClientLayer = Layer.unwrapEffect(
 );
 
 export const GatewayServicesLive = Layer.mergeAll(
-  GatewayLogger.Default,
   TokenCrypto.Default,
   AdminSessionRepo.Default,
   InstallationRepo.Default,
@@ -55,6 +54,11 @@ export const GatewayServicesLive = Layer.mergeAll(
   Admin.Default,
 ).pipe(
   Layer.provideMerge(sqliteClientLayer),
+  Layer.provideMerge(GatewayConfig.Default),
+);
+
+const gatewayLoggerLive = PinoLoggerLive.pipe(
+  Layer.provideMerge(GatewayLogger.Default),
   Layer.provideMerge(GatewayConfig.Default),
 );
 
@@ -91,9 +95,8 @@ const servicesWithScheduler = Layer.provideMerge(
   servicesWithHttp,
 );
 
-export const GatewayLive = Layer.provideMerge(
-  PinoLoggerLive,
-  servicesWithScheduler,
-);
+export const GatewayLive = servicesWithScheduler;
 
-export const main = Layer.launch(GatewayLive);
+export const main = Layer.launch(GatewayLive).pipe(
+  Effect.provide(gatewayLoggerLive),
+);

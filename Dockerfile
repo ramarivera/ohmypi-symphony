@@ -35,7 +35,7 @@ COPY --from=omp /usr/local/bin/omp /usr/local/bin/omp
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json /app/bun.lock* ./
 RUN bun install --production --frozen-lockfile
-RUN mkdir -p /app/data /app/workspaces /home/bun/.omp/natives \
+RUN mkdir -p /app/data /app/logs /app/workspaces /home/bun/.omp/natives \
   && chown -R bun:bun /app /home/bun/.omp
 USER bun
 EXPOSE 3000
