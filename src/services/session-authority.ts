@@ -46,6 +46,21 @@ interface WorkerState {
   readonly unsubscribe: () => Effect.Effect<void, never, never>;
 }
 
+const LINEAR_WORKER_CONTRACT = `Linear integration:
+- Use OMP todos for meaningful multi-step work; they are displayed as the Linear agent plan.
+- Use OMP UI requests when human input, selection, confirmation, or authorization is required; they are displayed as Linear elicitations.
+- Tool execution and lifecycle progress are projected automatically as Linear thought and action activities. Do not call Linear directly to report progress.
+- Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
+- If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
+
+export const linearWorkerPrompt = (
+  kind: "created" | "prompted" | "stop",
+  body: string,
+): string =>
+  kind === "created"
+    ? `${LINEAR_WORKER_CONTRACT}\n\nLinear task:\n${body}`
+    : body;
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -950,7 +965,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     );
                   }
                   const agentInvoked = yield* worker.prompt(
-                    latestActionable.value.body,
+                    linearWorkerPrompt(
+                      latestActionable.value.kind,
+                      latestActionable.value.body,
+                    ),
                   );
                   if (!agentInvoked) {
                     yield* finishLocalCommand(
@@ -1032,7 +1050,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 const updatedOption = yield* runRepo.get(sessionId);
                 if (Option.isNone(updatedOption)) return;
                 worker = yield* startWorker(updatedOption.value, workspacePath);
-                const agentInvoked = yield* worker.prompt(input.body);
+                const agentInvoked = yield* worker.prompt(
+                  linearWorkerPrompt(input.kind, input.body),
+                );
                 if (!agentInvoked) {
                   yield* finishLocalCommand(sessionId, worker, input.id);
                 }

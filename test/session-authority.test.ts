@@ -31,7 +31,10 @@ import {
   RpcWorker,
   type RpcWorkerHandle,
 } from "../src/services/rpc-worker.js";
-import { SessionAuthority } from "../src/services/session-authority.js";
+import {
+  linearWorkerPrompt,
+  SessionAuthority,
+} from "../src/services/session-authority.js";
 import {
   InstallationRepo,
   RunEventRepo,
@@ -45,6 +48,29 @@ import {
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+
+describe("Linear worker prompt contract", () => {
+  it("adds the Linear activity contract to a created session", () => {
+    const prompt = linearWorkerPrompt("created", "Fix the webhook race");
+
+    expect(prompt).toContain("Use OMP todos");
+    expect(prompt).toContain("Linear agent plan");
+    expect(prompt).toContain("Linear elicitations");
+    expect(prompt).toContain("thought and action activities");
+    expect(prompt).toContain("include relevant artifact URLs");
+    expect(prompt).toContain("cease work immediately");
+    expect(prompt.endsWith("Linear task:\nFix the webhook race")).toBe(true);
+  });
+
+  it.each(["prompted", "stop"] as const)(
+    "leaves %s input unchanged",
+    (kind) => {
+      expect(linearWorkerPrompt(kind, "Continue from here")).toBe(
+        "Continue from here",
+      );
+    },
+  );
+});
 
 describe("SessionAuthority behavior invariants", () => {
   it.effect.prop(
