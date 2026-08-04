@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { it } from "@effect/vitest";
-import { Effect, Fiber, Layer, Option } from "effect";
+import { Clock, Effect, Fiber, Layer, Option } from "effect";
 import * as fc from "effect/FastCheck";
 import { describe, expect } from "vitest";
 import { LinearApiError } from "../src/domain/errors.js";
@@ -14,6 +14,7 @@ import {
 } from "../src/services/projector.js";
 import { ProjectionRepo } from "../src/services/store/projection-repo.js";
 import { RunEventRepo } from "../src/services/store/run-event-repo.js";
+import { RunInputRepo } from "../src/services/store/run-input-repo.js";
 import { RunRepo } from "../src/services/store/run-repo.js";
 import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 
@@ -91,6 +92,7 @@ const repoDeps = Layer.mergeAll(
   sqlite,
   RunEventRepo.Default,
   RunRepo.Default,
+  RunInputRepo.Default,
   ProjectionRepo.Default,
 ).pipe(Layer.provide(sqlite));
 const deps = Layer.mergeAll(repoDeps, Layer.succeed(LinearGateway, mockLinear));
@@ -301,6 +303,55 @@ describe("ActivityProjector", () => {
             result: "queued",
           });
           expect(mockState.activities).toHaveLength(0);
+        }),
+    );
+
+    it.effect(
+      "drops a queued deviation comment when the run is stopped before dispatch",
+      () =>
+        Effect.gen(function* () {
+          resetMock();
+          const projector = yield* ActivityProjector;
+          const projectionRepo = yield* ProjectionRepo;
+          const runRepo = yield* RunRepo;
+          const sessionId = makeSessionId("stopped-session");
+          yield* runRepo.create({
+            sessionId,
+            organizationId: "org" as never,
+            issueId: Option.some("issue-1" as never),
+            now: 0,
+          });
+          yield* projectionRepo.enqueue({
+            sourceKey: makeSourceKey("deviation:stopped"),
+            sessionId,
+            activityType: "comment",
+            payloadHash: sha256("stopped-deviation"),
+            payload: {
+              request: {
+                sessionId,
+                body: "### Agent deviation report\n\nToo late.",
+              },
+            },
+            firstWriteWins: true,
+            now: 0,
+          });
+          const runInputRepo = yield* RunInputRepo;
+          yield* runInputRepo.enqueue({
+            id: "stop-input" as never,
+            sessionId,
+            kind: "stop",
+            body: "",
+            payload: { signal: "stop" },
+            createdAt: 1,
+          });
+
+          const flushed = yield* projector.flushPending(
+            50,
+            yield* Clock.currentTimeMillis,
+          );
+
+          expect(flushed).toBe(1);
+          expect(mockState.comments).toHaveLength(0);
         }),
     );
 

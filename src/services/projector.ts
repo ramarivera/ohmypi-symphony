@@ -331,6 +331,22 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
                   }),
               ),
             );
+            const run = yield* runRepo.get(sessionId);
+            if (
+              Option.isSome(run) &&
+              (run.value.desiredState === "canceled" ||
+                run.value.state === "canceled")
+            ) {
+              yield* projectionRepo.complete(sourceKey, owner, Option.none());
+              yield* Effect.logInfo("projector.comment.skipped").pipe(
+                Effect.annotateLogs({
+                  sessionId,
+                  sourceKey,
+                  reason: "run canceled",
+                }),
+              );
+              return true;
+            }
             yield* linear.createIssueComment({
               sessionId,
               body: request.body,
