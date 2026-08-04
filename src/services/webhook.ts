@@ -198,7 +198,8 @@ const decodeOptionalBrand = <A>(
   if (value === null) return Effect.succeed(Option.none());
   return Schema.decodeUnknown(schema)(value).pipe(
     Effect.map((v) => Option.some(v)),
-    Effect.mapError(
+    Effect.catchTag(
+      "ParseError",
       () =>
         new WebhookPayloadError({
           message: `Invalid identifier ${value}`,
@@ -249,7 +250,8 @@ const validateAgentSessionIdentity = (
     const organizationId = yield* Schema.decodeUnknown(OrganizationId)(
       event.organizationId,
     ).pipe(
-      Effect.mapError(
+      Effect.catchTag(
+        "ParseError",
         () =>
           new WebhookIdentityError({
             message: "Organization identity is not a valid identifier",
@@ -301,7 +303,8 @@ const handleAgentSessionEvent = (
     const sessionId = yield* Schema.decodeUnknown(SessionId)(
       event.agentSession.id,
     ).pipe(
-      Effect.mapError(
+      Effect.catchTag(
+        "ParseError",
         () =>
           new WebhookPayloadError({
             message: `Invalid session id ${event.agentSession.id}`,
@@ -312,7 +315,8 @@ const handleAgentSessionEvent = (
     const organizationId = yield* Schema.decodeUnknown(OrganizationId)(
       event.agentSession.organizationId,
     ).pipe(
-      Effect.mapError(
+      Effect.catchTag(
+        "ParseError",
         () =>
           new WebhookPayloadError({
             message: `Invalid organization id ${event.agentSession.organizationId}`,
@@ -341,7 +345,8 @@ const handleAgentSessionEvent = (
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, "created"),
       ).pipe(
-        Effect.mapError(
+        Effect.catchTag(
+          "ParseError",
           () =>
             new WebhookPayloadError({
               message: `Invalid input id ${buildInputId(event, "created")}`,
@@ -385,7 +390,8 @@ const handleAgentSessionEvent = (
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, kind),
       ).pipe(
-        Effect.mapError(
+        Effect.catchTag(
+          "ParseError",
           () =>
             new WebhookPayloadError({
               message: `Invalid input id ${buildInputId(event, kind)}`,
@@ -412,7 +418,8 @@ const handleAgentSessionEvent = (
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, "stop"),
       ).pipe(
-        Effect.mapError(
+        Effect.catchTag(
+          "ParseError",
           () =>
             new WebhookPayloadError({
               message: `Invalid input id ${buildInputId(event, "stop")}`,
@@ -465,7 +472,8 @@ const validateOAuthAppPayload = (
     const decoded = yield* Schema.decodeUnknown(OrganizationId)(
       organizationId,
     ).pipe(
-      Effect.mapError(
+      Effect.catchTag(
+        "ParseError",
         () =>
           new WebhookIdentityError({
             message: "Organization identity is not a valid identifier",
@@ -537,7 +545,8 @@ const validatePermissionChangePayload = (
     const decodedOrganizationId = yield* Schema.decodeUnknown(OrganizationId)(
       organizationId,
     ).pipe(
-      Effect.mapError(
+      Effect.catchTag(
+        "ParseError",
         () =>
           new WebhookIdentityError({
             message: "Organization identity is not a valid identifier",
@@ -548,7 +557,8 @@ const validatePermissionChangePayload = (
     const decodedAppUserId = yield* Schema.decodeUnknown(AppUserId)(
       appUserId,
     ).pipe(
-      Effect.mapError(
+      Effect.catchTag(
+        "ParseError",
         () =>
           new WebhookPayloadError({
             message: `Invalid app user id ${appUserId}`,
@@ -559,7 +569,8 @@ const validatePermissionChangePayload = (
 
     const addedTeamIds = yield* Effect.forEach(added, (teamId) =>
       Schema.decodeUnknown(TeamId)(teamId).pipe(
-        Effect.mapError(
+        Effect.catchTag(
+          "ParseError",
           () =>
             new WebhookPayloadError({
               message: `Invalid team id ${teamId}`,
@@ -571,7 +582,8 @@ const validatePermissionChangePayload = (
 
     const removedTeamIds = yield* Effect.forEach(removed, (teamId) =>
       Schema.decodeUnknown(TeamId)(teamId).pipe(
-        Effect.mapError(
+        Effect.catchTag(
+          "ParseError",
           () =>
             new WebhookPayloadError({
               message: `Invalid team id ${teamId}`,
@@ -617,7 +629,8 @@ const decodeDeliveryId = (
   raw: string,
 ): Effect.Effect<DeliveryId, WebhookPayloadError> =>
   Schema.decodeUnknown(DeliveryId)(raw).pipe(
-    Effect.mapError(
+    Effect.catchTag(
+      "ParseError",
       () =>
         new WebhookPayloadError({
           message: "Invalid delivery id",
@@ -872,7 +885,8 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                 const event = yield* Schema.decodeUnknown(AgentSessionEvent)(
                   parsed,
                 ).pipe(
-                  Effect.mapError(
+                  Effect.catchTag(
+                    "ParseError",
                     (error) =>
                       new WebhookPayloadError({
                         message: `AgentSessionEvent payload is invalid: ${error}`,

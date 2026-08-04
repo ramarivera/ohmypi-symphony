@@ -105,7 +105,8 @@ const buildInstallation = (
 ): Effect.Effect<InstallationType, LinearApiError> => {
   const record = buildInstallationRecord(token, organizationId, appUserId, now);
   return Schema.decodeUnknown(Installation)(record).pipe(
-    Effect.mapError(
+    Effect.catchTag(
+      "ParseError",
       (error) =>
         new LinearApiError({
           message: `Invalid installation record: ${error}`,
@@ -183,7 +184,8 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
         const consumed = yield* installationRepo
           .consumeOAuthState(stateHash, now)
           .pipe(
-            Effect.mapError(
+            Effect.catchTag(
+              "@Gateway/DatabaseError",
               () =>
                 new OAuthStateError({
                   message: "Invalid or expired OAuth state",

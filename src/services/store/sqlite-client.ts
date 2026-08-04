@@ -64,7 +64,8 @@ export const decodeRow = <A, I, R>(
   entity: string,
 ): Effect.Effect<A, RowDecodeError, R> =>
   Schema.decodeUnknown(schema)(row).pipe(
-    Effect.mapError(
+    Effect.catchTag(
+      "ParseError",
       (error) =>
         new RowDecodeError({
           message: ParseResult.TreeFormatter.formatErrorSync(error),
@@ -89,7 +90,8 @@ export const runChanges = (
 ): Effect.Effect<number, DatabaseError> =>
   Schema.decodeUnknown(RunResult)(result).pipe(
     Effect.map((r) => r.changes),
-    Effect.mapError(
+    Effect.catchTag(
+      "ParseError",
       () =>
         new DatabaseError({
           message: `${operation}: run result did not contain changes`,

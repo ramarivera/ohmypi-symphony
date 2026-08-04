@@ -87,7 +87,8 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
 
       const decodeSourceKey = (value: string) =>
         Schema.decodeUnknown(SourceKey)(value).pipe(
-          Effect.mapError(
+          Effect.catchTag(
+            "ParseError",
             (error) =>
               new RowDecodeError({
                 message: ParseResult.TreeFormatter.formatErrorSync(error),
@@ -99,7 +100,8 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
 
       const decodeSessionId = (value: string) =>
         Schema.decodeUnknown(SessionId)(value).pipe(
-          Effect.mapError(
+          Effect.catchTag(
+            "ParseError",
             (error) =>
               new RowDecodeError({
                 message: ParseResult.TreeFormatter.formatErrorSync(error),
@@ -111,7 +113,8 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
 
       const decodeActivityId = (value: string) =>
         Schema.decodeUnknown(ActivityId)(value).pipe(
-          Effect.mapError(
+          Effect.catchTag(
+            "ParseError",
             (error) =>
               new RowDecodeError({
                 message: ParseResult.TreeFormatter.formatErrorSync(error),
@@ -311,7 +314,8 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
             const sessionId = yield* Schema.decodeUnknown(SessionId)(
               update.sessionId,
             ).pipe(
-              Effect.mapError(
+              Effect.catchTag(
+                "ParseError",
                 (error) =>
                   new LinearApiError({
                     operation: "updateSession",
@@ -334,7 +338,8 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
             const sessionId = yield* Schema.decodeUnknown(SessionId)(
               request.sessionId,
             ).pipe(
-              Effect.mapError(
+              Effect.catchTag(
+                "ParseError",
                 (error) =>
                   new LinearApiError({
                     operation: "createActivity",

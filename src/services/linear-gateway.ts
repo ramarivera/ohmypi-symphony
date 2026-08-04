@@ -324,7 +324,8 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         const orgId = yield* Schema.decodeUnknown(OrganizationId)(
           organizationId,
         ).pipe(
-          Effect.mapError(
+          Effect.catchTag(
+            "ParseError",
             (error) =>
               new TokenRefreshError({
                 organizationId,
@@ -464,7 +465,8 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           const sessionId = yield* Schema.decodeUnknown(SessionId)(
             input.sessionId,
           ).pipe(
-            Effect.mapError(
+            Effect.catchTag(
+              "ParseError",
               (error) =>
                 new LinearApiError({
                   operation: "createActivity",
@@ -604,7 +606,8 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           const sessionId = yield* Schema.decodeUnknown(SessionId)(
             input.sessionId,
           ).pipe(
-            Effect.mapError(
+            Effect.catchTag(
+              "ParseError",
               (error) =>
                 new LinearApiError({
                   operation: "updateSession",
