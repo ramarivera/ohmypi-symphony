@@ -32,7 +32,9 @@ import {
   type RpcWorkerHandle,
 } from "../src/services/rpc-worker.js";
 import {
+  deviationFromRpcEvent,
   linearWorkerPrompt,
+  resolveDeviationExtensionPath,
   SessionAuthority,
 } from "../src/services/session-authority.js";
 import {
@@ -58,6 +60,7 @@ describe("Linear worker prompt contract", () => {
     expect(prompt).toContain("Linear elicitations");
     expect(prompt).toContain("thought and action activities");
     expect(prompt).toContain("include relevant artifact URLs");
+    expect(prompt).toContain("rromp_report_deviation");
     expect(prompt).toContain("cease work immediately");
     expect(prompt.endsWith("Linear task:\nFix the webhook race")).toBe(true);
   });
@@ -70,6 +73,27 @@ describe("Linear worker prompt contract", () => {
       );
     },
   );
+
+  it("extracts only valid deviation tool calls", () => {
+    expect(
+      deviationFromRpcEvent({
+        type: "tool_execution_start",
+        toolName: "rromp_report_deviation",
+        args: { deviation: "  Used a narrower migration scope.  " },
+      }),
+    ).toBe("Used a narrower migration scope.");
+    expect(
+      deviationFromRpcEvent({
+        type: "tool_execution_start",
+        toolName: "read",
+        args: { deviation: "not a report" },
+      }),
+    ).toBeNull();
+  });
+
+  it("resolves the bundled deviation extension entrypoint", () => {
+    expect(resolveDeviationExtensionPath()).not.toBeNull();
+  });
 });
 
 describe("SessionAuthority behavior invariants", () => {
@@ -426,6 +450,7 @@ const signalElicitation = (): void => {
 let terminalFailure: DatabaseError | undefined;
 const mockProjector = ActivityProjector.make({
   thought: () => Effect.succeed(true),
+  deviation: () => Effect.succeed(true),
   elicitation: (sessionId, sourceKey, text, options) =>
     Effect.sync(() => {
       projectorElicitations.push({ sessionId, sourceKey, text, options });
@@ -792,6 +817,10 @@ describe("SessionAuthority Nix environment preparation", () => {
             `/nix/store/test-node/bin${process.env.PATH ? `:${process.env.PATH}` : ""}`,
           );
           expect(workerSpawnInputs[0]?.env?.HOME).toBe(process.env.HOME);
+          expect(workerSpawnInputs[0]?.command).toContain("--extension");
+          expect(workerSpawnInputs[0]?.command).toContain(
+            resolveDeviationExtensionPath(),
+          );
 
           yield* authority.shutdown();
           yield* runRepo.update(testSessionId, {

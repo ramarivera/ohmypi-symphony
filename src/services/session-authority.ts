@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Clock, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
   type DatabaseError,
@@ -8,7 +10,7 @@ import {
   type NixEnvironmentError,
   type RowDecodeError,
   RpcProtocolError,
-  type RpcSpawnError,
+  RpcSpawnError,
   type RpcTimeoutError,
   type RunLeaseError,
   type TokenCipherError,
@@ -50,6 +52,7 @@ const LINEAR_WORKER_CONTRACT = `Linear integration:
 - Use OMP todos for meaningful multi-step work; they are displayed as the Linear agent plan.
 - Use OMP UI requests when human input, selection, confirmation, or authorization is required; they are displayed as Linear elicitations.
 - Tool execution and lifecycle progress are projected automatically as Linear thought and action activities. Do not call Linear directly to report progress.
+- Call rromp_report_deviation as soon as you take a shortcut, depart from the original request, change a material assumption, or make a consequential implementation decision. The report becomes a visible Linear issue comment.
 - Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
 - If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
 
@@ -61,6 +64,25 @@ export const linearWorkerPrompt = (
     ? `${LINEAR_WORKER_CONTRACT}\n\nLinear task:\n${body}`
     : body;
 
+export const resolveDeviationExtensionPath = (): string | null => {
+  const candidates = [
+    fileURLToPath(
+      new URL("../extensions/report-deviation.ts", import.meta.url),
+    ),
+    fileURLToPath(new URL("./extensions/report-deviation.js", import.meta.url)),
+  ];
+  return candidates.find((candidate) => existsSync(candidate)) ?? null;
+};
+
+export const deviationFromRpcEvent = (event: RpcEvent): string | null => {
+  if (event.type !== "tool_execution_start") return null;
+  const toolName = event.toolName ?? event.tool;
+  if (toolName !== "rromp_report_deviation" || !record(event.args)) return null;
+  const deviation = event.args.deviation;
+  return typeof deviation === "string" && deviation.trim().length > 0
+    ? deviation.trim()
+    : null;
+};
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -606,6 +628,30 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         });
         yield* recordRunEvent(sessionId, sequence, event);
 
+        const deviation = deviationFromRpcEvent(event);
+        if (deviation !== null) {
+          if (Option.isSome(run.issueId)) {
+            const eventId =
+              typeof event.id === "string"
+                ? event.id
+                : createHash("sha256")
+                    .update(deviation)
+                    .digest("hex")
+                    .slice(0, 16);
+            yield* projector.deviation(
+              sessionId,
+              `deviation:${sessionId}:${eventId}`,
+              deviation,
+            );
+          } else {
+            yield* Effect.logWarning("deviation.comment.skipped").pipe(
+              Effect.annotateLogs({
+                sessionId,
+                reason: "run has no Linear issue",
+              }),
+            );
+          }
+        }
         if (event.type === "extension_ui_request") {
           const id = event.id;
           const method = event.method;
@@ -726,12 +772,23 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           command.push("--session", run.ompSessionFile.value);
         }
 
+        const deviationExtensionPath = resolveDeviationExtensionPath();
+        if (deviationExtensionPath === null) {
+          return yield* Effect.fail(
+            new RpcSpawnError({
+              message: "Deviation reporting extension is missing",
+            }),
+          );
+        }
+        command.push("--extension", deviationExtensionPath);
+
         const environment = { ...process.env };
         if (Option.isSome(run.repositoryId)) {
           const repository = yield* workspaceRepo.getRepository(
             run.organizationId,
             run.repositoryId.value,
           );
+
           if (Option.isSome(repository)) {
             const prepared = yield* nixEnvironment
               .prepare(repository.value)

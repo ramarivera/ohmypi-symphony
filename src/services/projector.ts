@@ -195,6 +195,21 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         return { sessionId: job.sessionId, content };
       };
 
+      const decodeCommentRequest = (
+        job: ProjectionJob,
+      ): { readonly sessionId: string; readonly body: string } => {
+        if (!isRecord(job.payload) || !isRecord(job.payload.request)) {
+          throw new Error(
+            `Projection ${job.sourceKey} comment request is invalid`,
+          );
+        }
+        const body = text(job.payload.request.body);
+        if (body === undefined) {
+          throw new Error(`Projection ${job.sourceKey} comment body is empty`);
+        }
+        return { sessionId: job.sessionId, body };
+      };
+
       const decodeSessionUpdate = (
         job: ProjectionJob,
       ): {
@@ -294,7 +309,34 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
           });
 
         return yield* Effect.gen(function* () {
-          if (
+          if (job.activityType === "comment") {
+            const request = yield* Effect.try({
+              try: () => decodeCommentRequest(job),
+              catch: (error) =>
+                new LinearApiError({
+                  operation: "decodeCommentRequest",
+                  message:
+                    error instanceof Error ? error.message : String(error),
+                }),
+            });
+            const sessionId = yield* Schema.decodeUnknown(SessionId)(
+              request.sessionId,
+            ).pipe(
+              Effect.catchTag(
+                "ParseError",
+                (error) =>
+                  new LinearApiError({
+                    operation: "createIssueComment",
+                    message: ParseResult.TreeFormatter.formatErrorSync(error),
+                  }),
+              ),
+            );
+            yield* linear.createIssueComment({
+              sessionId,
+              body: request.body,
+            });
+            yield* projectionRepo.complete(sourceKey, owner, Option.none());
+          } else if (
             job.activityType === "plan" ||
             job.activityType === "externalUrls"
           ) {
@@ -496,6 +538,20 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         );
       });
 
+      const deviation = Effect.fn("ActivityProjector.deviation")(function* (
+        sessionId: string,
+        sourceKey: string,
+        text: string,
+      ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
+        const body = `### Agent deviation report\n\n${boundedText(text)}\n\n_Reported automatically by OhMyPi during this run._`;
+        return yield* enqueueAndDispatch(
+          sessionId,
+          sourceKey,
+          "comment",
+          { request: { sessionId, body } },
+          true,
+        );
+      });
       const elicitation = Effect.fn("ActivityProjector.elicitation")(function* (
         sessionId: string,
         sourceKey: string,
@@ -634,6 +690,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
             case "tool_execution_start": {
               const toolName =
                 text(event.toolName) ?? text(event.tool) ?? "tool";
+              if (toolName === "rromp_report_deviation") return;
               const parameter = isString(event.args)
                 ? event.args
                 : yield* stringify(event.args ?? {});
@@ -652,6 +709,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
             case "tool_execution_end": {
               const toolName =
                 text(event.toolName) ?? text(event.tool) ?? "tool";
+              if (toolName === "rromp_report_deviation") return;
               const result = isString(event.result)
                 ? event.result
                 : yield* stringify(event.result ?? {});
@@ -717,6 +775,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
 
       return {
         thought,
+        deviation,
         elicitation,
         terminal,
         plan,

@@ -689,6 +689,94 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         },
       );
 
+      const createIssueComment = Effect.fn("LinearGateway.createIssueComment")(
+        function* (input: {
+          readonly sessionId: string;
+          readonly body: string;
+        }): Effect.fn.Return<
+          string,
+          | InstallationRevokedError
+          | LinearApiError
+          | LinearRateLimitError
+          | TokenRefreshError
+        > {
+          const sessionId = yield* Schema.decodeUnknown(SessionId)(
+            input.sessionId,
+          ).pipe(
+            Effect.catchTag(
+              "ParseError",
+              (error) =>
+                new LinearApiError({
+                  operation: "createIssueComment",
+                  message: `Invalid session id: ${error.message}`,
+                }),
+            ),
+          );
+          const runOption = yield* runRepo.get(sessionId).pipe(
+            Effect.catchTags({
+              "@Gateway/DatabaseError": (error: DatabaseError) =>
+                Effect.fail(
+                  new LinearApiError({
+                    operation: "createIssueComment",
+                    message: error.message,
+                  }),
+                ),
+              "@Gateway/RowDecodeError": (error: RowDecodeError) =>
+                Effect.fail(
+                  new LinearApiError({
+                    operation: "createIssueComment",
+                    message: error.message,
+                  }),
+                ),
+            }),
+          );
+          const run = yield* Option.match(runOption, {
+            onNone: () =>
+              Effect.fail(
+                new LinearApiError({
+                  operation: "createIssueComment",
+                  message: `Unknown run ${sessionId}`,
+                }),
+              ),
+            onSome: Effect.succeed,
+          });
+          const issueId = yield* Option.match(run.issueId, {
+            onNone: () =>
+              Effect.fail(
+                new LinearApiError({
+                  operation: "createIssueComment",
+                  message: `Run ${sessionId} is not linked to a Linear issue`,
+                }),
+              ),
+            onSome: Effect.succeed,
+          });
+
+          return yield* withOrgQueue(
+            run.organizationId,
+            Effect.gen(function* () {
+              const client = yield* clientFor(run.organizationId);
+              return yield* withRateLimitRetry(
+                Effect.tryPromise({
+                  try: async () => {
+                    const payload = await client.createComment({
+                      issueId,
+                      body: input.body,
+                    });
+                    if (!payload.success)
+                      throw new Error("Linear failed to create issue comment");
+                    const comment = await payload.comment;
+                    if (!comment?.id)
+                      throw new Error("Linear did not return a comment id");
+                    return comment.id;
+                  },
+                  catch: (error) => mapLinearError("createIssueComment", error),
+                }),
+              );
+            }),
+          );
+        },
+      );
+
       const refreshInstallation = Effect.fn(
         "LinearGateway.refreshInstallation",
       )(function* (
@@ -707,7 +795,12 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         return installation.accessToken;
       });
 
-      return { createActivity, updateSession, refreshInstallation };
+      return {
+        createActivity,
+        updateSession,
+        createIssueComment,
+        refreshInstallation,
+      };
     }),
   },
 ) {}

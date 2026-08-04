@@ -19,6 +19,7 @@ import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 
 interface MockState {
   activities: Array<{ readonly sessionId: string; readonly content: unknown }>;
+  comments: Array<{ readonly sessionId: string; readonly body: string }>;
   updates: Array<{
     readonly sessionId: string;
     readonly plan?: unknown;
@@ -31,6 +32,7 @@ interface MockState {
 
 const mockState: MockState = {
   activities: [],
+  comments: [],
   updates: [],
   failuresRemaining: 0,
   block: Option.none(),
@@ -39,6 +41,7 @@ const mockState: MockState = {
 
 const resetMock = () => {
   mockState.activities.length = 0;
+  mockState.comments.length = 0;
   mockState.updates.length = 0;
   mockState.failuresRemaining = 0;
   mockState.block = Option.none();
@@ -74,6 +77,11 @@ const mockLinear = LinearGateway.make({
     Effect.gen(function* () {
       mockState.updates.push(input);
       return yield* Effect.void;
+    }),
+  createIssueComment: (input) =>
+    Effect.sync(() => {
+      mockState.comments.push(input);
+      return `comment-${mockState.comments.length}`;
     }),
   refreshInstallation: () => Effect.succeed("token"),
 });
@@ -248,6 +256,49 @@ describe("ActivityProjector", () => {
           yield* projector.projectRpcEvent("session", 1, {
             type: "extension_ui_request",
             method: "setStatus",
+          });
+          expect(mockState.activities).toHaveLength(0);
+        }),
+    );
+
+    it.effect(
+      "posts deviations as issue comments without duplicating them as activities",
+      () =>
+        Effect.gen(function* () {
+          resetMock();
+          const projector = yield* ActivityProjector;
+          const runRepo = yield* RunRepo;
+          yield* runRepo.create({
+            sessionId: makeSessionId("session"),
+            organizationId: "org" as never,
+            issueId: Option.some("issue-1" as never),
+            now: 0,
+          });
+
+          const posted = yield* projector.deviation(
+            "session",
+            "deviation:call-1",
+            "Used a narrower migration scope to avoid destructive changes.",
+          );
+          expect(posted).toBe(true);
+          expect(mockState.comments).toEqual([
+            {
+              sessionId: "session",
+              body: expect.stringContaining(
+                "Used a narrower migration scope to avoid destructive changes.",
+              ),
+            },
+          ]);
+
+          yield* projector.projectRpcEvent("session", 1, {
+            type: "tool_execution_start",
+            toolName: "rromp_report_deviation",
+            args: { deviation: "same deviation" },
+          });
+          yield* projector.projectRpcEvent("session", 2, {
+            type: "tool_execution_end",
+            toolName: "rromp_report_deviation",
+            result: "queued",
           });
           expect(mockState.activities).toHaveLength(0);
         }),

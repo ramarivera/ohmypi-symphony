@@ -6,6 +6,10 @@ const sdkState = vi.hoisted(() => {
     readonly content?: unknown;
     readonly signalMetadata?: unknown;
   };
+  type CommentInput = {
+    readonly issueId: string;
+    readonly body: string;
+  };
   type UpdateInput = {
     readonly plan?: unknown;
     readonly externalUrls?: unknown;
@@ -17,6 +21,7 @@ const sdkState = vi.hoisted(() => {
 
   const state: {
     readonly activities: ActivityInput[];
+    readonly comments: CommentInput[];
     readonly updates: UpdateInput[];
     readonly pending: Pending[];
     readonly waiters: Array<{
@@ -26,6 +31,7 @@ const sdkState = vi.hoisted(() => {
     activityHandler: (input: ActivityInput) => Promise<unknown>;
   } = {
     activities: [],
+    comments: [],
     updates: [],
     pending: [],
     waiters: [],
@@ -45,6 +51,13 @@ const sdkState = vi.hoisted(() => {
       return state.activityHandler(input);
     }
 
+    createComment(input: CommentInput): Promise<unknown> {
+      state.comments.push(input);
+      return Promise.resolve({
+        success: true,
+        comment: Promise.resolve({ id: "comment-id" }),
+      });
+    }
     updateAgentSession(
       _sessionId: string,
       input: UpdateInput,
@@ -59,6 +72,7 @@ const sdkState = vi.hoisted(() => {
     TestLinearClient,
     reset: () => {
       state.activities.length = 0;
+      state.comments.length = 0;
       state.updates.length = 0;
       state.pending.length = 0;
       state.waiters.length = 0;
@@ -85,7 +99,12 @@ import { it as effectIt } from "@effect/vitest";
 import { Effect, Exit, Fiber, Layer, Option, Redacted, Schema } from "effect";
 import { beforeEach, describe, expect, it } from "vitest";
 import { LinearRateLimitError } from "../src/domain/errors.js";
-import { AppUserId, OrganizationId, SessionId } from "../src/domain/ids.js";
+import {
+  AppUserId,
+  IssueId,
+  OrganizationId,
+  SessionId,
+} from "../src/domain/ids.js";
 import type { AgentRun, Installation } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
@@ -103,10 +122,13 @@ const sessionId = Schema.decodeUnknownSync(SessionId)(
 const appUserId = Schema.decodeUnknownSync(AppUserId)(
   "33333333-3333-4333-8333-333333333333",
 );
+const issueId = Schema.decodeUnknownSync(IssueId)(
+  "44444444-4444-4444-8444-444444444444",
+);
 const run: AgentRun = {
   sessionId,
   organizationId,
-  issueId: Option.none(),
+  issueId: Option.some(issueId),
   repositoryId: Option.none(),
   state: "running",
   desiredState: "running",
@@ -274,6 +296,27 @@ describe("LinearGateway parity", () => {
     );
 
     expect(sdkState.state.updates).toEqual([{ plan, externalUrls }]);
+  });
+
+  it("posts deviation text as an issue comment with the app installation", async () => {
+    const gateway = await getGateway();
+
+    const commentId = await Effect.runPromise(
+      gateway
+        .createIssueComment({
+          sessionId,
+          body: "### Agent deviation report\n\nUsed the safe fallback.",
+        })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+
+    expect(commentId).toBe("comment-id");
+    expect(sdkState.state.comments).toEqual([
+      {
+        issueId,
+        body: "### Agent deviation report\n\nUsed the safe fallback.",
+      },
+    ]);
   });
 
   it("executes three same-organization requests in order", async () => {
