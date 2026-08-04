@@ -47,6 +47,11 @@ const config: GatewayConfigShape = {
   tokenEncryptionKey: Redacted.make(tokenEncryptionKey),
   publicUrl: new URL("https://gateway.example.com"),
   databasePath: ":memory:",
+  nixBinaryPath: "nix",
+  nixpkgsFlakeRef:
+    "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+  nixRootsDir: "/tmp/nix-roots",
+  nixGcMaxBytes: 1_000_000,
   workspaceRoot: "/workspaces",
   ompCliPath: "omp",
   port: 3000,
@@ -72,6 +77,10 @@ const configProviderFor = (gatewayConfig: GatewayConfigShape) =>
       ["RECONCILER_INTERVAL_MS", String(gatewayConfig.reconcilerIntervalMs)],
       ["WEBHOOK_REPLAY_WINDOW_MS", String(gatewayConfig.webhookReplayWindowMs)],
       ["LOG_LEVEL", gatewayConfig.logLevel],
+      ["NIX_BINARY_PATH", gatewayConfig.nixBinaryPath],
+      ["NIXPKGS_FLAKE_REF", gatewayConfig.nixpkgsFlakeRef],
+      ["NIX_ROOTS_DIR", gatewayConfig.nixRootsDir],
+      ["NIX_GC_MAX_BYTES", String(gatewayConfig.nixGcMaxBytes)],
     ]),
   );
 

@@ -6,6 +6,7 @@ import { Admin } from "./services/admin.js";
 import { GatewayConfig } from "./services/config.js";
 import { LinearGateway } from "./services/linear-gateway.js";
 import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
+import { NixEnvironment } from "./services/nix-environment.js";
 import { OAuth } from "./services/oauth.js";
 import { ActivityProjector } from "./services/projector.js";
 import { Reconciler } from "./services/reconciler.js";
@@ -47,6 +48,7 @@ export const GatewayServicesLive = Layer.mergeAll(
   WebhookPipeline.Default,
   ActivityProjector.Default,
   SessionAuthority.Default,
+  NixEnvironment.Default,
   RpcWorker.Default,
   Reconciler.Default,
   Workspace.Default,

@@ -5,6 +5,7 @@ import {
   type InstallationRevokedError,
   InterruptedRunNoActionableInputError,
   type LinearApiError,
+  type NixEnvironmentError,
   type RowDecodeError,
   RpcProtocolError,
   type RpcSpawnError,
@@ -16,6 +17,7 @@ import {
 import type { SessionId, SourceKey } from "../domain/ids.js";
 import type { AgentRun } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
+import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import type { RpcEvent, RpcWorkerHandle } from "./rpc-worker.js";
 import { RpcWorker } from "./rpc-worker.js";
@@ -161,7 +163,8 @@ type AuthorityError =
   | WorkspaceError
   | LinearApiError
   | InstallationRevokedError
-  | InterruptedRunNoActionableInputError;
+  | InterruptedRunNoActionableInputError
+  | NixEnvironmentError;
 
 export class SessionAuthority extends Effect.Service<SessionAuthority>()(
   "SessionAuthority",
@@ -176,6 +179,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       WorkspaceRepo.Default,
       GatewayConfig.Default,
       RpcWorker.Default,
+      NixEnvironment.Default,
     ],
     effect: Effect.gen(function* () {
       const runRepo = yield* RunRepo;
@@ -185,6 +189,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const workspaceRepo = yield* WorkspaceRepo;
       const projector = yield* ActivityProjector;
       const rpc = yield* RpcWorker;
+      const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
 
       const owner = `authority:${yield* Effect.sync(() => randomUUID())}`;
@@ -699,17 +704,62 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         | RpcProtocolError
         | RpcSpawnError
         | RpcTimeoutError
+        | NixEnvironmentError
       > {
         const command: string[] = [config.ompCliPath];
         if (Option.isSome(run.ompSessionFile)) {
           command.push("--session", run.ompSessionFile.value);
         }
 
+        const environment = { ...process.env };
+        if (Option.isSome(run.repositoryId)) {
+          const repository = yield* workspaceRepo.getRepository(
+            run.organizationId,
+            run.repositoryId.value,
+          );
+          if (Option.isSome(repository)) {
+            const prepared = yield* nixEnvironment
+              .prepare(repository.value)
+              .pipe(
+                Effect.tap((result) =>
+                  Effect.logInfo("nix.environment_prepared").pipe(
+                    Effect.annotateLogs({
+                      event: "nix.environment_prepared",
+                      sessionId: run.sessionId,
+                      repositoryId: repository.value.id,
+                      cacheKey: result.cacheKey,
+                      reused: result.reused,
+                      pathEntryCount: result.pathEntries.length,
+                    }),
+                  ),
+                ),
+                Effect.catchTag(
+                  "@Gateway/NixEnvironmentError",
+                  (error: NixEnvironmentError) =>
+                    Effect.logWarning("nix.environment_failed").pipe(
+                      Effect.annotateLogs({
+                        event: "nix.environment_failed",
+                        sessionId: run.sessionId,
+                        repositoryId: repository.value.id,
+                        errorTag: error._tag,
+                        reason: error.reason,
+                      }),
+                      Effect.zipRight(handleFailure(run.sessionId, error)),
+                      Effect.zipRight(Effect.fail(error)),
+                    ),
+                ),
+              );
+            environment.PATH = [...prepared.pathEntries, environment.PATH ?? ""]
+              .filter((entry) => entry.length > 0)
+              .join(":");
+          }
+        }
+
         const worker = yield* rpc.spawn({
           command,
           cwd,
+          env: environment,
         });
-
         const queue = yield* Queue.unbounded<RpcEvent>();
 
         const unsubscribe = yield* worker.onEvent((event) => {

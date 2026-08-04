@@ -21,6 +21,10 @@ export interface GatewayConfigShape {
   readonly publicUrl: URL;
   readonly logLevel: LogLevel;
   readonly logFile: Option.Option<LogFileConfig>;
+  readonly nixBinaryPath: string;
+  readonly nixpkgsFlakeRef: string;
+  readonly nixRootsDir: string;
+  readonly nixGcMaxBytes: number;
   readonly databasePath: string;
   readonly workspaceRoot: string;
   readonly ompCliPath: string;
@@ -107,6 +111,25 @@ const logFileSize = Config.string("LOG_FILE_SIZE").pipe(
 
 const logFileLimit = positiveInteger("LOG_FILE_LIMIT", 14);
 
+const nixpkgsFlakeRef = Config.string("NIXPKGS_FLAKE_REF").pipe(
+  Config.withDefault(
+    "github:NixOS/nixpkgs/ac62194c3917d5f474c1a844b6fd6da2db95077d",
+  ),
+  Config.mapOrFail((value) => {
+    const normalized = value.trim();
+    return /^github:[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/[0-9a-fA-F]{40}$/.test(
+      normalized,
+    )
+      ? Either.right(normalized)
+      : Either.left(
+          ConfigError.InvalidData(
+            ["NIXPKGS_FLAKE_REF"],
+            "NIXPKGS_FLAKE_REF must be an immutable github owner/repository commit reference",
+          ),
+        );
+  }),
+);
+
 const logFile = Config.all({
   path: logFilePath,
   frequency: logFileFrequency,
@@ -142,6 +165,16 @@ const GatewayConfigValues = Config.all({
   leaseDurationMs: positiveInteger("LEASE_DURATION_MS", 60_000),
   reconcilerIntervalMs: positiveInteger("RECONCILER_INTERVAL_MS", 1_000),
   webhookReplayWindowMs: positiveInteger("WEBHOOK_REPLAY_WINDOW_MS", 60_000),
+  nixBinaryPath: Config.string("NIX_BINARY_PATH").pipe(
+    Config.withDefault("nix"),
+    Config.map((value) => value.trim() || "nix"),
+  ),
+  nixpkgsFlakeRef,
+  nixRootsDir: Config.string("NIX_ROOTS_DIR").pipe(
+    Config.withDefault("/app/nix-roots"),
+    Config.map(resolve),
+  ),
+  nixGcMaxBytes: positiveInteger("NIX_GC_MAX_BYTES", 10 * 1024 * 1024 * 1024),
 });
 
 const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (

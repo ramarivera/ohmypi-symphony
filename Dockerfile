@@ -28,15 +28,26 @@ RUN bun run build
 FROM oven/bun:1.3.14
 WORKDIR /app
 ENV NODE_ENV=production
-ENV PATH="/app/node_modules/.bin:${PATH}"
-RUN apt-get update && apt-get install -y --no-install-recommends bash ca-certificates git openssh-client \
+ENV PATH="/home/bun/.nix-profile/bin:/app/node_modules/.bin:${PATH}"
+ENV NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+# Install a pinned single-user Nix while building the image. Docker copies the
+# populated /nix into gateway-nix when it initializes the named volume.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl git openssh-client xz-utils \
+  && install -d -m 0755 -o bun -g bun /nix /app/data /app/logs /app/nix-roots /app/workspaces /home/bun/.omp/natives /home/bun/.config/nix \
+  && curl --fail --location --retry 3 --output /tmp/nix-install https://releases.nixos.org/nix/nix-2.30.3/install \
+  && echo "8ff029ac2a49134441dc14c9168abb04506710834d7390039a8c1800dd998cd9  /tmp/nix-install" | sha256sum --check --strict \
+  && chmod 0755 /tmp/nix-install \
+  && su -s /bin/sh bun -c 'HOME=/home/bun /tmp/nix-install --no-daemon' \
+  && rm -f /tmp/nix-install \
+  && printf '%s\n' 'experimental-features = nix-command flakes' 'sandbox = false' > /home/bun/.config/nix/nix.conf \
+  && chown -R bun:bun /app /home/bun /nix \
+  && apt-get purge -y --auto-remove curl xz-utils \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=omp /usr/local/bin/omp /usr/local/bin/omp
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json /app/bun.lock* ./
 RUN bun install --production --frozen-lockfile
-RUN mkdir -p /app/data /app/logs /app/workspaces /home/bun/.omp/natives \
-  && chown -R bun:bun /app /home/bun/.omp
 USER bun
 EXPOSE 3000
 CMD ["bun", "dist/index.js"]

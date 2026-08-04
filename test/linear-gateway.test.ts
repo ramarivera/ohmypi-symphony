@@ -175,6 +175,11 @@ const gatewayDependencies = Layer.mergeAll(
       logLevel: "info",
       logFile: Option.none(),
       databasePath: ":memory:",
+      nixBinaryPath: "nix",
+      nixpkgsFlakeRef:
+        "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+      nixRootsDir: "/tmp/nix-roots",
+      nixGcMaxBytes: 1_000_000,
       workspaceRoot: "/tmp/workspaces",
       ompCliPath: "omp",
       port: 3000,

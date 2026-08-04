@@ -121,6 +121,7 @@ describe("Effect foundation", () => {
         ref: nonce,
         teamIds: [nonce],
         projectIds: [nonce],
+        nixPackages: ["nodejs_22"],
       };
       roundTrip(RepositoryDefinition, repository);
       roundTrip(RepositoryRecord, {

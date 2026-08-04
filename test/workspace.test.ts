@@ -160,6 +160,7 @@ const repositoryRecord = (input: {
   labels: [...(input.labels ?? [])],
   projectIds: (input.projectIds ?? []).map(projectId),
   teamIds: (input.teamIds ?? []).map(teamId),
+  nixPackages: [],
   isDefault: input.isDefault ?? false,
   createdAt: 0,
   updatedAt: 0,

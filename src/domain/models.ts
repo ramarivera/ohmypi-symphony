@@ -50,12 +50,44 @@ export type LogLevel = Schema.Schema.Type<typeof LogLevel>;
 const NullableString = Schema.OptionFromNullOr(Schema.String);
 const NullableNumber = Schema.OptionFromNullOr(Schema.Number);
 
+/**
+ * A conservative Nix attribute path. Attribute selectors are passed to `nix`
+ * as argv values, never interpolated into a shell command.
+ */
+export const NixPackageName = Schema.String.pipe(
+  Schema.pattern(/^[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*$/u),
+  Schema.brand("@Gateway/NixPackageName"),
+);
+export type NixPackageName = Schema.Schema.Type<typeof NixPackageName>;
+
+export const NixCacheEntry = Schema.Struct({
+  cacheKey: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/u)),
+  nixpkgsFlakeRef: Schema.String,
+  packages: Schema.Array(NixPackageName),
+  storePaths: Schema.Array(Schema.String),
+  pathEntries: Schema.Array(Schema.String),
+  sizeBytes: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+});
+export type NixCacheEntry = Schema.Schema.Type<typeof NixCacheEntry>;
+
+export const normalizeNixPackages = (
+  packages: ReadonlyArray<unknown>,
+): ReadonlyArray<NixPackageName> => {
+  const normalized = packages.map((value) =>
+    Schema.decodeUnknownSync(NixPackageName)(value),
+  );
+  return [...new Set(normalized)].sort();
+};
+
 export const RepositoryDefinition = Schema.Struct({
   id: WorkspaceId,
   url: Schema.String,
   ref: Schema.String,
   teamIds: Schema.Array(TeamId),
   projectIds: Schema.Array(ProjectId),
+  nixPackages: Schema.Array(NixPackageName),
 });
 export type RepositoryDefinition = Schema.Schema.Type<
   typeof RepositoryDefinition

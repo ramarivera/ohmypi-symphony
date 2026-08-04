@@ -1,6 +1,7 @@
 export { AdminSessionRepo } from "./admin-session-repo.js";
 export { DeliveryRepo } from "./delivery-repo.js";
 export { InstallationRepo } from "./installation-repo.js";
+export { NixCacheRepo } from "./nix-cache-repo.js";
 export { ProjectionRepo } from "./projection-repo.js";
 export { RunEventRepo } from "./run-event-repo.js";
 export { RunInputRepo } from "./run-input-repo.js";

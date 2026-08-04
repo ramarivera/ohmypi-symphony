@@ -243,6 +243,11 @@ describe("HTTP router parity", () => {
       logLevel: "silent",
       logFile: Option.none(),
       databasePath: ":memory:",
+      nixBinaryPath: "nix",
+      nixpkgsFlakeRef:
+        "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+      nixRootsDir: "/tmp/nix-roots",
+      nixGcMaxBytes: 1_000_000,
       workspaceRoot: "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/router-test",
       ompCliPath: "omp",
       port: 3000,
@@ -321,6 +326,11 @@ describe("HTTP router parity", () => {
           logLevel: "silent",
           logFile: Option.none(),
           databasePath: ":memory:",
+          nixBinaryPath: "nix",
+          nixpkgsFlakeRef:
+            "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+          nixRootsDir: "/tmp/nix-roots",
+          nixGcMaxBytes: 1_000_000,
           workspaceRoot: "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/router-test",
           ompCliPath: "omp",
           port: 3000,

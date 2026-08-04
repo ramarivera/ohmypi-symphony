@@ -52,6 +52,11 @@ const testConfig: GatewayConfigShape = {
   tokenEncryptionKey: Redacted.make("test-token-key"),
   publicUrl: new URL("https://gateway.example/base/"),
   databasePath: ":memory:",
+  nixBinaryPath: "nix",
+  nixpkgsFlakeRef:
+    "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+  nixRootsDir: "/tmp/nix-roots",
+  nixGcMaxBytes: 1_000_000,
   workspaceRoot: "/workspaces",
   ompCliPath: "omp",
   port: 3000,

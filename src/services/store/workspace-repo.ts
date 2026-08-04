@@ -7,7 +7,11 @@ import type {
   TeamId,
   WorkspaceId,
 } from "../../domain/ids.js";
-import { RepositoryRecord } from "../../domain/models.js";
+import {
+  NixPackageName,
+  normalizeNixPackages,
+  RepositoryRecord,
+} from "../../domain/models.js";
 import {
   decodeRow,
   decodeRows,
@@ -25,6 +29,7 @@ const RepositoryRow = Schema.Struct({
   team_ids_json: Schema.String,
   project_ids_json: Schema.String,
   labels_json: Schema.String,
+  nix_packages_json: Schema.String,
   is_default: Schema.Number,
   created_at: Schema.Number,
   updated_at: Schema.Number,
@@ -75,6 +80,7 @@ const validateRepository = (
     readonly teamIds?: ReadonlyArray<TeamId>;
     readonly projectIds?: ReadonlyArray<ProjectId>;
     readonly labels?: ReadonlyArray<string>;
+    readonly nixPackages?: ReadonlyArray<NixPackageName>;
     readonly isDefault?: boolean;
   },
   now: number,
@@ -103,6 +109,7 @@ const validateRepository = (
         teamIds: normalizeStringArray(input.teamIds ?? [], "teamIds"),
         projectIds: normalizeStringArray(input.projectIds ?? [], "projectIds"),
         labels: normalizeStringArray(input.labels ?? [], "labels"),
+        nixPackages: normalizeNixPackages(input.nixPackages ?? []),
         isDefault: input.isDefault === true,
         createdAt: now,
         updatedAt: now,
@@ -132,6 +139,10 @@ const rowToRepositoryRecord = (
       row.labels_json,
       "repository labels",
     );
+    const nixPackages = yield* parseStringArray(
+      row.nix_packages_json,
+      "repository nix packages",
+    );
     const validTeamIds = yield* decodeRow(
       Schema.Array(Schema.String),
       teamIds,
@@ -147,6 +158,11 @@ const rowToRepositoryRecord = (
       labels,
       "RepositoryRecord.labels",
     );
+    const validNixPackages = yield* decodeRow(
+      Schema.Array(NixPackageName),
+      nixPackages,
+      "RepositoryRecord.nixPackages",
+    );
     return yield* decodeRow(
       RepositoryRecord,
       {
@@ -157,6 +173,7 @@ const rowToRepositoryRecord = (
         teamIds: validTeamIds,
         projectIds: validProjectIds,
         labels: validLabels,
+        nixPackages: validNixPackages,
         isDefault: row.is_default === 1,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
@@ -244,6 +261,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           readonly teamIds?: ReadonlyArray<TeamId>;
           readonly projectIds?: ReadonlyArray<ProjectId>;
           readonly labels?: ReadonlyArray<string>;
+          readonly nixPackages?: ReadonlyArray<NixPackageName>;
           readonly isDefault?: boolean;
           readonly now?: number;
         }): Effect.fn.Return<RepositoryRecord, DatabaseError | RowDecodeError> {
@@ -285,10 +303,10 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
               () =>
                 db
                   .query(`
-                  INSERT INTO repository (
-                    organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, is_default, created_at, updated_at
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                `)
+                    INSERT INTO repository (
+                      organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, nix_packages_json, is_default, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  `)
                   .run(
                     record.organizationId,
                     record.id,
@@ -297,6 +315,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
                     JSON.stringify(record.teamIds),
                     JSON.stringify(record.projectIds),
                     JSON.stringify(record.labels),
+                    JSON.stringify(record.nixPackages),
                     record.isDefault ? 1 : 0,
                     record.createdAt,
                     record.updatedAt,
@@ -321,6 +340,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
             readonly teamIds?: ReadonlyArray<TeamId>;
             readonly projectIds?: ReadonlyArray<ProjectId>;
             readonly labels?: ReadonlyArray<string>;
+            readonly nixPackages?: ReadonlyArray<NixPackageName>;
             readonly isDefault?: boolean;
             readonly now?: number;
           },
@@ -346,6 +366,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
               teamIds: input.teamIds ?? existing.teamIds,
               projectIds: input.projectIds ?? existing.projectIds,
               labels: input.labels ?? existing.labels,
+              nixPackages: input.nixPackages ?? existing.nixPackages,
               isDefault: input.isDefault ?? existing.isDefault,
             },
             now,
@@ -368,16 +389,17 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
               () =>
                 db
                   .query(`
-                  UPDATE repository
-                  SET url=?, ref=?, team_ids_json=?, project_ids_json=?, labels_json=?, is_default=?, updated_at=?
-                  WHERE organization_id=? AND id=?
-                `)
+                    UPDATE repository
+                    SET url=?, ref=?, team_ids_json=?, project_ids_json=?, labels_json=?, nix_packages_json=?, is_default=?, updated_at=?
+                    WHERE organization_id=? AND id=?
+                  `)
                   .run(
                     patch.url,
                     patch.ref,
                     JSON.stringify(patch.teamIds),
                     JSON.stringify(patch.projectIds),
                     JSON.stringify(patch.labels),
+                    JSON.stringify(patch.nixPackages),
                     patch.isDefault ? 1 : 0,
                     now,
                     organizationId,

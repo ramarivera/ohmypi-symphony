@@ -144,16 +144,19 @@ describe("renderAdminPage", () => {
     const html = renderAdminPage();
     expect(html).toContain("/api/admin/bootstrap");
     expect(html).toContain("/api/admin/repositories");
+    expect(html).toContain("/api/admin/nix-cache");
     expect(html).toContain("/api/admin/preview");
     expect(html).toContain("/api/admin/logout");
+    expect(html).toContain('name="nixPackages"');
+    expect(html).toContain("Nix package cache");
 
-    // compose a detail URL the right way
+    // compose detail URLs using encoded identifiers and never paths.
     expect(html).toMatch(
       /REPOSITORIES_BASE\s*\+\s*"\/"\s*\+\s*encodeURIComponent/,
     );
+    expect(html).toMatch(/NIX_CACHE_URL\s*\+\s*"\/"\s*\+\s*encodeURIComponent/);
 
-    // verb coverage for mutations: POST (create or logout), PUT (update),
-    // DELETE (delete) all used against the repository detail URL.
+    // POST create/prune, PUT update, and DELETE repository mutations.
     expect(html).toMatch(/method:\s*"POST"/);
     expect(html).toMatch(/isUpdate\s*\?\s*"PUT"\s*:\s*"POST"/);
     expect(html).toMatch(/method:\s*"DELETE"/);
@@ -188,6 +191,8 @@ describe("renderAdminPage", () => {
     // The script must do at least one textContent assignment for user-derived
     // values, proving the safe-by-default path is exercised.
     expect(html).toMatch(/\.textContent\s*=/);
+    expect(html).toMatch(/entry\s*&&\s*entry\.cacheKey/);
+    expect(html).toMatch(/cell\.textContent\s*=/);
   });
 
   test("renders semantic landmarks (header/nav/aside/main) and aria-live status regions", () => {

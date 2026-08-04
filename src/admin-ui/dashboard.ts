@@ -123,6 +123,12 @@ export const ADMIN_BODY = `
               placeholder="backend, urgent">
           </div>
           <div class="field full">
+            <label for="repo-nix-packages">Nix packages (comma-separated)</label>
+            <input id="repo-nix-packages" name="nixPackages" type="text" autocomplete="off"
+              placeholder="git, nodejs_22">
+            <span class="hint">Nixpkgs attribute paths only; packages are installed for this repository's agent sessions.</span>
+          </div>
+          <div class="field full">
             <div class="field-row">
               <label class="checkbox" for="repo-default">
                 <input id="repo-default" name="isDefault" type="checkbox">
@@ -136,6 +142,16 @@ export const ADMIN_BODY = `
             <button type="submit" class="btn btn-primary" id="repo-form-submit">Save repository</button>
           </div>
         </form>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="nix-cache-heading">
+      <div class="panel-header">
+        <h2 id="nix-cache-heading">Nix package cache</h2>
+      </div>
+      <div class="panel-body">
+        <div id="nix-cache-status" role="status" aria-live="polite"></div>
+        <div id="nix-cache-list" aria-busy="true"></div>
       </div>
     </section>
 
@@ -202,13 +218,14 @@ export const ADMIN_SCRIPT = `
   var REPOSITORIES_BASE = "/api/admin/repositories";
   var REPOSITORY_DETAIL = function (id) { return REPOSITORIES_BASE + "/" + encodeURIComponent(id); };
   var PREVIEW_URL = "/api/admin/preview";
+  var NIX_CACHE_URL = "/api/admin/nix-cache";
   var LOGOUT_URL = "/api/admin/logout";
-  var TOAST_DURATION_MS = 3500;
 
   var state = {
     csrfToken: "",
     installation: null,
     repositories: [],
+    nixCache: [],
     editing: null,
     pendingDelete: null,
     pendingConfirm: null,
@@ -379,7 +396,7 @@ export const ADMIN_SCRIPT = `
     table.className = "repos";
     var thead = document.createElement("thead");
     var headRow = document.createElement("tr");
-    ["Default ref", "URL", "Teams", "Projects", "Labels", "Default", ""].forEach(function (text) {
+    ["URL", "Default ref", "Teams", "Projects", "Labels", "Nix packages", "Default", ""].forEach(function (text) {
       var th = document.createElement("th");
       th.scope = "col";
       th.textContent = text;
@@ -414,6 +431,10 @@ export const ADMIN_SCRIPT = `
       var labelsCell = document.createElement("td");
       labelsCell.appendChild(buildPillList(repo.labels, "no label matching"));
       tr.appendChild(labelsCell);
+
+      var nixPackagesCell = document.createElement("td");
+      nixPackagesCell.appendChild(buildPillList(repo.nixPackages, "no extra packages"));
+      tr.appendChild(nixPackagesCell);
 
       var defaultCell = document.createElement("td");
       defaultCell.className = "default-cell";
@@ -479,6 +500,79 @@ export const ADMIN_SCRIPT = `
     return frag;
   }
 
+  function renderNixCache(entries) {
+    var list = el("nix-cache-list");
+    var status = el("nix-cache-status");
+    if (!list || !status) return;
+    list.textContent = "";
+    status.textContent = "";
+    if (!Array.isArray(entries) || entries.length === 0) {
+      list.textContent = "No cached Nix environments.";
+      setAriaBusy("nix-cache-list", false);
+      return;
+    }
+    var table = document.createElement("table");
+    table.className = "repos";
+    var head = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    ["Cache key", "Status", "Size (bytes)", "Last used", ""].forEach(function (label) {
+      var th = document.createElement("th");
+      th.scope = "col";
+      th.textContent = label;
+      headRow.appendChild(th);
+    });
+    head.appendChild(headRow);
+    table.appendChild(head);
+    var body = document.createElement("tbody");
+    entries.forEach(function (entry) {
+      var row = document.createElement("tr");
+      [
+        entry && entry.cacheKey,
+        entry && entry.status,
+        entry && entry.sizeBytes,
+        entry && entry.lastUsedAt,
+      ].forEach(function (value) {
+        var cell = document.createElement("td");
+        cell.textContent = value === undefined || value === null ? "—" : String(value);
+        row.appendChild(cell);
+      });
+      var actions = document.createElement("td");
+      var prune = document.createElement("button");
+      prune.type = "button";
+      prune.className = "btn-danger";
+      prune.dataset.action = "prune-nix-cache";
+      prune.dataset.cacheKey = entry && typeof entry.cacheKey === "string" ? entry.cacheKey : "";
+      prune.textContent = "Prune";
+      prune.disabled = !prune.dataset.cacheKey;
+      actions.appendChild(prune);
+      row.appendChild(actions);
+      body.appendChild(row);
+    });
+    table.appendChild(body);
+    list.appendChild(table);
+    status.textContent = entries.length + " cached Nix environment" + (entries.length === 1 ? "." : "s.");
+    setAriaBusy("nix-cache-list", false);
+  }
+
+  async function loadNixCache() {
+    setAriaBusy("nix-cache-list", true);
+    var result = await fetchJSON(NIX_CACHE_URL, { method: "GET" });
+    if (result && result.redirecting) return;
+    state.nixCache = result && result.data && Array.isArray(result.data.entries) ? result.data.entries : [];
+    renderNixCache(state.nixCache);
+  }
+
+  async function pruneNixCache(cacheKey) {
+    var result = await fetchJSON(NIX_CACHE_URL + "/" + encodeURIComponent(cacheKey) + "/prune", {
+      method: "POST",
+      body: {},
+    });
+    if (result && result.redirecting) return;
+    showToast("Nix cache entry pruned.", "ok");
+    await loadNixCache();
+  }
+
+
   // ---- form ----------------------------------------------------------------
 
   function openForm(repository) {
@@ -502,6 +596,9 @@ export const ADMIN_SCRIPT = `
         : "",
       labels: Array.isArray(repository && repository.labels)
         ? repository.labels.join(", ")
+        : "",
+      nixPackages: Array.isArray(repository && repository.nixPackages)
+        ? repository.nixPackages.join(", ")
         : "",
       isDefault: !!(repository && repository.isDefault),
     };
@@ -545,6 +642,7 @@ export const ADMIN_SCRIPT = `
     data.teamIds = parseList(elements.namedItem("teamIds").value);
     data.projectIds = parseList(elements.namedItem("projectIds").value);
     data.labels = parseList(elements.namedItem("labels").value);
+    data.nixPackages = parseList(elements.namedItem("nixPackages").value);
     data.isDefault = !!(elements.namedItem("isDefault") && elements.namedItem("isDefault").checked);
     var idField = elements.namedItem("id");
     if (idField && idField.value) data.id = idField.value;
@@ -642,6 +740,16 @@ export const ADMIN_SCRIPT = `
     if (!button) return;
     var id = button.getAttribute("data-repo-id") || "";
     var action = button.getAttribute("data-action");
+    if (action === "prune-nix-cache") {
+      var cacheKey = button.getAttribute("data-cache-key") || "";
+      if (!cacheKey) return;
+      openConfirm({
+        title: "Prune Nix cache?",
+        body: "Remove cached Nix environment " + cacheKey + "? Future sessions will rebuild it.",
+        onConfirm: function () { pruneNixCache(cacheKey); },
+      });
+      return;
+    }
     if (!id) return;
     if (action === "edit") {
       var found = state.repositories.find(function (r) { return r && r.id === id; });
@@ -834,6 +942,7 @@ export const ADMIN_SCRIPT = `
       state.repositories = Array.isArray(data.repositories) ? data.repositories : [];
       renderInstallation(state.installation);
       renderRepositories(state.repositories);
+      await loadNixCache();
       var badge = computeAccessibilityBadge(state.installation);
       setStatus(badge.state, badge.label);
       var logoutBtn = el("logout-btn");
@@ -890,6 +999,8 @@ export const ADMIN_SCRIPT = `
 
     var list = el("repos-list");
     if (list) list.addEventListener("click", handleRepoRowClick);
+    var nixCacheList = el("nix-cache-list");
+    if (nixCacheList) nixCacheList.addEventListener("click", handleRepoRowClick);
 
     var yesBtn = el("confirm-yes");
     var noBtn = el("confirm-no");

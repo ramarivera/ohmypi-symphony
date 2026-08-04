@@ -13,6 +13,21 @@ export class RowDecodeError extends Schema.TaggedError<RowDecodeError>()(
   "@Gateway/RowDecodeError",
   { ...message, entity: Schema.String },
 ) {}
+
+export class NixEnvironmentError extends Schema.TaggedError<NixEnvironmentError>()(
+  "@Gateway/NixEnvironmentError",
+  {
+    ...message,
+    reason: Schema.Literal(
+      "invalid_package",
+      "root_escape",
+      "process_failed",
+      "metadata_failed",
+      "gc_failed",
+    ),
+    cause: Schema.optional(Schema.String),
+  },
+) {}
 export class TokenCipherError extends Schema.TaggedError<TokenCipherError>()(
   "@Gateway/TokenCipherError",
   {

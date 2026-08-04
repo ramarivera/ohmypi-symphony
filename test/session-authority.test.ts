@@ -12,6 +12,7 @@ import {
 import {
   DatabaseError,
   InterruptedRunNoActionableInputError,
+  NixEnvironmentError,
 } from "../src/domain/errors.js";
 import {
   AppUserId,
@@ -19,9 +20,11 @@ import {
   OrganizationId,
   SessionId,
   SourceKey,
+  WorkspaceId,
 } from "../src/domain/ids.js";
-import type { Installation } from "../src/domain/models.js";
+import { type Installation, NixPackageName } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
   type RpcEvent,
@@ -346,6 +349,10 @@ const testConfigProvider = ConfigProvider.fromMap(
     ["TOKEN_ENCRYPTION_KEY", "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="],
     ["PUBLIC_URL", "http://localhost:3000"],
     [
+      "NIXPKGS_FLAKE_REF",
+      "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
+    ],
+    [
       "WORKSPACE_ROOT",
       "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/authority-tests",
     ],
@@ -438,7 +445,33 @@ const mockWorker: RpcWorkerHandle = {
 };
 
 const mockRpcWorker = RpcWorker.make({
-  spawn: () => Effect.succeed(mockWorker),
+  spawn: (input) =>
+    Effect.sync(() => {
+      workerSpawnInputs.push(input);
+      return mockWorker;
+    }),
+});
+const workerSpawnInputs: Array<{
+  readonly command: ReadonlyArray<string>;
+  readonly cwd: string;
+  readonly env?: Record<string, string | undefined>;
+}> = [];
+let nixPathEntries: ReadonlyArray<string> = [];
+let nixPrepareError: NixEnvironmentError | undefined;
+const nixPreparedRepositories: Array<string> = [];
+const mockNixEnvironment = NixEnvironment.make({
+  prepare: (repository) => {
+    nixPreparedRepositories.push(repository.id);
+    if (nixPrepareError !== undefined) return Effect.fail(nixPrepareError);
+    return Effect.succeed({
+      cacheKey: "test-cache",
+      storePaths: [],
+      pathEntries: nixPathEntries,
+      reused: false,
+    });
+  },
+  list: () => Effect.succeed([]),
+  prune: () => Effect.succeed(false),
 });
 
 const withAuthority = <A, E>(
@@ -447,7 +480,13 @@ const withAuthority = <A, E>(
   ) => Effect.Effect<
     A,
     E,
-    SessionAuthority | RunRepo | RunInputRepo | RunEventRepo | InstallationRepo
+    | SessionAuthority
+    | RunRepo
+    | RunInputRepo
+    | RunEventRepo
+    | InstallationRepo
+    | WorkspaceRepo
+    | NixEnvironment
   >,
 ) =>
   Effect.scoped(
@@ -459,6 +498,10 @@ const withAuthority = <A, E>(
       projectionExpected = 0;
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
+      workerSpawnInputs.length = 0;
+      nixPreparedRepositories.length = 0;
+      nixPathEntries = [];
+      nixPrepareError = undefined;
       projectorTerminals.length = 0;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
@@ -472,6 +515,7 @@ const withAuthority = <A, E>(
         WorkspaceRepo.Default,
         Layer.succeed(ActivityProjector, mockProjector),
         Layer.succeed(RpcWorker, mockRpcWorker),
+        Layer.succeed(NixEnvironment, mockNixEnvironment),
       ).pipe(
         Layer.provide(
           Layer.mergeAll(
@@ -676,6 +720,157 @@ describe("SessionAuthority infrastructure failures", () => {
           expect(Either.isLeft(result)).toBe(true);
           if (Either.isLeft(result)) {
             expect(result.left.message).toBe("primary projection failure");
+          }
+        }),
+      ),
+  );
+});
+describe("SessionAuthority Nix environment preparation", () => {
+  it.scopedLive(
+    "prepares repository dependencies before the first worker and its orphan retry",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const workspaceRepo = yield* WorkspaceRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "nix-authority-repository",
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* workspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://example.com/repository.git",
+            ref: "main",
+            nixPackages: [Schema.decodeUnknownSync(NixPackageName)("nodejs")],
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some("/tmp/nix-authority"),
+            ompSessionFile: Option.some("/tmp/nix-authority/session.jsonl"),
+          });
+          nixPathEntries = ["/nix/store/test-node/bin"];
+
+          yield* authority.processSession(testSessionId);
+          expect(nixPreparedRepositories).toEqual([repositoryId]);
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(workerSpawnInputs[0]?.env?.PATH).toBe(
+            `/nix/store/test-node/bin${process.env.PATH ? `:${process.env.PATH}` : ""}`,
+          );
+          expect(workerSpawnInputs[0]?.env?.HOME).toBe(process.env.HOME);
+
+          yield* authority.shutdown();
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            ompSessionFile: Option.some("/tmp/nix-authority/session.jsonl"),
+          });
+          yield* authority.processSession(testSessionId);
+          expect(nixPreparedRepositories).toEqual([repositoryId, repositoryId]);
+          expect(workerSpawnInputs).toHaveLength(2);
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "keeps the inherited environment unchanged for an empty dependency result",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const workspaceRepo = yield* WorkspaceRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "nix-empty-dependencies",
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* workspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://example.com/empty.git",
+            ref: "main",
+            nixPackages: [],
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some("/tmp/nix-empty"),
+            ompSessionFile: Option.some("/tmp/nix-empty/session.jsonl"),
+          });
+
+          yield* authority.processSession(testSessionId);
+          expect(nixPreparedRepositories).toEqual([repositoryId]);
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(workerSpawnInputs[0]?.env?.PATH).toBe(process.env.PATH);
+          expect(workerSpawnInputs[0]?.env?.HOME).toBe(process.env.HOME);
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "records a typed preparation failure without spawning an RPC worker",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const workspaceRepo = yield* WorkspaceRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "nix-failing-dependencies",
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* workspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://example.com/failing.git",
+            ref: "main",
+            nixPackages: [Schema.decodeUnknownSync(NixPackageName)("nodejs")],
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some("/tmp/nix-failing"),
+            ompSessionFile: Option.some("/tmp/nix-failing/session.jsonl"),
+          });
+          nixPrepareError = new NixEnvironmentError({
+            message: "Nix preparation failed",
+            reason: "process_failed",
+          });
+
+          const result = yield* Effect.either(
+            authority.processSession(testSessionId),
+          );
+          expect(Either.isLeft(result)).toBe(true);
+          if (Either.isLeft(result)) {
+            expect(result.left._tag).toBe("@Gateway/NixEnvironmentError");
+          }
+          expect(workerSpawnInputs).toHaveLength(0);
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.state).toBe("orphaned");
+            expect(run.value.terminalReason).toEqual(
+              Option.some("Nix preparation failed"),
+            );
           }
         }),
       ),

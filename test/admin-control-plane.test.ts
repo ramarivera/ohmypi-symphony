@@ -28,12 +28,14 @@ import {
   tokenHash,
 } from "../src/services/admin.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { NixEnvironment } from "../src/services/nix-environment.js";
 import { OAuth } from "../src/services/oauth.js";
 import { Reconciler } from "../src/services/reconciler.js";
 import {
   AdminSessionRepo,
   DeliveryRepo,
   InstallationRepo,
+  NixCacheRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -61,6 +63,13 @@ const configProvider = ConfigProvider.fromMap(
     ["LEASE_DURATION_MS", "60000"],
     ["WEBHOOK_REPLAY_WINDOW_MS", "60000"],
     ["LOG_LEVEL", "silent"],
+    ["NIX_BINARY_PATH", "nix"],
+    [
+      "NIXPKGS_FLAKE_REF",
+      "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+    ],
+    ["NIX_ROOTS_DIR", "/tmp/gateway-admin-nix-roots"],
+    ["NIX_GC_MAX_BYTES", "1000000"],
   ]),
 );
 
@@ -87,6 +96,8 @@ const withApp = <A, E>(
     | DeliveryRepo
     | GatewayConfig
     | InstallationRepo
+    | NixCacheRepo
+    | NixEnvironment
     | OAuth
     | RunEventRepo
     | RunInputRepo
@@ -113,6 +124,8 @@ const withApp = <A, E>(
       WebhookPipeline.Default,
       WorkspaceRepo.Default,
       Workspace.Default,
+      NixCacheRepo.Default,
+      NixEnvironment.Default,
       Admin.Default,
       reconcilerLayer,
     ).pipe(

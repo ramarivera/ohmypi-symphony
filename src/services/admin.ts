@@ -14,6 +14,7 @@ import {
 } from "../admin-ui.js";
 import {
   DatabaseError,
+  type NixEnvironmentError,
   RowDecodeError,
   type TokenCipherError,
   type WorkspaceError,
@@ -23,10 +24,14 @@ import { ProjectId, SessionId, TeamId, WorkspaceId } from "../domain/ids.js";
 import type {
   AgentRun,
   Installation,
+  NixCacheEntry,
+  NixPackageName,
   RepositoryRecord,
   RunEvent,
 } from "../domain/models.js";
+import { normalizeNixPackages } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
+import { NixEnvironment } from "./nix-environment.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
@@ -77,6 +82,7 @@ export interface AdminDeps {
   readonly workspaceRepo: WorkspaceRepo;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
+  readonly nixEnvironment: NixEnvironment;
 }
 
 interface RepositoryPayload {
@@ -87,6 +93,7 @@ interface RepositoryPayload {
   readonly projectIds: ReadonlyArray<string>;
   readonly labels: ReadonlyArray<string>;
   readonly isDefault: boolean | undefined;
+  readonly nixPackages: ReadonlyArray<NixPackageName>;
 }
 
 class AdminError extends Schema.TaggedError<AdminError>()(
@@ -200,6 +207,25 @@ function optionalStringArray(
   return stringArray(value, field);
 }
 
+function optionalNixPackageArray(
+  value: unknown,
+): Either.Either<ReadonlyArray<NixPackageName>, string> {
+  if (value === undefined || value === null) return Either.right([]);
+  if (!Array.isArray(value)) return Either.left("nixPackages must be an array");
+  if (value.some((item) => typeof item !== "string")) {
+    return Either.left("nixPackages must contain only strings");
+  }
+  const values = value.map((item) => item.trim()).filter(Boolean);
+  if (
+    values.some(
+      (item) => !/^[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*$/u.test(item),
+    )
+  ) {
+    return Either.left("Invalid Nix package name");
+  }
+  return Either.right(normalizeNixPackages(values));
+}
+
 function optionalBoolean(value: unknown): boolean | undefined {
   if (typeof value === "boolean") return value;
   return undefined;
@@ -220,6 +246,8 @@ function repositoryPayload(
   if (Either.isLeft(projectIds)) return Either.left(projectIds.left);
   const labels = optionalStringArray(body.labels, "labels");
   if (Either.isLeft(labels)) return Either.left(labels.left);
+  const nixPackages = optionalNixPackageArray(body.nixPackages);
+  if (Either.isLeft(nixPackages)) return Either.left(nixPackages.left);
   return Either.right({
     id,
     url,
@@ -227,6 +255,7 @@ function repositoryPayload(
     teamIds: teamIds.right,
     projectIds: projectIds.right,
     labels: labels.right,
+    nixPackages: nixPackages.right,
     isDefault: optionalBoolean(body.isDefault),
   });
 }
@@ -235,6 +264,7 @@ export function toApiRepository(repository: RepositoryRecord) {
   return {
     id: repository.id,
     organizationId: repository.organizationId,
+    nixPackages: [...repository.nixPackages],
     url: repository.url,
     ref: repository.ref,
     teamIds: [...repository.teamIds],
@@ -249,6 +279,7 @@ export function toApiRepository(repository: RepositoryRecord) {
 function toAdminInstallation(installation: Installation) {
   return {
     organizationId: installation.organizationId,
+
     appUserId: installation.appUserId,
     scopes: [...installation.scopes],
     revokedAt: Option.getOrElse(installation.revokedAt, () => null),
@@ -260,6 +291,15 @@ function toAdminInstallation(installation: Installation) {
       installation.canAccessAllPublicTeams,
       () => null,
     ),
+  };
+}
+
+function toApiNixCache(entry: NixCacheEntry) {
+  return {
+    cacheKey: entry.cacheKey,
+    status: "ready",
+    sizeBytes: entry.sizeBytes,
+    lastUsedAt: entry.updatedAt,
   };
 }
 
@@ -489,7 +529,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
       request: Request,
     ): Effect.fn.Return<
       Option.Option<Response>,
-      AdminError | DatabaseError | RowDecodeError | TokenCipherError
+      | AdminError
+      | DatabaseError
+      | NixEnvironmentError
+      | RowDecodeError
+      | TokenCipherError
     > {
       const now = yield* Clock.currentTimeMillis;
       const url = new URL(request.url);
@@ -643,6 +687,32 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
       }
 
+      if (url.pathname === "/api/admin/nix-cache" && request.method === "GET") {
+        yield* requireSession(request);
+        const entries = yield* deps.nixEnvironment.list();
+        return Option.some(json({ entries: entries.map(toApiNixCache) }));
+      }
+
+      const nixCachePrune =
+        /^\/api\/admin\/nix-cache\/([a-f0-9]{64})\/prune$/u.exec(url.pathname);
+      if (nixCachePrune !== null && request.method === "POST") {
+        const cacheKey = nixCachePrune[1];
+        if (cacheKey === undefined) {
+          return Option.some(text("Invalid Nix cache key", 400));
+        }
+        yield* requireMutation(request);
+        const pruned = yield* deps.nixEnvironment.prune(cacheKey);
+        return Option.some(json({ pruned }));
+      }
+
+      if (
+        url.pathname.startsWith("/api/admin/nix-cache/") &&
+        request.method === "POST"
+      ) {
+        yield* requireMutation(request);
+        return Option.some(text("Invalid Nix cache key", 400));
+      }
+
       if (
         url.pathname === "/api/admin/repositories" &&
         request.method === "POST"
@@ -695,6 +765,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           teamIds,
           projectIds,
           labels: payload.labels,
+          nixPackages: payload.nixPackages,
           isDefault: payload.isDefault ?? false,
           now,
         });
@@ -764,6 +835,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
               teamIds,
               projectIds,
               labels: payload.labels,
+              nixPackages: payload.nixPackages,
               ...(payload.isDefault !== undefined
                 ? { isDefault: payload.isDefault }
                 : {}),
@@ -881,6 +953,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     WorkspaceRepo.Default,
     Workspace.Default,
     Reconciler.Default,
+    NixEnvironment.Default,
   ],
   effect: Effect.gen(function* () {
     const config = yield* GatewayConfig;
@@ -891,6 +964,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const workspaceRepo = yield* WorkspaceRepo;
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
+    const nixEnvironment = yield* NixEnvironment;
     const handle = createAdminHandle({
       config,
       adminSessionRepo,
@@ -900,6 +974,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
       workspaceRepo,
       workspace,
       reconciler,
+      nixEnvironment,
     });
     return { handle };
   }),

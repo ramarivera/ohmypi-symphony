@@ -200,6 +200,7 @@ const migrate = (db: Database): void => {
       team_ids_json TEXT NOT NULL,
       project_ids_json TEXT NOT NULL,
       labels_json TEXT NOT NULL,
+      nix_packages_json TEXT NOT NULL DEFAULT '[]',
       is_default INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
@@ -230,6 +231,29 @@ const migrate = (db: Database): void => {
     );
     CREATE INDEX IF NOT EXISTS run_event_session
       ON run_event(session_id, created_at, source_key);
+  `);
+
+  const repositoryColumns = db
+    .query<{ name: string }, []>('PRAGMA table_info("repository")')
+    .all()
+    .map((column) => column.name);
+  if (!repositoryColumns.includes("nix_packages_json")) {
+    db.exec(
+      "ALTER TABLE repository ADD COLUMN nix_packages_json TEXT NOT NULL DEFAULT '[]'",
+    );
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS nix_cache (
+      cache_key TEXT PRIMARY KEY,
+      nixpkgs_flake_ref TEXT NOT NULL,
+      packages_json TEXT NOT NULL,
+      store_paths_json TEXT NOT NULL,
+      path_entries_json TEXT NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   const indexes = db
