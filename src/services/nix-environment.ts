@@ -312,8 +312,6 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
             input.nixBinaryPath,
             "path-info",
             "--json",
-            "--json-format",
-            "1",
             "--closure-size",
             ...storePaths,
           ]),
