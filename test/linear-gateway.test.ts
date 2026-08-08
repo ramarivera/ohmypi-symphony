@@ -166,6 +166,7 @@ const gatewayDependencies = Layer.mergeAll(
       get: () => Effect.succeed(Option.some(run)),
       create: unusedRepoMethod,
       update: unusedRepoMethod,
+      reopen: unusedRepoMethod,
       listRunnable: unusedRepoMethod,
       listCancellationPending: unusedRepoMethod,
       claimLease: unusedRepoMethod,

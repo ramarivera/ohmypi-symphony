@@ -75,6 +75,7 @@ const deps: AdminDeps = {
     get: unreachable,
     create: unreachable,
     update: unreachable,
+    reopen: unreachable,
     listRunnable: unreachable,
     listCancellationPending: unreachable,
     claimLease: unreachable,

@@ -893,12 +893,37 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* Effect.annotateCurrentSpan("sessionId", sessionId);
           return yield* Effect.gen(function* () {
             const initial = yield* runRepo.get(sessionId);
+            const inputs = yield* runInputRepo.pending(sessionId);
             if (
               Option.isSome(initial) &&
               initial.value.desiredState === "canceled"
             ) {
-              yield* cancel(initial.value);
-              return;
+              // A pending follow-up prompt resumes a user-stopped run.
+              // reopen only fires from state='canceled'; anything else
+              // (mid-flight 'stopping', externally canceled active runs)
+              // keeps honoring the cancellation.
+              const hasActionableInput = inputs.some(
+                (input) => input.kind !== "stop",
+              );
+              const resumed =
+                hasActionableInput && (yield* runRepo.reopen(sessionId));
+              if (!resumed) {
+                yield* cancel(initial.value);
+                // The cancellation honors any pending stop inputs; mark them
+                // so a later prompt isn't preceded by a stale stop re-cancel.
+                yield* Effect.forEach(
+                  inputs.filter((input) => input.kind === "stop"),
+                  (input) => runInputRepo.markProcessed(input.id),
+                  { discard: true },
+                );
+                return;
+              }
+              yield* Effect.logInfo("run.resumed").pipe(
+                Effect.annotateLogs({
+                  event: "run.resumed",
+                  sessionId,
+                }),
+              );
             }
             const workerState = yield* getWorker(sessionId);
             const leased = Option.isSome(workerState)
@@ -972,7 +997,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               );
               return;
             }
-            const inputs = yield* runInputRepo.pending(sessionId);
             let worker: RpcWorkerHandle | undefined = Option.getOrElse(
               Option.map(workerState, (state) => state.worker),
               () => undefined,
@@ -1040,13 +1064,39 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             }
             for (const input of inputs) {
               const latestOption = yield* runRepo.get(sessionId);
-              const latest = Option.isSome(latestOption)
+              let latest = Option.isSome(latestOption)
                 ? latestOption.value
                 : run;
-              if (latest.desiredState === "canceled" || input.kind === "stop") {
+              if (input.kind === "stop") {
                 yield* cancel(latest);
                 yield* runInputRepo.markProcessed(input.id);
                 break;
+              }
+              if (latest.desiredState === "canceled") {
+                // A follow-up prompt on a user-stopped session resumes the
+                // run; any other input on a canceled run still honors the
+                // cancellation. reopen refuses mid-flight cancellations
+                // (state='stopping'), which fall through to cancel.
+                const reopened =
+                  input.kind === "prompted"
+                    ? yield* runRepo.reopen(sessionId)
+                    : false;
+                if (!reopened) {
+                  yield* cancel(latest);
+                  yield* runInputRepo.markProcessed(input.id);
+                  break;
+                }
+                yield* Effect.logInfo("run.resumed").pipe(
+                  Effect.annotateLogs({
+                    event: "run.resumed",
+                    sessionId,
+                    inputId: input.id,
+                  }),
+                );
+                const reopenedOption = yield* runRepo.get(sessionId);
+                latest = Option.isSome(reopenedOption)
+                  ? reopenedOption.value
+                  : latest;
               }
               if (worker === undefined) {
                 if (runUrlForSession !== null) {
@@ -1061,52 +1111,78 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   `accepted:${input.id}`,
                   "Request accepted; preparing the OhMyPi worker.",
                 );
-                const baseContext = inputContext(input.payload);
-                const resolvedContext = {
-                  ...baseContext,
-                  organizationId:
-                    baseContext.organizationId ??
-                    (run.organizationId as string),
-                };
-                const context =
-                  input.kind === "prompted" &&
-                  latest.state === "waiting" &&
-                  resolvedContext.repositoryId === null
-                    ? { ...resolvedContext, repositoryId: input.body.trim() }
-                    : resolvedContext;
-                const resolution = yield* workspace.resolve(context);
-                if (resolution.kind === "none") {
-                  yield* projector.elicitation(
-                    sessionId,
-                    `repo:none:${input.id}`,
-                    "No repository is configured for this Linear issue.",
+                const existingWorkspacePath =
+                  Option.isSome(latest.repositoryId) &&
+                  Option.isSome(latest.workspacePath)
+                    ? latest.workspacePath
+                    : Option.none<string>();
+                if (Option.isSome(existingWorkspacePath)) {
+                  // Resume path (mirrors the orphan retry): repository and
+                  // workspace were resolved by an earlier attempt, and
+                  // startWorker reattaches the persisted OMP session via
+                  // --session when one was captured.
+                  yield* runRepo.update(sessionId, {
+                    state: "starting",
+                    incrementAttempt: true,
+                    nextAttemptAt: Option.none(),
+                  });
+                  const updatedOption = yield* runRepo.get(sessionId);
+                  if (Option.isNone(updatedOption)) return;
+                  worker = yield* startWorker(
+                    updatedOption.value,
+                    existingWorkspacePath.value,
                   );
-                  yield* runRepo.update(sessionId, { state: "waiting" });
-                  return;
-                }
-                if (resolution.kind === "ambiguous") {
-                  yield* projector.elicitation(
+                } else {
+                  const baseContext = inputContext(input.payload);
+                  const resolvedContext = {
+                    ...baseContext,
+                    organizationId:
+                      baseContext.organizationId ??
+                      (run.organizationId as string),
+                  };
+                  const context =
+                    input.kind === "prompted" &&
+                    latest.state === "waiting" &&
+                    resolvedContext.repositoryId === null
+                      ? { ...resolvedContext, repositoryId: input.body.trim() }
+                      : resolvedContext;
+                  const resolution = yield* workspace.resolve(context);
+                  if (resolution.kind === "none") {
+                    yield* projector.elicitation(
+                      sessionId,
+                      `repo:none:${input.id}`,
+                      "No repository is configured for this Linear issue.",
+                    );
+                    yield* runRepo.update(sessionId, { state: "waiting" });
+                    return;
+                  }
+                  if (resolution.kind === "ambiguous") {
+                    yield* projector.elicitation(
+                      sessionId,
+                      `repo:ambiguous:${input.id}`,
+                      "Select the repository for this issue.",
+                      resolution.repositories.map((r) => r.id),
+                    );
+                    yield* runRepo.update(sessionId, { state: "waiting" });
+                    return;
+                  }
+                  const workspacePath = yield* workspace.materialize(
                     sessionId,
-                    `repo:ambiguous:${input.id}`,
-                    "Select the repository for this issue.",
-                    resolution.repositories.map((r) => r.id),
+                    resolution.repository,
                   );
-                  yield* runRepo.update(sessionId, { state: "waiting" });
-                  return;
+                  yield* runRepo.update(sessionId, {
+                    state: "starting",
+                    repositoryId: Option.some(resolution.repository.id),
+                    workspacePath: Option.some(workspacePath),
+                    incrementAttempt: true,
+                  });
+                  const updatedOption = yield* runRepo.get(sessionId);
+                  if (Option.isNone(updatedOption)) return;
+                  worker = yield* startWorker(
+                    updatedOption.value,
+                    workspacePath,
+                  );
                 }
-                const workspacePath = yield* workspace.materialize(
-                  sessionId,
-                  resolution.repository,
-                );
-                yield* runRepo.update(sessionId, {
-                  state: "starting",
-                  repositoryId: Option.some(resolution.repository.id),
-                  workspacePath: Option.some(workspacePath),
-                  incrementAttempt: true,
-                });
-                const updatedOption = yield* runRepo.get(sessionId);
-                if (Option.isNone(updatedOption)) return;
-                worker = yield* startWorker(updatedOption.value, workspacePath);
                 const agentInvoked = yield* worker.prompt(
                   linearWorkerPrompt(input.kind, input.body),
                 );

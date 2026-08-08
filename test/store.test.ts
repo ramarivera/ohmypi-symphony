@@ -300,7 +300,7 @@ describe("Store repositories", () => {
   );
 
   it.scopedLive(
-    "stop dominates later prompts and revocation cancels all live runs",
+    "prompts after stop are accepted for resume and revocation cancels all live runs",
     () =>
       withRepos(
         Effect.gen(function* () {
@@ -324,6 +324,9 @@ describe("Store repositories", () => {
               payload: {},
             }),
           ).toBe(true);
+          // A follow-up prompt is no longer rejected at enqueue time; the
+          // session authority decides between honoring the cancellation and
+          // resuming when it processes the input.
           expect(
             yield* inputRepo.enqueue({
               id: makeInputId("late"),
@@ -332,7 +335,7 @@ describe("Store repositories", () => {
               body: "keep going",
               payload: {},
             }),
-          ).toBe(false);
+          ).toBe(true);
 
           const maybeRun = yield* runRepo.get(makeSessionId("session-1"));
           Option.match(maybeRun, {

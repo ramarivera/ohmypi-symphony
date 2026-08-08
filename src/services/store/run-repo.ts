@@ -254,6 +254,30 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       }
     });
 
+    // Reopens a user-stopped run so a follow-up Linear prompt can resume it.
+    // Raw SQL because `update` treats terminal states as immutable; guarded by
+    // state='canceled' so finished-run reopening stays with RunInputRepo and a
+    // mid-flight cancellation (state='stopping') is left alone.
+    const reopen = Effect.fn("RunRepo.reopen")(function* (
+      sessionId: SessionId,
+    ): Effect.fn.Return<boolean, DatabaseError> {
+      yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+      const now = yield* Clock.currentTimeMillis;
+      const result = yield* tryDb(
+        () =>
+          db
+            .query(`
+              UPDATE agent_run
+              SET state='queued', desired_state='running', attempt=0,
+                terminal_reason=NULL, next_attempt_at=NULL, updated_at=?
+              WHERE session_id=? AND state='canceled'
+            `)
+            .run(now, sessionId),
+        "RunRepo.reopen",
+      );
+      return (yield* runChanges(result, "RunRepo.reopen")) === 1;
+    });
+
     const listRunnable = Effect.fn("RunRepo.listRunnable")(function* (
       now: number,
     ): Effect.fn.Return<
@@ -386,6 +410,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       create,
       get,
       update,
+      reopen,
       listRunnable,
       listCancellationPending,
       claimLease,

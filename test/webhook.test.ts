@@ -654,7 +654,7 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive("stop dominates later prompted events", () =>
+  it.scopedLive("prompted events after stop are accepted for resume", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
@@ -665,10 +665,12 @@ describe("Linear webhook input correctness", () => {
           signedRequest(promptedPayload(now)),
         );
 
+        // The prompt is enqueued alongside the stop; the session authority
+        // decides between honoring the cancellation and resuming the run.
         expect(response.status).toBe(200);
         expect(
           yield* RunInputRepo.pending(sessionId("session-1")),
-        ).toHaveLength(2);
+        ).toHaveLength(3);
         expect(
           expectSome(yield* RunRepo.get(sessionId("session-1")))?.desiredState,
         ).toBe("canceled");

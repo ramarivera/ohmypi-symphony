@@ -389,6 +389,90 @@ describe("SessionAuthority behavior invariants", () => {
       ),
     { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
+
+  it.effect(
+    "resumes a user-stopped run when a follow-up prompt arrives",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          const installationRepo = yield* InstallationRepo;
+          const workspaceRepo = yield* WorkspaceRepo;
+          const repositoryId =
+            Schema.decodeUnknownSync(WorkspaceId)("resume-repository");
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* workspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://example.com/repository.git",
+            ref: "main",
+            nixPackages: [],
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "running",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some("/tmp/resume-workspace"),
+            ompSessionFile: Option.some("/tmp/resume-workspace/session.jsonl"),
+          });
+
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("stop-input"),
+            sessionId: testSessionId,
+            kind: "stop",
+            body: "stop",
+            payload: {},
+          });
+          yield* authority.processSession(testSessionId);
+
+          const stopped = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(stopped)).toBe(true);
+          if (Option.isSome(stopped)) {
+            expect(stopped.value.state).toBe("canceled");
+            expect(stopped.value.desiredState).toBe("canceled");
+          }
+          expect(projectorTerminals).toContainEqual({
+            sessionId: testSessionId,
+            sourceKey: `stop:${testSessionId}`,
+            kind: "response",
+            text: "Stopped as requested.",
+          });
+
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("resume-input"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "please continue the task",
+            payload: {},
+          });
+          yield* authority.processSession(testSessionId);
+
+          const resumed = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(resumed)).toBe(true);
+          if (Option.isSome(resumed)) {
+            // startWorker marks the run running once the worker accepts the
+            // prompt.
+            expect(resumed.value.state).toBe("running");
+            expect(resumed.value.desiredState).toBe("running");
+            expect(resumed.value.terminalReason).toEqual(Option.none());
+          }
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(workerSpawnInputs[0]?.command).toContain("--session");
+          expect(workerSpawnInputs[0]?.command).toContain(
+            "/tmp/resume-workspace/session.jsonl",
+          );
+          expect(workerSpawnInputs[0]?.cwd).toBe("/tmp/resume-workspace");
+          expect(workerPrompts).toEqual(["please continue the task"]);
+        }),
+      ),
+    { timeout: 15_000 },
+  );
 });
 
 const testConfigProvider = ConfigProvider.fromMap(
@@ -473,13 +557,18 @@ const mockProjector = ActivityProjector.make({
     }),
 });
 
+const workerPrompts: Array<string> = [];
 const mockWorker: RpcWorkerHandle = {
   sessionId: Effect.succeed(Option.none()),
   sessionFile: Effect.succeed(Option.none()),
   isStreaming: Effect.succeed(false),
   start: () => Effect.void,
   stop: () => Effect.void,
-  prompt: () => Effect.succeed(true),
+  prompt: (message) =>
+    Effect.sync(() => {
+      workerPrompts.push(message);
+      return true;
+    }),
   steer: () => Effect.void,
   followUp: () => Effect.void,
   abort: () => Effect.void,
@@ -550,6 +639,7 @@ const withAuthority = <A, E>(
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
       workerSpawnInputs.length = 0;
+      workerPrompts.length = 0;
       nixPreparedRepositories.length = 0;
       nixPathEntries = [];
       nixPrepareError = undefined;

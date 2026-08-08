@@ -114,9 +114,9 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
               new DatabaseError({ message: `Unknown run ${input.sessionId}` }),
             );
           }
-          if (input.kind !== "stop" && run.value.desired_state === "canceled") {
-            return false;
-          }
+          // Prompts on canceled runs are accepted so the authority can resume
+          // them; cancellation dominance is enforced during input processing,
+          // not at enqueue time.
 
           const createdAt = input.createdAt ?? (yield* Clock.currentTimeMillis);
           const insertResult = yield* tryDb(
