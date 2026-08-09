@@ -19,7 +19,7 @@
   "dependencies": {
     "@effect/platform": "^0.97.1",
     "@effect/platform-bun": "^0.91.2",
-    "@linear/sdk": "88.3.0",
+    "@linear/sdk": "89.0.0",
     "@oh-my-pi/pi-coding-agent": "17.1.8",
     "effect": "^3.22.1",
     "pino": "^10.3.1",
