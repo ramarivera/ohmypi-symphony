@@ -634,6 +634,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Effect.flatMap(sessionMutationGate(sessionId), (gate) =>
           gate.withPermits(1)(effect),
         );
+      const releaseMutationGate = (
+        sessionId: SessionId,
+      ): Effect.Effect<void, never, never> =>
+        Ref.update(sessionMutationGatesRef, (gates) => {
+          const next = new Map(gates);
+          next.delete(sessionId);
+          return next;
+        });
       const recordStopDeferral = (
         sessionId: SessionId,
         inputId: string,
@@ -866,48 +874,54 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const cancel = Effect.fn("SessionAuthority.cancel")(function* (
         run: AgentRun,
       ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
-        // Share the mutation gate with host-tool dispatch: cancellation
-        // either lands before a mutation's in-gate re-read (mutation
-        // refused) or waits for the in-flight mutation to complete.
-        yield* withSessionMutationGate(run.sessionId, Effect.void);
-        const state = yield* getWorker(run.sessionId);
-        if (Option.isSome(state)) {
-          yield* abortForCleanup(run.sessionId, state.value.worker);
-          yield* state.value.worker.stop();
-          yield* Ref.update(workersRef, (workers) => {
-            const next = new Map(workers);
-            next.delete(run.sessionId);
-            return next;
-          });
-        }
-        yield* Ref.update(pendingUiRef, (pending) => {
-          const next = new Map(pending);
-          next.delete(run.sessionId);
-          return next;
-        });
-        if (
-          run.state !== "succeeded" &&
-          run.state !== "failed" &&
-          run.state !== "canceled"
-        ) {
-          yield* runRepo.update(run.sessionId, {
-            state: "canceled",
-            terminalReason: Option.some("Stopped by Linear user"),
-          });
-          yield* Effect.logInfo("run.canceled").pipe(
-            Effect.annotateLogs({
-              event: "run.canceled",
-              sessionId: run.sessionId,
-              attempt: run.attempt,
-            }),
-          );
-          yield* projector.terminal(
-            run.sessionId,
-            `stop:${run.sessionId}`,
-            "response",
-            "Stopped as requested.",
-          );
-        }
+        // Hold the mutation gate for the whole cancellation: an in-flight
+        // host-tool mutation completes first, and a mutation arriving
+        // after the gate is acquired sees the canceled run in its in-gate
+        // re-read and is refused.
+        yield* withSessionMutationGate(
+          run.sessionId,
+          Effect.gen(function* () {
+            const state = yield* getWorker(run.sessionId);
+            if (Option.isSome(state)) {
+              yield* abortForCleanup(run.sessionId, state.value.worker);
+              yield* state.value.worker.stop();
+              yield* Ref.update(workersRef, (workers) => {
+                const next = new Map(workers);
+                next.delete(run.sessionId);
+                return next;
+              });
+            }
+            yield* Ref.update(pendingUiRef, (pending) => {
+              const next = new Map(pending);
+              next.delete(run.sessionId);
+              return next;
+            });
+            if (
+              run.state !== "succeeded" &&
+              run.state !== "failed" &&
+              run.state !== "canceled"
+            ) {
+              yield* runRepo.update(run.sessionId, {
+                state: "canceled",
+                terminalReason: Option.some("Stopped by Linear user"),
+              });
+              yield* Effect.logInfo("run.canceled").pipe(
+                Effect.annotateLogs({
+                  event: "run.canceled",
+                  sessionId: run.sessionId,
+                  attempt: run.attempt,
+                }),
+              );
+              yield* projector.terminal(
+                run.sessionId,
+                `stop:${run.sessionId}`,
+                "response",
+                "Stopped as requested.",
+              );
+            }
+          }),
+        );
+        yield* releaseMutationGate(run.sessionId);
         yield* releaseIfNoWorker(run.sessionId);
       });
 
@@ -977,6 +991,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               "error",
               `The OhMyPi run failed after ${run.attempt} attempts. Reference: ${correlationId}`,
             );
+            yield* releaseMutationGate(sessionId);
             return;
           }
 
@@ -1450,9 +1465,17 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     ),
                   );
                 if (Option.isNone(fresh)) return fail("Run no longer exists");
-                if (fresh.value.desiredState === "canceled") {
+                // Reject terminal runs too: the team-access-removal and
+                // failure paths write terminal states without flipping
+                // desiredState.
+                if (
+                  fresh.value.desiredState === "canceled" ||
+                  fresh.value.state === "succeeded" ||
+                  fresh.value.state === "failed" ||
+                  fresh.value.state === "canceled"
+                ) {
                   return fail(
-                    "Run is canceled; mutating Linear tools are refused",
+                    "Run is finished; mutating Linear tools are refused",
                   );
                 }
                 return yield* dispatch;
@@ -1692,6 +1715,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 "error",
                 "The Linear installation is unavailable. Reinstall or reauthorize the app, then try again.",
               );
+              yield* releaseMutationGate(sessionId);
               return;
             }
             const teamAccess = Option.match(
@@ -1723,6 +1747,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 "response",
                 "Stopped because this Linear installation no longer has access to the issue's team.",
               );
+              yield* releaseMutationGate(sessionId);
               return;
             }
             let worker: RpcWorkerHandle | undefined = Option.getOrElse(
@@ -2074,6 +2099,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* Ref.set(eventSequenceRef, new Map());
           yield* Ref.set(pendingUiRef, new Map());
           yield* Ref.set(reportedPullRequestUrlsRef, new Map());
+          yield* Ref.set(stopDeferralCountsRef, new Map());
+          yield* Ref.set(sessionMutationGatesRef, new Map());
           yield* projector.flushPending();
         },
       );

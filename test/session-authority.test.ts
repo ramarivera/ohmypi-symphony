@@ -5,6 +5,7 @@ import {
   Deferred,
   Effect,
   Either,
+  Fiber,
   Layer,
   Option,
   Schema,
@@ -567,12 +568,16 @@ let hostToolListener:
       request: RpcHostToolCall,
     ) => Effect.Effect<RpcHostToolResult, never, never>)
   | undefined;
+const orderEvents: Array<string> = [];
 const mockWorker: RpcWorkerHandle = {
   sessionId: Effect.succeed(Option.none()),
   sessionFile: Effect.succeed(Option.none()),
   isStreaming: Effect.succeed(false),
   start: () => Effect.void,
-  stop: () => Effect.void,
+  stop: () =>
+    Effect.sync(() => {
+      orderEvents.push("worker-stopped");
+    }),
   prompt: (message) =>
     Effect.sync(() => {
       workerPrompts.push(message);
@@ -636,12 +641,21 @@ const toolCommentCalls: Array<{
   readonly sessionId: string;
   readonly body: string;
 }> = [];
+let commentEnteredSignal: Deferred.Deferred<void> | undefined;
+let commentRelease: Deferred.Deferred<void> | undefined;
 const mockToolsGateway = LinearGateway.make({
   createActivity: () => Effect.die(new Error("unused in authority tests")),
   updateSession: () => Effect.die(new Error("unused in authority tests")),
   createIssueComment: (input) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
+      if (commentEnteredSignal !== undefined) {
+        Deferred.unsafeDone(commentEnteredSignal, Effect.void);
+      }
+      if (commentRelease !== undefined) {
+        yield* Deferred.await(commentRelease);
+      }
       toolCommentCalls.push(input);
+      orderEvents.push("comment-completed");
       return `comment-${toolCommentCalls.length}`;
     }),
   refreshInstallation: () => Effect.die(new Error("unused in authority tests")),
@@ -702,6 +716,9 @@ const withAuthority = <A, E>(
       nixPrepareError = undefined;
       projectorTerminals.length = 0;
       toolCommentCalls.length = 0;
+      orderEvents.length = 0;
+      commentEnteredSignal = undefined;
+      commentRelease = undefined;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
       const dependencies = Layer.mergeAll(
@@ -984,6 +1001,74 @@ describe("SessionAuthority host-tool mutation gate", () => {
             arguments: { issueId: "issue-1" },
           });
           expect(read.isError).not.toBe(true);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
+
+  it.scopedLive("cancel waits for an in-flight mutation holding the gate", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/mutation-gate-order"),
+            ompSessionFile: Option.some(
+              "/tmp/mutation-gate-order/session.jsonl",
+            ),
+          });
+          yield* authority.processSession(testSessionId);
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
+
+          // Block the mutation inside the gateway's Linear call while it
+          // holds the session gate.
+          commentEnteredSignal = yield* Deferred.make<void>();
+          commentRelease = yield* Deferred.make<void>();
+          const mutationFiber = yield* Effect.fork(
+            listener({
+              id: "call-blocked",
+              toolCallId: "tool-blocked",
+              toolName: "linear_create_comment",
+              arguments: { body: "in-flight" },
+            }),
+          );
+          yield* Deferred.await(commentEnteredSignal);
+
+          // A user stop arrives; processSession must not reach
+          // worker.stop until the in-flight mutation releases the gate.
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)(
+              `${testSessionId}:stop:stop-1`,
+            ),
+            sessionId: testSessionId,
+            kind: "stop",
+            body: "Stop requested",
+            payload: {},
+          });
+          const cancelFiber = yield* Effect.fork(
+            authority.processSession(testSessionId),
+          );
+          yield* Effect.yieldNow();
+          yield* Effect.yieldNow();
+          yield* Effect.yieldNow();
+          expect(orderEvents).not.toContain("worker-stopped");
+
+          Deferred.unsafeDone(commentRelease, Effect.void);
+          yield* Fiber.await(mutationFiber);
+          yield* Fiber.await(cancelFiber);
+          expect(orderEvents).toEqual(["comment-completed", "worker-stopped"]);
         }),
       { withLinearGateway: true },
     ),
