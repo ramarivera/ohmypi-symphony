@@ -132,7 +132,8 @@ export const parseRepositorySuggestionCandidate = (
   }
   const repositoryFullName = pathname
     .replace(/^\/+/u, "")
-    .replace(/\.git$/u, "");
+    .replace(/\.git$/u, "")
+    .replace(/\/+$/u, "");
   if (hostname.length === 0 || !/^[^/]+\/[^/]+$/u.test(repositoryFullName)) {
     return null;
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Option, Schema } from "effect";
+import { Effect, Layer, Option, Schema, TestClock } from "effect";
 import { LinearApiError } from "../src/domain/errors.js";
 import { OrganizationId, SessionId } from "../src/domain/ids.js";
 import type { AgentRun } from "../src/domain/models.js";
@@ -57,6 +57,7 @@ const makeLayer = (
 ) => {
   const inserted = new Set<string>();
   const ids: string[] = [];
+  const bodies = new Map<string, string>();
   const listRunnableCalls: Array<{
     readonly now: number;
     readonly includeUnleased: boolean;
@@ -70,11 +71,12 @@ const makeLayer = (
     listCancellationPending: () => Effect.succeed(runs),
   } as unknown as RunRepo;
   const runInputRepo = {
-    enqueue: (input: { id: string }) =>
+    enqueue: (input: { id: string; body?: string }) =>
       Effect.sync(() => {
         if (inserted.has(input.id)) return false;
         inserted.add(input.id);
         ids.push(input.id);
+        bodies.set(input.id, input.body ?? "");
         return true;
       }),
   } as unknown as RunInputRepo;
@@ -91,7 +93,7 @@ const makeLayer = (
     Layer.provide(Layer.succeed(SessionAuthority, authority)),
   );
   const layer = Layer.mergeAll(reconciler, deps);
-  return { layer, ids, listRunnableCalls };
+  return { layer, ids, bodies, listRunnableCalls };
 };
 
 describe("Reconciler catch-up", () => {
@@ -99,7 +101,7 @@ describe("Reconciler catch-up", () => {
     "injects prompt and stop activities once, with unknown activities ignored",
     () =>
       Effect.gen(function* () {
-        const { layer, ids, listRunnableCalls } = makeLayer(
+        const { layer, ids, bodies, listRunnableCalls } = makeLayer(
           [run(sessionA)],
           () =>
             Effect.succeed([
@@ -107,6 +109,7 @@ describe("Reconciler catch-up", () => {
                 id: "prompt-1",
                 type: "prompt",
                 body: "hello",
+                title: "Follow-up on ENG-1",
                 signal: null,
                 createdAt: "2025-01-01T00:00:00.000Z",
               },
@@ -114,6 +117,7 @@ describe("Reconciler catch-up", () => {
                 id: "stop-1",
                 type: "prompt",
                 body: "stop",
+                title: null,
                 signal: "stop",
                 createdAt: "2025-01-01T00:00:00.000Z",
               },
@@ -121,6 +125,7 @@ describe("Reconciler catch-up", () => {
                 id: "new-1",
                 type: "unknown",
                 body: "ignored",
+                title: null,
                 signal: null,
                 createdAt: "2025-01-01T00:00:00.000Z",
               },
@@ -128,6 +133,9 @@ describe("Reconciler catch-up", () => {
         );
         yield* Effect.gen(function* () {
           const reconciler = yield* Reconciler;
+          // TestClock starts at epoch: advance past the catch-up min-age so
+          // the createdAt=0 fixtures are old enough to be polled.
+          yield* TestClock.adjust("10 minutes");
           yield* reconciler.catchup();
           yield* reconciler.catchup();
         }).pipe(Effect.provide(layer));
@@ -138,6 +146,11 @@ describe("Reconciler catch-up", () => {
           `${sessionA}:prompted:prompt-1`,
           `${sessionA}:stop:stop-1`,
         ]);
+        // Catch-up mirrors the webhook's extractPromptBody title prefix.
+        expect(bodies.get(`${sessionA}:prompted:prompt-1`)).toBe(
+          "# Follow-up on ENG-1\n\nhello",
+        );
+        expect(bodies.get(`${sessionA}:stop:stop-1`)).toBe("stop");
       }),
   );
 
@@ -160,6 +173,7 @@ describe("Reconciler catch-up", () => {
                     id: "cancel-stop",
                     type: "prompt",
                     body: "stop",
+                    title: null,
                     signal: "stop",
                     createdAt: "2025-01-01T00:00:00.000Z",
                   },
@@ -167,6 +181,7 @@ describe("Reconciler catch-up", () => {
                     id: "cancel-prompt",
                     type: "prompt",
                     body: "resume",
+                    title: null,
                     signal: null,
                     createdAt: "2025-01-01T00:00:00.000Z",
                   },
@@ -174,6 +189,7 @@ describe("Reconciler catch-up", () => {
         );
         yield* Effect.gen(function* () {
           const reconciler = yield* Reconciler;
+          yield* TestClock.adjust("10 minutes");
           yield* reconciler.catchup();
         }).pipe(Effect.provide(layer));
         expect(ids).toEqual([`${sessionB}:prompted:cancel-prompt`]);
@@ -189,6 +205,7 @@ describe("Reconciler catch-up", () => {
               id: "recent-prompt",
               type: "prompt",
               body: "ignored",
+              title: null,
               signal: null,
               createdAt: "2025-01-01T00:00:00.000Z",
             },

@@ -20,6 +20,11 @@ export interface ReconcilerStatus {
   readonly lastError: Option.Option<string>;
 }
 
+// Catch-up polls run inline before processRunnable and share the per-org
+// Linear queue, so each sweep handles a bounded batch; the rest wait for
+// the next sweep.
+const MAX_CATCHUP_CANDIDATES_PER_SWEEP = 25;
+
 export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
   accessors: true,
   dependencies: [SessionAuthority.Default],
@@ -75,6 +80,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
           }),
         );
         const seen = new Set<string>();
+        let polled = 0;
         for (const run of candidatesResult) {
           if (seen.has(run.sessionId)) continue;
           seen.add(run.sessionId);
@@ -88,12 +94,22 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
           ) {
             continue;
           }
-          if (
-            Option.isSome(run.lastActivityAt) &&
-            now - run.lastActivityAt.value < minAgeMs
-          ) {
+          // Bound per-sweep Linear traffic: catchup runs inline before
+          // processRunnable and shares the per-org API queue, so a large
+          // backlog must not starve live runs. Oldest candidates first
+          // (SQL orders by created_at); the rest are picked up next sweep.
+          if (polled >= MAX_CATCHUP_CANDIDATES_PER_SWEEP) break;
+          // Runs that never recorded activity (e.g. just created by a live
+          // webhook) fall back to createdAt for the min-age guard, so fresh
+          // sessions aren't pointlessly polled.
+          const activityAt = Option.getOrElse(
+            run.lastActivityAt,
+            () => run.createdAt,
+          );
+          if (now - activityAt < minAgeMs) {
             continue;
           }
+          polled += 1;
           const activities = yield* gateway
             .listSessionActivities({
               sessionId: run.sessionId,
@@ -122,19 +138,29 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
             const id = Schema.decodeUnknownSync(InputId)(
               `${run.sessionId}:${kind}:${activity.id}`,
             );
+            // Mirror the webhook's extractPromptBody: title-prefixed when the
+            // activity carries a title, so a catch-up-first injection reads
+            // identically to a webhook-delivered prompt.
+            const body =
+              activity.title !== null && activity.body !== null
+                ? `# ${activity.title}\n\n${activity.body}`
+                : (activity.body ?? activity.title ?? "");
+            const activityCreatedAt = Date.parse(activity.createdAt);
             const inserted = yield* runInputRepo
               .enqueue({
                 id,
                 sessionId: run.sessionId,
                 kind,
-                body: activity.body ?? "",
+                body,
                 payload: {
                   source: "reconciler.catchup",
                   sessionId: run.sessionId,
                   activityId: activity.id,
                   activity,
                 },
-                createdAt: Date.parse(activity.createdAt) || now,
+                createdAt: Number.isFinite(activityCreatedAt)
+                  ? activityCreatedAt
+                  : now,
               })
               .pipe(
                 Effect.matchCauseEffect({

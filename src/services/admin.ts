@@ -695,12 +695,18 @@ export const createAdminHandle = (deps: AdminDeps) =>
               ),
           }),
         );
-        yield* requireMutation(request);
+        const adminSession = yield* requireMutation(request);
         const runOption = yield* deps.runRepo.get(sessionId);
         if (Option.isNone(runOption)) {
           return Option.some(text("Not found", 404));
         }
         const run = runOption.value;
+        // Scope to the authenticated admin's organization: a valid admin
+        // session for org A must not drive runs (or spend tokens) of org B.
+        // 404 rather than 403 so cross-org run ids are not confirmable.
+        if (run.organizationId !== adminSession.organizationId) {
+          return Option.some(text("Not found", 404));
+        }
         if (Option.isNone(run.issueId)) {
           return Option.some(text("Run is not linked to an issue", 409));
         }

@@ -31,6 +31,7 @@ export interface ListedSessionActivity {
     | "prompt"
     | "unknown";
   readonly body: string | null;
+  readonly title: string | null;
   readonly signal: "auth" | "continue" | "select" | "stop" | null;
   readonly createdAt: string;
 }
@@ -707,6 +708,8 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
                         ? "prompt"
                         : "unknown";
           const body = typeof content.body === "string" ? content.body : null;
+          const title =
+            typeof content.title === "string" ? content.title : null;
           const createdAt =
             activity.createdAt instanceof Date
               ? activity.createdAt.toISOString()
@@ -720,6 +723,7 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
                 : String(activity.id),
             type,
             body,
+            title,
             signal: mapSignal(activity.signal),
             createdAt,
           };

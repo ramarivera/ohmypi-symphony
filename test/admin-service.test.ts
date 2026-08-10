@@ -473,6 +473,35 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       "A run for this issue is already active",
     );
   });
+  it("returns 404 for runs belonging to another organization", async () => {
+    const foreignRun: AgentRun = {
+      ...terminalRun,
+      organizationId: Schema.decodeUnknownSync(OrganizationId)(
+        "99999999-9999-4999-8999-999999999999",
+      ),
+    };
+    const foreignHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(foreignRun)),
+      }),
+      linearGateway: {
+        createSessionOnIssue: () =>
+          Effect.die(new Error("must not be called cross-org")),
+      },
+    });
+    const response = await Effect.runPromise(
+      foreignHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    expect(Option.getOrElse(response, () => null)?.status).toBe(404);
+  });
+
   it("creates a new session, run, and dedupe-safe created input", async () => {
     const created: {
       sessionId?: string;
