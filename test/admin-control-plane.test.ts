@@ -83,6 +83,7 @@ const reconcilerLayer = Layer.succeed(Reconciler, {
       lastError: Option.none(),
     }),
   tick: () => Effect.void,
+  catchup: () => Effect.void,
   trigger: () => Effect.void,
   awaitTrigger: () => Effect.void,
 });

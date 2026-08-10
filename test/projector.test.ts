@@ -74,6 +74,16 @@ const mockLinear = LinearGateway.make({
       }
       return `activity-${mockState.activities.length}`;
     }),
+  listSessionActivities: () => Effect.succeed([]),
+  getIssue: () => Effect.die(new Error("not used in projector tests")),
+  updateIssue: () => Effect.die(new Error("not used in projector tests")),
+  addSessionExternalUrls: () =>
+    Effect.die(new Error("not used in projector tests")),
+  teamStartedStates: () => Effect.die(new Error("not used in projector tests")),
+  repositorySuggestions: () =>
+    Effect.die(new Error("not used in projector tests")),
+  createSessionOnIssue: () =>
+    Effect.die(new Error("not used in projector tests")),
   updateSession: (input) =>
     Effect.gen(function* () {
       mockState.updates.push(input);

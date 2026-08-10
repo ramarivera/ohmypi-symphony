@@ -31,7 +31,10 @@ export interface GatewayConfigShape {
   readonly port: number;
   readonly leaseDurationMs: number;
   readonly reconcilerIntervalMs: number;
+  readonly reconcilerCatchupIntervalMs: number;
+  readonly reconcilerCatchupMinAgeMs: number;
   readonly webhookReplayWindowMs: number;
+  readonly repositorySuggestionConfidenceThreshold: number;
 }
 
 const positiveInteger = (name: string, fallback: number) =>
@@ -45,6 +48,21 @@ const positiveInteger = (name: string, fallback: number) =>
             ConfigError.InvalidData(
               [name],
               `${name} must be a positive integer`,
+            ),
+          );
+    }),
+  );
+const decimalBetween = (name: string, fallback: number) =>
+  Config.string(name).pipe(
+    Config.withDefault(String(fallback)),
+    Config.mapOrFail((value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1
+        ? Either.right(parsed)
+        : Either.left(
+            ConfigError.InvalidData(
+              [name],
+              `${name} must be a number between 0 and 1`,
             ),
           );
     }),
@@ -164,7 +182,19 @@ const GatewayConfigValues = Config.all({
   port: positiveInteger("PORT", 3000),
   leaseDurationMs: positiveInteger("LEASE_DURATION_MS", 60_000),
   reconcilerIntervalMs: positiveInteger("RECONCILER_INTERVAL_MS", 1_000),
+  reconcilerCatchupIntervalMs: positiveInteger(
+    "RECONCILER_CATCHUP_INTERVAL_MS",
+    5 * 60_000,
+  ),
+  reconcilerCatchupMinAgeMs: positiveInteger(
+    "RECONCILER_CATCHUP_MIN_AGE_MS",
+    2 * 60_000,
+  ),
   webhookReplayWindowMs: positiveInteger("WEBHOOK_REPLAY_WINDOW_MS", 60_000),
+  repositorySuggestionConfidenceThreshold: decimalBetween(
+    "REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD",
+    0.8,
+  ),
   nixBinaryPath: Config.string("NIX_BINARY_PATH").pipe(
     Config.withDefault("nix"),
     Config.map((value) => value.trim() || "nix"),
