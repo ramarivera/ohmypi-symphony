@@ -21,6 +21,13 @@ const sdkState = vi.hoisted(() => {
 
   const state: {
     readonly activities: ActivityInput[];
+    readonly activityPages: Array<{
+      readonly nodes: ReadonlyArray<Record<string, unknown>>;
+      readonly pageInfo: {
+        readonly hasNextPage: boolean;
+        readonly endCursor: string | null;
+      };
+    }>;
     readonly comments: CommentInput[];
     readonly updates: UpdateInput[];
     readonly pending: Pending[];
@@ -31,6 +38,7 @@ const sdkState = vi.hoisted(() => {
     activityHandler: (input: ActivityInput) => Promise<unknown>;
   } = {
     activities: [],
+    activityPages: [],
     comments: [],
     updates: [],
     pending: [],
@@ -50,6 +58,17 @@ const sdkState = vi.hoisted(() => {
       }
       return state.activityHandler(input);
     }
+    agentSession(_id: string): Promise<unknown> {
+      return Promise.resolve({
+        activities: (variables?: { readonly after?: string }) =>
+          Promise.resolve(
+            state.activityPages[variables?.after ? 1 : 0] ?? {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          ),
+      });
+    }
 
     createComment(input: CommentInput): Promise<unknown> {
       state.comments.push(input);
@@ -65,6 +84,13 @@ const sdkState = vi.hoisted(() => {
       state.updates.push(input);
       return Promise.resolve({ success: true });
     }
+
+    agentSessionCreateOnIssue(_input: { issueId: string }): Promise<unknown> {
+      return Promise.resolve({
+        success: true,
+        agentSessionId: "new-session-id",
+      });
+    }
   }
 
   return {
@@ -74,7 +100,7 @@ const sdkState = vi.hoisted(() => {
       state.activities.length = 0;
       state.comments.length = 0;
       state.updates.length = 0;
-      state.pending.length = 0;
+      state.activityPages.length = 0;
       state.waiters.length = 0;
       state.activityHandler = async () => ({
         success: true,
@@ -167,6 +193,8 @@ const gatewayDependencies = Layer.mergeAll(
       create: unusedRepoMethod,
       update: unusedRepoMethod,
       reopen: unusedRepoMethod,
+      hasActiveForIssue: unusedRepoMethod,
+      listNonTerminalByIssue: unusedRepoMethod,
       listRunnable: unusedRepoMethod,
       listCancellationPending: unusedRepoMethod,
       claimLease: unusedRepoMethod,
@@ -207,6 +235,9 @@ const gatewayDependencies = Layer.mergeAll(
       ompCliPath: "omp",
       port: 3000,
       leaseDurationMs: 60_000,
+      reconcilerCatchupIntervalMs: 300_000,
+      reconcilerCatchupMinAgeMs: 120_000,
+      repositorySuggestionConfidenceThreshold: 0.8,
       reconcilerIntervalMs: 1_000,
       webhookReplayWindowMs: 60_000,
     }),
@@ -239,6 +270,60 @@ const activityBody = (content: unknown): string | undefined => {
 beforeEach(() => sdkState.reset());
 
 describe("LinearGateway parity", () => {
+  it("paginates activities and preserves unknown content typenames", async () => {
+    sdkState.state.activityPages.push(
+      {
+        nodes: [
+          {
+            id: "activity-1",
+            content: {
+              __typename: "AgentActivityPromptContent",
+              body: "hello",
+            },
+            signal: "stop",
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ],
+        pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+      },
+      {
+        nodes: [
+          {
+            id: "activity-2",
+            content: {
+              __typename: "AgentActivityFutureContent",
+              body: "future",
+            },
+            signal: "continue",
+            createdAt: "2025-01-01T00:01:00.000Z",
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    );
+    const gateway = await getGateway();
+    const activities = await Effect.runPromise(
+      gateway
+        .listSessionActivities({ sessionId })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    expect(activities).toEqual([
+      {
+        id: "activity-1",
+        type: "prompt",
+        body: "hello",
+        signal: "stop",
+        createdAt: "2025-01-01T00:00:00.000Z",
+      },
+      {
+        id: "activity-2",
+        type: "unknown",
+        body: "future",
+        signal: "continue",
+        createdAt: "2025-01-01T00:01:00.000Z",
+      },
+    ]);
+  });
   it("forwards persisted activity content and signal metadata verbatim", async () => {
     const gateway = await getGateway();
     const content = {
@@ -461,5 +546,21 @@ describe("LinearGateway parity", () => {
       if (exit.cause._tag === "Fail")
         expect(exit.cause.error).toBeInstanceOf(LinearRateLimitError);
     }
+  });
+});
+
+describe("LinearGateway.createSessionOnIssue", () => {
+  it("creates an agent session on an issue and returns the new session id", async () => {
+    sdkState.reset();
+    const gateway = await getGateway();
+    const newSessionId = await Effect.runPromise(
+      gateway
+        .createSessionOnIssue({
+          organizationId: String(organizationId),
+          issueId: String(issueId),
+        })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    expect(newSessionId).toBe("new-session-id");
   });
 });

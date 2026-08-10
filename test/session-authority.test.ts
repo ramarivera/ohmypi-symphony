@@ -571,6 +571,8 @@ const mockWorker: RpcWorkerHandle = {
     }),
   steer: () => Effect.void,
   followUp: () => Effect.void,
+  setHostTools: () => Effect.void,
+  onHostToolCall: () => Effect.succeed(() => Effect.void),
   abort: () => Effect.void,
   getState: () => Effect.succeed({}),
   respondToUi: () => Effect.void,

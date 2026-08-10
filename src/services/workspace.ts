@@ -108,6 +108,37 @@ function parseContext(context: unknown): Option.Option<ResolveContext> {
   });
 }
 
+export interface RepositorySuggestionCandidate {
+  readonly hostname: string;
+  readonly repositoryFullName: string;
+}
+
+export const parseRepositorySuggestionCandidate = (
+  repositoryUrl: string,
+): RepositorySuggestionCandidate | null => {
+  let hostname: string;
+  let pathname: string;
+  try {
+    const parsed = new URL(repositoryUrl);
+    hostname = parsed.hostname;
+    pathname = parsed.pathname;
+  } catch {
+    const scp = /^git@([^:]+):(.+)$/u.exec(repositoryUrl);
+    const scpHost = scp?.[1];
+    const scpPath = scp?.[2];
+    if (scpHost === undefined || scpPath === undefined) return null;
+    hostname = scpHost;
+    pathname = `/${scpPath}`;
+  }
+  const repositoryFullName = pathname
+    .replace(/^\/+/u, "")
+    .replace(/\.git$/u, "");
+  if (hostname.length === 0 || !/^[^/]+\/[^/]+$/u.test(repositoryFullName)) {
+    return null;
+  }
+  return { hostname, repositoryFullName };
+};
+
 function onlyItem<A>(items: ReadonlyArray<A>): A | undefined {
   return items.length === 1 ? items[0] : undefined;
 }

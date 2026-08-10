@@ -19,9 +19,16 @@ import {
 import type { SessionId, SourceKey } from "../domain/ids.js";
 import type { AgentRun } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
+import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
-import type { RpcEvent, RpcWorkerHandle } from "./rpc-worker.js";
+import type {
+  RpcEvent,
+  RpcHostToolCall,
+  RpcHostToolDefinition,
+  RpcHostToolResult,
+  RpcWorkerHandle,
+} from "./rpc-worker.js";
 import { RpcWorker } from "./rpc-worker.js";
 import {
   InstallationRepo,
@@ -30,7 +37,11 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
-import { makeWorkspace } from "./workspace.js";
+import {
+  makeWorkspace,
+  parseRepositorySuggestionCandidate,
+  type RepositoryResolution,
+} from "./workspace.js";
 
 interface InputContext {
   readonly organizationId: string | null;
@@ -52,6 +63,9 @@ const LINEAR_WORKER_CONTRACT = `Linear integration:
 - Use OMP todos for meaningful multi-step work; they are displayed as the Linear agent plan.
 - Use OMP UI requests when human input, selection, confirmation, or authorization is required; they are displayed as Linear elicitations.
 - Tool execution and lifecycle progress are projected automatically as Linear thought and action activities. Do not call Linear directly to report progress.
+- Gateway-owned Linear tools are available: linear_get_issue(issueId) reads any issue visible to this installation; linear_create_comment(body) posts a comment to this run's issue; linear_update_issue(stateId?, delegateId?) updates this run's issue; linear_add_external_url(label, url) appends a URL to this run's agent session.
+- Use linear_get_issue to inspect issue state/details, linear_create_comment for user-facing issue updates, linear_update_issue when changing workflow state or delegation, and linear_add_external_url for durable artifact links.
+- Call linear_add_external_url immediately when you open or update a pull request, using label "Pull request" and the PR URL.
 - Call rromp_report_deviation as soon as you take a shortcut, depart from the original request, change a material assumption, or make a consequential implementation decision. The report becomes a visible Linear issue comment.
 - Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
 - If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
@@ -69,9 +83,44 @@ export const resolveDeviationExtensionPath = (): string | null => {
     fileURLToPath(
       new URL("../extensions/report-deviation.ts", import.meta.url),
     ),
+
     fileURLToPath(new URL("./extensions/report-deviation.js", import.meta.url)),
   ];
   return candidates.find((candidate) => existsSync(candidate)) ?? null;
+};
+const PULL_REQUEST_URL_RE =
+  /\bhttps:\/\/(?:github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9]\d*(?![A-Za-z0-9_-])(?:[/?#][^\s<>"']*)?|gitlab\.com\/(?:[A-Za-z0-9_.-]+\/)+-\/merge_requests\/[1-9]\d*(?![A-Za-z0-9_-])(?:[/?#][^\s<>"']*)?)/gi;
+
+export const extractPullRequestUrls = (
+  text: string,
+  maxCount = 16,
+): ReadonlyArray<string> => {
+  const urls = new Set<string>();
+  for (const match of text.matchAll(PULL_REQUEST_URL_RE)) {
+    const url = match[0]?.replace(/[.,;:!?)}\]]+$/g, "");
+    if (url) urls.add(url);
+    if (urls.size >= maxCount) break;
+  }
+  return [...urls];
+};
+export const assistantResponseTextFromRpcEvent = (event: RpcEvent): string => {
+  const collect = (value: unknown): string => {
+    if (typeof value === "string") return value;
+    if (Array.isArray(value))
+      return value.map(collect).filter(Boolean).join("\n");
+    if (!record(value)) return "";
+    if (typeof value.text === "string") return value.text;
+    return collect(value.content ?? value.message ?? value.messages);
+  };
+  const candidates = [
+    ...(Array.isArray(event.messages) ? event.messages : []),
+    event.message,
+  ];
+  return candidates
+    .filter((candidate) => !record(candidate) || candidate.role === "assistant")
+    .map(collect)
+    .filter(Boolean)
+    .join("\n");
 };
 
 export const deviationFromRpcEvent = (event: RpcEvent): string | null => {
@@ -150,6 +199,9 @@ function inputContext(payload: unknown): InputContext {
     projectLabels: project ? labelSet(project.labels) : [],
   };
 }
+function isAutomationDelegated(payload: unknown): boolean {
+  return record(payload) && payload.automationDelegated === true;
+}
 
 function planItems(value: unknown): Array<{
   content: string;
@@ -213,6 +265,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       RunEventRepo.Default,
       RunInputRepo.Default,
       RunRepo.Default,
+      LinearGateway.Default,
       WorkspaceRepo.Default,
       GatewayConfig.Default,
       RpcWorker.Default,
@@ -228,6 +281,50 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const rpc = yield* RpcWorker;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      const linearOption = yield* Effect.serviceOption(LinearGateway);
+
+      const stopShouldApply = Effect.fn("SessionAuthority.stopShouldApply")(
+        function* (
+          sessionId: SessionId,
+          input: { readonly kind: string; readonly payload: unknown },
+        ): Effect.fn.Return<Option.Option<boolean>, never> {
+          if (input.kind !== "stop" || !record(input.payload)) {
+            return Option.some(true);
+          }
+          if (
+            input.payload.type !== "AppUserNotification" ||
+            input.payload.action !== "issueStatusChanged"
+          ) {
+            return Option.some(true);
+          }
+          const notification = input.payload.notification;
+          const issueId =
+            record(notification) && typeof notification.issueId === "string"
+              ? notification.issueId
+              : null;
+          if (issueId === null) return Option.some(false);
+          if (Option.isNone(linearOption)) return Option.none();
+          const linear = linearOption.value;
+          return yield* linear.getIssue({ sessionId, issueId }).pipe(
+            Effect.map((issue) => Option.some(issue.stateType === "canceled")),
+            Effect.catchAll((error) =>
+              Effect.gen(function* () {
+                yield* Effect.logWarning(
+                  "authority.notification_issue_fetch_failed",
+                ).pipe(
+                  Effect.annotateLogs({
+                    event: "authority.notification_issue_fetch_failed",
+                    sessionId,
+                    issueId,
+                    error: String(error),
+                  }),
+                );
+                return Option.none<boolean>();
+              }),
+            ),
+          );
+        },
+      );
 
       const owner = `authority:${yield* Effect.sync(() => randomUUID())}`;
       const leaseDurationMs = config.leaseDurationMs;
@@ -246,6 +343,255 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         workspaceRoot: config.workspaceRoot,
         repo: workspaceRepo,
       });
+      const ensureIssueLifecycle = (
+        run: AgentRun,
+        payload: unknown,
+        installation: { readonly appUserId: string },
+      ): Effect.Effect<void, never> =>
+        Effect.gen(function* () {
+          if (Option.isNone(linearOption)) return;
+          const linear = linearOption.value;
+          if (Option.isNone(run.issueId) || isAutomationDelegated(payload)) {
+            return;
+          }
+          const runIssueId = run.issueId.value;
+          const issue = yield* linear
+            .getIssue({
+              sessionId: run.sessionId,
+              issueId: runIssueId,
+            })
+            .pipe(
+              Effect.map(Option.some),
+              Effect.catchAll((error) =>
+                Effect.logWarning("issue.lifecycle_fetch_failed").pipe(
+                  Effect.annotateLogs({
+                    event: "issue.lifecycle_fetch_failed",
+                    sessionId: run.sessionId,
+                    issueId: runIssueId,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  }),
+                  Effect.as(Option.none()),
+                ),
+              ),
+            );
+          if (Option.isNone(issue)) return;
+
+          const stateType = issue.value.stateType?.toLowerCase();
+          if (
+            stateType !== "started" &&
+            stateType !== "completed" &&
+            stateType !== "canceled"
+          ) {
+            const teamId =
+              issue.value.teamId ?? Option.getOrElse(run.teamId, () => null);
+            if (teamId !== null) {
+              const states = yield* linear
+                .teamStartedStates({ sessionId: run.sessionId, teamId })
+                .pipe(
+                  Effect.catchAll((error) =>
+                    Effect.logWarning("issue.lifecycle_states_failed").pipe(
+                      Effect.annotateLogs({
+                        event: "issue.lifecycle_states_failed",
+                        sessionId: run.sessionId,
+                        issueId: runIssueId,
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : String(error),
+                      }),
+                      Effect.as([]),
+                    ),
+                  ),
+                );
+              const started = states[0];
+              if (started !== undefined) {
+                yield* linear
+                  .updateIssue({
+                    sessionId: run.sessionId,
+                    issueId: runIssueId,
+                    stateId: started.id,
+                  })
+                  .pipe(
+                    Effect.catchAll((error) =>
+                      Effect.logWarning(
+                        "issue.lifecycle_state_update_failed",
+                      ).pipe(
+                        Effect.annotateLogs({
+                          event: "issue.lifecycle_state_update_failed",
+                          sessionId: run.sessionId,
+                          issueId: runIssueId,
+                          error:
+                            error instanceof Error
+                              ? error.message
+                              : String(error),
+                        }),
+                      ),
+                    ),
+                  );
+              }
+            }
+          }
+
+          if (
+            issue.value.delegateId === null ||
+            issue.value.delegateId === ""
+          ) {
+            yield* linear
+              .updateIssue({
+                sessionId: run.sessionId,
+                issueId: runIssueId,
+                delegateId: installation.appUserId,
+              })
+              .pipe(
+                Effect.catchAll((error) =>
+                  Effect.logWarning(
+                    "issue.lifecycle_delegate_update_failed",
+                  ).pipe(
+                    Effect.annotateLogs({
+                      event: "issue.lifecycle_delegate_update_failed",
+                      sessionId: run.sessionId,
+                      issueId: runIssueId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    }),
+                  ),
+                ),
+              );
+          }
+        });
+
+      const augmentResolution = (
+        run: AgentRun,
+        context: InputContext,
+        resolution: RepositoryResolution,
+      ): Effect.Effect<
+        {
+          readonly resolution: RepositoryResolution;
+          readonly options: ReadonlyArray<string>;
+        },
+        DatabaseError | RowDecodeError
+      > =>
+        Effect.gen(function* () {
+          if (Option.isNone(linearOption)) return { resolution, options: [] };
+          const linear = linearOption.value;
+          if (
+            resolution.kind === "match" ||
+            Option.isNone(run.issueId) ||
+            context.organizationId === null
+          ) {
+            return { resolution, options: [] };
+          }
+          const runIssueId = run.issueId.value;
+          const repositories = yield* workspaceRepo.listRepositories(
+            run.organizationId,
+          );
+          if (repositories.length === 0) return { resolution, options: [] };
+          const candidates = repositories.flatMap((repository) => {
+            const candidate = parseRepositorySuggestionCandidate(
+              repository.url,
+            );
+            return candidate === null ? [] : [candidate];
+          });
+          if (candidates.length === 0) return { resolution, options: [] };
+          const suggestions = yield* linear
+            .repositorySuggestions({
+              sessionId: run.sessionId,
+              issueId: runIssueId,
+              candidates,
+            })
+            .pipe(
+              Effect.catchAll((error) =>
+                Effect.logDebug("repository.suggestions_failed").pipe(
+                  Effect.annotateLogs({
+                    event: "repository.suggestions_failed",
+                    sessionId: run.sessionId,
+                    issueId: runIssueId,
+                    error:
+                      error instanceof Error ? error.message : String(error),
+                  }),
+                  Effect.as([]),
+                ),
+              ),
+            );
+          const ranked = suggestions
+            .slice()
+            .sort((a, b) => b.confidence - a.confidence);
+          const mapped: Array<{
+            readonly repository: (typeof repositories)[number];
+            readonly confidence: number;
+          }> = [];
+          for (const suggestion of ranked) {
+            const matches = repositories.filter((repository) => {
+              const candidate = parseRepositorySuggestionCandidate(
+                repository.url,
+              );
+              return (
+                candidate !== null &&
+                candidate.hostname.toLowerCase() ===
+                  suggestion.hostname.toLowerCase() &&
+                candidate.repositoryFullName.toLowerCase() ===
+                  suggestion.repositoryFullName.toLowerCase()
+              );
+            });
+            const only = matches.length === 1 ? matches[0] : undefined;
+            if (
+              only !== undefined &&
+              !mapped.some((item) => item.repository.id === only.id)
+            ) {
+              mapped.push({
+                repository: only,
+                confidence: suggestion.confidence,
+              });
+            }
+          }
+          const firstMatch = mapped[0];
+          if (
+            mapped.length === 1 &&
+            firstMatch !== undefined &&
+            firstMatch.confidence >=
+              config.repositorySuggestionConfidenceThreshold
+          ) {
+            yield* Effect.logInfo("repository.suggestion_auto_routed").pipe(
+              Effect.annotateLogs({
+                event: "repository.suggestion_auto_routed",
+                sessionId: run.sessionId,
+                issueId: run.issueId.value,
+                repositoryId: firstMatch.repository.id,
+                confidence: firstMatch.confidence,
+              }),
+            );
+            return {
+              resolution: { kind: "match", repository: firstMatch.repository },
+              options: [],
+            };
+          }
+          const options = mapped.map((item) => item.repository.id);
+          if (resolution.kind === "ambiguous" && options.length > 0) {
+            const staticById = new Map(
+              resolution.repositories.map((repository) => [
+                repository.id,
+                repository,
+              ]),
+            );
+            const ordered = [
+              ...mapped
+                .map((item) => staticById.get(item.repository.id))
+                .filter(
+                  (repository): repository is (typeof repositories)[number] =>
+                    repository !== undefined,
+                ),
+              ...resolution.repositories.filter(
+                (repository) => !options.includes(repository.id),
+              ),
+            ];
+            return {
+              resolution: { kind: "ambiguous", repositories: ordered },
+              options,
+            };
+          }
+          return { resolution, options };
+        });
 
       const workersRef = yield* Ref.make<ReadonlyMap<SessionId, WorkerState>>(
         new Map(),
@@ -255,6 +601,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       );
       const pendingUiRef = yield* Ref.make<
         ReadonlyMap<SessionId, { readonly id: string; readonly method: string }>
+      >(new Map());
+      const reportedPullRequestUrlsRef = yield* Ref.make<
+        ReadonlyMap<SessionId, ReadonlySet<string>>
       >(new Map());
 
       const getWorker = (
@@ -723,6 +1072,39 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
 
         if (terminalAgentEnd) {
+          const finalText = assistantResponseTextFromRpcEvent(event);
+          const discovered = extractPullRequestUrls(finalText);
+          if (discovered.length > 0 && Option.isSome(linearOption)) {
+            const existing = yield* Ref.get(reportedPullRequestUrlsRef);
+            const already = existing.get(sessionId) ?? new Set<string>();
+            const fresh = discovered.filter((url) => !already.has(url));
+            if (fresh.length > 0) {
+              const nextSet = new Set(already);
+              for (const url of fresh) nextSet.add(url);
+              yield* Ref.update(reportedPullRequestUrlsRef, (current) => {
+                const next = new Map(current);
+                next.set(sessionId, nextSet);
+                return next;
+              });
+              yield* linearOption.value
+                .addSessionExternalUrls({
+                  sessionId,
+                  urls: fresh.map((url) => ({ label: "Pull request", url })),
+                })
+                .pipe(
+                  Effect.catchAll((error) =>
+                    Effect.logWarning("pull_request_url.report_failed").pipe(
+                      Effect.annotateLogs({
+                        event: "pull_request_url.report_failed",
+                        sessionId,
+                        count: fresh.length,
+                        error: String(error),
+                      }),
+                    ),
+                  ),
+                );
+            }
+          }
           yield* Effect.logInfo("run.completed").pipe(
             Effect.annotateLogs({
               event: "run.completed",
@@ -753,6 +1135,247 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
 
         yield* projector.projectRpcEvent(sessionId, sequence, event);
+      });
+
+      const registerLinearHostTools = Effect.fn(
+        "SessionAuthority.registerLinearHostTools",
+      )(function* (
+        run: AgentRun,
+        worker: RpcWorkerHandle,
+      ): Effect.fn.Return<void, RpcProtocolError> {
+        if (
+          typeof worker.onHostToolCall !== "function" ||
+          typeof worker.setHostTools !== "function"
+        ) {
+          return;
+        }
+        const textResult = (
+          text: string,
+          details?: unknown,
+          isError = false,
+        ): RpcHostToolResult => ({
+          content: [{ type: "text", text }],
+          ...(details === undefined ? {} : { details }),
+          ...(isError ? { isError: true } : {}),
+        });
+        const definitions: ReadonlyArray<RpcHostToolDefinition> = [
+          {
+            name: "linear_get_issue",
+            label: "Linear: get issue",
+            description:
+              "Read a Linear issue visible to this installation, including state, team, and labels.",
+            parameters: {
+              type: "object",
+              additionalProperties: false,
+              required: ["issueId"],
+              properties: { issueId: { type: "string", minLength: 1 } },
+            },
+          },
+          {
+            name: "linear_create_comment",
+            label: "Linear: create comment",
+            description: "Post a comment to the Linear issue for this run.",
+            parameters: {
+              type: "object",
+              additionalProperties: false,
+              required: ["body"],
+              properties: { body: { type: "string", minLength: 1 } },
+            },
+          },
+          {
+            name: "linear_update_issue",
+            label: "Linear: update issue",
+            description:
+              "Update the workflow state or delegation of this run's issue.",
+            parameters: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                stateId: { type: "string", minLength: 1 },
+                delegateId: { type: ["string", "null"] },
+              },
+              anyOf: [{ required: ["stateId"] }, { required: ["delegateId"] }],
+            },
+          },
+          {
+            name: "linear_add_external_url",
+            label: "Linear: add external URL",
+            description:
+              "Append an http(s) artifact URL to this run's Linear session.",
+            parameters: {
+              type: "object",
+              additionalProperties: false,
+              required: ["label", "url"],
+              properties: {
+                label: { type: "string", minLength: 1 },
+                url: { type: "string", pattern: "^https?://" },
+              },
+            },
+          },
+        ];
+
+        yield* worker.onHostToolCall((request: RpcHostToolCall) =>
+          Effect.gen(function* () {
+            const fail = (message: string) =>
+              textResult(message, undefined, true);
+            if (Option.isNone(linearOption)) {
+              return fail("Linear gateway is unavailable");
+            }
+            const raw = request.arguments;
+            const current = yield* runRepo
+              .get(run.sessionId)
+              .pipe(
+                Effect.catchAll(() => Effect.succeed(Option.none<AgentRun>())),
+              );
+            if (Option.isNone(current)) return fail("Run no longer exists");
+            const currentRun = current.value;
+            const issueId = Option.isSome(currentRun.issueId)
+              ? currentRun.issueId.value
+              : null;
+            const mutating =
+              request.toolName === "linear_create_comment" ||
+              request.toolName === "linear_update_issue" ||
+              request.toolName === "linear_add_external_url";
+            if (mutating && currentRun.desiredState === "canceled") {
+              return fail("Run is canceled; mutating Linear tools are refused");
+            }
+            const linear = linearOption.value;
+            switch (request.toolName) {
+              case "linear_get_issue": {
+                const requested = raw.issueId;
+                if (
+                  typeof requested !== "string" ||
+                  requested.trim().length === 0
+                )
+                  return fail("issueId must be a non-empty string");
+                return yield* linear
+                  .getIssue({
+                    sessionId: run.sessionId,
+                    issueId: requested.trim(),
+                  })
+                  .pipe(
+                    Effect.map((issue) =>
+                      textResult(JSON.stringify(issue), issue),
+                    ),
+                    Effect.catchAll((error) =>
+                      Effect.succeed(
+                        fail(`Unable to read issue: ${String(error)}`),
+                      ),
+                    ),
+                  );
+              }
+              case "linear_create_comment": {
+                if (issueId === null) return fail("Run has no Linear issue");
+                const body = raw.body;
+                if (typeof body !== "string" || body.trim().length === 0)
+                  return fail("body must be a non-empty string");
+                return yield* linear
+                  .createIssueComment({ sessionId: run.sessionId, body })
+                  .pipe(
+                    Effect.map((commentId) =>
+                      textResult(`Created Linear comment ${commentId}`, {
+                        commentId,
+                      }),
+                    ),
+                    Effect.catchAll((error) =>
+                      Effect.succeed(
+                        fail(`Unable to create comment: ${String(error)}`),
+                      ),
+                    ),
+                  );
+              }
+              case "linear_update_issue": {
+                if (issueId === null) return fail("Run has no Linear issue");
+                const stateId = raw.stateId;
+                const delegateId = raw.delegateId;
+                if (
+                  stateId !== undefined &&
+                  (typeof stateId !== "string" || stateId.trim().length === 0)
+                )
+                  return fail("stateId must be a non-empty string");
+                if (
+                  delegateId !== undefined &&
+                  delegateId !== null &&
+                  (typeof delegateId !== "string" ||
+                    delegateId.trim().length === 0)
+                )
+                  return fail("delegateId must be a non-empty string or null");
+                if (stateId === undefined && delegateId === undefined)
+                  return fail("Provide stateId and/or delegateId");
+                return yield* linear
+                  .updateIssue({
+                    sessionId: run.sessionId,
+                    issueId,
+                    ...(stateId === undefined ? {} : { stateId }),
+                    ...(delegateId === undefined ? {} : { delegateId }),
+                  })
+                  .pipe(
+                    Effect.map(() => textResult("Updated Linear issue")),
+                    Effect.catchAll((error) =>
+                      Effect.succeed(
+                        fail(`Unable to update issue: ${String(error)}`),
+                      ),
+                    ),
+                  );
+              }
+              case "linear_add_external_url": {
+                if (issueId === null) return fail("Run has no Linear issue");
+                const label = raw.label;
+                const url = raw.url;
+                if (typeof label !== "string" || label.trim().length === 0)
+                  return fail("label must be a non-empty string");
+                if (typeof url !== "string")
+                  return fail("url must be an http(s) URL");
+                try {
+                  const parsed = new URL(url);
+                  if (
+                    parsed.protocol !== "http:" &&
+                    parsed.protocol !== "https:"
+                  )
+                    return fail("url must be an http(s) URL");
+                } catch {
+                  return fail("url must be a valid http(s) URL");
+                }
+                return yield* linear
+                  .addSessionExternalUrls({
+                    sessionId: run.sessionId,
+                    urls: [{ label: label.trim(), url }],
+                  })
+                  .pipe(
+                    Effect.tap(() =>
+                      Ref.update(reportedPullRequestUrlsRef, (current) => {
+                        const next = new Map(current);
+                        const urls = new Set(next.get(run.sessionId) ?? []);
+                        urls.add(url);
+                        next.set(run.sessionId, urls);
+                        return next;
+                      }),
+                    ),
+                    Effect.map(() =>
+                      textResult("Added external URL to Linear session"),
+                    ),
+                    Effect.catchAll((error) =>
+                      Effect.succeed(
+                        fail(`Unable to add external URL: ${String(error)}`),
+                      ),
+                    ),
+                  );
+              }
+              default:
+                return fail(`Unknown host tool: ${request.toolName}`);
+            }
+          }).pipe(
+            Effect.catchAll((error) =>
+              Effect.succeed({
+                content: [
+                  { type: "text", text: `Host tool failed: ${String(error)}` },
+                ],
+                isError: true,
+              }),
+            ),
+          ),
+        );
+        yield* worker.setHostTools(definitions);
       });
 
       const startWorker = Effect.fn("SessionAuthority.startWorker")(function* (
@@ -866,6 +1489,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         });
 
         yield* worker.start();
+        yield* registerLinearHostTools(run, worker);
         yield* runRepo.update(run.sessionId, { state: "running" });
         yield* captureWorkerState(run.sessionId, worker);
 
@@ -1015,6 +1639,18 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 const resumedOption = yield* runRepo.get(sessionId);
                 if (Option.isNone(resumedOption)) return;
                 const resumed = resumedOption.value;
+                const retryPayload = yield* runInputRepo
+                  .latestActionableInput(sessionId)
+                  .pipe(
+                    Effect.map((input) =>
+                      Option.isSome(input) ? input.value.payload : null,
+                    ),
+                  );
+                yield* ensureIssueLifecycle(
+                  resumed,
+                  retryPayload,
+                  installation.value,
+                );
                 yield* Effect.logInfo("run.retried").pipe(
                   Effect.annotateLogs({
                     event: "run.retried",
@@ -1067,6 +1703,22 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               let latest = Option.isSome(latestOption)
                 ? latestOption.value
                 : run;
+              const stopDecision = yield* stopShouldApply(sessionId, input);
+              if (Option.isNone(stopDecision)) return;
+              if (!stopDecision.value) {
+                yield* runInputRepo.markProcessed(input.id);
+                continue;
+              }
+              if (
+                input.kind === "stop" &&
+                record(input.payload) &&
+                input.payload.type === "AppUserNotification" &&
+                input.payload.action === "issueStatusChanged"
+              ) {
+                yield* runInputRepo.applyStop(sessionId);
+                const refreshed = yield* runRepo.get(sessionId);
+                if (Option.isSome(refreshed)) latest = refreshed.value;
+              }
               if (input.kind === "stop") {
                 yield* cancel(latest);
                 yield* runInputRepo.markProcessed(input.id);
@@ -1128,6 +1780,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   });
                   const updatedOption = yield* runRepo.get(sessionId);
                   if (Option.isNone(updatedOption)) return;
+                  yield* ensureIssueLifecycle(
+                    updatedOption.value,
+                    input.payload,
+                    installation.value,
+                  );
                   worker = yield* startWorker(
                     updatedOption.value,
                     existingWorkspacePath.value,
@@ -1146,12 +1803,21 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     resolvedContext.repositoryId === null
                       ? { ...resolvedContext, repositoryId: input.body.trim() }
                       : resolvedContext;
-                  const resolution = yield* workspace.resolve(context);
+                  const staticResolution = yield* workspace.resolve(context);
+                  const augmented = yield* augmentResolution(
+                    run,
+                    context,
+                    staticResolution,
+                  );
+                  const resolution = augmented.resolution;
                   if (resolution.kind === "none") {
                     yield* projector.elicitation(
                       sessionId,
                       `repo:none:${input.id}`,
                       "No repository is configured for this Linear issue.",
+                      augmented.options.length > 0
+                        ? augmented.options
+                        : undefined,
                     );
                     yield* runRepo.update(sessionId, { state: "waiting" });
                     return;
@@ -1178,6 +1844,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   });
                   const updatedOption = yield* runRepo.get(sessionId);
                   if (Option.isNone(updatedOption)) return;
+                  yield* ensureIssueLifecycle(
+                    updatedOption.value,
+                    input.payload,
+                    installation.value,
+                  );
                   worker = yield* startWorker(
                     updatedOption.value,
                     workspacePath,
@@ -1276,6 +1947,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* Ref.set(workersRef, new Map());
           yield* Ref.set(eventSequenceRef, new Map());
           yield* Ref.set(pendingUiRef, new Map());
+          yield* Ref.set(reportedPullRequestUrlsRef, new Map());
           yield* projector.flushPending();
         },
       );
