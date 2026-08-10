@@ -811,46 +811,42 @@ describe("SessionAuthority team-access gate", () => {
       ),
   );
 
-  it.scopedLive(
-    "cancels when a known snapshot excludes the run's team",
-    () =>
-      withAuthority(() =>
-        Effect.gen(function* () {
-          const authority = yield* SessionAuthority;
-          const installationRepo = yield* InstallationRepo;
-          const runRepo = yield* RunRepo;
-          const teamId = Schema.decodeUnknownSync(TeamId)("authority-team");
-          yield* installationRepo.put({
-            ...install(testOrganizationId),
-            accessibleTeamIds: Option.some([]),
-            canAccessAllPublicTeams: Option.some(false),
-          });
-          yield* runRepo.create({
-            sessionId: testSessionId,
-            organizationId: testOrganizationId,
-            issueId: Option.some(testIssueId),
-            teamId: Option.some(teamId),
-          });
-          yield* runRepo.update(testSessionId, {
-            state: "orphaned",
-            workspacePath: Option.some("/tmp/team-access-known"),
-            ompSessionFile: Option.some(
-              "/tmp/team-access-known/session.jsonl",
-            ),
-          });
+  it.scopedLive("cancels when a known snapshot excludes the run's team", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const installationRepo = yield* InstallationRepo;
+        const runRepo = yield* RunRepo;
+        const teamId = Schema.decodeUnknownSync(TeamId)("authority-team");
+        yield* installationRepo.put({
+          ...install(testOrganizationId),
+          accessibleTeamIds: Option.some([]),
+          canAccessAllPublicTeams: Option.some(false),
+        });
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.some(testIssueId),
+          teamId: Option.some(teamId),
+        });
+        yield* runRepo.update(testSessionId, {
+          state: "orphaned",
+          workspacePath: Option.some("/tmp/team-access-known"),
+          ompSessionFile: Option.some("/tmp/team-access-known/session.jsonl"),
+        });
 
-          yield* authority.processSession(testSessionId);
-          expect(workerSpawnInputs).toHaveLength(0);
-          const run = yield* runRepo.get(testSessionId);
-          expect(Option.isSome(run)).toBe(true);
-          if (Option.isSome(run)) {
-            expect(run.value.state).toBe("canceled");
-            expect(run.value.terminalReason).toEqual(
-              Option.some("Linear team access was removed"),
-            );
-          }
-        }),
-      ),
+        yield* authority.processSession(testSessionId);
+        expect(workerSpawnInputs).toHaveLength(0);
+        const run = yield* runRepo.get(testSessionId);
+        expect(Option.isSome(run)).toBe(true);
+        if (Option.isSome(run)) {
+          expect(run.value.state).toBe("canceled");
+          expect(run.value.terminalReason).toEqual(
+            Option.some("Linear team access was removed"),
+          );
+        }
+      }),
+    ),
   );
 });
 
