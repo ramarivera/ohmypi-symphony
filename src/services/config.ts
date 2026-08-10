@@ -41,7 +41,10 @@ const positiveInteger = (name: string, fallback: number) =>
   Config.string(name).pipe(
     Config.withDefault(String(fallback)),
     Config.mapOrFail((value) => {
-      const parsed = Number.parseInt(value, 10);
+      const trimmed = value.trim();
+      // Digit-only: Number.parseInt would silently truncate "5m", "1.5",
+      // and "1e3" into wrong-but-accepted values.
+      const parsed = /^\d+$/u.test(trimmed) ? Number(trimmed) : Number.NaN;
       return Number.isSafeInteger(parsed) && parsed > 0
         ? Either.right(parsed)
         : Either.left(

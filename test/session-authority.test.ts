@@ -17,6 +17,7 @@ import {
 import {
   AppUserId,
   InputId,
+  IssueId,
   OrganizationId,
   SessionId,
   SourceKey,
@@ -24,10 +25,13 @@ import {
 } from "../src/domain/ids.js";
 import { type Installation, NixPackageName } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { LinearGateway } from "../src/services/linear-gateway.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
   type RpcEvent,
+  type RpcHostToolCall,
+  type RpcHostToolResult,
   RpcWorker,
   type RpcWorkerHandle,
 } from "../src/services/rpc-worker.js";
@@ -558,6 +562,11 @@ const mockProjector = ActivityProjector.make({
 });
 
 const workerPrompts: Array<string> = [];
+let hostToolListener:
+  | ((
+      request: RpcHostToolCall,
+    ) => Effect.Effect<RpcHostToolResult, never, never>)
+  | undefined;
 const mockWorker: RpcWorkerHandle = {
   sessionId: Effect.succeed(Option.none()),
   sessionFile: Effect.succeed(Option.none()),
@@ -572,7 +581,14 @@ const mockWorker: RpcWorkerHandle = {
   steer: () => Effect.void,
   followUp: () => Effect.void,
   setHostTools: () => Effect.void,
-  onHostToolCall: () => Effect.succeed(() => Effect.void),
+  onHostToolCall: (listener) =>
+    Effect.sync(() => {
+      hostToolListener = listener;
+      return () =>
+        Effect.sync(() => {
+          if (hostToolListener === listener) hostToolListener = undefined;
+        });
+    }),
   abort: () => Effect.void,
   getState: () => Effect.succeed({}),
   respondToUi: () => Effect.void,
@@ -616,6 +632,43 @@ const mockNixEnvironment = NixEnvironment.make({
   prune: () => Effect.succeed(false),
 });
 
+const toolCommentCalls: Array<{
+  readonly sessionId: string;
+  readonly body: string;
+}> = [];
+const mockToolsGateway = LinearGateway.make({
+  createActivity: () => Effect.die(new Error("unused in authority tests")),
+  updateSession: () => Effect.die(new Error("unused in authority tests")),
+  createIssueComment: (input) =>
+    Effect.sync(() => {
+      toolCommentCalls.push(input);
+      return `comment-${toolCommentCalls.length}`;
+    }),
+  refreshInstallation: () => Effect.die(new Error("unused in authority tests")),
+  listSessionActivities: () =>
+    Effect.die(new Error("unused in authority tests")),
+  getIssue: () =>
+    Effect.succeed({
+      id: "issue-1",
+      identifier: "AUTH-1",
+      title: "Authority issue",
+      description: null,
+      stateId: "state-started",
+      stateName: "In Progress",
+      stateType: "started",
+      delegateId: "authority-app-user",
+      url: null,
+      teamId: null,
+      labels: [],
+    }),
+  updateIssue: () => Effect.void,
+  addSessionExternalUrls: () => Effect.void,
+  teamStartedStates: () => Effect.succeed([]),
+  repositorySuggestions: () => Effect.succeed([]),
+  createSessionOnIssue: () =>
+    Effect.die(new Error("unused in authority tests")),
+});
+
 const withAuthority = <A, E>(
   effect: (
     db: SqliteClientShape["db"],
@@ -630,11 +683,13 @@ const withAuthority = <A, E>(
     | WorkspaceRepo
     | NixEnvironment
   >,
+  options?: { readonly withLinearGateway?: boolean },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       terminalFailure = undefined;
       workerEventListener = undefined;
+      hostToolListener = undefined;
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
       projectionExpected = 0;
@@ -646,6 +701,7 @@ const withAuthority = <A, E>(
       nixPathEntries = [];
       nixPrepareError = undefined;
       projectorTerminals.length = 0;
+      toolCommentCalls.length = 0;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
       const dependencies = Layer.mergeAll(
@@ -659,6 +715,9 @@ const withAuthority = <A, E>(
         Layer.succeed(ActivityProjector, mockProjector),
         Layer.succeed(RpcWorker, mockRpcWorker),
         Layer.succeed(NixEnvironment, mockNixEnvironment),
+        ...(options?.withLinearGateway === true
+          ? [Layer.succeed(LinearGateway, mockToolsGateway)]
+          : []),
       ).pipe(
         Layer.provide(
           Layer.mergeAll(
@@ -677,6 +736,7 @@ const withAuthority = <A, E>(
   );
 
 const testSessionId = Schema.decodeUnknownSync(SessionId)("authority-session");
+const testIssueId = Schema.decodeUnknownSync(IssueId)("authority-issue");
 const testOrganizationId = Schema.decodeUnknownSync(OrganizationId)(
   "authority-organization",
 );
@@ -868,6 +928,68 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 });
+describe("SessionAuthority host-tool mutation gate", () => {
+  it.scopedLive("refuses mutating host tools once the run is canceled", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/mutation-gate"),
+            ompSessionFile: Option.some("/tmp/mutation-gate/session.jsonl"),
+          });
+
+          yield* authority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(1);
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
+
+          const allowed = yield* listener({
+            id: "call-allowed",
+            toolCallId: "tool-1",
+            toolName: "linear_create_comment",
+            arguments: { body: "first" },
+          });
+          expect(allowed.isError).not.toBe(true);
+          expect(toolCommentCalls).toHaveLength(1);
+
+          // Stop dominance: desired_state flips to canceled, then the
+          // in-gate re-read must refuse further mutations.
+          yield* runInputRepo.applyStop(testSessionId);
+          const refused = yield* listener({
+            id: "call-refused",
+            toolCallId: "tool-2",
+            toolName: "linear_create_comment",
+            arguments: { body: "second" },
+          });
+          expect(refused.isError).toBe(true);
+          expect(toolCommentCalls).toHaveLength(1);
+
+          // Read tools still work after cancellation.
+          const read = yield* listener({
+            id: "call-read",
+            toolCallId: "tool-3",
+            toolName: "linear_get_issue",
+            arguments: { issueId: "issue-1" },
+          });
+          expect(read.isError).not.toBe(true);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
+});
+
 describe("SessionAuthority Nix environment preparation", () => {
   it.scopedLive(
     "prepares repository dependencies before the first worker and its orphan retry",

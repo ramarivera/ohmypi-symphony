@@ -609,6 +609,31 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const stopDeferralCountsRef = yield* Ref.make<
         ReadonlyMap<SessionId, ReadonlyMap<string, number>>
       >(new Map());
+      // Serializes cancel() with Linear host-tool mutations per session:
+      // the desiredState check and the Linear call happen inside the same
+      // gate, so a stop landing mid-dispatch is either seen (mutation
+      // refused) or blocks until the in-flight mutation completes.
+      const sessionMutationGatesRef = yield* Ref.make<
+        ReadonlyMap<SessionId, Effect.Semaphore>
+      >(new Map());
+      const sessionMutationGate = (
+        sessionId: SessionId,
+      ): Effect.Effect<Effect.Semaphore, never, never> =>
+        Ref.modify(sessionMutationGatesRef, (gates) => {
+          const existing = gates.get(sessionId);
+          if (existing !== undefined) return [existing, gates];
+          const created = Effect.unsafeMakeSemaphore(1);
+          const next = new Map(gates);
+          next.set(sessionId, created);
+          return [created, next];
+        });
+      const withSessionMutationGate = <A, E, R>(
+        sessionId: SessionId,
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E, R> =>
+        Effect.flatMap(sessionMutationGate(sessionId), (gate) =>
+          gate.withPermits(1)(effect),
+        );
       const recordStopDeferral = (
         sessionId: SessionId,
         inputId: string,
@@ -841,6 +866,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const cancel = Effect.fn("SessionAuthority.cancel")(function* (
         run: AgentRun,
       ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
+        // Share the mutation gate with host-tool dispatch: cancellation
+        // either lands before a mutation's in-gate re-read (mutation
+        // refused) or waits for the in-flight mutation to complete.
+        yield* withSessionMutationGate(run.sessionId, Effect.void);
         const state = yield* getWorker(run.sessionId);
         if (Option.isSome(state)) {
           yield* abortForCleanup(run.sessionId, state.value.worker);
@@ -1157,6 +1186,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   return next;
                 });
                 yield* clearSessionStopDeferrals(sessionId);
+                yield* Ref.update(sessionMutationGatesRef, (gates) => {
+                  const next = new Map(gates);
+                  next.delete(sessionId);
+                  return next;
+                });
                 yield* releaseIfNoWorker(sessionId);
               }),
             ),
@@ -1266,134 +1300,164 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               request.toolName === "linear_create_comment" ||
               request.toolName === "linear_update_issue" ||
               request.toolName === "linear_add_external_url";
-            if (mutating && currentRun.desiredState === "canceled") {
-              return fail("Run is canceled; mutating Linear tools are refused");
-            }
             const linear = linearOption.value;
-            switch (request.toolName) {
-              case "linear_get_issue": {
-                const requested = raw.issueId;
-                if (
-                  typeof requested !== "string" ||
-                  requested.trim().length === 0
-                )
-                  return fail("issueId must be a non-empty string");
-                return yield* linear
-                  .getIssue({
-                    sessionId: run.sessionId,
-                    issueId: requested.trim(),
-                  })
-                  .pipe(
-                    Effect.map((issue) =>
-                      textResult(JSON.stringify(issue), issue),
-                    ),
-                    Effect.catchAll((error) =>
-                      Effect.succeed(
-                        fail(`Unable to read issue: ${String(error)}`),
-                      ),
-                    ),
-                  );
-              }
-              case "linear_create_comment": {
-                if (issueId === null) return fail("Run has no Linear issue");
-                const body = raw.body;
-                if (typeof body !== "string" || body.trim().length === 0)
-                  return fail("body must be a non-empty string");
-                return yield* linear
-                  .createIssueComment({ sessionId: run.sessionId, body })
-                  .pipe(
-                    Effect.map((commentId) =>
-                      textResult(`Created Linear comment ${commentId}`, {
-                        commentId,
-                      }),
-                    ),
-                    Effect.catchAll((error) =>
-                      Effect.succeed(
-                        fail(`Unable to create comment: ${String(error)}`),
-                      ),
-                    ),
-                  );
-              }
-              case "linear_update_issue": {
-                if (issueId === null) return fail("Run has no Linear issue");
-                const stateId = raw.stateId;
-                const delegateId = raw.delegateId;
-                if (
-                  stateId !== undefined &&
-                  (typeof stateId !== "string" || stateId.trim().length === 0)
-                )
-                  return fail("stateId must be a non-empty string");
-                if (
-                  delegateId !== undefined &&
-                  delegateId !== null &&
-                  (typeof delegateId !== "string" ||
-                    delegateId.trim().length === 0)
-                )
-                  return fail("delegateId must be a non-empty string or null");
-                if (stateId === undefined && delegateId === undefined)
-                  return fail("Provide stateId and/or delegateId");
-                return yield* linear
-                  .updateIssue({
-                    sessionId: run.sessionId,
-                    issueId,
-                    ...(stateId === undefined ? {} : { stateId }),
-                    ...(delegateId === undefined ? {} : { delegateId }),
-                  })
-                  .pipe(
-                    Effect.map(() => textResult("Updated Linear issue")),
-                    Effect.catchAll((error) =>
-                      Effect.succeed(
-                        fail(`Unable to update issue: ${String(error)}`),
-                      ),
-                    ),
-                  );
-              }
-              case "linear_add_external_url": {
-                if (issueId === null) return fail("Run has no Linear issue");
-                const label = raw.label;
-                const url = raw.url;
-                if (typeof label !== "string" || label.trim().length === 0)
-                  return fail("label must be a non-empty string");
-                if (typeof url !== "string")
-                  return fail("url must be an http(s) URL");
-                try {
-                  const parsed = new URL(url);
-                  if (
-                    parsed.protocol !== "http:" &&
-                    parsed.protocol !== "https:"
-                  )
-                    return fail("url must be an http(s) URL");
-                } catch {
-                  return fail("url must be a valid http(s) URL");
+            const dispatch: Effect.Effect<RpcHostToolResult, never, never> =
+              Effect.gen(function* () {
+                switch (request.toolName) {
+                  case "linear_get_issue": {
+                    const requested = raw.issueId;
+                    if (
+                      typeof requested !== "string" ||
+                      requested.trim().length === 0
+                    )
+                      return fail("issueId must be a non-empty string");
+                    return yield* linear
+                      .getIssue({
+                        sessionId: run.sessionId,
+                        issueId: requested.trim(),
+                      })
+                      .pipe(
+                        Effect.map((issue) =>
+                          textResult(JSON.stringify(issue), issue),
+                        ),
+                        Effect.catchAll((error) =>
+                          Effect.succeed(
+                            fail(`Unable to read issue: ${String(error)}`),
+                          ),
+                        ),
+                      );
+                  }
+                  case "linear_create_comment": {
+                    if (issueId === null)
+                      return fail("Run has no Linear issue");
+                    const body = raw.body;
+                    if (typeof body !== "string" || body.trim().length === 0)
+                      return fail("body must be a non-empty string");
+                    return yield* linear
+                      .createIssueComment({ sessionId: run.sessionId, body })
+                      .pipe(
+                        Effect.map((commentId) =>
+                          textResult(`Created Linear comment ${commentId}`, {
+                            commentId,
+                          }),
+                        ),
+                        Effect.catchAll((error) =>
+                          Effect.succeed(
+                            fail(`Unable to create comment: ${String(error)}`),
+                          ),
+                        ),
+                      );
+                  }
+                  case "linear_update_issue": {
+                    if (issueId === null)
+                      return fail("Run has no Linear issue");
+                    const stateId = raw.stateId;
+                    const delegateId = raw.delegateId;
+                    if (
+                      stateId !== undefined &&
+                      (typeof stateId !== "string" ||
+                        stateId.trim().length === 0)
+                    )
+                      return fail("stateId must be a non-empty string");
+                    if (
+                      delegateId !== undefined &&
+                      delegateId !== null &&
+                      (typeof delegateId !== "string" ||
+                        delegateId.trim().length === 0)
+                    )
+                      return fail(
+                        "delegateId must be a non-empty string or null",
+                      );
+                    if (stateId === undefined && delegateId === undefined)
+                      return fail("Provide stateId and/or delegateId");
+                    return yield* linear
+                      .updateIssue({
+                        sessionId: run.sessionId,
+                        issueId,
+                        ...(stateId === undefined ? {} : { stateId }),
+                        ...(delegateId === undefined ? {} : { delegateId }),
+                      })
+                      .pipe(
+                        Effect.map(() => textResult("Updated Linear issue")),
+                        Effect.catchAll((error) =>
+                          Effect.succeed(
+                            fail(`Unable to update issue: ${String(error)}`),
+                          ),
+                        ),
+                      );
+                  }
+                  case "linear_add_external_url": {
+                    if (issueId === null)
+                      return fail("Run has no Linear issue");
+                    const label = raw.label;
+                    const url = raw.url;
+                    if (typeof label !== "string" || label.trim().length === 0)
+                      return fail("label must be a non-empty string");
+                    if (typeof url !== "string")
+                      return fail("url must be an http(s) URL");
+                    try {
+                      const parsed = new URL(url);
+                      if (
+                        parsed.protocol !== "http:" &&
+                        parsed.protocol !== "https:"
+                      )
+                        return fail("url must be an http(s) URL");
+                    } catch {
+                      return fail("url must be a valid http(s) URL");
+                    }
+                    return yield* linear
+                      .addSessionExternalUrls({
+                        sessionId: run.sessionId,
+                        urls: [{ label: label.trim(), url }],
+                      })
+                      .pipe(
+                        Effect.tap(() =>
+                          Ref.update(reportedPullRequestUrlsRef, (current) => {
+                            const next = new Map(current);
+                            const urls = new Set(next.get(run.sessionId) ?? []);
+                            urls.add(url);
+                            next.set(run.sessionId, urls);
+                            return next;
+                          }),
+                        ),
+                        Effect.map(() =>
+                          textResult("Added external URL to Linear session"),
+                        ),
+                        Effect.catchAll((error) =>
+                          Effect.succeed(
+                            fail(
+                              `Unable to add external URL: ${String(error)}`,
+                            ),
+                          ),
+                        ),
+                      );
+                  }
+                  default:
+                    return fail(`Unknown host tool: ${request.toolName}`);
                 }
-                return yield* linear
-                  .addSessionExternalUrls({
-                    sessionId: run.sessionId,
-                    urls: [{ label: label.trim(), url }],
-                  })
+              });
+            if (!mutating) return yield* dispatch;
+            // Serialize with cancel(): re-read the run inside the gate
+            // immediately before any Linear mutation.
+            return yield* withSessionMutationGate(
+              run.sessionId,
+              Effect.gen(function* () {
+                const fresh = yield* runRepo
+                  .get(run.sessionId)
                   .pipe(
-                    Effect.tap(() =>
-                      Ref.update(reportedPullRequestUrlsRef, (current) => {
-                        const next = new Map(current);
-                        const urls = new Set(next.get(run.sessionId) ?? []);
-                        urls.add(url);
-                        next.set(run.sessionId, urls);
-                        return next;
-                      }),
-                    ),
-                    Effect.map(() =>
-                      textResult("Added external URL to Linear session"),
-                    ),
-                    Effect.catchAll((error) =>
-                      Effect.succeed(
-                        fail(`Unable to add external URL: ${String(error)}`),
-                      ),
+                    Effect.catchAll(() =>
+                      Effect.succeed(Option.none<AgentRun>()),
                     ),
                   );
-              }
-              default:
-                return fail(`Unknown host tool: ${request.toolName}`);
-            }
+                if (Option.isNone(fresh)) return fail("Run no longer exists");
+                if (fresh.value.desiredState === "canceled") {
+                  return fail(
+                    "Run is canceled; mutating Linear tools are refused",
+                  );
+                }
+                return yield* dispatch;
+              }),
+            );
           }).pipe(
             Effect.catchAll((error) =>
               Effect.succeed({
