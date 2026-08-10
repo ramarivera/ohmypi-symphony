@@ -53,10 +53,13 @@ const positiveInteger = (name: string, fallback: number) =>
     }),
   );
 const decimalBetween = (name: string, fallback: number) =>
-  Config.string(name).pipe(
-    Config.withDefault(String(fallback)),
+  Config.option(Config.string(name)).pipe(
     Config.mapOrFail((value) => {
-      const parsed = Number(value);
+      const raw = Option.match(value, {
+        onNone: () => String(fallback),
+        onSome: (configured) => configured.trim(),
+      });
+      const parsed = Number(raw);
       return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1
         ? Either.right(parsed)
         : Either.left(

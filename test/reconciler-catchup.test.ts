@@ -22,6 +22,7 @@ const organizationId = Schema.decodeUnknownSync(OrganizationId)(
 const run = (
   sessionId: SessionId,
   state: AgentRun["state"] = "running",
+  lastActivityAt?: number,
 ): AgentRun => ({
   sessionId,
   organizationId,
@@ -37,7 +38,7 @@ const run = (
   attempt: 0,
   leaseOwner: Option.none(),
   leaseExpiresAt: Option.none(),
-  lastActivityAt: Option.none(),
+  lastActivityAt: Option.fromNullable(lastActivityAt),
   terminalReason: Option.none(),
   nextAttemptAt: Option.none(),
   createdAt: 0,
@@ -56,9 +57,17 @@ const makeLayer = (
 ) => {
   const inserted = new Set<string>();
   const ids: string[] = [];
+  const listRunnableCalls: Array<{
+    readonly now: number;
+    readonly includeUnleased: boolean;
+  }> = [];
   const runRepo = {
-    listRunnable: () => Effect.succeed(runs),
-    listCancellationPending: () => Effect.succeed([]),
+    listRunnable: (now: number, includeUnleased: boolean) =>
+      Effect.sync(() => {
+        listRunnableCalls.push({ now, includeUnleased });
+        return runs;
+      }),
+    listCancellationPending: () => Effect.succeed(runs),
   } as unknown as RunRepo;
   const runInputRepo = {
     enqueue: (input: { id: string }) =>
@@ -82,7 +91,7 @@ const makeLayer = (
     Layer.provide(Layer.succeed(SessionAuthority, authority)),
   );
   const layer = Layer.mergeAll(reconciler, deps);
-  return { layer, ids };
+  return { layer, ids, listRunnableCalls };
 };
 
 describe("Reconciler catch-up", () => {
@@ -90,36 +99,41 @@ describe("Reconciler catch-up", () => {
     "injects prompt and stop activities once, with unknown activities ignored",
     () =>
       Effect.gen(function* () {
-        const { layer, ids } = makeLayer([run(sessionA)], () =>
-          Effect.succeed([
-            {
-              id: "prompt-1",
-              type: "prompt",
-              body: "hello",
-              signal: null,
-              createdAt: "2025-01-01T00:00:00.000Z",
-            },
-            {
-              id: "stop-1",
-              type: "prompt",
-              body: "stop",
-              signal: "stop",
-              createdAt: "2025-01-01T00:00:00.000Z",
-            },
-            {
-              id: "new-1",
-              type: "unknown",
-              body: "ignored",
-              signal: null,
-              createdAt: "2025-01-01T00:00:00.000Z",
-            },
-          ]),
+        const { layer, ids, listRunnableCalls } = makeLayer(
+          [run(sessionA)],
+          () =>
+            Effect.succeed([
+              {
+                id: "prompt-1",
+                type: "prompt",
+                body: "hello",
+                signal: null,
+                createdAt: "2025-01-01T00:00:00.000Z",
+              },
+              {
+                id: "stop-1",
+                type: "prompt",
+                body: "stop",
+                signal: "stop",
+                createdAt: "2025-01-01T00:00:00.000Z",
+              },
+              {
+                id: "new-1",
+                type: "unknown",
+                body: "ignored",
+                signal: null,
+                createdAt: "2025-01-01T00:00:00.000Z",
+              },
+            ]),
         );
         yield* Effect.gen(function* () {
           const reconciler = yield* Reconciler;
           yield* reconciler.catchup();
           yield* reconciler.catchup();
         }).pipe(Effect.provide(layer));
+        expect(listRunnableCalls.length).toBe(2);
+        expect(listRunnableCalls[0]?.includeUnleased).toBe(true);
+        expect(typeof listRunnableCalls[0]?.now).toBe("number");
         expect(ids).toEqual([
           `${sessionA}:prompted:prompt-1`,
           `${sessionA}:stop:stop-1`,
@@ -164,5 +178,27 @@ describe("Reconciler catch-up", () => {
         }).pipe(Effect.provide(layer));
         expect(ids).toEqual([`${sessionB}:prompted:cancel-prompt`]);
       }),
+  );
+  it.effect("skips runs with recent activity", () =>
+    Effect.gen(function* () {
+      const { layer, ids } = makeLayer(
+        [run(sessionA, "running", Date.now())],
+        () =>
+          Effect.succeed([
+            {
+              id: "recent-prompt",
+              type: "prompt",
+              body: "ignored",
+              signal: null,
+              createdAt: "2025-01-01T00:00:00.000Z",
+            },
+          ]),
+      );
+      yield* Effect.gen(function* () {
+        const reconciler = yield* Reconciler;
+        yield* reconciler.catchup();
+      }).pipe(Effect.provide(layer));
+      expect(ids).toEqual([]);
+    }),
   );
 });

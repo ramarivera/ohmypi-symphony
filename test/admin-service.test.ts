@@ -1,7 +1,14 @@
 import { Effect, Option, Redacted, Schema } from "effect";
 import { describe, expect, it } from "vitest";
-import { WorkspaceError } from "../src/domain/errors.js";
-import { IssueId, OrganizationId, SessionId } from "../src/domain/ids.js";
+import { LinearRateLimitError, WorkspaceError } from "../src/domain/errors.js";
+import {
+  IssueId,
+  OrganizationId,
+  ProjectId,
+  SessionId,
+  TeamId,
+  WorkspaceId,
+} from "../src/domain/ids.js";
 import {
   type AgentRun,
   RepositoryRecord,
@@ -32,6 +39,9 @@ const organizationId = Schema.decodeUnknownSync(OrganizationId)(
 const issueId = Schema.decodeUnknownSync(IssueId)(
   "44444444-4444-4444-8444-444444444444",
 );
+const repositoryId = Schema.decodeUnknownSync(WorkspaceId)("repo-main");
+const teamId = Schema.decodeUnknownSync(TeamId)("team-main");
+const projectId = Schema.decodeUnknownSync(ProjectId)("project-main");
 const config: GatewayConfigShape = {
   linearClientId: "client",
   linearClientSecret: Redacted.make("secret"),
@@ -82,6 +92,7 @@ const deps: AdminDeps = {
   runRepo: RunRepo.make({
     get: unreachable,
     create: unreachable,
+    createIfNoActiveForIssue: unreachable,
     update: unreachable,
     reopen: unreachable,
     hasActiveForIssue: unreachable,
@@ -358,14 +369,14 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     ),
     organizationId,
     issueId: Option.some(issueId),
-    repositoryId: Option.none(),
+    repositoryId: Option.some(repositoryId),
     state: "succeeded",
     desiredState: "running",
     ompSessionId: Option.none(),
     ompSessionFile: Option.none(),
     workspacePath: Option.none(),
-    teamId: Option.none(),
-    projectId: Option.none(),
+    teamId: Option.some(teamId),
+    projectId: Option.some(projectId),
     attempt: 0,
     leaseOwner: Option.none(),
     leaseExpiresAt: Option.none(),
@@ -399,6 +410,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
         method: "POST",
         headers: {
           Cookie: `omp_gateway_admin=${token}`,
+          Origin: config.publicUrl.toString(),
           "Content-Type": "application/json",
         },
         body: "{}",
@@ -430,15 +442,22 @@ describe("POST /api/admin/runs/:id/rerun", () => {
         ),
       ),
     );
-    expect(Option.getOrElse(noIssueResponse, () => null)?.status).toBe(409);
-
+    const noIssueResponseValue = Option.getOrElse(noIssueResponse, () => null);
+    expect(noIssueResponseValue?.status).toBe(409);
+    expect(await noIssueResponseValue?.text()).toBe(
+      "Run is not linked to an issue",
+    );
     const activeHandle = createAdminHandle({
       ...deps,
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
-        hasActiveForIssue: () => Effect.succeed(true),
+        createIfNoActiveForIssue: () => Effect.succeed("active"),
       }),
+      linearGateway: {
+        createSessionOnIssue: () =>
+          Effect.succeed("55555555-5555-4555-8555-555555555555"),
+      },
     });
     const activeResponse = await Effect.runPromise(
       activeHandle(
@@ -448,14 +467,19 @@ describe("POST /api/admin/runs/:id/rerun", () => {
         ),
       ),
     );
-    expect(Option.getOrElse(activeResponse, () => null)?.status).toBe(409);
+    const activeResponseValue = Option.getOrElse(activeResponse, () => null);
+    expect(activeResponseValue?.status).toBe(409);
+    expect(await activeResponseValue?.text()).toBe(
+      "A run for this issue is already active",
+    );
   });
-
   it("creates a new session, run, and dedupe-safe created input", async () => {
     const created: {
       sessionId?: string;
       createdRun?: boolean;
       enqueued?: boolean;
+      createdRunInput?: unknown;
+      payload?: unknown;
     } = {};
     const newSessionId = "55555555-5555-4555-8555-555555555555";
     const rerunHandle = createAdminHandle({
@@ -463,20 +487,18 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
-        hasActiveForIssue: () => Effect.succeed(false),
-        create: (input) => {
+        createIfNoActiveForIssue: (input) => {
+          created.createdRunInput = input;
           created.sessionId = input.sessionId;
           created.createdRun = true;
-          return Effect.succeed(terminalRun);
+          return Effect.succeed("created");
         },
       }),
       runInputRepo: RunInputRepo.make({
         ...deps.runInputRepo,
         enqueue: (input) => {
+          created.payload = input.payload;
           created.enqueued = true;
-          expect(input.id).toBe(`${newSessionId}:created`);
-          expect(input.sessionId).toBe(newSessionId);
-          expect(input.kind).toBe("created");
           return Effect.succeed(true);
         },
       }),
@@ -498,5 +520,49 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(created.sessionId).toBe(newSessionId);
     expect(created.createdRun).toBe(true);
     expect(created.enqueued).toBe(true);
+    const createdInput = created.createdRunInput as {
+      organizationId: unknown;
+      issueId: unknown;
+      repositoryId: unknown;
+      teamId: unknown;
+      projectId: unknown;
+    };
+    expect(createdInput.organizationId).toBe(organizationId);
+    expect(createdInput.issueId).toEqual(Option.some(issueId));
+    expect(createdInput.repositoryId).toEqual(Option.some(repositoryId));
+    expect(createdInput.teamId).toEqual(Option.some(teamId));
+    expect(createdInput.projectId).toEqual(Option.some(projectId));
+    const payload = created.payload as Record<string, unknown>;
+    expect(payload.repositoryId).toBe(repositoryId);
+    expect(payload.automationDelegated).toBe(false);
+  });
+  it("maps Linear rate limits to 429 with retry delay", async () => {
+    const rateLimitHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(terminalRun)),
+      }),
+      linearGateway: {
+        createSessionOnIssue: () =>
+          Effect.fail(
+            new LinearRateLimitError({
+              message: "Linear rate limit exceeded",
+              retryAfterMs: 12_345,
+            }),
+          ),
+      },
+    });
+    const response = await Effect.runPromise(
+      rateLimitHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    const responseValue = Option.getOrElse(response, () => null);
+    expect(responseValue?.status).toBe(429);
+    expect(await responseValue?.text()).toContain("12345ms");
   });
 });

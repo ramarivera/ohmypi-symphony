@@ -44,6 +44,9 @@ type TokenResponse = {
 };
 const LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token";
 const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const STARTED_STATES_CACHE_TTL_MS = 60 * 60 * 1000;
+const STARTED_STATES_CACHE_MAX_TEAMS = 100;
+const LIST_SESSION_ACTIVITIES_MAX_PAGES = 10;
 
 export class LinearGateway extends Effect.Service<LinearGateway>()(
   "LinearGateway",
@@ -67,7 +70,14 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
       const startedStatesCache = yield* Ref.make<
         Map<
           string,
-          ReadonlyArray<{ id: string; name: string; position: number }>
+          {
+            readonly states: ReadonlyArray<{
+              id: string;
+              name: string;
+              position: number;
+            }>;
+            readonly fetchedAt: number;
+          }
         >
       >(new Map());
 
@@ -719,18 +729,21 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           run.organizationId,
           Effect.gen(function* () {
             const client = yield* clientFor(run.organizationId);
-            return yield* withRateLimitRetry(
+            const result = yield* withRateLimitRetry(
               Effect.tryPromise({
                 try: async () => {
                   const activities: Array<ListedSessionActivity> = [];
                   const session = await client.agentSession(sessionId);
                   let after: string | undefined;
-                  while (true) {
+                  let pages = 0;
+                  let capped = false;
+                  while (pages < LIST_SESSION_ACTIVITIES_MAX_PAGES) {
                     const connection = await session.activities({
                       after,
                       first: 100,
                       orderBy: "createdAt",
                     } as Parameters<typeof session.activities>[0]);
+                    pages += 1;
                     for (const activity of connection.nodes) {
                       activities.push(mapActivity(activity));
                     }
@@ -738,13 +751,27 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
                     const next = connection.pageInfo.endCursor;
                     if (!next || next === after) break;
                     after = next;
+                    if (pages === LIST_SESSION_ACTIVITIES_MAX_PAGES) {
+                      capped = true;
+                    }
                   }
-                  return activities;
+                  return { activities, capped };
                 },
                 catch: (error) =>
                   mapLinearError("listSessionActivities", error),
               }),
             );
+            if (result.capped) {
+              yield* Effect.logDebug(
+                "linear.listSessionActivities.pagination_capped",
+              ).pipe(
+                Effect.annotateLogs({
+                  sessionId,
+                  maxPages: LIST_SESSION_ACTIVITIES_MAX_PAGES,
+                }),
+              );
+            }
+            return result.activities;
           }),
         );
       });
@@ -904,9 +931,15 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
               ),
             onSome: Effect.succeed,
           });
+          const now = yield* Clock.currentTimeMillis;
           const cached = yield* Ref.get(startedStatesCache);
           const hit = cached.get(input.teamId);
-          if (hit !== undefined) return hit;
+          if (
+            hit !== undefined &&
+            now - hit.fetchedAt < STARTED_STATES_CACHE_TTL_MS
+          ) {
+            return hit.states;
+          }
           const states = yield* withOrgQueue(
             run.organizationId,
             Effect.gen(function* () {
@@ -943,9 +976,24 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
               );
             }),
           );
+          const fetchedAt = yield* Clock.currentTimeMillis;
           yield* Ref.update(startedStatesCache, (current) => {
             const next = new Map(current);
-            next.set(input.teamId, states);
+            if (
+              !next.has(input.teamId) &&
+              next.size >= STARTED_STATES_CACHE_MAX_TEAMS
+            ) {
+              let oldestTeamId: string | undefined;
+              let oldestFetchedAt = Number.POSITIVE_INFINITY;
+              for (const [teamId, entry] of next) {
+                if (entry.fetchedAt < oldestFetchedAt) {
+                  oldestTeamId = teamId;
+                  oldestFetchedAt = entry.fetchedAt;
+                }
+              }
+              if (oldestTeamId !== undefined) next.delete(oldestTeamId);
+            }
+            next.set(input.teamId, { states, fetchedAt });
             return next;
           });
           return states;

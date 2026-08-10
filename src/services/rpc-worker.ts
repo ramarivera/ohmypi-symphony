@@ -54,8 +54,9 @@ export interface RpcWorkerHandle {
   readonly setHostTools: (
     tools: ReadonlyArray<RpcHostToolDefinition>,
   ) => Effect.Effect<void, RpcProtocolError, never>;
+  /** Registers the sole host-tool handler, replacing any previous handler. */
   readonly onHostToolCall: (
-    listener: (
+    handler: (
       request: RpcHostToolCall,
     ) => Effect.Effect<RpcHostToolResult, never, never>,
   ) => Effect.Effect<() => Effect.Effect<void, never, never>, never, never>;
@@ -186,12 +187,15 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const listenersRef = yield* Ref.make<Set<(event: RpcEvent) => void>>(
         new Set(),
       );
-      const hostToolListenersRef = yield* Ref.make<
-        Set<
+      const hostToolListenerRef = yield* Ref.make<
+        Option.Option<
           (
             request: RpcHostToolCall,
           ) => Effect.Effect<RpcHostToolResult, never, never>
         >
+      >(Option.none());
+      const hostToolResultFibersRef = yield* Ref.make<
+        Set<Fiber.Fiber<void, never>>
       >(new Set());
       const promptRequestIdsRef = yield* Ref.make<Set<string>>(new Set());
       const ready = yield* Deferred.make<void, RpcSpawnError>();
@@ -428,23 +432,36 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             const callId = frame.id;
             const toolCallId = frame.toolCallId;
             const toolName = frame.toolName;
+            if (!isString(callId)) {
+              return yield* Effect.fail(
+                new RpcProtocolError({
+                  method: "host_tool_call",
+                  message: "Invalid host tool call frame: missing string id",
+                }),
+              );
+            }
             if (
-              !isString(callId) ||
               !isString(toolCallId) ||
               !isString(toolName) ||
               !record(frame.arguments)
             ) {
-              return yield* Effect.fail(
-                new RpcProtocolError({
-                  method: "host_tool_call",
-                  message: "Invalid host tool call frame",
+              yield* forkHostToolResult(
+                callId,
+                Effect.succeed({
+                  content: [
+                    {
+                      type: "text",
+                      text: "Invalid host tool call frame",
+                    },
+                  ],
+                  isError: true,
                 }),
               );
+              return;
             }
-            const listeners = yield* Ref.get(hostToolListenersRef);
-            const listener = listeners.values().next().value;
+            const listener = yield* Ref.get(hostToolListenerRef);
             const result: Effect.Effect<RpcHostToolResult, never, never> =
-              listener === undefined
+              Option.isNone(listener)
                 ? Effect.succeed({
                     content: [
                       {
@@ -454,25 +471,13 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
                     ],
                     isError: true,
                   })
-                : listener({
+                : listener.value({
                     id: callId,
                     toolCallId,
                     toolName,
                     arguments: frame.arguments,
                   });
-            yield* Effect.forkDaemon(
-              result.pipe(
-                Effect.flatMap((toolResult) =>
-                  writeFrame({
-                    type: "host_tool_result",
-                    id: callId,
-                    result: toolResult,
-                    ...(toolResult.isError === true ? { isError: true } : {}),
-                  }),
-                ),
-                Effect.catchAll(() => Effect.void),
-              ),
-            );
+            yield* forkHostToolResult(callId, result);
             return;
           }
 
@@ -753,6 +758,40 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               fail(error).pipe(Effect.zipRight(Effect.fail(error))),
           }),
         );
+      const forkHostToolResult = (
+        callId: string,
+        result: Effect.Effect<RpcHostToolResult, never, never>,
+      ): Effect.Effect<void, never, never> =>
+        Effect.gen(function* () {
+          const resultFiber = yield* Effect.fork(
+            result.pipe(
+              Effect.flatMap((toolResult) =>
+                writeFrame({
+                  type: "host_tool_result",
+                  id: callId,
+                  result: toolResult,
+                  ...(toolResult.isError === true ? { isError: true } : {}),
+                }),
+              ),
+              Effect.catchAll(() => Effect.void),
+            ),
+          );
+          yield* Ref.update(hostToolResultFibersRef, (fibers) => {
+            fibers.add(resultFiber);
+            return fibers;
+          });
+          yield* Effect.fork(
+            Fiber.join(resultFiber).pipe(
+              Effect.flatMap(() =>
+                Ref.update(hostToolResultFibersRef, (fibers) => {
+                  fibers.delete(resultFiber);
+                  return fibers;
+                }),
+              ),
+              Effect.catchAll(() => Effect.void),
+            ),
+          );
+        });
 
       const send = Effect.fn("RpcWorker.send")(function* (
         type: string,
@@ -890,6 +929,12 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         void,
         never
       > {
+        const hostToolResultFibers = yield* Ref.get(hostToolResultFibersRef);
+        for (const fiber of hostToolResultFibers) {
+          yield* Fiber.interruptFork(fiber);
+        }
+        yield* Ref.set(hostToolResultFibersRef, new Set());
+
         const process = yield* Ref.get(processRef);
         if (Option.isNone(process)) {
           return;
@@ -904,26 +949,14 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               Effect.sync(() => process.value.kill()).pipe(Effect.ignore),
           }),
         );
-
-        const exited = yield* Effect.race(
-          Effect.promise(() => process.value.exited).pipe(
-            Effect.map(() => true),
-          ),
-          Effect.sleep(2_000).pipe(Effect.map(() => false)),
-        );
-
-        if (!exited) {
-          yield* Effect.sync(() => process.value.kill()).pipe(Effect.ignore);
-          yield* Effect.promise(() => process.value.exited).pipe(Effect.ignore);
-        }
-
+        yield* Effect.sync(() => process.value.kill()).pipe(Effect.ignore);
         const stdoutFiber = yield* Ref.get(stdoutFiberRef);
         const stderrFiber = yield* Ref.get(stderrFiberRef);
         if (Option.isSome(stdoutFiber)) {
-          yield* Fiber.interrupt(stdoutFiber.value);
+          yield* Fiber.interruptFork(stdoutFiber.value);
         }
         if (Option.isSome(stderrFiber)) {
-          yield* Fiber.interrupt(stderrFiber.value);
+          yield* Fiber.interruptFork(stderrFiber.value);
         }
 
         yield* rejectPending(
@@ -967,19 +1000,17 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       });
 
       const onHostToolCall = Effect.fn("RpcWorker.onHostToolCall")(function* (
-        listener: (
+        handler: (
           request: RpcHostToolCall,
         ) => Effect.Effect<RpcHostToolResult, never, never>,
       ): Effect.fn.Return<() => Effect.Effect<void, never, never>, never> {
-        yield* Ref.update(hostToolListenersRef, (listeners) => {
-          listeners.add(listener);
-          return listeners;
-        });
+        yield* Ref.set(hostToolListenerRef, Option.some(handler));
         return () =>
-          Ref.update(hostToolListenersRef, (listeners) => {
-            listeners.delete(listener);
-            return listeners;
-          });
+          Ref.update(hostToolListenerRef, (current) =>
+            Option.isSome(current) && current.value === handler
+              ? Option.none()
+              : current,
+          );
       });
 
       const abort = Effect.fn("RpcWorker.abort")(function* (): Effect.fn.Return<

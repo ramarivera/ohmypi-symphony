@@ -112,7 +112,7 @@ class AdminError extends Schema.TaggedError<AdminError>()(
   "@Gateway/AdminError",
   {
     message: Schema.String,
-    status: Schema.Literal(400, 401, 403, 404, 409, 500),
+    status: Schema.Literal(400, 401, 403, 404, 409, 429, 500),
   },
 ) {}
 
@@ -647,9 +647,18 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const adminSession =
           rawToken === null
             ? Option.none()
-            : yield* deps.adminSessionRepo
-                .get(tokenHash(rawToken), now)
-                .pipe(Effect.catchAll(() => Effect.succeed(Option.none())));
+            : yield* deps.adminSessionRepo.get(tokenHash(rawToken), now).pipe(
+                Effect.catchAll((error) =>
+                  Effect.logWarning("admin.session_lookup_failed").pipe(
+                    Effect.annotateLogs({
+                      sessionId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    }),
+                    Effect.as(Option.none()),
+                  ),
+                ),
+              );
         const csrfToken = Option.match(adminSession, {
           onNone: () => null,
           onSome: () => deriveCsrfToken(rawToken ?? ""),
@@ -696,28 +705,28 @@ export const createAdminHandle = (deps: AdminDeps) =>
           return Option.some(text("Run is not linked to an issue", 409));
         }
         const issueId = run.issueId.value;
-        const active = yield* deps.runRepo.hasActiveForIssue(
-          run.organizationId,
-          issueId,
-        );
-        if (active) {
-          return Option.some(
-            text("A run for this issue is already active", 409),
-          );
-        }
         const newSessionId = yield* deps.linearGateway
           .createSessionOnIssue({
             organizationId: run.organizationId,
             issueId,
           })
           .pipe(
-            Effect.mapError(
-              (error) =>
-                new AdminError({
-                  message: `Could not create Linear agent session: ${error.message}`,
-                  status: 500,
-                }),
-            ),
+            Effect.mapError((error) => {
+              if (error._tag === "@Gateway/LinearRateLimitError") {
+                const retry =
+                  error.retryAfterMs === undefined
+                    ? ""
+                    : ` Retry after ${error.retryAfterMs}ms.`;
+                return new AdminError({
+                  message: `Could not create Linear agent session: ${error.message}.${retry}`,
+                  status: 429,
+                });
+              }
+              return new AdminError({
+                message: `Could not create Linear agent session: ${error.message}`,
+                status: 500,
+              });
+            }),
           );
         const newRunSessionId = yield* Schema.decodeUnknown(SessionId)(
           newSessionId,
@@ -732,15 +741,20 @@ export const createAdminHandle = (deps: AdminDeps) =>
               ),
           }),
         );
-        const now = yield* Clock.currentTimeMillis;
-        yield* deps.runRepo.create({
+        const rerunStatus = yield* deps.runRepo.createIfNoActiveForIssue({
           sessionId: newRunSessionId,
           organizationId: run.organizationId,
           issueId: Option.some(issueId),
+          repositoryId: run.repositoryId,
           teamId: run.teamId,
           projectId: run.projectId,
-          now,
         });
+        if (rerunStatus === "active") {
+          return Option.some(
+            text("A run for this issue is already active", 409),
+          );
+        }
+        const rerunCreatedAt = yield* Clock.currentTimeMillis;
         const inputId = yield* Schema.decodeUnknown(InputId)(
           `${newSessionId}:created`,
         ).pipe(
@@ -761,21 +775,25 @@ export const createAdminHandle = (deps: AdminDeps) =>
             type: "AgentSessionEvent",
             action: "created",
             organizationId: run.organizationId,
+            ...(Option.isSome(run.repositoryId)
+              ? { repositoryId: run.repositoryId.value }
+              : {}),
+            automationDelegated: false,
             appUserId: "synthetic",
             oauthClientId: "synthetic",
             webhookId: "synthetic",
-            webhookTimestamp: now,
+            webhookTimestamp: rerunCreatedAt,
             agentSession: {
               id: newSessionId,
               appUserId: "synthetic",
               organizationId: run.organizationId,
               status: "pending",
-              createdAt: now,
-              updatedAt: now,
+              createdAt: rerunCreatedAt,
+              updatedAt: rerunCreatedAt,
               issueId,
             },
           },
-          createdAt: now,
+          createdAt: rerunCreatedAt,
         });
         return Option.some(json({ sessionId: newSessionId }));
       }

@@ -35,6 +35,16 @@ const sdkState = vi.hoisted(() => {
       readonly count: number;
       readonly resolve: () => void;
     }>;
+    readonly createdSessionInputs: Array<{ readonly issueId: string }>;
+    readonly startedStates: Map<
+      string,
+      ReadonlyArray<{
+        readonly id: string;
+        readonly name: string;
+        readonly position: number;
+      }>
+    >;
+    teamCalls: number;
     activityHandler: (input: ActivityInput) => Promise<unknown>;
   } = {
     activities: [],
@@ -43,6 +53,9 @@ const sdkState = vi.hoisted(() => {
     updates: [],
     pending: [],
     waiters: [],
+    createdSessionInputs: [],
+    startedStates: new Map(),
+    teamCalls: 0,
     activityHandler: async () => ({
       success: true,
       agentActivityId: "activity-id",
@@ -60,16 +73,37 @@ const sdkState = vi.hoisted(() => {
     }
     agentSession(_id: string): Promise<unknown> {
       return Promise.resolve({
-        activities: (variables?: { readonly after?: string }) =>
-          Promise.resolve(
-            state.activityPages[variables?.after ? 1 : 0] ?? {
+        activities: (variables?: { readonly after?: string }) => {
+          const previousPageIndex =
+            variables?.after === undefined
+              ? -1
+              : state.activityPages.findIndex(
+                  (page) => page.pageInfo.endCursor === variables.after,
+                );
+          const pageIndex =
+            variables?.after === undefined
+              ? 0
+              : previousPageIndex < 0
+                ? -1
+                : previousPageIndex + 1;
+          return Promise.resolve(
+            state.activityPages[pageIndex] ?? {
               nodes: [],
               pageInfo: { hasNextPage: false, endCursor: null },
             },
-          ),
+          );
+        },
       });
     }
-
+    team(teamId: string): Promise<unknown> {
+      state.teamCalls += 1;
+      return Promise.resolve({
+        states: () =>
+          Promise.resolve({
+            nodes: state.startedStates.get(teamId) ?? [],
+          }),
+      });
+    }
     createComment(input: CommentInput): Promise<unknown> {
       state.comments.push(input);
       return Promise.resolve({
@@ -85,7 +119,8 @@ const sdkState = vi.hoisted(() => {
       return Promise.resolve({ success: true });
     }
 
-    agentSessionCreateOnIssue(_input: { issueId: string }): Promise<unknown> {
+    agentSessionCreateOnIssue(input: { issueId: string }): Promise<unknown> {
+      state.createdSessionInputs.push(input);
       return Promise.resolve({
         success: true,
         agentSessionId: "new-session-id",
@@ -101,7 +136,11 @@ const sdkState = vi.hoisted(() => {
       state.comments.length = 0;
       state.updates.length = 0;
       state.activityPages.length = 0;
+      state.pending.length = 0;
       state.waiters.length = 0;
+      state.createdSessionInputs.length = 0;
+      state.startedStates.clear();
+      state.teamCalls = 0;
       state.activityHandler = async () => ({
         success: true,
         agentActivityId: "activity-id",
@@ -122,7 +161,17 @@ vi.mock("@linear/sdk", async () => {
 });
 
 import { it as effectIt } from "@effect/vitest";
-import { Effect, Exit, Fiber, Layer, Option, Redacted, Schema } from "effect";
+import {
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Redacted,
+  Schema,
+  TestClock,
+} from "effect";
 import { beforeEach, describe, expect, it } from "vitest";
 import { LinearRateLimitError } from "../src/domain/errors.js";
 import {
@@ -191,6 +240,7 @@ const gatewayDependencies = Layer.mergeAll(
     RunRepo.make({
       get: () => Effect.succeed(Option.some(run)),
       create: unusedRepoMethod,
+      createIfNoActiveForIssue: unusedRepoMethod,
       update: unusedRepoMethod,
       reopen: unusedRepoMethod,
       hasActiveForIssue: unusedRepoMethod,
@@ -247,6 +297,53 @@ const gatewayDependencies = Layer.mergeAll(
 const gatewayLayer = LinearGateway.DefaultWithoutDependencies.pipe(
   Layer.provide(gatewayDependencies),
 );
+const cacheTests = () => {
+  effectIt.effect("expires started-state cache entries after one hour", () =>
+    Effect.gen(function* () {
+      sdkState.state.startedStates.set("team-ttl", [
+        { id: "state-1", name: "Started", position: 1 },
+      ]);
+      const clock = yield* TestClock.testClock();
+      const gateway = yield* LinearGateway;
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-ttl",
+      });
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-ttl",
+      });
+      expect(sdkState.state.teamCalls).toBe(1);
+      yield* clock.adjust(Duration.hours(1));
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-ttl",
+      });
+      expect(sdkState.state.teamCalls).toBe(2);
+    }).pipe(Effect.provide(gatewayLayer)),
+  );
+
+  effectIt.effect("bounds started-state cache to one hundred teams", () =>
+    Effect.gen(function* () {
+      const gateway = yield* LinearGateway;
+      for (let index = 0; index < 101; index += 1) {
+        const teamId = `team-${index}`;
+        sdkState.state.startedStates.set(teamId, []);
+        yield* gateway.teamStartedStates({
+          sessionId: String(sessionId),
+          teamId,
+        });
+      }
+      expect(sdkState.state.teamCalls).toBe(101);
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-0",
+      });
+      expect(sdkState.state.teamCalls).toBe(102);
+    }).pipe(Effect.provide(gatewayLayer)),
+  );
+};
+cacheTests();
 
 const getGateway = () =>
   Effect.runPromise(
@@ -323,6 +420,35 @@ describe("LinearGateway parity", () => {
         createdAt: "2025-01-01T00:01:00.000Z",
       },
     ]);
+  });
+  it("caps activity pagination at ten pages", async () => {
+    sdkState.state.activityPages.push(
+      ...Array.from({ length: 11 }, (_, index) => ({
+        nodes: [
+          {
+            id: `activity-${index}`,
+            content: {
+              __typename: "AgentActivityPromptContent",
+              body: `body-${index}`,
+            },
+            signal: null,
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ],
+        pageInfo: {
+          hasNextPage: true,
+          endCursor: `cursor-${index}`,
+        },
+      })),
+    );
+    const gateway = await getGateway();
+    const activities = await Effect.runPromise(
+      gateway
+        .listSessionActivities({ sessionId })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    expect(activities).toHaveLength(10);
+    expect(activities.at(-1)?.id).toBe("activity-9");
   });
   it("forwards persisted activity content and signal metadata verbatim", async () => {
     const gateway = await getGateway();
@@ -562,5 +688,8 @@ describe("LinearGateway.createSessionOnIssue", () => {
         .pipe(Effect.provide(gatewayLayer)),
     );
     expect(newSessionId).toBe("new-session-id");
+    expect(sdkState.state.createdSessionInputs).toEqual([
+      { issueId: String(issueId) },
+    ]);
   });
 });

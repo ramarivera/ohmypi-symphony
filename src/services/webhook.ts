@@ -23,7 +23,11 @@ import type {
   AgentSessionIssue as AgentSessionIssueType,
   AppUserNotification as AppUserNotificationType,
 } from "../domain/models.js";
-import { AgentSessionEvent, AppUserNotification } from "../domain/models.js";
+import {
+  AgentSessionEvent,
+  APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION,
+  AppUserNotification,
+} from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
 import {
   isNumber,
@@ -640,7 +644,7 @@ const handlePermissionChange = (
 
 const APP_USER_NOTIFICATION_STOP_ACTIONS: Record<string, true> = {
   issueUnassignedFromYou: true,
-  issueStatusChanged: true,
+  [APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION]: true,
 };
 
 const validateAppUserNotification = (
@@ -668,7 +672,7 @@ const validateAppUserNotification = (
         "ParseError",
         (error) =>
           new WebhookPayloadError({
-            message: `AppUserNotification payload is invalid: ${error}`,
+            message: "AppUserNotification payload is invalid",
             status: 400,
             cause: String(error),
           }),

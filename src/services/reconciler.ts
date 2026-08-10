@@ -181,61 +181,61 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
         yield* Deferred.await(claim.value);
         return;
       }
-      const now = yield* Clock.currentTimeMillis;
-      yield* Ref.update(statusRef, (s) => ({
-        ...s,
-        running: true,
-        lastStartedAt: Option.some(now),
-      }));
-
-      const configOption = yield* Effect.serviceOption(GatewayConfig);
-      const catchupIntervalMs = Option.match(configOption, {
-        onNone: () => 5 * 60_000,
-        onSome: (config) => config.reconcilerCatchupIntervalMs ?? 5 * 60_000,
+      const release = Effect.gen(function* () {
+        yield* Ref.set(inFlight, Option.none());
+        yield* Deferred.succeed(myDeferred, undefined);
       });
-      const lastCatchup = yield* Ref.get(catchupLastAt);
-      if (
-        Option.isNone(lastCatchup) ||
-        now - lastCatchup.value >= catchupIntervalMs
-      ) {
-        yield* Ref.set(catchupLastAt, Option.some(now));
-        yield* catchup();
-      }
+      yield* Effect.gen(function* () {
+        const now = yield* Clock.currentTimeMillis;
+        yield* Ref.update(statusRef, (s) => ({
+          ...s,
+          running: true,
+          lastStartedAt: Option.some(now),
+        }));
 
-      const perform = authority.processRunnable().pipe(
-        Effect.matchCauseEffect({
-          onSuccess: () =>
-            Effect.gen(function* () {
-              const completedAt = yield* Clock.currentTimeMillis;
-              return yield* Ref.update(statusRef, (s) => ({
-                ...s,
-                lastCompletedAt: Option.some(completedAt),
-                lastError: Option.none(),
-              }));
-            }),
-          onFailure: (cause) =>
-            Effect.gen(function* () {
-              const message = Cause.pretty(cause);
-              yield* Ref.update(statusRef, (s) => ({
-                ...s,
-                lastError: Option.some(message),
-              }));
-              yield* Effect.logWarning("reconciler.tick.error").pipe(
-                Effect.annotateLogs({
-                  error: message,
-                }),
-              );
-            }),
-        }),
-        Effect.ensuring(
-          Effect.gen(function* () {
-            yield* Ref.set(inFlight, Option.none());
-            yield* Deferred.succeed(myDeferred, undefined);
+        const configOption = yield* Effect.serviceOption(GatewayConfig);
+        const catchupIntervalMs = Option.match(configOption, {
+          onNone: () => 5 * 60_000,
+          onSome: (config) => config.reconcilerCatchupIntervalMs ?? 5 * 60_000,
+        });
+        const lastCatchup = yield* Ref.get(catchupLastAt);
+        if (
+          Option.isNone(lastCatchup) ||
+          now - lastCatchup.value >= catchupIntervalMs
+        ) {
+          yield* Ref.set(catchupLastAt, Option.some(now));
+          yield* catchup();
+        }
+
+        const perform = authority.processRunnable().pipe(
+          Effect.matchCauseEffect({
+            onSuccess: () =>
+              Effect.gen(function* () {
+                const completedAt = yield* Clock.currentTimeMillis;
+                return yield* Ref.update(statusRef, (s) => ({
+                  ...s,
+                  lastCompletedAt: Option.some(completedAt),
+                  lastError: Option.none(),
+                }));
+              }),
+            onFailure: (cause) =>
+              Effect.gen(function* () {
+                const message = Cause.pretty(cause);
+                yield* Ref.update(statusRef, (s) => ({
+                  ...s,
+                  lastError: Option.some(message),
+                }));
+                yield* Effect.logWarning("reconciler.tick.error").pipe(
+                  Effect.annotateLogs({
+                    error: message,
+                  }),
+                );
+              }),
           }),
-        ),
-      );
+        );
 
-      yield* perform;
+        yield* perform;
+      }).pipe(Effect.ensuring(release));
     });
 
     const trigger = Effect.fn("Reconciler.trigger")(

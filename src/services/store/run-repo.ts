@@ -20,6 +20,7 @@ import {
   decodeRows,
   runChanges,
   SqliteClient,
+  transact,
   tryDb,
 } from "./sqlite-client.js";
 
@@ -122,6 +123,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       readonly sessionId: SessionId;
       readonly organizationId: OrganizationId;
       readonly issueId: Option.Option<IssueId>;
+      readonly repositoryId?: Option.Option<WorkspaceId>;
       readonly teamId?: Option.Option<TeamId>;
       readonly projectId?: Option.Option<ProjectId>;
       readonly now?: number;
@@ -133,14 +135,15 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
           db
             .query(`
               INSERT INTO agent_run (
-                session_id, organization_id, issue_id, team_id, project_id, state, desired_state, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, 'queued', 'running', ?, ?)
+                session_id, organization_id, issue_id, repository_id, team_id, project_id, state, desired_state, created_at, updated_at
+              ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 'running', ?, ?)
               ON CONFLICT(session_id) DO NOTHING
             `)
             .run(
               input.sessionId,
               input.organizationId,
               optionToSql(input.issueId),
+              optionToSql(input.repositoryId ?? Option.none()),
               optionToSql(input.teamId ?? Option.none()),
               optionToSql(input.projectId ?? Option.none()),
               now,
@@ -158,6 +161,66 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
           ),
         onSome: Effect.succeed,
       });
+    });
+
+    const createIfNoActiveForIssue = Effect.fn(
+      "RunRepo.createIfNoActiveForIssue",
+    )(function* (input: {
+      readonly sessionId: SessionId;
+      readonly organizationId: OrganizationId;
+      readonly issueId: Option.Option<IssueId>;
+      readonly repositoryId?: Option.Option<WorkspaceId>;
+      readonly teamId?: Option.Option<TeamId>;
+      readonly projectId?: Option.Option<ProjectId>;
+      readonly now?: number;
+    }): Effect.fn.Return<"created" | "active", DatabaseError | RowDecodeError> {
+      yield* Effect.annotateCurrentSpan("sessionId", input.sessionId);
+      const now = input.now ?? (yield* Clock.currentTimeMillis);
+      const tx = Effect.gen(function* () {
+        const active = yield* tryDb(
+          () =>
+            db
+              .query<unknown, [string, string | null]>(`
+                SELECT 1
+                FROM agent_run
+                WHERE organization_id=? AND issue_id=?
+                  AND state NOT IN ('succeeded','failed','canceled')
+                LIMIT 1
+              `)
+              .get(input.organizationId, optionToSql(input.issueId)),
+          "RunRepo.createIfNoActiveForIssue.check",
+        );
+        if (active !== null) return "active" as const;
+
+        const result = yield* tryDb(
+          () =>
+            db
+              .query(`
+                INSERT INTO agent_run (
+                  session_id, organization_id, issue_id, repository_id, team_id, project_id, state, desired_state, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 'running', ?, ?)
+                ON CONFLICT(session_id) DO NOTHING
+              `)
+              .run(
+                input.sessionId,
+                input.organizationId,
+                optionToSql(input.issueId),
+                optionToSql(input.repositoryId ?? Option.none()),
+                optionToSql(input.teamId ?? Option.none()),
+                optionToSql(input.projectId ?? Option.none()),
+                now,
+                now,
+              ),
+          "RunRepo.createIfNoActiveForIssue.insert",
+        );
+        const inserted =
+          (yield* runChanges(
+            result,
+            "RunRepo.createIfNoActiveForIssue.insert",
+          )) === 1;
+        return inserted ? ("created" as const) : ("active" as const);
+      });
+      return yield* transact(db, tx);
     });
 
     const update = Effect.fn("RunRepo.update")(function* (
@@ -452,28 +515,31 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       },
     );
 
-    const hasActiveForIssue = Effect.fn("RunRepo.hasActiveForIssue")(function* (
-      organizationId: OrganizationId,
-      issueId: IssueId,
-    ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
-      const row = yield* tryDb(
-        () =>
-          db
-            .query<{ count: number }, [string, string]>(`
-                SELECT 1 AS count
+    const hasActiveForIssue = Effect.fn("RunRepo.hasActiveForIssue")(
+      function* (input: {
+        readonly organizationId: OrganizationId;
+        readonly issueId: IssueId;
+      }): Effect.fn.Return<boolean, DatabaseError> {
+        const row = yield* tryDb(
+          () =>
+            db
+              .query<unknown, [string, string]>(`
+                SELECT 1
                 FROM agent_run
                 WHERE organization_id=? AND issue_id=?
                   AND state NOT IN ('succeeded','failed','canceled')
                 LIMIT 1
               `)
-            .get(organizationId, issueId),
-        "RunRepo.hasActiveForIssue",
-      );
-      return row !== null;
-    });
+              .get(input.organizationId, input.issueId),
+          "RunRepo.hasActiveForIssue",
+        );
+        return row !== null;
+      },
+    );
 
     return {
       create,
+      createIfNoActiveForIssue,
       get,
       update,
       reopen,

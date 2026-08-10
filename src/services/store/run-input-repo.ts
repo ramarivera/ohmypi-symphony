@@ -2,7 +2,11 @@ import { Clock, Effect, Option, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type { InputId } from "../../domain/ids.js";
 import { SessionId, SourceKey } from "../../domain/ids.js";
-import { InputKind, RunInput } from "../../domain/models.js";
+import {
+  InputKind,
+  isDeferredNotificationStopPayload,
+  RunInput,
+} from "../../domain/models.js";
 import { RunEventRepo } from "./run-event-repo.js";
 import {
   decodeRow,
@@ -100,17 +104,9 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
       const isDeferredNotificationStop = (input: {
         readonly kind: InputKind;
         readonly payload: unknown;
-      }): boolean => {
-        if (input.kind !== "stop" || typeof input.payload !== "object") {
-          return false;
-        }
-        const payload = input.payload as Record<string, unknown> | null;
-        return (
-          payload !== null &&
-          payload.type === "AppUserNotification" &&
-          payload.action === "issueStatusChanged"
-        );
-      };
+      }): boolean =>
+        input.kind === "stop" &&
+        isDeferredNotificationStopPayload(input.payload);
 
       const applyStop = Effect.fn("RunInputRepo.applyStop")(function* (
         sessionId: SessionId,

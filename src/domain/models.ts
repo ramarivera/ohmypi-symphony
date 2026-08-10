@@ -28,6 +28,18 @@ export const DesiredRunState = Schema.Literal("running", "canceled");
 export type DesiredRunState = Schema.Schema.Type<typeof DesiredRunState>;
 export const InputKind = Schema.Literal("created", "prompted", "stop");
 export type InputKind = Schema.Schema.Type<typeof InputKind>;
+export const APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION = "issueStatusChanged";
+
+export const isDeferredNotificationStopPayload = (
+  payload: unknown,
+): boolean => {
+  if (typeof payload !== "object" || payload === null) return false;
+  const record = payload as Record<string, unknown>;
+  return (
+    record.type === "AppUserNotification" &&
+    record.action === APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION
+  );
+};
 export const ActivityType = Schema.Literal(
   "thought",
   "action",

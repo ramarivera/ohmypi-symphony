@@ -175,15 +175,23 @@ export function renderRunDetailBody(
   const issue = model.issue;
   const terminal = Object.hasOwn(TERMINAL_STATES, model.run.state);
   const canRerun = terminal && issue !== null && csrfToken !== null;
+  const rerunDisabledTitle = canRerun
+    ? ""
+    : `title="Rerun unavailable: ${[
+        !terminal ? "the run is not terminal" : "",
+        csrfToken === null ? "a CSRF token or admin session is missing" : "",
+      ]
+        .filter(Boolean)
+        .join("; ")}."`;
   const rerunButton = issue
     ? `<button type="button" class="run-rerun" data-run-rerun
         ${canRerun ? "" : "disabled"}
+        ${rerunDisabledTitle}
         data-session-id="${escapeHtml(model.run.sessionId)}"
-        data-csrf-token="${canRerun ? escapeHtml(csrfToken ?? "") : ""}"
-        aria-live="polite">
+        data-csrf-token="${canRerun ? escapeHtml(csrfToken ?? "") : ""}">
       Run again on this issue
     </button>
-    <p class="run-rerun-status" id="run-rerun-status" hidden>
+    <p class="run-rerun-status" id="run-rerun-status" role="status" aria-live="polite" hidden>
       <a id="run-rerun-link" rel="noreferrer"></a>
       <span id="run-rerun-toast"></span>
     </p>`
@@ -262,6 +270,7 @@ export const RUN_DETAIL_STYLES = `
   .run-status[data-state="failed"], .run-status[data-state="canceled"], .run-event[data-run-level="error"] .run-event-level { border-color: var(--danger); color: var(--danger); }
   .run-status[data-state="succeeded"], .run-event[data-run-level="result"] .run-event-level { border-color: var(--good); color: var(--good); }
   .run-issue, .run-facts, .run-timeline { margin-top: 28px; padding: 24px; border: 1px solid var(--rule); background: var(--paper); }
+  .run-issue h2 { margin-bottom: 8px; }
   .run-rerun { margin-top: 14px; padding: 8px 12px; border: 1px solid var(--rule); background: var(--paper); font-family: var(--mono); font-size: 0.8rem; cursor: pointer; }
   .run-rerun:disabled { opacity: 0.45; cursor: not-allowed; }
   .run-rerun-status { margin-top: 10px; }
@@ -318,31 +327,49 @@ export const RUN_DETAIL_SCRIPT = `
       var toast = document.getElementById("run-rerun-toast");
       var status = document.getElementById("run-rerun-status");
       if (!sessionId || !csrf) return;
+      rerun.disabled = true;
       window.fetch("/api/admin/runs/" + encodeURIComponent(sessionId) + "/rerun", {
         method: "POST",
         headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" },
         credentials: "same-origin",
         body: "{}",
       })
-        .then(function (response) { return response.ok ? response.json() : null; })
-        .then(function (payload) {
-          if (payload && payload.sessionId) {
-            if (link) {
-              link.href = window.location.origin + "/runs/" + encodeURIComponent(payload.sessionId);
-              link.textContent = payload.sessionId;
+        .then(function (response) {
+          return response.text().then(function (message) {
+            if (!response.ok) throw new Error(message || "Failed to start a new run");
+            try {
+              return JSON.parse(message);
+            } catch {
+              throw new Error(message || "Failed to start a new run");
             }
-            if (toast) toast.textContent = "Started a new run";
-          } else if (toast) {
-            toast.textContent = "Failed to start a new run";
+          });
+        })
+        .then(function (payload) {
+          if (!payload || !payload.sessionId) {
+            throw new Error("Failed to start a new run");
           }
+          if (link) {
+            link.href = window.location.origin + "/runs/" + encodeURIComponent(payload.sessionId);
+            link.textContent = payload.sessionId;
+          }
+          if (toast) toast.textContent = "Started a new run";
           if (status) status.hidden = false;
         })
-        .catch(function () {
-          if (toast) toast.textContent = "Failed to start a new run";
+        .catch(function (error) {
+          if (link) {
+            link.removeAttribute("href");
+            link.textContent = "";
+          }
+          if (toast) {
+            toast.textContent =
+              error instanceof Error ? error.message : String(error);
+          }
           if (status) status.hidden = false;
+          rerun.disabled = false;
         });
     });
   }
+
   if (!window.__OHMYPI_RUN_POLL__) return;
   var root = document.querySelector("[data-run-updated-at]");
   if (!root) return;

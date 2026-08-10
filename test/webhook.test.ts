@@ -760,6 +760,9 @@ describe("Linear webhook input correctness", () => {
             expectSome(yield* RunRepo.get(sessionId("session-terminal")))
               ?.desiredState,
           ).toBe("running");
+          expect(
+            yield* RunInputRepo.pending(sessionId("session-terminal")),
+          ).toHaveLength(0);
         }),
       ),
   );
@@ -953,6 +956,24 @@ describe("Linear webhook input correctness", () => {
         expect(yield* Effect.promise(() => response.text())).toContain(
           "AgentSessionEvent payload is invalid",
         );
+      }),
+    ),
+  );
+  it.scopedLive("does not expose malformed notification payload details", () =>
+    withWebhook(
+      Effect.gen(function* () {
+        const now = yield* currentTime;
+        yield* install();
+        const secretContent = "notification-content-secret";
+        const payload = {
+          ...appUserNotificationPayload(now, "issueStatusChanged"),
+          notification: secretContent,
+        };
+        const response = yield* WebhookPipeline.handle(signedRequest(payload));
+        const body = yield* Effect.promise(() => response.text());
+        expect(response.status).toBe(400);
+        expect(body).toBe("AppUserNotification payload is invalid");
+        expect(body).not.toContain(secretContent);
       }),
     ),
   );

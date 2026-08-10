@@ -216,6 +216,7 @@ const migrate = (db: Database): void => {
       created_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS admin_session_org ON admin_session(organization_id);
+    CREATE INDEX IF NOT EXISTS agent_run_org_issue ON agent_run(organization_id, issue_id);
     CREATE UNIQUE INDEX IF NOT EXISTS repository_default
       ON repository(organization_id, is_default)
       WHERE is_default = 1;

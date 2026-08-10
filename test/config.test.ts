@@ -156,6 +156,16 @@ describe("GatewayConfig", () => {
     );
     expect(Either.isLeft(result)).toBe(true);
   });
+  test("rejects a blank repository suggestion confidence threshold", async () => {
+    const result = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", " \u200b "],
+        ]),
+      ),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+  });
 
   test("wraps all secret values in Redacted", async () => {
     const config = await Effect.runPromise(

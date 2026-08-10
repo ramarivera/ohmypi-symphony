@@ -17,7 +17,10 @@ import {
   type WorkspaceError,
 } from "../domain/errors.js";
 import type { SessionId, SourceKey } from "../domain/ids.js";
-import type { AgentRun } from "../domain/models.js";
+import {
+  type AgentRun,
+  isDeferredNotificationStopPayload,
+} from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
@@ -288,16 +291,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           sessionId: SessionId,
           input: { readonly kind: string; readonly payload: unknown },
         ): Effect.fn.Return<Option.Option<boolean>, never> {
-          if (input.kind !== "stop" || !record(input.payload)) {
-            return Option.some(true);
-          }
           if (
-            input.payload.type !== "AppUserNotification" ||
-            input.payload.action !== "issueStatusChanged"
+            input.kind !== "stop" ||
+            !isDeferredNotificationStopPayload(input.payload)
           ) {
             return Option.some(true);
           }
-          const notification = input.payload.notification;
+          const notification = record(input.payload)
+            ? input.payload.notification
+            : undefined;
           const issueId =
             record(notification) && typeof notification.issueId === "string"
               ? notification.issueId
@@ -487,11 +489,20 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             run.organizationId,
           );
           if (repositories.length === 0) return { resolution, options: [] };
+          const byKey = new Map<string, (typeof repositories)[number] | null>();
           const candidates = repositories.flatMap((repository) => {
             const candidate = parseRepositorySuggestionCandidate(
               repository.url,
             );
-            return candidate === null ? [] : [candidate];
+            if (candidate === null) return [];
+            const key =
+              `${candidate.hostname}/${candidate.repositoryFullName}`.toLowerCase();
+            if (byKey.has(key)) {
+              byKey.set(key, null);
+            } else {
+              byKey.set(key, repository);
+            }
+            return [candidate];
           });
           if (candidates.length === 0) return { resolution, options: [] };
           const suggestions = yield* linear
@@ -522,19 +533,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             readonly confidence: number;
           }> = [];
           for (const suggestion of ranked) {
-            const matches = repositories.filter((repository) => {
-              const candidate = parseRepositorySuggestionCandidate(
-                repository.url,
-              );
-              return (
-                candidate !== null &&
-                candidate.hostname.toLowerCase() ===
-                  suggestion.hostname.toLowerCase() &&
-                candidate.repositoryFullName.toLowerCase() ===
-                  suggestion.repositoryFullName.toLowerCase()
-              );
-            });
-            const only = matches.length === 1 ? matches[0] : undefined;
+            const key =
+              `${suggestion.hostname}/${suggestion.repositoryFullName}`.toLowerCase();
+            const only = byKey.get(key) ?? undefined;
             if (
               only !== undefined &&
               !mapped.some((item) => item.repository.id === only.id)
@@ -605,6 +606,29 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const reportedPullRequestUrlsRef = yield* Ref.make<
         ReadonlyMap<SessionId, ReadonlySet<string>>
       >(new Map());
+      const stopDeferralCountsRef = yield* Ref.make<
+        ReadonlyMap<SessionId, ReadonlyMap<string, number>>
+      >(new Map());
+      const recordStopDeferral = (
+        sessionId: SessionId,
+        inputId: string,
+      ): Effect.Effect<number, never, never> =>
+        Ref.modify(stopDeferralCountsRef, (counts) => {
+          const next = new Map(counts);
+          const sessionCounts = new Map(next.get(sessionId) ?? []);
+          const count = (sessionCounts.get(inputId) ?? 0) + 1;
+          sessionCounts.set(inputId, count);
+          next.set(sessionId, sessionCounts);
+          return [count, next];
+        });
+      const clearSessionStopDeferrals = (
+        sessionId: SessionId,
+      ): Effect.Effect<void, never, never> =>
+        Ref.update(stopDeferralCountsRef, (counts) => {
+          const next = new Map(counts);
+          next.delete(sessionId);
+          return next;
+        });
 
       const getWorker = (
         sessionId: SessionId,
@@ -1127,6 +1151,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   next.delete(sessionId);
                   return next;
                 });
+                yield* Ref.update(reportedPullRequestUrlsRef, (reported) => {
+                  const next = new Map(reported);
+                  next.delete(sessionId);
+                  return next;
+                });
+                yield* clearSessionStopDeferrals(sessionId);
                 yield* releaseIfNoWorker(sessionId);
               }),
             ),
@@ -1375,7 +1405,17 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             ),
           ),
         );
-        yield* worker.setHostTools(definitions);
+        yield* worker.setHostTools(definitions).pipe(
+          Effect.catchTag("@Gateway/RpcProtocolError", (error) =>
+            Effect.logWarning("linear.host_tools_registration_failed").pipe(
+              Effect.annotateLogs({
+                event: "linear.host_tools_registration_failed",
+                sessionId: run.sessionId,
+                error: error.message,
+              }),
+            ),
+          ),
+        );
       });
 
       const startWorker = Effect.fn("SessionAuthority.startWorker")(function* (
@@ -1703,17 +1743,33 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               let latest = Option.isSome(latestOption)
                 ? latestOption.value
                 : run;
-              const stopDecision = yield* stopShouldApply(sessionId, input);
-              if (Option.isNone(stopDecision)) return;
-              if (!stopDecision.value) {
+              let stopDecision = yield* stopShouldApply(sessionId, input);
+              if (Option.isNone(stopDecision)) {
+                const deferralCount = yield* recordStopDeferral(
+                  sessionId,
+                  input.id,
+                );
+                if (deferralCount < 10) return;
+                yield* Effect.logWarning(
+                  "authority.stop_deferral_bound_reached",
+                ).pipe(
+                  Effect.annotateLogs({
+                    event: "authority.stop_deferral_bound_reached",
+                    sessionId,
+                    inputId: input.id,
+                    deferralCount,
+                  }),
+                );
+                stopDecision = Option.some(true);
+              }
+              const shouldStop = Option.getOrElse(stopDecision, () => true);
+              if (!shouldStop) {
                 yield* runInputRepo.markProcessed(input.id);
                 continue;
               }
               if (
                 input.kind === "stop" &&
-                record(input.payload) &&
-                input.payload.type === "AppUserNotification" &&
-                input.payload.action === "issueStatusChanged"
+                isDeferredNotificationStopPayload(input.payload)
               ) {
                 yield* runInputRepo.applyStop(sessionId);
                 const refreshed = yield* runRepo.get(sessionId);
@@ -1889,7 +1945,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               }
               yield* runInputRepo.markProcessed(input.id);
             }
-          }).pipe(Effect.ensuring(releaseIfNoWorker(sessionId)));
+          }).pipe(
+            Effect.ensuring(
+              Effect.gen(function* () {
+                yield* clearSessionStopDeferrals(sessionId);
+                yield* releaseIfNoWorker(sessionId);
+              }),
+            ),
+          );
         },
       );
 
