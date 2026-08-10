@@ -160,7 +160,10 @@ function eventMarkup(event: RunDetailEvent): string {
 </article>`;
 }
 
-export function renderRunDetailBody(model: RunDetailModel): string {
+export function renderRunDetailBody(
+  model: RunDetailModel,
+  csrfToken: string | null = null,
+): string {
   const counts: Record<RunDetailLevel, number> = {
     debug: 0,
     info: 0,
@@ -170,18 +173,33 @@ export function renderRunDetailBody(model: RunDetailModel): string {
   };
   for (const event of model.events) counts[event.level] += 1;
   const issue = model.issue;
+  const terminal = Object.hasOwn(TERMINAL_STATES, model.run.state);
+  const canRerun = terminal && issue !== null && csrfToken !== null;
+  const rerunButton = issue
+    ? `<button type="button" class="run-rerun" data-run-rerun
+        ${canRerun ? "" : "disabled"}
+        data-session-id="${escapeHtml(model.run.sessionId)}"
+        data-csrf-token="${canRerun ? escapeHtml(csrfToken ?? "") : ""}"
+        aria-live="polite">
+      Run again on this issue
+    </button>
+    <p class="run-rerun-status" id="run-rerun-status" hidden>
+      <a id="run-rerun-link" rel="noreferrer"></a>
+      <span id="run-rerun-toast"></span>
+    </p>`
+    : "";
   const issueMarkup = issue
     ? `<section class="run-issue" aria-labelledby="issue-heading">
       <p class="eyebrow">Linked Linear issue</p>
       <h2 id="issue-heading">${present(issue.identifier)}${issue.title === null ? "" : ` · ${present(issue.title)}`}</h2>
       ${issue.url === null ? "" : `<a href="${escapeHtml(issue.url)}" rel="noreferrer">Open in Linear</a>`}
+      ${rerunButton}
     </section>`
     : "";
   const filters = LEVELS.map(
     (level) =>
       `<button type="button" class="run-filter" data-run-level-toggle="${level}" aria-pressed="true">${level} <span>${counts[level]}</span></button>`,
   ).join("\n");
-  const terminal = Object.hasOwn(TERMINAL_STATES, model.run.state);
 
   return `<main class="run-detail" data-run-updated-at="${model.run.updatedAt}">
   <header class="run-header">
@@ -244,7 +262,10 @@ export const RUN_DETAIL_STYLES = `
   .run-status[data-state="failed"], .run-status[data-state="canceled"], .run-event[data-run-level="error"] .run-event-level { border-color: var(--danger); color: var(--danger); }
   .run-status[data-state="succeeded"], .run-event[data-run-level="result"] .run-event-level { border-color: var(--good); color: var(--good); }
   .run-issue, .run-facts, .run-timeline { margin-top: 28px; padding: 24px; border: 1px solid var(--rule); background: var(--paper); }
-  .run-issue h2 { margin-bottom: 8px; }
+  .run-rerun { margin-top: 14px; padding: 8px 12px; border: 1px solid var(--rule); background: var(--paper); font-family: var(--mono); font-size: 0.8rem; cursor: pointer; }
+  .run-rerun:disabled { opacity: 0.45; cursor: not-allowed; }
+  .run-rerun-status { margin-top: 10px; }
+  .run-rerun-status a { display: inline-block; margin-right: 12px; word-break: break-all; }
   .run-facts dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin: 18px 0 0; border-top: 1px solid var(--rule-soft); }
   .run-facts dl > div { min-width: 0; padding: 12px 14px 12px 0; border-bottom: 1px solid var(--rule-soft); }
   .run-facts dt, .run-event-source { color: var(--ink-mute); font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.04em; text-transform: uppercase; }
@@ -286,6 +307,40 @@ export const RUN_DETAIL_SCRIPT = `
       if (active.has(level)) active.delete(level); else active.add(level);
       toggle.setAttribute("aria-pressed", active.has(level) ? "true" : "false");
       applyFilters();
+    });
+  }
+  var rerun = document.querySelector("[data-run-rerun]");
+  if (rerun) {
+    rerun.addEventListener("click", function () {
+      var sessionId = rerun.getAttribute("data-session-id");
+      var csrf = rerun.getAttribute("data-csrf-token");
+      var link = document.getElementById("run-rerun-link");
+      var toast = document.getElementById("run-rerun-toast");
+      var status = document.getElementById("run-rerun-status");
+      if (!sessionId || !csrf) return;
+      window.fetch("/api/admin/runs/" + encodeURIComponent(sessionId) + "/rerun", {
+        method: "POST",
+        headers: { "X-CSRF-Token": csrf, "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: "{}",
+      })
+        .then(function (response) { return response.ok ? response.json() : null; })
+        .then(function (payload) {
+          if (payload && payload.sessionId) {
+            if (link) {
+              link.href = window.location.origin + "/runs/" + encodeURIComponent(payload.sessionId);
+              link.textContent = payload.sessionId;
+            }
+            if (toast) toast.textContent = "Started a new run";
+          } else if (toast) {
+            toast.textContent = "Failed to start a new run";
+          }
+          if (status) status.hidden = false;
+        })
+        .catch(function () {
+          if (toast) toast.textContent = "Failed to start a new run";
+          if (status) status.hidden = false;
+        });
     });
   }
   if (!window.__OHMYPI_RUN_POLL__) return;

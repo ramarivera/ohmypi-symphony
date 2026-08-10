@@ -1,8 +1,9 @@
 import { Effect, Option, Redacted, Schema } from "effect";
 import { describe, expect, it } from "vitest";
 import { WorkspaceError } from "../src/domain/errors.js";
-import { OrganizationId } from "../src/domain/ids.js";
+import { IssueId, OrganizationId, SessionId } from "../src/domain/ids.js";
 import {
+  type AgentRun,
   RepositoryRecord,
   type RepositoryRecord as RepositoryRecordType,
 } from "../src/domain/models.js";
@@ -18,6 +19,7 @@ import {
   AdminSessionRepo,
   InstallationRepo,
   RunEventRepo,
+  RunInputRepo,
   RunRepo,
   WorkspaceRepo,
 } from "../src/services/store/repositories.js";
@@ -26,6 +28,9 @@ const unreachable = (..._args: ReadonlyArray<unknown>) => Effect.never;
 const token = "admin-token";
 const organizationId = Schema.decodeUnknownSync(OrganizationId)(
   "11111111-1111-4111-8111-111111111111",
+);
+const issueId = Schema.decodeUnknownSync(IssueId)(
+  "44444444-4444-4444-8444-444444444444",
 );
 const config: GatewayConfigShape = {
   linearClientId: "client",
@@ -46,7 +51,10 @@ const config: GatewayConfigShape = {
     "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
   nixRootsDir: "/tmp/nix-roots",
   nixGcMaxBytes: 1_000_000,
+  reconcilerCatchupIntervalMs: 300_000,
+  reconcilerCatchupMinAgeMs: 120_000,
   webhookReplayWindowMs: 60_000,
+  repositorySuggestionConfidenceThreshold: 0.8,
 };
 
 const deps: AdminDeps = {
@@ -76,6 +84,8 @@ const deps: AdminDeps = {
     create: unreachable,
     update: unreachable,
     reopen: unreachable,
+    hasActiveForIssue: unreachable,
+    listNonTerminalByIssue: unreachable,
     listRunnable: unreachable,
     listCancellationPending: unreachable,
     claimLease: unreachable,
@@ -87,6 +97,17 @@ const deps: AdminDeps = {
     upsert: unreachable,
     list: unreachable,
   }),
+  runInputRepo: RunInputRepo.make({
+    enqueue: unreachable,
+    applyStop: unreachable,
+    pending: unreachable,
+    latestActionableInput: unreachable,
+    listSessionsWithPendingInputs: unreachable,
+    markProcessed: unreachable,
+  }),
+  linearGateway: {
+    createSessionOnIssue: unreachable,
+  },
   workspaceRepo: WorkspaceRepo.make({
     setWorkspace: unreachable,
     createRepository: unreachable,
@@ -327,5 +348,155 @@ describe("service Admin request validation", () => {
       );
       expect(response.status).toBe(400);
     }
+  });
+});
+
+describe("POST /api/admin/runs/:id/rerun", () => {
+  const terminalRun: AgentRun = {
+    sessionId: Schema.decodeUnknownSync(SessionId)(
+      "22222222-2222-4222-8222-222222222222",
+    ),
+    organizationId,
+    issueId: Option.some(issueId),
+    repositoryId: Option.none(),
+    state: "succeeded",
+    desiredState: "running",
+    ompSessionId: Option.none(),
+    ompSessionFile: Option.none(),
+    workspacePath: Option.none(),
+    teamId: Option.none(),
+    projectId: Option.none(),
+    attempt: 0,
+    leaseOwner: Option.none(),
+    leaseExpiresAt: Option.none(),
+    lastActivityAt: Option.none(),
+    terminalReason: Option.none(),
+    nextAttemptAt: Option.none(),
+    createdAt: 0,
+    updatedAt: 0,
+  };
+
+  it("rejects unauthenticated and un-CSRF requests", async () => {
+    const noCookie = new Request(
+      new URL(
+        "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+        config.publicUrl,
+      ),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      },
+    );
+    expect((await run(noCookie)).status).toBe(401);
+
+    const noCsrf = new Request(
+      new URL(
+        "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+        config.publicUrl,
+      ),
+      {
+        method: "POST",
+        headers: {
+          Cookie: `omp_gateway_admin=${token}`,
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      },
+    );
+    expect((await run(noCsrf)).status).toBe(403);
+  });
+
+  it("rejects reruns for runs without an issue or with an active run", async () => {
+    const noIssue: AgentRun = {
+      ...terminalRun,
+      sessionId: Schema.decodeUnknownSync(SessionId)(
+        "33333333-3333-4333-8333-333333333333",
+      ),
+      issueId: Option.none(),
+    };
+    const noIssueHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(noIssue)),
+      }),
+    });
+    const noIssueResponse = await Effect.runPromise(
+      noIssueHandle(
+        request(
+          "/api/admin/runs/33333333-3333-4333-8333-333333333333/rerun",
+          {},
+        ),
+      ),
+    );
+    expect(Option.getOrElse(noIssueResponse, () => null)?.status).toBe(409);
+
+    const activeHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(true),
+      }),
+    });
+    const activeResponse = await Effect.runPromise(
+      activeHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    expect(Option.getOrElse(activeResponse, () => null)?.status).toBe(409);
+  });
+
+  it("creates a new session, run, and dedupe-safe created input", async () => {
+    const created: {
+      sessionId?: string;
+      createdRun?: boolean;
+      enqueued?: boolean;
+    } = {};
+    const newSessionId = "55555555-5555-4555-8555-555555555555";
+    const rerunHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(false),
+        create: (input) => {
+          created.sessionId = input.sessionId;
+          created.createdRun = true;
+          return Effect.succeed(terminalRun);
+        },
+      }),
+      runInputRepo: RunInputRepo.make({
+        ...deps.runInputRepo,
+        enqueue: (input) => {
+          created.enqueued = true;
+          expect(input.id).toBe(`${newSessionId}:created`);
+          expect(input.sessionId).toBe(newSessionId);
+          expect(input.kind).toBe("created");
+          return Effect.succeed(true);
+        },
+      }),
+      linearGateway: {
+        createSessionOnIssue: () => Effect.succeed(newSessionId),
+      },
+    });
+    const response = await Effect.runPromise(
+      rerunHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    const res = Option.getOrElse(response, () => null);
+    expect(res?.status).toBe(200);
+    expect(await res?.json()).toEqual({ sessionId: newSessionId });
+    expect(created.sessionId).toBe(newSessionId);
+    expect(created.createdRun).toBe(true);
+    expect(created.enqueued).toBe(true);
   });
 });
