@@ -59,7 +59,9 @@ const decimalBetween = (name: string, fallback: number) =>
         onNone: () => String(fallback),
         onSome: (configured) => configured.trim(),
       });
-      const parsed = Number(raw);
+      // Blank values must fail: Number("") is 0, which would silently
+      // disable the repository-suggestion confidence gate.
+      const parsed = raw.length === 0 ? Number.NaN : Number(raw);
       return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1
         ? Either.right(parsed)
         : Either.left(

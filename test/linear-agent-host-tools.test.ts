@@ -146,7 +146,14 @@ while (true) {
           yield* worker.onEvent((event) => {
             if (event.type === "host_tool_result_seen") {
               echoed.push(event);
-              if (event.id === "call-2") Deferred.unsafeDone(seen, Effect.void);
+              // Await BOTH echoes: the malformed bad-1 result and the valid
+              // call-2 result may complete in either order.
+              if (
+                echoed.some((entry) => entry.id === "bad-1") &&
+                echoed.some((entry) => entry.id === "call-2")
+              ) {
+                Deferred.unsafeDone(seen, Effect.void);
+              }
             }
           });
           yield* worker.onHostToolCall(() =>

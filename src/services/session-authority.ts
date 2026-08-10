@@ -1946,12 +1946,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               yield* runInputRepo.markProcessed(input.id);
             }
           }).pipe(
-            Effect.ensuring(
-              Effect.gen(function* () {
-                yield* clearSessionStopDeferrals(sessionId);
-                yield* releaseIfNoWorker(sessionId);
-              }),
-            ),
+            // NOTE: stop-deferral counts are NOT cleared here — they must
+            // survive across processSession invocations for the deferral
+            // bound to trip. They are cleared in the terminal agent_end
+            // cleanup block instead.
+            Effect.ensuring(releaseIfNoWorker(sessionId)),
           );
         },
       );
