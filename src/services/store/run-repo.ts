@@ -280,19 +280,40 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
 
     const listRunnable = Effect.fn("RunRepo.listRunnable")(function* (
       now: number,
+      includeCanceled = false,
     ): Effect.fn.Return<
       ReadonlyArray<AgentRun>,
       DatabaseError | RowDecodeError
     > {
+      // Canceled runs are catch-up candidates only briefly: a missed
+      // resume-prompt webhook is retried by Linear for ~7h, so polling a
+      // canceled session's activities beyond a day cannot recover anything a
+      // live webhook would not have delivered.
+      const canceledHorizon = now - 24 * 60 * 60_000;
       const rows = yield* tryDb(
         () =>
-          db
-            .query<AgentRunRow, [number, number]>(`
+          includeCanceled
+            ? db
+                .query<AgentRunRow, [number, number, number]>(`
+              SELECT * FROM agent_run
+              WHERE (
+                (
+                  desired_state='running' AND state NOT IN ('succeeded','failed','canceled')
+                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                  AND (lease_owner IS NULL OR lease_expires_at<?)
+                )
+                OR (state='canceled' AND updated_at>=?)
+              )
+              ORDER BY created_at, session_id
+            `)
+                .all(now, now, canceledHorizon)
+            : db
+                .query<AgentRunRow, [number, number]>(`
               SELECT * FROM agent_run WHERE desired_state='running' AND state NOT IN ('succeeded','failed','canceled')
                 AND (next_attempt_at IS NULL OR next_attempt_at<=?) AND (lease_owner IS NULL OR lease_expires_at<?)
               ORDER BY created_at, session_id
             `)
-            .all(now, now),
+                .all(now, now),
         "RunRepo.listRunnable",
       );
       const decoded = yield* decodeRows(AgentRunRow, rows, "AgentRun");
@@ -317,6 +338,31 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       const decoded = yield* decodeRows(AgentRunRow, rows, "AgentRun");
       return yield* Effect.forEach(decoded, rowToAgentRun);
     });
+
+    const listNonTerminalByIssue = Effect.fn("RunRepo.listNonTerminalByIssue")(
+      function* (input: {
+        readonly organizationId: OrganizationId;
+        readonly issueId: IssueId;
+      }): Effect.fn.Return<
+        ReadonlyArray<AgentRun>,
+        DatabaseError | RowDecodeError
+      > {
+        const rows = yield* tryDb(
+          () =>
+            db
+              .query<AgentRunRow, [string, string]>(`
+              SELECT * FROM agent_run
+              WHERE organization_id=? AND issue_id=?
+                AND state NOT IN ('succeeded','failed','canceled')
+              ORDER BY created_at, session_id
+            `)
+              .all(input.organizationId, input.issueId),
+          "RunRepo.listNonTerminalByIssue",
+        );
+        const decoded = yield* decodeRows(AgentRunRow, rows, "AgentRun");
+        return yield* Effect.forEach(decoded, rowToAgentRun);
+      },
+    );
 
     const claimLease = Effect.fn("RunRepo.claimLease")(function* (
       sessionId: SessionId,
@@ -406,13 +452,35 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       },
     );
 
+    const hasActiveForIssue = Effect.fn("RunRepo.hasActiveForIssue")(function* (
+      organizationId: OrganizationId,
+      issueId: IssueId,
+    ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
+      const row = yield* tryDb(
+        () =>
+          db
+            .query<{ count: number }, [string, string]>(`
+                SELECT 1 AS count
+                FROM agent_run
+                WHERE organization_id=? AND issue_id=?
+                  AND state NOT IN ('succeeded','failed','canceled')
+                LIMIT 1
+              `)
+            .get(organizationId, issueId),
+        "RunRepo.hasActiveForIssue",
+      );
+      return row !== null;
+    });
+
     return {
       create,
       get,
       update,
       reopen,
+      hasActiveForIssue,
       listRunnable,
       listCancellationPending,
+      listNonTerminalByIssue,
       claimLease,
       renewLease,
       releaseLease,

@@ -1161,7 +1161,9 @@ describe("pure invariants", () => {
           if (kind === "stop") {
             expect(latest).toEqual(Option.none());
           } else {
-            expect(latest).toEqual(Option.some({ body, kind }));
+            expect(latest).toEqual(
+              Option.some({ body, kind, payload: { marker } }),
+            );
           }
 
           yield* repo.markProcessed(input.id, createdAt + 1);

@@ -319,3 +319,67 @@ export const AgentSessionEvent = Schema.Struct({
   agentSession: AgentSessionWebhookPayload,
 });
 export type AgentSessionEvent = Schema.Schema.Type<typeof AgentSessionEvent>;
+
+/**
+ * Linear SDK 89.0.0's AppUserNotification webhook envelope. The embedded
+ * notification is a union of notification payloads; the shared fields below
+ * are present on every generated variant, while issue details are optional for
+ * generic notifications.
+ */
+export const AppUserNotificationIssue = Schema.Struct(
+  {
+    id: Schema.String,
+    identifier: Schema.String,
+    team: Schema.Struct({
+      id: Schema.String,
+      key: Schema.String,
+      name: Schema.String,
+    }),
+    teamId: Schema.String,
+    title: Schema.String,
+    url: Schema.String,
+    description: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+  },
+  { key: Schema.String, value: Schema.Unknown },
+);
+export type AppUserNotificationIssue = Schema.Schema.Type<
+  typeof AppUserNotificationIssue
+>;
+
+export const AppUserNotificationDetails = Schema.Struct(
+  {
+    id: Schema.String,
+    type: Schema.String,
+    userId: Schema.String,
+    createdAt: Schema.String,
+    updatedAt: Schema.String,
+    issueId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
+      default: () => Option.none(),
+    }),
+    issue: Schema.optionalWith(
+      Schema.OptionFromNullOr(AppUserNotificationIssue),
+      { default: () => Option.none() },
+    ),
+  },
+  { key: Schema.String, value: Schema.Unknown },
+);
+export type AppUserNotificationDetails = Schema.Schema.Type<
+  typeof AppUserNotificationDetails
+>;
+
+export const AppUserNotification = Schema.Struct({
+  type: Schema.Literal("AppUserNotification"),
+  action: Schema.String,
+  appUserId: Schema.String,
+  createdAt: Schema.String,
+  notification: AppUserNotificationDetails,
+  oauthClientId: Schema.String,
+  organizationId: Schema.String,
+  webhookId: Schema.String,
+  webhookTimestamp: Schema.Number,
+});
+export type AppUserNotification = Schema.Schema.Type<
+  typeof AppUserNotification
+>;

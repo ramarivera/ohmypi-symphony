@@ -57,7 +57,10 @@ const config: GatewayConfigShape = {
   port: 3000,
   leaseDurationMs: 60_000,
   reconcilerIntervalMs: 1_000,
+  reconcilerCatchupIntervalMs: 300_000,
+  reconcilerCatchupMinAgeMs: 120_000,
   webhookReplayWindowMs: 60_000,
+  repositorySuggestionConfidenceThreshold: 0.8,
   logLevel: "silent",
   logFile: Option.none(),
 };
@@ -300,6 +303,39 @@ const permissionChangePayload = (
   addedTeamIds: [],
   removedTeamIds: ["team-b"],
   canAccessAllPublicTeams: false,
+  ...overrides,
+});
+
+const appUserNotificationPayload = (
+  now: number,
+  action: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  type: "AppUserNotification",
+  action,
+  appUserId: "app-user",
+  createdAt: "2024-01-01T00:00:00.000Z",
+  oauthClientId: "client",
+  organizationId: "org",
+  webhookId: "notification-webhook",
+  webhookTimestamp: now,
+  notification: {
+    id: "notification-1",
+    type: action,
+    userId: "app-user",
+    createdAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+    issueId: "issue-1",
+    issue: {
+      id: "issue-1",
+      identifier: "TEAM-123",
+      team: { id: "team-a", key: "TEAM", name: "Team" },
+      teamId: "team-a",
+      title: "Fix the bug",
+      url: "https://linear.app/issue/TEAM-123",
+      description: null,
+    },
+  },
   ...overrides,
 });
 
@@ -676,6 +712,102 @@ describe("Linear webhook input correctness", () => {
         ).toBe("canceled");
       }),
     ),
+  );
+
+  it.scopedLive(
+    "AppUserNotification unassignment stops every non-terminal issue run idempotently",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          const now = yield* currentTime;
+          yield* install();
+          for (const id of ["session-a", "session-b", "session-terminal"]) {
+            yield* RunRepo.create({
+              sessionId: sessionId(id),
+              organizationId: organizationId("org"),
+              issueId: Option.some(issueId("issue-1")),
+              now,
+            });
+          }
+          yield* RunRepo.update(sessionId("session-terminal"), {
+            state: "succeeded",
+          });
+          const payload = appUserNotificationPayload(
+            now,
+            "issueUnassignedFromYou",
+          );
+          const first = yield* WebhookPipeline.handle(
+            signedRequest(payload, { delivery: "notification-delivery-1" }),
+          );
+          const second = yield* WebhookPipeline.handle(
+            signedRequest(payload, { delivery: "notification-delivery-2" }),
+          );
+
+          expect(first.status).toBe(200);
+          expect(second.status).toBe(200);
+          for (const id of ["session-a", "session-b"]) {
+            expect(
+              expectSome(yield* RunRepo.get(sessionId(id)))?.desiredState,
+            ).toBe("canceled");
+            const inputs = yield* RunInputRepo.pending(sessionId(id));
+            expect(inputs).toHaveLength(1);
+            expect(inputs[0]).toMatchObject({
+              id: `${id}:stop:notification-1`,
+              kind: "stop",
+            });
+          }
+          expect(
+            expectSome(yield* RunRepo.get(sessionId("session-terminal")))
+              ?.desiredState,
+          ).toBe("running");
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "AppUserNotification status changes enqueue a deferred stop and ignore non-cancel actions",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          const now = yield* currentTime;
+          yield* install();
+          yield* RunRepo.create({
+            sessionId: sessionId("session-a"),
+            organizationId: organizationId("org"),
+            issueId: Option.some(issueId("issue-1")),
+            now,
+          });
+          const status = yield* WebhookPipeline.handle(
+            signedRequest(
+              appUserNotificationPayload(now, "issueStatusChanged"),
+            ),
+          );
+          expect(status.status).toBe(200);
+          expect(
+            expectSome(yield* RunRepo.get(sessionId("session-a")))
+              ?.desiredState,
+          ).toBe("running");
+          const inputs = yield* RunInputRepo.pending(sessionId("session-a"));
+          expect(inputs).toHaveLength(1);
+          expect(inputs[0]?.payload).toMatchObject({
+            type: "AppUserNotification",
+            action: "issueStatusChanged",
+            notification: { issueId: "issue-1" },
+          });
+
+          const ignored = yield* WebhookPipeline.handle(
+            signedRequest(
+              appUserNotificationPayload(now, "issueCommentMention", {
+                webhookId: "notification-webhook-ignored",
+              }),
+            ),
+          );
+          expect(ignored.status).toBe(200);
+          expect(
+            yield* RunInputRepo.pending(sessionId("session-a")),
+          ).toHaveLength(1);
+        }),
+      ),
   );
 
   it.scopedLive("dedupes by Linear-Delivery id", () =>
