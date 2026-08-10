@@ -1718,6 +1718,24 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               yield* releaseMutationGate(sessionId);
               return;
             }
+            // A null snapshot means "unknown" (installation predates the
+            // snapshot or no PermissionChange has arrived yet), not "no
+            // access". Denying on unknown cancels every teamed run forever
+            // even though Linear allows the calls — Linear enforces access
+            // server-side, so unknown snapshots warn and proceed; only a
+            // KNOWN snapshot that excludes the team cancels.
+            const snapshotKnown =
+              Option.isSome(installation.value.accessibleTeamIds) ||
+              Option.isSome(installation.value.canAccessAllPublicTeams);
+            if (!snapshotKnown && Option.isSome(run.teamId)) {
+              yield* Effect.logWarning("authority.team_access_unknown").pipe(
+                Effect.annotateLogs({
+                  event: "authority.team_access_unknown",
+                  sessionId,
+                  teamId: run.teamId.value,
+                }),
+              );
+            }
             const teamAccess = Option.match(
               installation.value.accessibleTeamIds,
               {
@@ -1733,6 +1751,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               },
             );
             if (
+              snapshotKnown &&
               Option.isSome(run.teamId) &&
               !canAccessAll &&
               !teamAccess.includes(run.teamId.value)
