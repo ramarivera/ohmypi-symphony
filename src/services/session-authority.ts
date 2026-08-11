@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Clock, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
@@ -1192,6 +1194,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
             Effect.ensuring(
               Effect.gen(function* () {
+                if (Option.isSome(run.workspacePath)) {
+                  const workspacePath = run.workspacePath.value;
+                  yield* Effect.tryPromise({
+                    try: () => unlink(join(workspacePath, "mcp.json")),
+                    catch: () => undefined,
+                  }).pipe(Effect.ignore);
+                }
                 if (Option.isSome(worker)) {
                   yield* worker.value.worker.stop();
                 }
@@ -1521,7 +1530,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         | RpcSpawnError
         | RpcTimeoutError
         | NixEnvironmentError
+        | TokenCipherError
       > {
+        if (!existsSync(cwd)) {
+          const error = new RpcSpawnError({
+            message: `Persisted workspace does not exist: ${cwd}`,
+          });
+          yield* handleFailure(run.sessionId, error);
+          return yield* Effect.fail(error);
+        }
         const command: string[] = [config.ompCliPath];
         if (Option.isSome(run.ompSessionFile)) {
           command.push("--session", run.ompSessionFile.value);

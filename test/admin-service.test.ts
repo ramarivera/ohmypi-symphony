@@ -110,6 +110,12 @@ const deps: AdminDeps = {
     upsert: unreachable,
     list: unreachable,
   }),
+  mcpServerRepo: {
+    listMcpServers: unreachable,
+    createMcpServer: unreachable,
+    updateMcpServer: unreachable,
+    deleteMcpServer: unreachable,
+  } as unknown as AdminDeps["mcpServerRepo"],
   runInputRepo: RunInputRepo.make({
     enqueue: unreachable,
     applyStop: unreachable,

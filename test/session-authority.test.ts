@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -1374,6 +1374,9 @@ describe("SessionAuthority Nix environment preparation", () => {
             workspacePath: Option.some("/tmp/nix-failing"),
             ompSessionFile: Option.some("/tmp/nix-failing/session.jsonl"),
           });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/nix-failing", { recursive: true }),
+          );
           nixPrepareError = new NixEnvironmentError({
             message: "Nix preparation failed",
             reason: "process_failed",

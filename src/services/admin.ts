@@ -95,7 +95,7 @@ export interface AdminDeps {
     readonly createSessionOnIssue: LinearGateway["createSessionOnIssue"];
   };
   readonly workspaceRepo: WorkspaceRepo;
-  readonly mcpServerRepo?: McpServerRepo;
+  readonly mcpServerRepo: McpServerRepo;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
   readonly nixEnvironment: NixEnvironment;
@@ -214,6 +214,16 @@ function stringArray(
     value.map((item) => String(item).trim().toLowerCase()).filter(Boolean),
   );
 }
+function preservingStringArray(
+  value: unknown,
+  field: string,
+): Either.Either<ReadonlyArray<string>, string> {
+  if (!Array.isArray(value)) return Either.left(`${field} must be an array`);
+  if (value.some((item) => typeof item !== "string")) {
+    return Either.left(`${field} must contain only strings`);
+  }
+  return Either.right(value.map((item) => String(item).trim()).filter(Boolean));
+}
 
 function optionalStringArray(
   value: unknown,
@@ -320,8 +330,29 @@ function mcpServerPayload(
   }
   const command = body.command === null ? null : optionalString(body.command);
   const url = body.url === null ? null : optionalString(body.url);
-  const args = optionalStringArray(body.args, "args");
-  if (Either.isLeft(args)) return Either.left(args.left);
+  if (rawTransport === "stdio" && command === null) {
+    return Either.left("stdio transport requires a command");
+  }
+  if (rawTransport !== "stdio") {
+    if (url === null) {
+      return Either.left(`${rawTransport} transport requires a valid URL`);
+    }
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        return Either.left(
+          `${rawTransport} transport requires a valid http(s) URL`,
+        );
+      }
+    } catch {
+      return Either.left(
+        `${rawTransport} transport requires a valid http(s) URL`,
+      );
+    }
+  }
+  const argsResult = preservingStringArray(body.args, "args");
+  if (Either.isLeft(argsResult)) return Either.left(argsResult.left);
+  const args = argsResult.right;
   const repositoryId =
     body.repositoryId === null ? null : optionalString(body.repositoryId);
   const envValue = body.env;
@@ -339,7 +370,7 @@ function mcpServerPayload(
     name,
     transport: rawTransport,
     command,
-    args: args.right,
+    args,
     url,
     env,
     repositoryId,
@@ -893,9 +924,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const repositories = yield* deps.workspaceRepo.listRepositories(
           session.organizationId,
         );
-        const mcpServers = deps.mcpServerRepo
-          ? yield* deps.mcpServerRepo.listMcpServers(session.organizationId)
-          : [];
+        const mcpServers = yield* deps.mcpServerRepo.listMcpServers(
+          session.organizationId,
+        );
         const reconcilerStatus = yield* deps.reconciler.status();
         return Option.some(
           json({
@@ -930,9 +961,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "GET"
       ) {
         const session = yield* requireSession(request);
-        const mcpServers = deps.mcpServerRepo
-          ? yield* deps.mcpServerRepo.listMcpServers(session.organizationId)
-          : [];
+        const mcpServers = yield* deps.mcpServerRepo.listMcpServers(
+          session.organizationId,
+        );
         return Option.some(
           json({ mcpServers: mcpServers.map(toApiMcpServer) }),
         );
@@ -943,13 +974,6 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "POST"
       ) {
         const session = yield* requireMutation(request);
-        if (!deps.mcpServerRepo)
-          return yield* Effect.fail(
-            new AdminError({
-              message: "MCP server repository unavailable",
-              status: 500,
-            }),
-          );
         const body = yield* parseJsonBody(request);
         const payloadEither = mcpServerPayload(body);
         if (Either.isLeft(payloadEither))
@@ -1015,7 +1039,6 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
         if (request.method === "GET") {
           const session = yield* requireSession(request);
-          if (!deps.mcpServerRepo) return Option.some(text("Not found", 404));
           const server = yield* deps.mcpServerRepo.getMcpServer(
             session.organizationId,
             id,
@@ -1026,13 +1049,6 @@ export const createAdminHandle = (deps: AdminDeps) =>
         }
         if (request.method === "PUT") {
           const session = yield* requireMutation(request);
-          if (!deps.mcpServerRepo)
-            return yield* Effect.fail(
-              new AdminError({
-                message: "MCP server repository unavailable",
-                status: 500,
-              }),
-            );
           const body = yield* parseJsonBody(request);
           const payloadEither = mcpServerPayload(body);
           if (Either.isLeft(payloadEither))
@@ -1092,7 +1108,6 @@ export const createAdminHandle = (deps: AdminDeps) =>
         }
         if (request.method === "DELETE") {
           const session = yield* requireMutation(request);
-          if (!deps.mcpServerRepo) return Option.some(text("Not found", 404));
           const deleted = yield* deps.mcpServerRepo.deleteMcpServer(
             session.organizationId,
             id,

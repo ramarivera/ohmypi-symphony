@@ -158,7 +158,7 @@ export const ADMIN_BODY = `
           <div class="field"><label for="mcp-name">MCP name</label><input id="mcp-name" name="name" required autocomplete="off" placeholder="github"></div>
           <div class="field"><label for="mcp-transport">Transport</label><select id="mcp-transport" name="transport"><option value="stdio">stdio</option><option value="http">http</option><option value="sse">sse</option></select></div>
           <div class="field"><label for="mcp-command">Command</label><input id="mcp-command" name="command" autocomplete="off" placeholder="npx"></div>
-          <div class="field"><label for="mcp-url">URL</label><input id="mcp-url" name="url" type="url" autocomplete="off" placeholder="mcp.example.com"></div>
+          <div class="field"><label for="mcp-url">URL</label><input id="mcp-url" name="url" type="url" autocomplete="off" placeholder="https://mcp.example.com"></div>
           <div class="field"><label for="mcp-args">Arguments (comma-separated)</label><input id="mcp-args" name="args" autocomplete="off"></div>
           <div class="field"><label for="mcp-env">Environment (KEY=value per line)</label><textarea id="mcp-env" name="env" rows="3" autocomplete="off"></textarea><span class="hint">Secret values are write-only; existing values show as •••.</span></div>
           <div class="field"><label for="mcp-repository">Repository ID (blank = installation-wide)</label><input id="mcp-repository" name="repositoryId" autocomplete="off"></div>
@@ -563,8 +563,8 @@ export const ADMIN_SCRIPT = `
     catch (err) { var box = el("mcp-form-error"); box.textContent = err && err.message ? err.message : "Could not save MCP server."; box.hidden = false; }
     finally { if (button) button.disabled = false; }
   }
-  async function deleteMcpServer(id) { await fetchJSON(MCP_DETAIL(id), { method: "DELETE" }); showToast("MCP server removed.", "ok"); await loadBootstrap({ announce: false }); }
-  async function toggleMcpServer(server) { await fetchJSON(MCP_DETAIL(server.id), { method: "PUT", body: Object.assign({}, server, { enabled: !server.enabled }) }); await loadBootstrap({ announce: false }); }
+  async function deleteMcpServer(id) { var result = await fetchJSON(MCP_DETAIL(id), { method: "DELETE" }); if (result && result.redirecting) return; showToast("MCP server removed.", "ok"); await loadBootstrap({ announce: false }); }
+  async function toggleMcpServer(server) { var result = await fetchJSON(MCP_DETAIL(server.id), { method: "PUT", body: Object.assign({}, server, { enabled: !server.enabled }) }); if (result && result.redirecting) return; await loadBootstrap({ announce: false }); }
   function handleMcpClick(event) {
     var target = event.target; if (!(target instanceof HTMLElement)) return;
     var button = target.closest("button[data-action]"); if (!button) return;

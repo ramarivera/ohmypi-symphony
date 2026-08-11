@@ -1,5 +1,9 @@
 import { Clock, Effect, Option, Schema } from "effect";
-import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
+import {
+  DatabaseError,
+  RowDecodeError,
+  type TokenCipherError,
+} from "../../domain/errors.js";
 import type {
   McpServerId,
   OrganizationId,
@@ -11,6 +15,7 @@ import {
   McpServerTransport,
   type McpServerTransport as McpServerTransportType,
 } from "../../domain/models.js";
+import { TokenCrypto } from "../token-crypto.js";
 import {
   decodeRow,
   decodeRows,
@@ -159,9 +164,16 @@ const parseJson = (
       }),
   });
 
+const isEncrypted = (value: string): boolean => {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) return false;
+  const payload = Buffer.from(value, "base64url");
+  return payload.byteLength >= 1 + 12 + 16 && payload[0] === 1;
+};
+
 const rowToRecord = (
+  tokenCrypto: TokenCrypto,
   row: McpServerRow,
-): Effect.Effect<McpServerRecordType, RowDecodeError> =>
+): Effect.Effect<McpServerRecordType, RowDecodeError | TokenCipherError> =>
   Effect.gen(function* () {
     const args = yield* parseJson(row.args_json, "mcp server args");
     const env = yield* parseJson(row.env_json, "mcp server env");
@@ -180,6 +192,14 @@ const rowToRecord = (
       env,
       "McpServerRecord.env",
     );
+    const decryptedEnv = Object.fromEntries(
+      yield* Effect.forEach(Object.entries(validEnv), ([key, value]) =>
+        (isEncrypted(value)
+          ? tokenCrypto.decrypt(value)
+          : Effect.succeed(value)
+        ).pipe(Effect.map((decrypted) => [key, decrypted] as const)),
+      ),
+    );
     return yield* decodeRow(
       McpServerRecord,
       {
@@ -190,7 +210,7 @@ const rowToRecord = (
         command: row.command,
         args: validArgs,
         url: row.url,
-        env: validEnv,
+        env: decryptedEnv,
         repositoryId: row.repository_id,
         enabled: row.enabled === 1,
         createdAt: row.created_at,
@@ -199,23 +219,72 @@ const rowToRecord = (
       "McpServerRecord",
     );
   });
+const encryptEnv = (
+  tokenCrypto: TokenCrypto,
+  env: Readonly<Record<string, string>>,
+): Effect.Effect<Record<string, string>, TokenCipherError> =>
+  Effect.forEach(Object.entries(env), ([key, value]) =>
+    tokenCrypto
+      .encrypt(value)
+      .pipe(Effect.map((encrypted) => [key, encrypted] as const)),
+  ).pipe(Effect.map(Object.fromEntries));
 
 export class McpServerRepo extends Effect.Service<McpServerRepo>()(
   "McpServerRepo",
   {
     accessors: true,
+    dependencies: [TokenCrypto.Default],
     effect: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
+      const tokenCrypto = yield* TokenCrypto;
 
+      const hasNameConflict = Effect.fn("McpServerRepo.hasNameConflict")(
+        function* (
+          organizationId: OrganizationId,
+          name: string,
+          repositoryId: Option.Option<WorkspaceId>,
+          excludeId: string | null,
+        ): Effect.fn.Return<boolean, DatabaseError> {
+          const repository = Option.getOrNull(repositoryId);
+          const row = yield* tryDb(
+            () =>
+              db
+                .query<
+                  { readonly id: string },
+                  [string, string, string | null, string | null, string | null]
+                >(
+                  "SELECT id FROM mcp_server WHERE organization_id=? AND name=? AND repository_id IS ? AND (id <> ? OR ? IS NULL) LIMIT 1",
+                )
+                .get(organizationId, name, repository, excludeId, excludeId),
+            "McpServerRepo.hasNameConflict",
+          );
+          return row !== null;
+        },
+      );
       const createMcpServer = Effect.fn("McpServerRepo.createMcpServer")(
         function* (
           input: McpInput & { readonly now?: number },
         ): Effect.fn.Return<
           McpServerRecordType,
-          DatabaseError | RowDecodeError
+          DatabaseError | RowDecodeError | TokenCipherError
         > {
           const now = input.now ?? (yield* Clock.currentTimeMillis);
           const record = yield* validateInput(input, now);
+          if (
+            yield* hasNameConflict(
+              record.organizationId,
+              record.name,
+              record.repositoryId,
+              null,
+            )
+          ) {
+            return yield* Effect.fail(
+              new DatabaseError({
+                message: `MCP server name "${record.name}" already exists in this scope`,
+              }),
+            );
+          }
+          const encryptedEnv = yield* encryptEnv(tokenCrypto, record.env);
           yield* tryDb(
             () =>
               db
@@ -232,7 +301,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   Option.getOrNull(record.command),
                   JSON.stringify(record.args),
                   Option.getOrNull(record.url),
-                  JSON.stringify(record.env),
+                  JSON.stringify(encryptedEnv),
                   Option.getOrNull(record.repositoryId),
                   record.enabled ? 1 : 0,
                   record.createdAt,
@@ -249,7 +318,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
         id: McpServerId,
       ): Effect.fn.Return<
         Option.Option<McpServerRecordType>,
-        DatabaseError | RowDecodeError
+        DatabaseError | RowDecodeError | TokenCipherError
       > {
         const row = yield* tryDb(
           () =>
@@ -263,6 +332,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
         if (row === null) return Option.none();
         return Option.some(
           yield* rowToRecord(
+            tokenCrypto,
             yield* decodeRow(McpServerRow, row, "McpServerRecord"),
           ),
         );
@@ -273,7 +343,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
           organizationId: OrganizationId,
         ): Effect.fn.Return<
           ReadonlyArray<McpServerRecordType>,
-          DatabaseError | RowDecodeError
+          DatabaseError | RowDecodeError | TokenCipherError
         > {
           const rows = yield* tryDb(
             () =>
@@ -289,7 +359,9 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
             rows,
             "McpServerRecord",
           );
-          return yield* Effect.forEach(decoded, rowToRecord);
+          return yield* Effect.forEach(decoded, (row) =>
+            rowToRecord(tokenCrypto, row),
+          );
         },
       );
 
@@ -304,7 +376,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
           } & { readonly now?: number },
         ): Effect.fn.Return<
           McpServerRecordType,
-          DatabaseError | RowDecodeError
+          DatabaseError | RowDecodeError | TokenCipherError
         > {
           const current = yield* getMcpServer(organizationId, id);
           if (Option.isNone(current)) {
@@ -335,6 +407,21 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
             },
             now,
           );
+          if (
+            yield* hasNameConflict(
+              organizationId,
+              next.name,
+              next.repositoryId,
+              id,
+            )
+          ) {
+            return yield* Effect.fail(
+              new DatabaseError({
+                message: `MCP server name "${next.name}" already exists in this scope`,
+              }),
+            );
+          }
+          const encryptedEnv = yield* encryptEnv(tokenCrypto, next.env);
           yield* tryDb(
             () =>
               db
@@ -348,7 +435,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   Option.getOrNull(next.command),
                   JSON.stringify(next.args),
                   Option.getOrNull(next.url),
-                  JSON.stringify(next.env),
+                  JSON.stringify(encryptedEnv),
                   Option.getOrNull(next.repositoryId),
                   next.enabled ? 1 : 0,
                   now,

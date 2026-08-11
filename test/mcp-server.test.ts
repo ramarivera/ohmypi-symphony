@@ -1,7 +1,15 @@
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
-import { ConfigProvider, Effect, HashMap, Layer, Logger, Option } from "effect";
+import {
+  ConfigProvider,
+  Effect,
+  Either,
+  HashMap,
+  Layer,
+  Logger,
+  Option,
+} from "effect";
 import { describe, expect } from "vitest";
 import type {
   McpServerId,
@@ -15,23 +23,39 @@ import {
   writeOmpMcpConfig,
 } from "../src/services/mcp-config.js";
 import { McpServerRepo } from "../src/services/store/repositories.js";
-import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
+import {
+  SqliteClient,
+  SqliteClientLive,
+} from "../src/services/store/sqlite-client.js";
+import { TokenCrypto } from "../src/services/token-crypto.js";
 
 const org = "org-mcp" as OrganizationId;
 const repo = "repo-a" as WorkspaceId;
 const serverId = (id: string) => id as McpServerId;
 
-const withRepo = <A, E>(effect: Effect.Effect<A, E, McpServerRepo>) =>
+const withRepo = <A, E>(
+  effect: Effect.Effect<A, E, McpServerRepo | SqliteClient>,
+) =>
   Effect.gen(function* () {
     const sqlite = SqliteClientLive(":memory:");
-    const layer = McpServerRepo.Default.pipe(
+    const token = TokenCrypto.Default.pipe(
       Layer.provide(
-        Layer.mergeAll(
-          sqlite,
-          Layer.setConfigProvider(ConfigProvider.fromMap(new Map())),
+        Layer.setConfigProvider(
+          ConfigProvider.fromMap(
+            new Map([
+              [
+                "TOKEN_ENCRYPTION_KEY",
+                Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64"),
+              ],
+            ]),
+          ),
         ),
       ),
     );
+    const repoLayer = McpServerRepo.Default.pipe(
+      Layer.provide(Layer.mergeAll(sqlite, token)),
+    );
+    const layer = Layer.mergeAll(sqlite, token, repoLayer);
     return yield* effect.pipe(Effect.provide(layer));
   });
 
@@ -51,6 +75,14 @@ describe("MCP server storage and worker config", () => {
           repositoryId: Option.none(),
           now: 1,
         });
+        const { db } = yield* SqliteClient;
+        const stored = db
+          .query<{ readonly env_json: string }, [string, string]>(
+            "SELECT env_json FROM mcp_server WHERE organization_id=? AND id=?",
+          )
+          .get(org, serverId("wide"));
+        expect(stored).not.toBeNull();
+        expect(stored?.env_json).not.toContain("secret");
         const scoped = yield* servers.createMcpServer({
           organizationId: org,
           id: serverId("scoped"),
@@ -79,6 +111,48 @@ describe("MCP server storage and worker config", () => {
         });
         expect(updated.enabled).toBe(false);
         expect(yield* servers.deleteMcpServer(org, serverId("off"))).toBe(true);
+      }),
+    ),
+  );
+  it.scopedLive("rejects duplicate MCP names within one scope", () =>
+    withRepo(
+      Effect.gen(function* () {
+        const servers = yield* McpServerRepo;
+        yield* servers.createMcpServer({
+          organizationId: org,
+          id: serverId("wide"),
+          name: "duplicate",
+          transport: "stdio",
+          command: "node",
+          repositoryId: Option.none(),
+        });
+        const duplicate = yield* Effect.either(
+          servers.createMcpServer({
+            organizationId: org,
+            id: serverId("wide-2"),
+            name: "duplicate",
+            transport: "stdio",
+            command: "node",
+            repositoryId: Option.none(),
+          }),
+        );
+        expect(Either.isLeft(duplicate)).toBe(true);
+
+        yield* servers.createMcpServer({
+          organizationId: org,
+          id: serverId("repo-1"),
+          name: "repo-name",
+          transport: "stdio",
+          command: "node",
+          repositoryId: Option.some(repo),
+        });
+        const collisionOnUpdate = yield* Effect.either(
+          servers.updateMcpServer(org, serverId("repo-1"), {
+            name: "duplicate",
+            repositoryId: Option.none(),
+          }),
+        );
+        expect(Either.isLeft(collisionOnUpdate)).toBe(true);
       }),
     ),
   );
@@ -141,6 +215,20 @@ describe("MCP server storage and worker config", () => {
         remote: { type: "http", url: "https://mcp.example.test" },
       },
     });
+    const disabledOverride = {
+      ...override,
+      id: serverId("disabled-override"),
+      enabled: false,
+    };
+    expect(resolveEffectiveMcpServers([wide, disabledOverride], repo)).toEqual(
+      [],
+    );
+    expect(
+      resolveEffectiveMcpServers(
+        [wide, { ...override, enabled: true }],
+        repo,
+      )[0]?.id,
+    ).toBe(override.id);
     expect(McpServerRecord).toBeDefined();
   });
 

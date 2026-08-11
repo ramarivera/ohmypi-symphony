@@ -31,7 +31,6 @@ export const resolveEffectiveMcpServers = (
   const effective: McpServerRecord[] = [];
   const positions = new Map<string, number>();
   for (const server of servers) {
-    if (!server.enabled) continue;
     const scope = Option.match(server.repositoryId, {
       onNone: () => null,
       onSome: (id) => id,
@@ -41,11 +40,18 @@ export const resolveEffectiveMcpServers = (
     if (position === undefined) {
       positions.set(server.name, effective.length);
       effective.push(server);
-    } else if (scope !== null) {
-      effective[position] = server;
+    } else {
+      const existing = effective[position];
+      if (
+        scope !== null &&
+        existing !== undefined &&
+        Option.isNone(existing.repositoryId)
+      ) {
+        effective[position] = server;
+      }
     }
   }
-  return effective;
+  return effective.filter((server) => server.enabled);
 };
 
 export const toOmpMcpConfig = (servers: ReadonlyArray<McpServerRecord>) => ({
