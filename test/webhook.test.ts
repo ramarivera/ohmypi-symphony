@@ -1106,6 +1106,26 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
+  it.scopedLive(
+    "PermissionChange accepts dashed and case variants of the client id",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          const now = yield* currentTime;
+          yield* install();
+          // Linear reports the OAuth client id in differing forms across
+          // webhook categories (console hex vs dashed UUID); the comparison
+          // is normalized, so both forms must pass.
+          for (const oauthClientId of ["CLIENT", "c-l-i-e-n-t"]) {
+            const response = yield* WebhookPipeline.handle(
+              signedRequest(permissionChangePayload(now, { oauthClientId })),
+            );
+            expect(response.status, oauthClientId).toBe(200);
+          }
+        }),
+      ),
+  );
+
   it.scopedLive("acknowledges unknown event types without side effects", () =>
     withWebhook(
       Effect.gen(function* () {

@@ -82,6 +82,16 @@ export const verifySignature = (
 export const payloadHash = (rawBody: Uint8Array): string =>
   createHash("sha256").update(rawBody).digest("hex");
 
+// Linear reports the OAuth client id in two forms: the console client_id
+// (hex, used by the OAuth flow) in AgentSessionEvent payloads, and the
+// dashed-UUID form of the same client in PermissionChange payloads. Compare
+// normalized forms; the client id is an identifier, not a secret.
+const normalizeClientId = (value: string): string =>
+  value.replaceAll("-", "").toLowerCase();
+
+const clientIdMatches = (received: string, configured: string): boolean =>
+  normalizeClientId(received) === normalizeClientId(configured);
+
 const buildFallbackDeliveryId = (
   parsed: Record<string, unknown>,
   timestamp: number,
@@ -245,7 +255,7 @@ const validateAgentSessionIdentity = (
   never
 > =>
   Effect.gen(function* () {
-    if (event.oauthClientId !== config.linearClientId) {
+    if (!clientIdMatches(event.oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
           message: "OAuth client identity mismatch",
@@ -479,7 +489,7 @@ const validateOAuthAppPayload = (
         }),
       );
     }
-    if (oauthClientId !== config.linearClientId) {
+    if (!clientIdMatches(oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
           message: "OAuth client identity mismatch",
@@ -551,7 +561,7 @@ const validatePermissionChangePayload = (
       );
     }
 
-    if (oauthClientId !== config.linearClientId) {
+    if (!clientIdMatches(oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
           message: "OAuth client identity mismatch",
@@ -678,7 +688,7 @@ const validateAppUserNotification = (
           }),
       ),
     );
-    if (payload.oauthClientId !== config.linearClientId) {
+    if (!clientIdMatches(payload.oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
           message: "OAuth client identity mismatch",
