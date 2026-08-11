@@ -1,6 +1,6 @@
-import { it } from "@effect/vitest";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { it } from "@effect/vitest";
 import { ConfigProvider, Effect, Layer, Option } from "effect";
 import { describe, expect } from "vitest";
 import type {
@@ -171,11 +171,17 @@ describe("MCP server storage and worker config", () => {
     const contents = JSON.parse(await readFile(join(root, "mcp.json"), "utf8"));
     expect(contents.mcpServers.shared.command).toBe("python");
     expect((await stat(join(root, "mcp.json"))).mode & 0o777).toBe(0o600);
-    const exclude = await readFile(join(root, ".git", "info", "exclude"), "utf8");
+    const exclude = await readFile(
+      join(root, ".git", "info", "exclude"),
+      "utf8",
+    );
     expect(exclude.split("\n")).toContain("mcp.json");
     // Rewrites stay idempotent (no duplicate exclude lines).
     await Effect.runPromise(writeOmpMcpConfig(root, [record]));
-    const rewritten = await readFile(join(root, ".git", "info", "exclude"), "utf8");
+    const rewritten = await readFile(
+      join(root, ".git", "info", "exclude"),
+      "utf8",
+    );
     expect(
       rewritten.split("\n").filter((line) => line === "mcp.json"),
     ).toHaveLength(1);
