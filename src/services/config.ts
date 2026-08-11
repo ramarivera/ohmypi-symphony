@@ -290,6 +290,20 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
       const githubAppPrivateKey = yield* optionalValue(
         "GITHUB_APP_PRIVATE_KEY",
       );
+      if ((githubAppId === undefined) !== (githubAppPrivateKey === undefined)) {
+        const missing =
+          githubAppId === undefined
+            ? "GITHUB_APP_ID"
+            : "GITHUB_APP_PRIVATE_KEY";
+        yield* Effect.logWarning(
+          `GitHub App configuration is partial; missing ${missing}`,
+        ).pipe(
+          Effect.annotateLogs({
+            event: "config.github_app.partial",
+            missing,
+          }),
+        );
+      }
       const publicUrlValue = yield* requiredValue("PUBLIC_URL");
       const publicUrl = yield* Effect.try({
         try: () => new URL(publicUrlValue),

@@ -90,6 +90,95 @@ describe("GitHubApp", () => {
     expect(requests).toHaveLength(4);
   });
 
+  it("bounds the token cache and prunes expired entries", async () => {
+    let now = 1_700_000_000_000;
+    let requests = 0;
+    const fetchMock: GitHubFetch = async (url) => {
+      requests += 1;
+      const path = String(url);
+      if (path.includes("/repos/")) {
+        return new Response(JSON.stringify({ id: requests }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({
+          token: `token-${requests}`,
+          expires_at: new Date(now + 1_000).toISOString(),
+        }),
+        { status: 201 },
+      );
+    };
+    const service = makeGitHubApp({
+      appId: "12345",
+      privateKey: privateKeyPem,
+      fetch: fetchMock,
+      now: () => now,
+    });
+
+    for (let index = 0; index < 100; index += 1) {
+      await Effect.runPromise(
+        service.getInstallationToken("octo-org", `repo-${index}`),
+      );
+    }
+    await Effect.runPromise(
+      service.getInstallationToken("octo-org", "repo-100"),
+    );
+    const afterInitialMints = requests;
+
+    // repo-0 had the oldest expiry and is evicted when repo-100 is inserted.
+    await Effect.runPromise(service.getInstallationToken("octo-org", "repo-0"));
+    expect(requests).toBe(afterInitialMints + 2);
+
+    now += 2_000;
+    await Effect.runPromise(
+      service.getInstallationToken("octo-org", "repo-100"),
+    );
+    expect(requests).toBe(afterInitialMints + 4);
+  });
+
+  it("single-flights concurrent token mints for one repository", async () => {
+    let releaseFirstRequest: (() => void) | undefined;
+    let resolveStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseFirstRequest = resolve;
+    });
+    let requests = 0;
+    const fetchMock: GitHubFetch = async (url) => {
+      requests += 1;
+      if (requests === 1) {
+        resolveStarted?.();
+        await gate;
+      }
+      if (String(url).includes("/repos/")) {
+        return new Response(JSON.stringify({ id: 42 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ token: "single-flight-token" }), {
+        status: 201,
+      });
+    };
+    const service = makeGitHubApp({
+      appId: "12345",
+      privateKey: privateKeyPem,
+      fetch: fetchMock,
+    });
+
+    const first = Effect.runPromise(
+      service.getInstallationToken("octo-org", "single-flight"),
+    );
+    await started;
+    const second = Effect.runPromise(
+      service.getInstallationToken("octo-org", "single-flight"),
+    );
+    releaseFirstRequest?.();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      "single-flight-token",
+      "single-flight-token",
+    ]);
+    expect(requests).toBe(2);
+  });
+
   it("returns a typed failure without exposing disabled credentials", async () => {
     const result = await Effect.runPromise(
       Effect.either(

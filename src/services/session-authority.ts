@@ -272,6 +272,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       LinearGateway.Default,
       WorkspaceRepo.Default,
       GatewayConfig.Default,
+      GitHubApp.Default,
       RpcWorker.Default,
       NixEnvironment.Default,
     ],

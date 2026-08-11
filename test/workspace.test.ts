@@ -22,6 +22,7 @@ import {
 } from "../src/domain/ids.js";
 import type { RepositoryRecord } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { buildGitHubExtraHeader } from "../src/services/github-app.js";
 import { WorkspaceRepo } from "../src/services/store/repositories.js";
 import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 import {
@@ -73,6 +74,23 @@ const runGit = (args: ReadonlyArray<string>, cwd: string) =>
       }
     },
     catch: fixtureFailure("git command"),
+  });
+
+const readGitConfig = (key: string, cwd: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const process = Bun.spawn(["git", "config", "--local", "--get", key], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stdout] = await Promise.all([
+        process.exited,
+        new Response(process.stdout).text(),
+      ]);
+      return exitCode === 0 ? stdout.trim() : undefined;
+    },
+    catch: fixtureFailure("git config read"),
   });
 
 interface GitFixture {
@@ -411,6 +429,148 @@ describe("Workspace", () => {
           }),
         );
       }),
+  );
+
+  it.scopedLive("refreshes GitHub credentials when reusing a workspace", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const id = sessionId("github-reuse-refresh");
+      const record = repositoryRecord({
+        id: "github-reuse-refresh",
+        url: "https://github.com/octo-org/private-repo.git",
+      });
+      yield* fixtureIo("workspace root creation", () =>
+        mkdir(fixture.workspaceRoot, { recursive: true }),
+      );
+      const target = join(fixture.workspaceRoot, safeSessionKey(id));
+      yield* fixtureIo("workspace target creation", () => mkdir(target));
+      yield* runGit(["init"], target);
+      yield* runGit(
+        [
+          "config",
+          "--local",
+          "http.https://github.com/.extraheader",
+          buildGitHubExtraHeader("stale-token"),
+        ],
+        target,
+      );
+      yield* fixtureIo("workspace marker creation", () =>
+        writeFile(
+          join(target, MARKER_FILE),
+          JSON.stringify({
+            repositoryId: record.id,
+            url: record.url,
+            ref: record.ref,
+          }),
+        ),
+      );
+      let tokenCalls = 0;
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: {
+          getInstallationToken: () => {
+            tokenCalls += 1;
+            return Effect.succeed("fresh-token");
+          },
+        },
+      });
+      yield* workspace.materialize(id, record);
+      expect(tokenCalls).toBe(1);
+      expect(
+        yield* readGitConfig("http.https://github.com/.extraheader", target),
+      ).toBe(buildGitHubExtraHeader("fresh-token"));
+    }),
+  );
+
+  it.scopedLive(
+    "unsets GitHub credentials when reusing without configuration",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const id = sessionId("github-reuse-unset");
+        const record = repositoryRecord({
+          id: "github-reuse-unset",
+          url: "https://github.com/octo-org/private-repo.git",
+        });
+        yield* fixtureIo("workspace root creation", () =>
+          mkdir(fixture.workspaceRoot, { recursive: true }),
+        );
+        const target = join(fixture.workspaceRoot, safeSessionKey(id));
+        yield* fixtureIo("workspace target creation", () => mkdir(target));
+        yield* runGit(["init"], target);
+        yield* runGit(
+          [
+            "config",
+            "--local",
+            "http.https://github.com/.extraheader",
+            buildGitHubExtraHeader("stale-token"),
+          ],
+          target,
+        );
+        yield* fixtureIo("workspace marker creation", () =>
+          writeFile(
+            join(target, MARKER_FILE),
+            JSON.stringify({
+              repositoryId: record.id,
+              url: record.url,
+              ref: record.ref,
+            }),
+          ),
+        );
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: undefined,
+        });
+        yield* workspace.materialize(id, record);
+        expect(
+          yield* readGitConfig("http.https://github.com/.extraheader", target),
+        ).toBeUndefined();
+      }),
+  );
+
+  it.scopedLive("does not mint credentials for SSH-style GitHub URLs", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const id = sessionId("github-ssh-reuse");
+      const record = repositoryRecord({
+        id: "github-ssh-reuse",
+        url: "git@github.com:octo-org/private-repo.git",
+      });
+      yield* fixtureIo("workspace root creation", () =>
+        mkdir(fixture.workspaceRoot, { recursive: true }),
+      );
+      const target = join(fixture.workspaceRoot, safeSessionKey(id));
+      yield* fixtureIo("workspace target creation", () => mkdir(target));
+      yield* runGit(["init"], target);
+      yield* fixtureIo("workspace marker creation", () =>
+        writeFile(
+          join(target, MARKER_FILE),
+          JSON.stringify({
+            repositoryId: record.id,
+            url: record.url,
+            ref: record.ref,
+          }),
+        ),
+      );
+      let tokenCalls = 0;
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: {
+          getInstallationToken: () => {
+            tokenCalls += 1;
+            return Effect.succeed("unexpected-token");
+          },
+        },
+      });
+      yield* workspace.materialize(id, record);
+      expect(tokenCalls).toBe(0);
+      expect(
+        yield* readGitConfig("http.https://github.com/.extraheader", target),
+      ).toBeUndefined();
+    }),
   );
 
   it.scopedLive(

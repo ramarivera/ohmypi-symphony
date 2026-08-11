@@ -144,6 +144,56 @@ export const parseRepositorySuggestionCandidate = (
   return { hostname, repositoryFullName };
 };
 
+const isHttpsGitHubRepositoryUrl = (repositoryUrl: string): boolean => {
+  try {
+    const parsed = new URL(repositoryUrl);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.hostname.toLowerCase() === "github.com"
+    );
+  } catch {
+    return false;
+  }
+};
+
+const mintGitHubExtraHeader = (
+  githubApp: GitHubAppTokenService,
+  repository: RepositoryRecord,
+  sessionId: string,
+) =>
+  Effect.gen(function* () {
+    const candidate = parseRepositorySuggestionCandidate(repository.url);
+    if (
+      candidate === null ||
+      candidate.hostname.toLowerCase() !== "github.com" ||
+      !isHttpsGitHubRepositoryUrl(repository.url)
+    ) {
+      return undefined;
+    }
+    const [owner, repositoryName] = candidate.repositoryFullName.split("/");
+    if (owner === undefined || repositoryName === undefined) {
+      return yield* Effect.fail(
+        workspaceFailure(
+          "Repository URL did not yield an owner and name",
+          "git_failed",
+          sessionId,
+        )(new Error("invalid repository full name")),
+      );
+    }
+    const token = yield* githubApp
+      .getInstallationToken(owner, repositoryName)
+      .pipe(
+        Effect.mapError(
+          workspaceFailure(
+            "GitHub credentials could not be minted",
+            "git_failed",
+            sessionId,
+          ),
+        ),
+      );
+    return buildGitHubExtraHeader(token);
+  });
+
 function onlyItem<A>(items: ReadonlyArray<A>): A | undefined {
   return items.length === 1 ? items[0] : undefined;
 }
@@ -494,6 +544,39 @@ export const makeWorkspace = (input: {
         );
         yield* validateMarker(markerPath, repository, sessionId);
 
+        if (isHttpsGitHubRepositoryUrl(repository.url)) {
+          if (input.githubApp !== undefined) {
+            const githubExtraHeader = yield* mintGitHubExtraHeader(
+              input.githubApp,
+              repository,
+              sessionId,
+            );
+            if (githubExtraHeader !== undefined) {
+              yield* runGit(
+                [
+                  "config",
+                  "--local",
+                  "http.https://github.com/.extraheader",
+                  githubExtraHeader,
+                ],
+                canonicalTarget,
+                sessionId,
+              );
+            }
+          } else {
+            yield* runGit(
+              [
+                "config",
+                "--local",
+                "--unset",
+                "http.https://github.com/.extraheader",
+              ],
+              canonicalTarget,
+              sessionId,
+            ).pipe(Effect.catchAll(() => Effect.void));
+          }
+        }
+
         yield* Effect.logInfo("Workspace ready (reused)").pipe(
           Effect.annotateLogs({
             event: "workspace.ready",
@@ -511,39 +594,22 @@ export const makeWorkspace = (input: {
         repository.url,
       );
       if (input.githubApp !== undefined) {
-        if (
-          repositoryCandidate === null ||
-          repositoryCandidate.hostname.toLowerCase() !== "github.com"
+        if (isHttpsGitHubRepositoryUrl(repository.url)) {
+          githubExtraHeader = yield* mintGitHubExtraHeader(
+            input.githubApp,
+            repository,
+            sessionId,
+          );
+        } else if (
+          repositoryCandidate?.hostname.toLowerCase() === "github.com"
         ) {
+          yield* Effect.logDebug(
+            "GitHub credentials skipped for SSH repository URL; SSH repositories are unsupported for GitHub App credentials",
+          );
+        } else {
           yield* Effect.logDebug(
             "GitHub credentials skipped for non-GitHub repository",
           );
-        } else {
-          const [owner, repositoryName] =
-            repositoryCandidate.repositoryFullName.split("/");
-          if (owner === undefined || repositoryName === undefined) {
-            return yield* Effect.fail(
-              workspaceFailure(
-                "Repository URL did not yield an owner and name",
-                "git_failed",
-                sessionId,
-              )(new Error("invalid repository full name")),
-            );
-          }
-          const token = yield* input.githubApp
-            .getInstallationToken(owner, repositoryName)
-            .pipe(
-              Effect.mapError(
-                workspaceFailure(
-                  "GitHub credentials could not be minted",
-                  "git_failed",
-                  sessionId,
-                ),
-              ),
-            );
-          // Git extraheader keeps the token out of remote URLs (which models
-          // echo) and out of process env (which the worker scrubber handles).
-          githubExtraHeader = buildGitHubExtraHeader(token);
         }
       }
 

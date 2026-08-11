@@ -27,6 +27,7 @@ import {
 } from "../src/domain/ids.js";
 import { type Installation, NixPackageName } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { GitHubApp } from "../src/services/github-app.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
@@ -730,6 +731,7 @@ const withAuthority = <A, E>(
         RunInputRepo.Default,
         RunRepo.Default,
         WorkspaceRepo.Default,
+        GitHubApp.Default,
         Layer.succeed(ActivityProjector, mockProjector),
         Layer.succeed(RpcWorker, mockRpcWorker),
         Layer.succeed(NixEnvironment, mockNixEnvironment),

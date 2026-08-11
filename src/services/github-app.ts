@@ -1,10 +1,11 @@
 import { createSign } from "node:crypto";
-import { Effect, Redacted, Schema } from "effect";
+import { Deferred, Effect, FiberId, Redacted, Schema } from "effect";
 import { GatewayConfig } from "./config.js";
 
 const GITHUB_API = "https://api.github.com";
 const TOKEN_LIFETIME_MS = 60 * 60_000;
 const TOKEN_REFRESH_MARGIN_MS = 10 * 60_000;
+const TOKEN_CACHE_MAX_ENTRIES = 100;
 const JWT_LIFETIME_SECONDS = 10 * 60;
 
 export type GitHubFetch = (
@@ -110,6 +111,7 @@ export const makeGitHubApp = (input: {
     string,
     { readonly token: string; readonly expiresAt: number }
   >();
+  const inFlight = new Map<string, Deferred.Deferred<string, GitHubAppError>>();
 
   const getInstallationToken = Effect.fn("GitHubApp.getInstallationToken")(
     function* (
@@ -140,6 +142,9 @@ export const makeGitHubApp = (input: {
 
       const key = `${owner}/${repository}`;
       const timestamp = now();
+      for (const [cachedKey, entry] of cache) {
+        if (timestamp >= entry.expiresAt) cache.delete(cachedKey);
+      }
       const cached = cache.get(key);
       if (
         cached !== undefined &&
@@ -148,81 +153,114 @@ export const makeGitHubApp = (input: {
         return cached.token;
       }
 
-      const jwt = yield* Effect.try({
-        try: () =>
-          buildGitHubAppJwt(
-            input.appId as string,
-            input.privateKey as string,
-            timestamp,
-          ),
-        catch: () =>
-          new GitHubAppError({
-            message: "Could not sign GitHub App JWT",
-            operation: "getInstallationToken",
-            reason: "jwt",
-          }),
+      const existing = inFlight.get(key);
+      if (existing !== undefined) return yield* Deferred.await(existing);
+
+      const deferred = Deferred.unsafeMake<string, GitHubAppError>(
+        FiberId.none,
+      );
+      inFlight.set(key, deferred);
+      const mint = Effect.gen(function* () {
+        const jwt = yield* Effect.try({
+          try: () =>
+            buildGitHubAppJwt(
+              input.appId as string,
+              input.privateKey as string,
+              timestamp,
+            ),
+          catch: () =>
+            new GitHubAppError({
+              message: "Could not sign GitHub App JWT",
+              operation: "getInstallationToken",
+              reason: "jwt",
+            }),
+        });
+        const headers = {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${jwt}`,
+          "X-GitHub-Api-Version": "2022-11-28",
+        };
+        const encodedOwner = encodeURIComponent(owner);
+        const encodedRepository = encodeURIComponent(repository);
+        const installation = yield* responseJson(
+          fetchImpl,
+          "installation_lookup",
+          "installation_lookup",
+          `${GITHUB_API}/repos/${encodedOwner}/${encodedRepository}/installation`,
+          { headers },
+        );
+        if (
+          typeof installation !== "object" ||
+          installation === null ||
+          typeof (installation as { id?: unknown }).id !== "number"
+        ) {
+          return yield* Effect.fail(
+            new GitHubAppError({
+              message: "GitHub installation response was invalid",
+              operation: "installation_lookup",
+              reason: "invalid_response",
+            }),
+          );
+        }
+        const tokenResponse = yield* responseJson(
+          fetchImpl,
+          "token_request",
+          "token_request",
+          `${GITHUB_API}/app/installations/${(installation as { id: number }).id}/access_tokens`,
+          {
+            method: "POST",
+            headers: { ...headers, "Content-Type": "application/json" },
+            body: JSON.stringify({ repositories: [repository] }),
+          },
+        );
+        if (
+          typeof tokenResponse !== "object" ||
+          tokenResponse === null ||
+          typeof (tokenResponse as { token?: unknown }).token !== "string"
+        ) {
+          return yield* Effect.fail(
+            new GitHubAppError({
+              message: "GitHub access token response was invalid",
+              operation: "token_request",
+              reason: "invalid_response",
+            }),
+          );
+        }
+        const expiresAtValue = (tokenResponse as { expires_at?: unknown })
+          .expires_at;
+        const expiresAt =
+          typeof expiresAtValue === "string" &&
+          Number.isFinite(Date.parse(expiresAtValue))
+            ? Math.min(
+                Date.parse(expiresAtValue),
+                timestamp + TOKEN_LIFETIME_MS,
+              )
+            : timestamp + TOKEN_LIFETIME_MS;
+        const token = (tokenResponse as { token: string }).token;
+        cache.delete(key);
+        if (cache.size >= TOKEN_CACHE_MAX_ENTRIES) {
+          let oldestKey: string | undefined;
+          let oldestExpiresAt = Number.POSITIVE_INFINITY;
+          for (const [cachedKey, entry] of cache) {
+            if (entry.expiresAt < oldestExpiresAt) {
+              oldestKey = cachedKey;
+              oldestExpiresAt = entry.expiresAt;
+            }
+          }
+          if (oldestKey !== undefined) cache.delete(oldestKey);
+        }
+        cache.set(key, { token, expiresAt });
+        return token;
       });
-      const headers = {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${jwt}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-      };
-      const encodedOwner = encodeURIComponent(owner);
-      const encodedRepository = encodeURIComponent(repository);
-      const installation = yield* responseJson(
-        fetchImpl,
-        "installation_lookup",
-        "installation_lookup",
-        `${GITHUB_API}/repos/${encodedOwner}/${encodedRepository}/installation`,
-        { headers },
-      );
-      if (
-        typeof installation !== "object" ||
-        installation === null ||
-        typeof (installation as { id?: unknown }).id !== "number"
-      ) {
-        return yield* Effect.fail(
-          new GitHubAppError({
-            message: "GitHub installation response was invalid",
-            operation: "installation_lookup",
-            reason: "invalid_response",
+      return yield* mint.pipe(
+        Effect.tap((token) => Deferred.succeed(deferred, token)),
+        Effect.tapError((error) => Deferred.fail(deferred, error)),
+        Effect.ensuring(
+          Effect.sync(() => {
+            if (inFlight.get(key) === deferred) inFlight.delete(key);
           }),
-        );
-      }
-      const tokenResponse = yield* responseJson(
-        fetchImpl,
-        "token_request",
-        "token_request",
-        `${GITHUB_API}/app/installations/${(installation as { id: number }).id}/access_tokens`,
-        {
-          method: "POST",
-          headers: { ...headers, "Content-Type": "application/json" },
-          body: JSON.stringify({ repositories: [repository] }),
-        },
+        ),
       );
-      if (
-        typeof tokenResponse !== "object" ||
-        tokenResponse === null ||
-        typeof (tokenResponse as { token?: unknown }).token !== "string"
-      ) {
-        return yield* Effect.fail(
-          new GitHubAppError({
-            message: "GitHub access token response was invalid",
-            operation: "token_request",
-            reason: "invalid_response",
-          }),
-        );
-      }
-      const expiresAtValue = (tokenResponse as { expires_at?: unknown })
-        .expires_at;
-      const expiresAt =
-        typeof expiresAtValue === "string" &&
-        Number.isFinite(Date.parse(expiresAtValue))
-          ? Math.min(Date.parse(expiresAtValue), timestamp + TOKEN_LIFETIME_MS)
-          : timestamp + TOKEN_LIFETIME_MS;
-      const token = (tokenResponse as { token: string }).token;
-      cache.set(key, { token, expiresAt });
-      return token;
     },
   );
 
