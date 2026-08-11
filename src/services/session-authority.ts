@@ -268,6 +268,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
     dependencies: [
       ActivityProjector.Default,
       InstallationRepo.Default,
+      McpServerRepo.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
       RunRepo.Default,
@@ -1589,7 +1590,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           allMcpServers,
           Option.isSome(run.repositoryId) ? run.repositoryId.value : null,
         );
-        yield* writeOmpMcpConfig(cwd, effectiveMcpServers).pipe(
+        yield* writeOmpMcpConfig(cwd, effectiveMcpServers, run.sessionId).pipe(
           Effect.mapError(
             (error) =>
               new RpcSpawnError({

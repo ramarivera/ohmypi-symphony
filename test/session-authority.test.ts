@@ -1,3 +1,5 @@
+import { mkdtemp, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import {
   ConfigProvider,
@@ -19,6 +21,7 @@ import {
   AppUserId,
   InputId,
   IssueId,
+  McpServerId,
   OrganizationId,
   SessionId,
   SourceKey,
@@ -45,6 +48,7 @@ import {
 } from "../src/services/session-authority.js";
 import {
   InstallationRepo,
+  McpServerRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -479,8 +483,91 @@ describe("SessionAuthority behavior invariants", () => {
       ),
     { timeout: 15_000 },
   );
-});
+  it.effect(
+    "materializes configured MCP servers through the real authority layer",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const mcpServerRepo = yield* McpServerRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "authority-mcp-repository",
+          );
+          const workspace = yield* Effect.promise(() =>
+            mkdtemp(join("/tmp", "authority-mcp-config-")),
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* mcpServerRepo.createMcpServer({
+            organizationId: testOrganizationId,
+            id: Schema.decodeUnknownSync(McpServerId)("authority-mcp-server"),
+            name: "configured",
+            transport: "stdio",
+            command: "node",
+            args: ["server.js"],
+            env: { TOKEN: "secret" },
+            repositoryId: Option.some(repositoryId),
+            now: 1,
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some(workspace),
+            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+          });
+          yield* authority.processSession(testSessionId);
+          const config = JSON.parse(
+            yield* Effect.promise(() =>
+              readFile(join(workspace, "mcp.json"), "utf8"),
+            ),
+          ) as { mcpServers: Record<string, { command: string }> };
+          expect(config.mcpServers.configured?.command).toBe("node");
+        }),
+      ),
+    { timeout: 15_000 },
+  );
 
+  it.effect(
+    "materializes an empty MCP config when no servers exist",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const workspace = yield* Effect.promise(() =>
+            mkdtemp(join("/tmp", "authority-mcp-empty-")),
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some(workspace),
+            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+          });
+          yield* authority.processSession(testSessionId);
+          expect(
+            JSON.parse(
+              yield* Effect.promise(() =>
+                readFile(join(workspace, "mcp.json"), "utf8"),
+              ),
+            ),
+          ).toEqual({ mcpServers: {} });
+        }),
+      ),
+    { timeout: 15_000 },
+  );
+});
 const testConfigProvider = ConfigProvider.fromMap(
   new Map([
     ["LINEAR_CLIENT_ID", "test-client"],
@@ -695,8 +782,8 @@ const withAuthority = <A, E>(
     | RunInputRepo
     | RunEventRepo
     | InstallationRepo
+    | McpServerRepo
     | WorkspaceRepo
-    | NixEnvironment
   >,
   options?: { readonly withLinearGateway?: boolean },
 ) =>
@@ -726,6 +813,7 @@ const withAuthority = <A, E>(
         GatewayConfig.Default,
         TokenCrypto.Default,
         InstallationRepo.Default,
+        McpServerRepo.Default,
         RunEventRepo.Default,
         RunInputRepo.Default,
         RunRepo.Default,

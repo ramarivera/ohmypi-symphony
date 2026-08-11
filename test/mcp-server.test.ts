@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
-import { ConfigProvider, Effect, Layer, Option } from "effect";
+import { ConfigProvider, Effect, HashMap, Layer, Logger, Option } from "effect";
 import { describe, expect } from "vitest";
 import type {
   McpServerId,
@@ -191,5 +191,66 @@ describe("MCP server storage and worker config", () => {
     expect(JSON.parse(await readFile(join(bare, "mcp.json"), "utf8"))).toEqual({
       mcpServers: {},
     });
+  });
+  it("appends mcp.json on a new line in an existing git exclude", async () => {
+    const root = await mkdtemp(join("/tmp", "mcp-writer-exclude-"));
+    await mkdir(join(root, ".git", "info"), { recursive: true });
+    await writeFile(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
+    await writeFile(join(root, ".git", "info", "exclude"), "foo");
+
+    await Effect.runPromise(writeOmpMcpConfig(root, []));
+
+    expect(await readFile(join(root, ".git", "info", "exclude"), "utf8")).toBe(
+      "foo\nmcp.json\n",
+    );
+  });
+
+  it("skips tracked mcp.json and logs the session warning", async () => {
+    const root = await mkdtemp(join("/tmp", "mcp-writer-tracked-"));
+    const original = '{"keep":"repo-content"}\n';
+    await writeFile(join(root, "mcp.json"), original);
+    const init = Bun.spawn(["git", "init", "-q"], {
+      cwd: root,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    expect(await init.exited).toBe(0);
+    const add = Bun.spawn(["git", "add", "mcp.json"], {
+      cwd: root,
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    expect(await add.exited).toBe(0);
+    const excludePath = join(root, ".git", "info", "exclude");
+    const excludeBefore = await readFile(excludePath, "utf8");
+    const logs: Array<{
+      readonly message: string;
+      readonly event: unknown;
+      readonly sessionId: unknown;
+    }> = [];
+    const logger = Logger.make(({ message, annotations }) => {
+      logs.push({
+        message: String(message),
+        event: Option.getOrNull(HashMap.get(annotations, "event")),
+        sessionId: Option.getOrNull(HashMap.get(annotations, "sessionId")),
+      });
+    });
+
+    await Effect.runPromise(
+      writeOmpMcpConfig(root, [], "tracked-session").pipe(
+        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+      ),
+    );
+
+    expect(
+      logs.some(
+        (entry) =>
+          entry.message === "mcp.config.tracked_skip" &&
+          entry.event === "mcp.config.tracked_skip" &&
+          entry.sessionId === "tracked-session",
+      ),
+    ).toBe(true);
+    expect(await readFile(join(root, "mcp.json"), "utf8")).toBe(original);
+    expect(await readFile(excludePath, "utf8")).toBe(excludeBefore);
   });
 });
