@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Either } from "effect";
+import { Deferred, Effect, Either, Exit, Fiber, FiberId } from "effect";
 import {
   buildGitHubAppJwt,
   buildGitHubExtraHeader,
@@ -64,10 +64,10 @@ describe("GitHubApp", () => {
     });
 
     const first = await Effect.runPromise(
-      service.getInstallationToken("octo-org", "private-repo"),
+      service.getInstallationToken("octo-org", "private-repo", "org-test"),
     );
     const second = await Effect.runPromise(
-      service.getInstallationToken("octo-org", "private-repo"),
+      service.getInstallationToken("octo-org", "private-repo", "org-test"),
     );
     expect(first).toBe("ghs_test_token");
     expect(second).toBe(first);
@@ -85,7 +85,7 @@ describe("GitHubApp", () => {
 
     now += 51 * 60_000;
     await Effect.runPromise(
-      service.getInstallationToken("octo-org", "private-repo"),
+      service.getInstallationToken("octo-org", "private-repo", "org-test"),
     );
     expect(requests).toHaveLength(4);
   });
@@ -116,21 +116,23 @@ describe("GitHubApp", () => {
 
     for (let index = 0; index < 100; index += 1) {
       await Effect.runPromise(
-        service.getInstallationToken("octo-org", `repo-${index}`),
+        service.getInstallationToken("octo-org", `repo-${index}`, "org-test"),
       );
     }
     await Effect.runPromise(
-      service.getInstallationToken("octo-org", "repo-100"),
+      service.getInstallationToken("octo-org", "repo-100", "org-test"),
     );
     const afterInitialMints = requests;
 
     // repo-0 had the oldest expiry and is evicted when repo-100 is inserted.
-    await Effect.runPromise(service.getInstallationToken("octo-org", "repo-0"));
+    await Effect.runPromise(
+      service.getInstallationToken("octo-org", "repo-0", "org-test"),
+    );
     expect(requests).toBe(afterInitialMints + 2);
 
     now += 2_000;
     await Effect.runPromise(
-      service.getInstallationToken("octo-org", "repo-100"),
+      service.getInstallationToken("octo-org", "repo-100", "org-test"),
     );
     expect(requests).toBe(afterInitialMints + 4);
   });
@@ -165,11 +167,11 @@ describe("GitHubApp", () => {
     });
 
     const first = Effect.runPromise(
-      service.getInstallationToken("octo-org", "single-flight"),
+      service.getInstallationToken("octo-org", "single-flight", "org-test"),
     );
     await started;
     const second = Effect.runPromise(
-      service.getInstallationToken("octo-org", "single-flight"),
+      service.getInstallationToken("octo-org", "single-flight", "org-test"),
     );
     releaseFirstRequest?.();
     await expect(Promise.all([first, second])).resolves.toEqual([
@@ -185,7 +187,7 @@ describe("GitHubApp", () => {
         makeGitHubApp({
           appId: undefined,
           privateKey: undefined,
-        }).getInstallationToken("owner", "repo"),
+        }).getInstallationToken("owner", "repo", "org-test"),
       ),
     );
     expect(Either.isLeft(result)).toBe(true);
@@ -193,5 +195,53 @@ describe("GitHubApp", () => {
       expect(result.left.reason).toBe("disabled");
       expect(result.left.message).not.toContain("private");
     }
+  });
+
+  it("reports not_installed when the App is absent from the repository", async () => {
+    const fetchMock: GitHubFetch = async () =>
+      new Response(JSON.stringify({ message: "Not Found" }), {
+        status: 404,
+      });
+    const service = makeGitHubApp({
+      appId: "12345",
+      privateKey: privateKeyPem,
+      fetch: fetchMock,
+    });
+    const result = await Effect.runPromise(
+      Effect.either(
+        service.getInstallationToken("octo-org", "other-repo", "org-test"),
+      ),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+    if (Either.isLeft(result)) {
+      expect(result.left.reason).toBe("not_installed");
+    }
+  });
+
+  it("releases single-flight waiters when the winner is interrupted", async () => {
+    const started = Deferred.unsafeMake<void>(FiberId.none);
+    const service = makeGitHubApp({
+      appId: "12345",
+      privateKey: privateKeyPem,
+      fetch: async () => {
+        Deferred.unsafeDone(started, Effect.void);
+        return new Promise<Response>(() => {}); // never resolves
+      },
+    });
+    const program = Effect.gen(function* () {
+      const winner = yield* Effect.fork(
+        service.getInstallationToken("octo-org", "repo", "org-test"),
+      );
+      yield* Deferred.await(started);
+      const waiter = yield* Effect.fork(
+        service.getInstallationToken("octo-org", "repo", "org-test"),
+      );
+      yield* Effect.yieldNow();
+      yield* Fiber.interrupt(winner);
+      // The waiter must be released (interrupted exit), not hang forever.
+      const waiterExit = yield* Fiber.await(waiter);
+      expect(Exit.isInterrupted(waiterExit)).toBe(true);
+    });
+    await Effect.runPromise(Effect.timeout(program, "5 seconds"));
   });
 });

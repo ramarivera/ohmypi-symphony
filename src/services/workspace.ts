@@ -181,8 +181,24 @@ const mintGitHubExtraHeader = (
       );
     }
     const token = yield* githubApp
-      .getInstallationToken(owner, repositoryName)
+      .getInstallationToken(owner, repositoryName, repository.organizationId)
       .pipe(
+        // App not installed on this repo: clone anonymously instead of
+        // failing (public repos, or repos outside the App's installations).
+        Effect.catchIf(
+          (error) =>
+            error._tag === "@Gateway/GitHubAppError" &&
+            error.reason === "not_installed",
+          (_error) =>
+            Effect.logInfo("workspace.github_credentials_not_installed").pipe(
+              Effect.annotateLogs({
+                event: "workspace.github_credentials_not_installed",
+                sessionId,
+                repositoryId: repository.id,
+              }),
+              Effect.as(undefined),
+            ),
+        ),
         Effect.mapError(
           workspaceFailure(
             "GitHub credentials could not be minted",
@@ -191,6 +207,7 @@ const mintGitHubExtraHeader = (
           ),
         ),
       );
+    if (token === undefined) return undefined;
     return buildGitHubExtraHeader(token);
   });
 
@@ -343,7 +360,7 @@ const unsetGitHubExtraHeader = (
   sessionId: string,
 ): Effect.Effect<void, never> =>
   runGit(
-    ["config", "--local", "--unset", GITHUB_EXTRA_HEADER_KEY],
+    ["config", "--local", "--unset-all", GITHUB_EXTRA_HEADER_KEY],
     target,
     sessionId,
   ).pipe(Effect.catchAll(() => Effect.void));
@@ -682,17 +699,27 @@ export const makeWorkspace = (input: {
           sessionId,
         );
       }
-      yield* runGit(
-        ["fetch", "--depth=1", "origin", repository.ref],
-        target,
-        sessionId,
+      // If anything after persisting the header fails, drop it so the next
+      // attempt doesn't inherit a stale/expired credential.
+      yield* Effect.gen(function* () {
+        yield* runGit(
+          ["fetch", "--depth=1", "origin", repository.ref],
+          target,
+          sessionId,
+        );
+        yield* runGit(
+          ["checkout", "--detach", "--force", "FETCH_HEAD"],
+          target,
+          sessionId,
+        );
+        yield* writeMarker(markerPath, repository, sessionId);
+      }).pipe(
+        Effect.onError(() =>
+          githubExtraHeader === undefined
+            ? Effect.void
+            : unsetGitHubExtraHeader(target, sessionId),
+        ),
       );
-      yield* runGit(
-        ["checkout", "--detach", "--force", "FETCH_HEAD"],
-        target,
-        sessionId,
-      );
-      yield* writeMarker(markerPath, repository, sessionId);
 
       const finalTarget = yield* realpathOrFail(
         target,

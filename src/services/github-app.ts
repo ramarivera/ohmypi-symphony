@@ -25,6 +25,7 @@ export class GitHubAppError extends Schema.TaggedError<GitHubAppError>()(
       "installation_lookup",
       "token_request",
       "invalid_response",
+      "not_installed",
     ),
     status: Schema.optional(Schema.Number),
   },
@@ -34,6 +35,7 @@ export interface GitHubAppTokenService {
   readonly getInstallationToken: (
     owner: string,
     repository: string,
+    organizationId: string,
   ) => Effect.Effect<string, GitHubAppError>;
 }
 
@@ -117,6 +119,7 @@ export const makeGitHubApp = (input: {
     function* (
       owner: string,
       repository: string,
+      organizationId: string,
     ): Effect.fn.Return<string, GitHubAppError> {
       if (input.appId === undefined || input.privateKey === undefined) {
         return yield* Effect.fail(
@@ -140,7 +143,10 @@ export const makeGitHubApp = (input: {
         );
       }
 
-      const key = `${owner}/${repository}`;
+      // Tenant dimension: one gateway may serve several Linear
+      // organizations; a token minted under org A's run must never be served
+      // to org B's run for the same repository.
+      const key = `${organizationId}:${owner}/${repository}`;
       const timestamp = now();
       for (const [cachedKey, entry] of cache) {
         if (timestamp >= entry.expiresAt) cache.delete(cachedKey);
@@ -188,6 +194,22 @@ export const makeGitHubApp = (input: {
           "installation_lookup",
           `${GITHUB_API}/repos/${encodedOwner}/${encodedRepository}/installation`,
           { headers },
+        ).pipe(
+          // The GitHub App is not installed on this repository — callers
+          // fall back to anonymous clone instead of failing the run.
+          Effect.catchIf(
+            (error) =>
+              error._tag === "@Gateway/GitHubAppError" && error.status === 404,
+            () =>
+              Effect.fail(
+                new GitHubAppError({
+                  message: "GitHub App is not installed on this repository",
+                  operation: "installation_lookup",
+                  reason: "not_installed",
+                  status: 404,
+                }),
+              ),
+          ),
         );
         if (
           typeof installation !== "object" ||
@@ -253,8 +275,8 @@ export const makeGitHubApp = (input: {
         return token;
       });
       return yield* mint.pipe(
-        Effect.tap((token) => Deferred.succeed(deferred, token)),
-        Effect.tapError((error) => Deferred.fail(deferred, error)),
+        // onExit (not tap/tapError): interruption must also release waiters.
+        Effect.onExit((exit) => Deferred.done(deferred, exit)),
         Effect.ensuring(
           Effect.sync(() => {
             if (inFlight.get(key) === deferred) inFlight.delete(key);
