@@ -1,4 +1,4 @@
-import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Option } from "effect";
 import type { McpServerRecord } from "../domain/models.js";
@@ -18,6 +18,23 @@ const isTrackedMcpConfig = async (cwd: string): Promise<boolean> => {
     return false;
   }
 };
+
+/**
+ * Best-effort removal of a generated mcp.json. Repository-tracked files are
+ * never removed: only the generated, untracked workspace copy is eligible.
+ */
+export const removeMcpConfig = (
+  cwd: string,
+): Effect.Effect<void, never, never> =>
+  Effect.promise(async () => {
+    if (await isTrackedMcpConfig(cwd)) return;
+    try {
+      await unlink(join(cwd, "mcp.json"));
+    } catch {
+      // Cleanup is deliberately best effort: a missing or locked config must
+      // not mask the terminal state of the run.
+    }
+  });
 
 /**
  * Resolve the servers visible to one worker. Repository-scoped entries have

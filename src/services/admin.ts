@@ -353,8 +353,14 @@ function mcpServerPayload(
   const argsResult = preservingStringArray(body.args, "args");
   if (Either.isLeft(argsResult)) return Either.left(argsResult.left);
   const args = argsResult.right;
-  const repositoryId =
-    body.repositoryId === null ? null : optionalString(body.repositoryId);
+  let repositoryId: string | null;
+  if (body.repositoryId === null || body.repositoryId === undefined) {
+    repositoryId = null;
+  } else if (typeof body.repositoryId !== "string") {
+    return Either.left("repositoryId must be a string or null");
+  } else {
+    repositoryId = optionalString(body.repositoryId);
+  }
   const envValue = body.env;
   const env: Record<string, string> = {};
   if (envValue !== undefined && envValue !== null) {

@@ -225,6 +225,8 @@ const migrate = (db: Database): void => {
     );
     CREATE INDEX IF NOT EXISTS mcp_server_scope
       ON mcp_server(organization_id, repository_id, enabled);
+    CREATE UNIQUE INDEX IF NOT EXISTS mcp_server_scope_name_unique
+      ON mcp_server(organization_id, COALESCE(repository_id, ''), name);
     CREATE TABLE IF NOT EXISTS admin_session (
       token_hash TEXT PRIMARY KEY,
       organization_id TEXT NOT NULL,

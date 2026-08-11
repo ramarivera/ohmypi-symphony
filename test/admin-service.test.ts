@@ -689,4 +689,39 @@ describe("MCP admin endpoints", () => {
     expect(detailBody.mcpServer.env).toEqual({ API_TOKEN: "•••" });
     expect(JSON.stringify(detailBody)).not.toContain("super-secret");
   });
+  it("rejects non-string repository ids before persistence", async () => {
+    let called = false;
+    const mcpServerRepo = McpServerRepo.make({
+      ...deps.mcpServerRepo,
+      createMcpServer: (..._args: ReadonlyArray<unknown>) => {
+        called = true;
+        return Effect.never;
+      },
+    });
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const response = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(
+          new Request(new URL("/api/admin/mcp-servers", config.publicUrl), {
+            method: "POST",
+            headers: {
+              Cookie: `omp_gateway_admin=${token}`,
+              Origin: config.publicUrl.toString(),
+              "Content-Type": "application/json",
+              "X-CSRF-Token": deriveCsrfToken(token),
+            },
+            body: JSON.stringify({
+              id: "numeric-repository",
+              name: "numeric-repository",
+              transport: "stdio",
+              command: "node",
+              repositoryId: 42,
+            }),
+          }),
+        ),
+      ),
+    );
+    expect(response.status).toBe(400);
+    expect(called).toBe(false);
+  });
 });

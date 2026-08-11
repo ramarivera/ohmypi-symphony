@@ -18,6 +18,7 @@ import type {
 } from "../src/domain/ids.js";
 import { McpServerRecord } from "../src/domain/models.js";
 import {
+  removeMcpConfig,
   resolveEffectiveMcpServers,
   toOmpMcpConfig,
   writeOmpMcpConfig,
@@ -81,7 +82,7 @@ describe("MCP server storage and worker config", () => {
             "SELECT env_json FROM mcp_server WHERE organization_id=? AND id=?",
           )
           .get(org, serverId("wide"));
-        expect(stored).not.toBeNull();
+        expect(stored?.env_json).toMatch(/"TOKEN":"mcpenc:v1:[A-Za-z0-9_-]+"/u);
         expect(stored?.env_json).not.toContain("secret");
         const scoped = yield* servers.createMcpServer({
           organizationId: org,
@@ -114,6 +115,71 @@ describe("MCP server storage and worker config", () => {
       }),
     ),
   );
+  it.scopedLive(
+    "preserves legacy plaintext and rejects tampered envelopes",
+    () =>
+      withRepo(
+        Effect.gen(function* () {
+          const servers = yield* McpServerRepo;
+          const { db } = yield* SqliteClient;
+          db.query(
+            `INSERT INTO mcp_server
+            (organization_id, id, name, transport, command, args_json, url, env_json, repository_id, enabled, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            org,
+            serverId("legacy"),
+            "legacy",
+            "stdio",
+            "node",
+            "[]",
+            null,
+            JSON.stringify({ TOKEN: "AQlegacy" }),
+            null,
+            1,
+            1,
+            1,
+          );
+          const legacy = yield* servers.getMcpServer(org, serverId("legacy"));
+          expect(Option.isSome(legacy)).toBe(true);
+          expect(Option.isSome(legacy) ? legacy.value.env.TOKEN : null).toBe(
+            "AQlegacy",
+          );
+
+          yield* servers.createMcpServer({
+            organizationId: org,
+            id: serverId("tampered"),
+            name: "tampered",
+            transport: "stdio",
+            command: "node",
+            env: { TOKEN: "secret" },
+            repositoryId: Option.none(),
+          });
+          const stored = db
+            .query<{ readonly env_json: string }, [string, string]>(
+              "SELECT env_json FROM mcp_server WHERE organization_id=? AND id=?",
+            )
+            .get(org, serverId("tampered"));
+          if (stored === null) throw new Error("tampered row missing");
+          const env = JSON.parse(stored.env_json) as Record<string, string>;
+          const ciphertext = env.TOKEN;
+          if (ciphertext === undefined) throw new Error("TOKEN env missing");
+          const payload = new Uint8Array(
+            Buffer.from(ciphertext.slice("mcpenc:v1:".length), "base64url"),
+          );
+          const last = payload.length - 1;
+          const byte = payload[last];
+          if (byte === undefined) throw new Error("ciphertext is empty");
+          payload[last] = byte ^ 0xff;
+          env.TOKEN = `mcpenc:v1:${Buffer.from(payload).toString("base64url")}`;
+          db.query(
+            "UPDATE mcp_server SET env_json=? WHERE organization_id=? AND id=?",
+          ).run(JSON.stringify(env), org, serverId("tampered"));
+          const tampered = yield* Effect.either(servers.listMcpServers(org));
+          expect(Either.isLeft(tampered)).toBe(true);
+        }),
+      ),
+  );
   it.scopedLive("rejects duplicate MCP names within one scope", () =>
     withRepo(
       Effect.gen(function* () {
@@ -137,6 +203,30 @@ describe("MCP server storage and worker config", () => {
           }),
         );
         expect(Either.isLeft(duplicate)).toBe(true);
+        const concurrent = yield* Effect.either(
+          Effect.all(
+            [
+              servers.createMcpServer({
+                organizationId: org,
+                id: serverId("race-1"),
+                name: "race",
+                transport: "stdio",
+                command: "node",
+                repositoryId: Option.some(repo),
+              }),
+              servers.createMcpServer({
+                organizationId: org,
+                id: serverId("race-2"),
+                name: "race",
+                transport: "stdio",
+                command: "node",
+                repositoryId: Option.some(repo),
+              }),
+            ],
+            { concurrency: 2 },
+          ),
+        );
+        expect(Either.isLeft(concurrent)).toBe(true);
 
         yield* servers.createMcpServer({
           organizationId: org,
@@ -340,5 +430,12 @@ describe("MCP server storage and worker config", () => {
     ).toBe(true);
     expect(await readFile(join(root, "mcp.json"), "utf8")).toBe(original);
     expect(await readFile(excludePath, "utf8")).toBe(excludeBefore);
+    await Effect.runPromise(removeMcpConfig(root));
+    expect(await readFile(join(root, "mcp.json"), "utf8")).toBe(original);
+
+    const untracked = await mkdtemp(join("/tmp", "mcp-writer-cleanup-"));
+    await writeFile(join(untracked, "mcp.json"), "generated");
+    await Effect.runPromise(removeMcpConfig(untracked));
+    await expect(stat(join(untracked, "mcp.json"))).rejects.toThrow();
   });
 });

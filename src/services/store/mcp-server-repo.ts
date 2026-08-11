@@ -164,11 +164,10 @@ const parseJson = (
       }),
   });
 
-const isEncrypted = (value: string): boolean => {
-  if (!/^[A-Za-z0-9_-]+$/u.test(value)) return false;
-  const payload = Buffer.from(value, "base64url");
-  return payload.byteLength >= 1 + 12 + 16 && payload[0] === 1;
-};
+const MCP_ENCRYPTED_PREFIX = "mcpenc:v1:";
+
+const isEncrypted = (value: string): boolean =>
+  value.startsWith(MCP_ENCRYPTED_PREFIX);
 
 const rowToRecord = (
   tokenCrypto: TokenCrypto,
@@ -195,7 +194,7 @@ const rowToRecord = (
     const decryptedEnv = Object.fromEntries(
       yield* Effect.forEach(Object.entries(validEnv), ([key, value]) =>
         (isEncrypted(value)
-          ? tokenCrypto.decrypt(value)
+          ? tokenCrypto.decrypt(value.slice(MCP_ENCRYPTED_PREFIX.length))
           : Effect.succeed(value)
         ).pipe(Effect.map((decrypted) => [key, decrypted] as const)),
       ),
@@ -226,7 +225,11 @@ const encryptEnv = (
   Effect.forEach(Object.entries(env), ([key, value]) =>
     tokenCrypto
       .encrypt(value)
-      .pipe(Effect.map((encrypted) => [key, encrypted] as const)),
+      .pipe(
+        Effect.map(
+          (encrypted) => [key, `${MCP_ENCRYPTED_PREFIX}${encrypted}`] as const,
+        ),
+      ),
   ).pipe(Effect.map(Object.fromEntries));
 
 export class McpServerRepo extends Effect.Service<McpServerRepo>()(
@@ -308,6 +311,19 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   record.updatedAt,
                 ),
             "McpServerRepo.createMcpServer",
+          ).pipe(
+            Effect.catchTag("@Gateway/DatabaseError", (error) =>
+              /unique constraint failed:\s*(?:mcp_server\.|index ['"]?mcp_server_scope_name_unique)/iu.test(
+                error.message,
+              )
+                ? Effect.fail(
+                    new DatabaseError({
+                      message: `MCP server name "${record.name}" already exists in this scope`,
+                      cause: error.cause,
+                    }),
+                  )
+                : Effect.fail(error),
+            ),
           );
           return record;
         },
