@@ -21,6 +21,7 @@ import {
 } from "../domain/errors.js";
 import {
   InputId,
+  McpServerId,
   type OrganizationId,
   ProjectId,
   SessionId,
@@ -30,6 +31,7 @@ import {
 import type {
   AgentRun,
   Installation,
+  McpServerRecord,
   NixCacheEntry,
   NixPackageName,
   RepositoryRecord,
@@ -43,6 +45,7 @@ import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
+  McpServerRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -92,6 +95,7 @@ export interface AdminDeps {
     readonly createSessionOnIssue: LinearGateway["createSessionOnIssue"];
   };
   readonly workspaceRepo: WorkspaceRepo;
+  readonly mcpServerRepo?: McpServerRepo;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
   readonly nixEnvironment: NixEnvironment;
@@ -285,6 +289,80 @@ export function toApiRepository(repository: RepositoryRecord) {
     isDefault: repository.isDefault,
     createdAt: repository.createdAt,
     updatedAt: repository.updatedAt,
+  };
+}
+interface McpServerPayload {
+  readonly id: string;
+  readonly name: string;
+  readonly transport: "stdio" | "http" | "sse";
+  readonly command: string | null;
+  readonly args: ReadonlyArray<string>;
+  readonly url: string | null;
+  readonly env: Readonly<Record<string, string>>;
+  readonly repositoryId: string | null;
+  readonly enabled: boolean | undefined;
+}
+
+function mcpServerPayload(
+  body: Record<string, unknown>,
+): Either.Either<McpServerPayload, string> {
+  const id = optionalString(body.id);
+  const name = optionalString(body.name);
+  if (id === null) return Either.left("id is required");
+  if (name === null) return Either.left("name is required");
+  const rawTransport = body.transport;
+  if (
+    rawTransport !== "stdio" &&
+    rawTransport !== "http" &&
+    rawTransport !== "sse"
+  ) {
+    return Either.left("transport must be stdio, http, or sse");
+  }
+  const command = body.command === null ? null : optionalString(body.command);
+  const url = body.url === null ? null : optionalString(body.url);
+  const args = optionalStringArray(body.args, "args");
+  if (Either.isLeft(args)) return Either.left(args.left);
+  const repositoryId =
+    body.repositoryId === null ? null : optionalString(body.repositoryId);
+  const envValue = body.env;
+  const env: Record<string, string> = {};
+  if (envValue !== undefined && envValue !== null) {
+    if (!record(envValue)) return Either.left("env must be an object");
+    for (const [key, value] of Object.entries(envValue)) {
+      if (typeof value !== "string")
+        return Either.left(`env.${key} must be a string`);
+      env[key] = value;
+    }
+  }
+  return Either.right({
+    id,
+    name,
+    transport: rawTransport,
+    command,
+    args: args.right,
+    url,
+    env,
+    repositoryId,
+    enabled: optionalBoolean(body.enabled),
+  });
+}
+
+export function toApiMcpServer(server: McpServerRecord) {
+  const env: Record<string, string> = {};
+  for (const name of Object.keys(server.env)) env[name] = "•••";
+  return {
+    id: server.id,
+    organizationId: server.organizationId,
+    name: server.name,
+    transport: server.transport,
+    command: Option.getOrElse(server.command, () => null),
+    args: [...server.args],
+    url: Option.getOrElse(server.url, () => null),
+    env,
+    repositoryId: Option.getOrElse(server.repositoryId, () => null),
+    enabled: server.enabled,
+    createdAt: server.createdAt,
+    updatedAt: server.updatedAt,
   };
 }
 
@@ -815,6 +893,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const repositories = yield* deps.workspaceRepo.listRepositories(
           session.organizationId,
         );
+        const mcpServers = deps.mcpServerRepo
+          ? yield* deps.mcpServerRepo.listMcpServers(session.organizationId)
+          : [];
         const reconcilerStatus = yield* deps.reconciler.status();
         return Option.some(
           json({
@@ -826,6 +907,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
             },
             installation: adminInstallation,
             repositories: repositories.map(toApiRepository),
+            mcpServers: mcpServers.map(toApiMcpServer),
             csrfToken: deriveCsrfToken(session.rawToken),
           }),
         );
@@ -842,6 +924,183 @@ export const createAdminHandle = (deps: AdminDeps) =>
         return Option.some(
           json({ repositories: repositories.map(toApiRepository) }),
         );
+      }
+      if (
+        url.pathname === "/api/admin/mcp-servers" &&
+        request.method === "GET"
+      ) {
+        const session = yield* requireSession(request);
+        const mcpServers = deps.mcpServerRepo
+          ? yield* deps.mcpServerRepo.listMcpServers(session.organizationId)
+          : [];
+        return Option.some(
+          json({ mcpServers: mcpServers.map(toApiMcpServer) }),
+        );
+      }
+
+      if (
+        url.pathname === "/api/admin/mcp-servers" &&
+        request.method === "POST"
+      ) {
+        const session = yield* requireMutation(request);
+        if (!deps.mcpServerRepo)
+          return yield* Effect.fail(
+            new AdminError({
+              message: "MCP server repository unavailable",
+              status: 500,
+            }),
+          );
+        const body = yield* parseJsonBody(request);
+        const payloadEither = mcpServerPayload(body);
+        if (Either.isLeft(payloadEither))
+          return Option.some(text(payloadEither.left, 400));
+        const payload = payloadEither.right;
+        const repositoryId =
+          payload.repositoryId === null
+            ? Option.none<WorkspaceId>()
+            : yield* Schema.decodeUnknown(WorkspaceId)(payload.repositoryId)
+                .pipe(
+                  Effect.catchTags({
+                    ParseError: () =>
+                      Effect.fail(
+                        new AdminError({
+                          message: "Invalid repository id",
+                          status: 400,
+                        }),
+                      ),
+                  }),
+                )
+                .pipe(Effect.map(Option.some));
+        const id = yield* Schema.decodeUnknown(McpServerId)(payload.id).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid MCP server id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        const server = yield* deps.mcpServerRepo.createMcpServer({
+          organizationId: session.organizationId,
+          id,
+          name: payload.name,
+          transport: payload.transport,
+          command: payload.command,
+          args: payload.args,
+          url: payload.url,
+          env: payload.env,
+          repositoryId,
+          enabled: payload.enabled ?? true,
+          now,
+        });
+        return Option.some(json({ mcpServer: toApiMcpServer(server) }, 201));
+      }
+
+      if (url.pathname.startsWith("/api/admin/mcp-servers/")) {
+        const rawId = decodeURIComponent(
+          url.pathname.slice("/api/admin/mcp-servers/".length),
+        );
+        const id = yield* Schema.decodeUnknown(McpServerId)(rawId).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid MCP server id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        if (request.method === "GET") {
+          const session = yield* requireSession(request);
+          if (!deps.mcpServerRepo) return Option.some(text("Not found", 404));
+          const server = yield* deps.mcpServerRepo.getMcpServer(
+            session.organizationId,
+            id,
+          );
+          return Option.isNone(server)
+            ? Option.some(text("Not found", 404))
+            : Option.some(json({ mcpServer: toApiMcpServer(server.value) }));
+        }
+        if (request.method === "PUT") {
+          const session = yield* requireMutation(request);
+          if (!deps.mcpServerRepo)
+            return yield* Effect.fail(
+              new AdminError({
+                message: "MCP server repository unavailable",
+                status: 500,
+              }),
+            );
+          const body = yield* parseJsonBody(request);
+          const payloadEither = mcpServerPayload(body);
+          if (Either.isLeft(payloadEither))
+            return Option.some(text(payloadEither.left, 400));
+          const payload = payloadEither.right;
+          if (payload.id !== id)
+            return Option.some(
+              text("MCP server id in body does not match path", 400),
+            );
+          const current = yield* deps.mcpServerRepo.getMcpServer(
+            session.organizationId,
+            id,
+          );
+          if (Option.isNone(current))
+            return Option.some(text("Not found", 404));
+          const repositoryId =
+            payload.repositoryId === null
+              ? Option.none<WorkspaceId>()
+              : yield* Schema.decodeUnknown(WorkspaceId)(payload.repositoryId)
+                  .pipe(
+                    Effect.catchTags({
+                      ParseError: () =>
+                        Effect.fail(
+                          new AdminError({
+                            message: "Invalid repository id",
+                            status: 400,
+                          }),
+                        ),
+                    }),
+                  )
+                  .pipe(Effect.map(Option.some));
+          const env: Record<string, string> =
+            body.env === undefined ? { ...current.value.env } : {};
+          if (body.env !== undefined) {
+            for (const [key, value] of Object.entries(payload.env)) {
+              const preserved = current.value.env[key];
+              env[key] =
+                value === "•••" && preserved !== undefined ? preserved : value;
+            }
+          }
+          const server = yield* deps.mcpServerRepo.updateMcpServer(
+            session.organizationId,
+            id,
+            {
+              name: payload.name,
+              transport: payload.transport,
+              command: payload.command,
+              args: payload.args,
+              url: payload.url,
+              env,
+              repositoryId,
+              enabled: payload.enabled,
+              now,
+            },
+          );
+          return Option.some(json({ mcpServer: toApiMcpServer(server) }));
+        }
+        if (request.method === "DELETE") {
+          const session = yield* requireMutation(request);
+          if (!deps.mcpServerRepo) return Option.some(text("Not found", 404));
+          const deleted = yield* deps.mcpServerRepo.deleteMcpServer(
+            session.organizationId,
+            id,
+          );
+          return deleted
+            ? Option.some(emptyResponse(204))
+            : Option.some(text("Not found", 404));
+        }
       }
 
       if (url.pathname === "/api/admin/nix-cache" && request.method === "GET") {
@@ -1110,6 +1369,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     RunInputRepo.Default,
     LinearGateway.Default,
     WorkspaceRepo.Default,
+    McpServerRepo.Default,
     Workspace.Default,
     Reconciler.Default,
     NixEnvironment.Default,
@@ -1121,6 +1381,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const runRepo = yield* RunRepo;
     const runEventRepo = yield* RunEventRepo;
     const workspaceRepo = yield* WorkspaceRepo;
+    const mcpServerRepo = yield* McpServerRepo;
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
     const nixEnvironment = yield* NixEnvironment;
@@ -1135,6 +1396,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
       runInputRepo,
       linearGateway,
       workspaceRepo,
+      mcpServerRepo,
       workspace,
       reconciler,
       nixEnvironment,

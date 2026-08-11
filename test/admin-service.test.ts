@@ -11,6 +11,7 @@ import {
 } from "../src/domain/ids.js";
 import {
   type AgentRun,
+  McpServerRecord,
   RepositoryRecord,
   type RepositoryRecord as RepositoryRecordType,
 } from "../src/domain/models.js";
@@ -25,6 +26,7 @@ import { NixEnvironment } from "../src/services/nix-environment.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
+  McpServerRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -593,5 +595,92 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     const responseValue = Option.getOrElse(response, () => null);
     expect(responseValue?.status).toBe(429);
     expect(await responseValue?.text()).toContain("12345ms");
+  });
+});
+describe("MCP admin endpoints", () => {
+  it("requires CSRF and masks secret environment values", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-admin",
+      organizationId,
+      name: "github",
+      transport: "stdio",
+      command: "node",
+      args: ["server.js"],
+      url: null,
+      env: { API_TOKEN: "super-secret" },
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const mcpServerRepo = McpServerRepo.make({
+      createMcpServer: unreachable,
+      getMcpServer: () => Effect.succeed(Option.some(server)),
+      listMcpServers: () => Effect.succeed([server]),
+      updateMcpServer: unreachable,
+      deleteMcpServer: unreachable,
+    });
+    const mcpHandle = createAdminHandle({
+      ...deps,
+      installationRepo: InstallationRepo.make({
+        ...deps.installationRepo,
+        get: () => Effect.succeed(Option.none()),
+      }),
+      workspaceRepo: WorkspaceRepo.make({
+        ...deps.workspaceRepo,
+        listRepositories: () => Effect.succeed([]),
+      }),
+      mcpServerRepo,
+    });
+    const noCsrf = await Effect.runPromise(
+      mcpHandle(
+        new Request(new URL("/api/admin/mcp-servers", config.publicUrl), {
+          method: "POST",
+          headers: {
+            Cookie: `omp_gateway_admin=${token}`,
+            Origin: config.publicUrl.toString(),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            id: "mcp-new",
+            name: "new",
+            transport: "stdio",
+            command: "node",
+            args: [],
+            env: {},
+          }),
+        }),
+      ),
+    );
+    expect(Option.getOrElse(noCsrf, () => null)?.status).toBe(403);
+
+    const bootstrap = Option.getOrThrow(
+      await Effect.runPromise(
+        mcpHandle(
+          new Request(new URL("/api/admin/bootstrap", config.publicUrl), {
+            headers: { Cookie: `omp_gateway_admin=${token}` },
+          }),
+        ),
+      ),
+    );
+    const bootstrapBody = await bootstrap.json();
+    expect(bootstrapBody.mcpServers[0].env).toEqual({ API_TOKEN: "•••" });
+    expect(JSON.stringify(bootstrapBody)).not.toContain("super-secret");
+
+    const detail = Option.getOrThrow(
+      await Effect.runPromise(
+        mcpHandle(
+          new Request(
+            new URL("/api/admin/mcp-servers/mcp-admin", config.publicUrl),
+            {
+              headers: { Cookie: `omp_gateway_admin=${token}` },
+            },
+          ),
+        ),
+      ),
+    );
+    const detailBody = await detail.json();
+    expect(detailBody.mcpServer.env).toEqual({ API_TOKEN: "•••" });
+    expect(JSON.stringify(detailBody)).not.toContain("super-secret");
   });
 });

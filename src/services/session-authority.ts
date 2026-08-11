@@ -20,9 +20,11 @@ import type { SessionId, SourceKey } from "../domain/ids.js";
 import {
   type AgentRun,
   isDeferredNotificationStopPayload,
+  type McpServerRecord,
 } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
+import { resolveEffectiveMcpServers, writeOmpMcpConfig } from "./mcp-config.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import type {
@@ -35,6 +37,7 @@ import type {
 import { RpcWorker } from "./rpc-worker.js";
 import {
   InstallationRepo,
+  McpServerRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -285,6 +288,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
+      const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
 
       const stopShouldApply = Effect.fn("SessionAuthority.stopShouldApply")(
         function* (
@@ -1571,11 +1575,28 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     ),
                 ),
               );
+
             environment.PATH = [...prepared.pathEntries, environment.PATH ?? ""]
               .filter((entry) => entry.length > 0)
               .join(":");
           }
         }
+        const allMcpServers = yield* Option.match(mcpServerRepoOption, {
+          onNone: () => Effect.succeed<ReadonlyArray<McpServerRecord>>([]),
+          onSome: (repo) => repo.listMcpServers(run.organizationId),
+        });
+        const effectiveMcpServers = resolveEffectiveMcpServers(
+          allMcpServers,
+          Option.isSome(run.repositoryId) ? run.repositoryId.value : null,
+        );
+        yield* writeOmpMcpConfig(cwd, effectiveMcpServers).pipe(
+          Effect.mapError(
+            (error) =>
+              new RpcSpawnError({
+                message: `MCP config materialization failed: ${error.message}`,
+              }),
+          ),
+        );
 
         const worker = yield* rpc.spawn({
           command,

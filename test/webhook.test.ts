@@ -988,7 +988,7 @@ describe("Linear webhook input correctness", () => {
         );
         expect(response.status).toBe(401);
         expect(yield* Effect.promise(() => response.text())).toBe(
-          "OAuth client identity mismatch",
+          "OAuth client identity mismatch (received other-client)",
         );
       }),
     ),

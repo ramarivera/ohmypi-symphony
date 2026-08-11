@@ -208,6 +208,23 @@ const migrate = (db: Database): void => {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (organization_id, id)
     );
+    CREATE TABLE IF NOT EXISTS mcp_server (
+      organization_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      transport TEXT NOT NULL,
+      command TEXT,
+      args_json TEXT NOT NULL,
+      url TEXT,
+      env_json TEXT NOT NULL,
+      repository_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS mcp_server_scope
+      ON mcp_server(organization_id, repository_id, enabled);
     CREATE TABLE IF NOT EXISTS admin_session (
       token_hash TEXT PRIMARY KEY,
       organization_id TEXT NOT NULL,
