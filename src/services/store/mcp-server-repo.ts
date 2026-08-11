@@ -33,6 +33,7 @@ const McpServerRow = Schema.Struct({
   args_json: Schema.String,
   url: Schema.NullOr(Schema.String),
   env_json: Schema.String,
+  headers_json: Schema.String,
   repository_id: Schema.NullOr(Schema.String),
   enabled: Schema.Number,
   created_at: Schema.Number,
@@ -52,6 +53,7 @@ type McpInput = {
   readonly args?: ReadonlyArray<string>;
   readonly url?: string | null;
   readonly env?: Readonly<Record<string, string>>;
+  readonly headers?: Readonly<Record<string, string>>;
   readonly repositoryId?: Option.Option<WorkspaceId>;
   readonly enabled?: boolean;
 };
@@ -82,6 +84,24 @@ const normalizeEnv = (value: unknown): Readonly<Record<string, string>> => {
       throw new Error(`Invalid environment variable name: ${key}`);
     if (typeof item !== "string")
       throw new Error(`env.${key} must be a string`);
+    output[key] = item;
+  }
+  return output;
+};
+
+const normalizeHeaders = (value: unknown): Readonly<Record<string, string>> => {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("headers must be an object");
+  }
+  const output: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!key || /[\s\r\n]/u.test(key))
+      throw new Error(`Invalid header name: ${key}`);
+    if (typeof item !== "string")
+      throw new Error(`headers.${key} must be a string`);
+    if (/[\r\n]/u.test(item))
+      throw new Error(`headers.${key} must not contain newlines`);
     output[key] = item;
   }
   return output;
@@ -133,6 +153,7 @@ const validateInput = (
         args: normalizeArgs(input.args ?? []),
         url,
         env: normalizeEnv(input.env),
+        headers: normalizeHeaders(input.headers),
         repositoryId: Option.match(repositoryId, {
           onNone: () => null,
           onSome: (value) => value,
@@ -176,6 +197,7 @@ const rowToRecord = (
   Effect.gen(function* () {
     const args = yield* parseJson(row.args_json, "mcp server args");
     const env = yield* parseJson(row.env_json, "mcp server env");
+    const headers = yield* parseJson(row.headers_json, "mcp server headers");
     const decodedTransport = yield* decodeRow(
       McpServerTransport,
       row.transport,
@@ -191,8 +213,21 @@ const rowToRecord = (
       env,
       "McpServerRecord.env",
     );
+    const validHeaders = yield* decodeRow(
+      Schema.Record({ key: Schema.String, value: Schema.String }),
+      headers,
+      "McpServerRecord.headers",
+    );
     const decryptedEnv = Object.fromEntries(
       yield* Effect.forEach(Object.entries(validEnv), ([key, value]) =>
+        (isEncrypted(value)
+          ? tokenCrypto.decrypt(value.slice(MCP_ENCRYPTED_PREFIX.length))
+          : Effect.succeed(value)
+        ).pipe(Effect.map((decrypted) => [key, decrypted] as const)),
+      ),
+    );
+    const decryptedHeaders = Object.fromEntries(
+      yield* Effect.forEach(Object.entries(validHeaders), ([key, value]) =>
         (isEncrypted(value)
           ? tokenCrypto.decrypt(value.slice(MCP_ENCRYPTED_PREFIX.length))
           : Effect.succeed(value)
@@ -210,6 +245,7 @@ const rowToRecord = (
         args: validArgs,
         url: row.url,
         env: decryptedEnv,
+        headers: decryptedHeaders,
         repositoryId: row.repository_id,
         enabled: row.enabled === 1,
         createdAt: row.created_at,
@@ -288,13 +324,17 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
             );
           }
           const encryptedEnv = yield* encryptEnv(tokenCrypto, record.env);
+          const encryptedHeaders = yield* encryptEnv(
+            tokenCrypto,
+            record.headers,
+          );
           yield* tryDb(
             () =>
               db
                 .query(
                   `INSERT INTO mcp_server
-              (organization_id, id, name, transport, command, args_json, url, env_json, repository_id, enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              (organization_id, id, name, transport, command, args_json, url, env_json, headers_json, repository_id, enabled, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 )
                 .run(
                   record.organizationId,
@@ -305,6 +345,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   JSON.stringify(record.args),
                   Option.getOrNull(record.url),
                   JSON.stringify(encryptedEnv),
+                  JSON.stringify(encryptedHeaders),
                   Option.getOrNull(record.repositoryId),
                   record.enabled ? 1 : 0,
                   record.createdAt,
@@ -380,7 +421,6 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
           );
         },
       );
-
       const updateMcpServer = Effect.fn("McpServerRepo.updateMcpServer")(
         function* (
           organizationId: OrganizationId,
@@ -413,11 +453,12 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   ? Option.getOrNull(existing.command)
                   : input.command,
               args: input.args ?? existing.args,
+              env: input.env ?? existing.env,
+              headers: input.headers ?? existing.headers,
               url:
                 input.url === undefined
                   ? Option.getOrNull(existing.url)
                   : input.url,
-              env: input.env ?? existing.env,
               repositoryId: input.repositoryId ?? existing.repositoryId,
               enabled: input.enabled ?? existing.enabled,
             },
@@ -438,11 +479,12 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
             );
           }
           const encryptedEnv = yield* encryptEnv(tokenCrypto, next.env);
+          const encryptedHeaders = yield* encryptEnv(tokenCrypto, next.headers);
           yield* tryDb(
             () =>
               db
                 .query(
-                  `UPDATE mcp_server SET name=?, transport=?, command=?, args_json=?, url=?, env_json=?, repository_id=?, enabled=?, updated_at=?
+                  `UPDATE mcp_server SET name=?, transport=?, command=?, args_json=?, url=?, env_json=?, headers_json=?, repository_id=?, enabled=?, updated_at=?
              WHERE organization_id=? AND id=?`,
                 )
                 .run(
@@ -452,6 +494,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   JSON.stringify(next.args),
                   Option.getOrNull(next.url),
                   JSON.stringify(encryptedEnv),
+                  JSON.stringify(encryptedHeaders),
                   Option.getOrNull(next.repositoryId),
                   next.enabled ? 1 : 0,
                   now,

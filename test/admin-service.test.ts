@@ -614,6 +614,7 @@ describe("MCP admin endpoints", () => {
       args: ["server.js"],
       url: null,
       env: { API_TOKEN: "super-secret" },
+      headers: { Authorization: "header-secret" },
       repositoryId: null,
       enabled: true,
       createdAt: 1,
@@ -671,6 +672,9 @@ describe("MCP admin endpoints", () => {
     );
     const bootstrapBody = await bootstrap.json();
     expect(bootstrapBody.mcpServers[0].env).toEqual({ API_TOKEN: "•••" });
+    expect(bootstrapBody.mcpServers[0].headers).toEqual({
+      Authorization: "•••",
+    });
     expect(JSON.stringify(bootstrapBody)).not.toContain("super-secret");
 
     const detail = Option.getOrThrow(
@@ -687,7 +691,75 @@ describe("MCP admin endpoints", () => {
     );
     const detailBody = await detail.json();
     expect(detailBody.mcpServer.env).toEqual({ API_TOKEN: "•••" });
+    expect(detailBody.mcpServer.headers).toEqual({
+      Authorization: "•••",
+    });
     expect(JSON.stringify(detailBody)).not.toContain("super-secret");
+  });
+  it("preserves masked headers on update and clears them with an explicit empty map", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-headers",
+      organizationId,
+      name: "remote",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://mcp.example.test",
+      env: { API_TOKEN: "super-secret" },
+      headers: { Authorization: "header-secret" },
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let received: Record<string, unknown> | undefined;
+    const mcpServerRepo = McpServerRepo.make({
+      listMcpServers: () => Effect.succeed([server]),
+      createMcpServer: unreachable,
+      getMcpServer: () => Effect.succeed(Option.some(server)),
+      updateMcpServer: (_org, _id, input) => {
+        received = input as Record<string, unknown>;
+        return Effect.succeed(server);
+      },
+      deleteMcpServer: unreachable,
+    });
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const put = (headers: Record<string, string>) =>
+      Effect.runPromise(
+        handle(
+          new Request(
+            new URL("/api/admin/mcp-servers/mcp-headers", config.publicUrl),
+            {
+              method: "PUT",
+              headers: {
+                Cookie: `omp_gateway_admin=${token}`,
+                Origin: config.publicUrl.toString(),
+                "Content-Type": "application/json",
+                "X-CSRF-Token": deriveCsrfToken(token),
+              },
+              body: JSON.stringify({
+                id: "mcp-headers",
+                name: "remote",
+                transport: "http",
+                command: null,
+                args: [],
+                url: "https://mcp.example.test",
+                env: { API_TOKEN: "•••" },
+                headers,
+                repositoryId: null,
+                enabled: true,
+              }),
+            },
+          ),
+        ),
+      );
+    await put({ Authorization: "•••", "X-Trace": "trace-secret" });
+    expect(received?.headers).toEqual({
+      Authorization: "header-secret",
+      "X-Trace": "trace-secret",
+    });
+    await put({});
+    expect(received?.headers).toEqual({});
   });
   it("rejects non-string repository ids before persistence", async () => {
     let called = false;

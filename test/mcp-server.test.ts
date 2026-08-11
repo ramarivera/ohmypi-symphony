@@ -73,6 +73,7 @@ describe("MCP server storage and worker config", () => {
           command: "node",
           args: ["server.js"],
           env: { TOKEN: "secret" },
+          headers: { Authorization: "header-secret" },
           repositoryId: Option.none(),
           now: 1,
         });
@@ -84,6 +85,15 @@ describe("MCP server storage and worker config", () => {
           .get(org, serverId("wide"));
         expect(stored?.env_json).toMatch(/"TOKEN":"mcpenc:v1:[A-Za-z0-9_-]+"/u);
         expect(stored?.env_json).not.toContain("secret");
+        const storedHeaders = db
+          .query<{ readonly headers_json: string }, [string, string]>(
+            "SELECT headers_json FROM mcp_server WHERE organization_id=? AND id=?",
+          )
+          .get(org, serverId("wide"));
+        expect(storedHeaders?.headers_json).toMatch(
+          /"Authorization":"mcpenc:v1:[A-Za-z0-9_-]+"/u,
+        );
+        expect(storedHeaders?.headers_json).not.toContain("header-secret");
         const scoped = yield* servers.createMcpServer({
           organizationId: org,
           id: serverId("scoped"),
@@ -91,6 +101,7 @@ describe("MCP server storage and worker config", () => {
           transport: "http",
           url: "https://mcp.example.test",
           repositoryId: Option.some(repo),
+          headers: { "X-Scoped": "scoped-secret" },
           now: 2,
         });
         yield* servers.createMcpServer({
@@ -104,6 +115,7 @@ describe("MCP server storage and worker config", () => {
         });
         expect(wide.env.TOKEN).toBe("secret");
         expect(Option.isSome(scoped.repositoryId)).toBe(true);
+        expect(scoped.headers["X-Scoped"]).toBe("scoped-secret");
         const listed = yield* servers.listMcpServers(org);
         expect(listed).toHaveLength(3);
         const updated = yield* servers.updateMcpServer(org, serverId("wide"), {
@@ -257,6 +269,7 @@ describe("MCP server storage and worker config", () => {
       args: ["wide.js"],
       url: Option.none<string>(),
       env: { TOKEN: "secret" },
+      headers: { "X-Stdio": "stdio-secret" },
       repositoryId: Option.none<WorkspaceId>(),
       enabled: true,
       createdAt: 1,
@@ -277,8 +290,17 @@ describe("MCP server storage and worker config", () => {
       command: Option.none<string>(),
       args: [],
       url: Option.some("https://mcp.example.test"),
+      headers: { Authorization: "remote-secret" },
       repositoryId: Option.none<WorkspaceId>(),
       env: {},
+    };
+    const sse = {
+      ...http,
+      id: serverId("sse"),
+      name: "events",
+      transport: "sse" as const,
+      url: Option.some("https://sse.example.test"),
+      headers: { "X-SSE": "sse-secret" },
     };
     const disabled = {
       ...wide,
@@ -287,12 +309,13 @@ describe("MCP server storage and worker config", () => {
       enabled: false,
     };
     const effective = resolveEffectiveMcpServers(
-      [wide, override, http, disabled],
+      [wide, override, http, sse, disabled],
       repo,
     );
     expect(effective.map((server) => server.name)).toEqual([
       "shared",
       "remote",
+      "events",
     ]);
     expect(toOmpMcpConfig(effective)).toEqual({
       mcpServers: {
@@ -302,7 +325,16 @@ describe("MCP server storage and worker config", () => {
           args: ["repo.py"],
           env: { TOKEN: "secret" },
         },
-        remote: { type: "http", url: "https://mcp.example.test" },
+        remote: {
+          type: "http",
+          url: "https://mcp.example.test",
+          headers: { Authorization: "remote-secret" },
+        },
+        events: {
+          type: "sse",
+          url: "https://sse.example.test",
+          headers: { "X-SSE": "sse-secret" },
+        },
       },
     });
     const disabledOverride = {
@@ -337,6 +369,7 @@ describe("MCP server storage and worker config", () => {
         args: ["server.py"],
         url: Option.none<string>(),
         env: { TOKEN: "secret" },
+        headers: {},
         repositoryId: Option.none<WorkspaceId>(),
         enabled: true,
         createdAt: 0,

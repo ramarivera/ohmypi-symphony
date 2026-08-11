@@ -309,6 +309,7 @@ interface McpServerPayload {
   readonly args: ReadonlyArray<string>;
   readonly url: string | null;
   readonly env: Readonly<Record<string, string>>;
+  readonly headers: Readonly<Record<string, string>>;
   readonly repositoryId: string | null;
   readonly enabled: boolean | undefined;
 }
@@ -371,6 +372,16 @@ function mcpServerPayload(
       env[key] = value;
     }
   }
+  const headersValue = body.headers;
+  const headers: Record<string, string> = {};
+  if (headersValue !== undefined && headersValue !== null) {
+    if (!record(headersValue)) return Either.left("headers must be an object");
+    for (const [key, value] of Object.entries(headersValue)) {
+      if (typeof value !== "string")
+        return Either.left(`headers.${key} must be a string`);
+      headers[key] = value;
+    }
+  }
   return Either.right({
     id,
     name,
@@ -379,6 +390,7 @@ function mcpServerPayload(
     args,
     url,
     env,
+    headers,
     repositoryId,
     enabled: optionalBoolean(body.enabled),
   });
@@ -387,6 +399,10 @@ function mcpServerPayload(
 export function toApiMcpServer(server: McpServerRecord) {
   const env: Record<string, string> = {};
   for (const name of Object.keys(server.env)) env[name] = "•••";
+  const headers: Record<string, string> = {};
+  for (const name of Object.keys(server.headers ?? {})) {
+    headers[name] = "•••";
+  }
   return {
     id: server.id,
     organizationId: server.organizationId,
@@ -396,6 +412,7 @@ export function toApiMcpServer(server: McpServerRecord) {
     args: [...server.args],
     url: Option.getOrElse(server.url, () => null),
     env,
+    headers,
     repositoryId: Option.getOrElse(server.repositoryId, () => null),
     enabled: server.enabled,
     createdAt: server.createdAt,
@@ -1021,6 +1038,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           args: payload.args,
           url: payload.url,
           env: payload.env,
+          headers: payload.headers,
           repositoryId,
           enabled: payload.enabled ?? true,
           now,
@@ -1095,6 +1113,15 @@ export const createAdminHandle = (deps: AdminDeps) =>
                 value === "•••" && preserved !== undefined ? preserved : value;
             }
           }
+          const headers: Record<string, string> =
+            body.headers === undefined ? { ...current.value.headers } : {};
+          if (body.headers !== undefined) {
+            for (const [key, value] of Object.entries(payload.headers)) {
+              const preserved = current.value.headers[key];
+              headers[key] =
+                value === "•••" && preserved !== undefined ? preserved : value;
+            }
+          }
           const server = yield* deps.mcpServerRepo.updateMcpServer(
             session.organizationId,
             id,
@@ -1105,8 +1132,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
               args: payload.args,
               url: payload.url,
               env,
-              repositoryId,
+              headers,
               enabled: payload.enabled,
+              repositoryId,
               now,
             },
           );

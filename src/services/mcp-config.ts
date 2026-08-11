@@ -74,6 +74,7 @@ export const resolveEffectiveMcpServers = (
 export const toOmpMcpConfig = (servers: ReadonlyArray<McpServerRecord>) => ({
   mcpServers: Object.fromEntries(
     servers.map((server) => {
+      const headers = server.headers ?? {};
       const config: Record<string, unknown> = {
         type: server.transport,
       };
@@ -82,6 +83,9 @@ export const toOmpMcpConfig = (servers: ReadonlyArray<McpServerRecord>) => ({
         config.args = [...server.args];
       } else {
         config.url = Option.getOrThrow(server.url);
+        if (Object.keys(headers).length > 0) {
+          config.headers = { ...headers };
+        }
       }
       if (Object.keys(server.env).length > 0) config.env = { ...server.env };
       return [server.name, config];

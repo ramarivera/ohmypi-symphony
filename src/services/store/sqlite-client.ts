@@ -217,6 +217,7 @@ const migrate = (db: Database): void => {
       args_json TEXT NOT NULL,
       url TEXT,
       env_json TEXT NOT NULL,
+      headers_json TEXT NOT NULL DEFAULT '{}',
       repository_id TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL,
@@ -262,6 +263,15 @@ const migrate = (db: Database): void => {
   if (!repositoryColumns.includes("nix_packages_json")) {
     db.exec(
       "ALTER TABLE repository ADD COLUMN nix_packages_json TEXT NOT NULL DEFAULT '[]'",
+    );
+  }
+  const mcpServerColumns = db
+    .query<{ name: string }, []>('PRAGMA table_info("mcp_server")')
+    .all()
+    .map((column) => column.name);
+  if (!mcpServerColumns.includes("headers_json")) {
+    db.exec(
+      "ALTER TABLE mcp_server ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'",
     );
   }
 

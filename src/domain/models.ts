@@ -129,6 +129,10 @@ export const McpServerRecord = Schema.Struct({
   args: Schema.Array(Schema.String),
   url: Schema.OptionFromNullOr(Schema.String),
   env: Schema.Record({ key: Schema.String, value: Schema.String }),
+  headers: Schema.optionalWith(
+    Schema.Record({ key: Schema.String, value: Schema.String }),
+    { default: () => ({}) },
+  ),
   repositoryId: Schema.OptionFromNullOr(WorkspaceId),
   enabled: Schema.Boolean,
   createdAt: Schema.Number,

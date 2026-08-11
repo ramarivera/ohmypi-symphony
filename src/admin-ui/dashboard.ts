@@ -161,6 +161,12 @@ export const ADMIN_BODY = `
           <div class="field"><label for="mcp-url">URL</label><input id="mcp-url" name="url" type="url" autocomplete="off" placeholder="https://mcp.example.com"></div>
           <div class="field"><label for="mcp-args">Arguments (comma-separated)</label><input id="mcp-args" name="args" autocomplete="off"></div>
           <div class="field"><label for="mcp-env">Environment (KEY=value per line)</label><textarea id="mcp-env" name="env" rows="3" autocomplete="off"></textarea><span class="hint">Secret values are write-only; existing values show as •••.</span></div>
+          <div class="field full" id="mcp-headers-field" hidden>
+            <label>Headers</label>
+            <div id="mcp-headers-editor" class="key-value-editor"></div>
+            <button type="button" class="btn" id="mcp-add-header">+ Add header</button>
+            <span class="hint">Secret values are write-only; existing values show as •••.</span>
+          </div>
           <div class="field"><label for="mcp-repository">Repository ID (blank = installation-wide)</label><input id="mcp-repository" name="repositoryId" autocomplete="off"></div>
           <div class="field"><label class="checkbox"><input id="mcp-enabled" name="enabled" type="checkbox" checked> Enabled</label></div>
           <div id="mcp-form-error" class="error" role="alert" hidden></div>
@@ -540,11 +546,40 @@ export const ADMIN_SCRIPT = `
     });
     table.appendChild(body); list.appendChild(table); setAriaBusy("mcp-list", false);
   }
+  function addMcpHeaderRow(key, value) {
+    var editor = el("mcp-headers-editor"); if (!editor) return;
+    var row = document.createElement("div"); row.className = "key-value-row"; row.setAttribute("data-header-row", "true");
+    var keyInput = document.createElement("input"); keyInput.type = "text"; keyInput.placeholder = "Header name"; keyInput.autocomplete = "off"; keyInput.value = key || "";
+    var valueInput = document.createElement("input"); valueInput.type = "text"; valueInput.placeholder = "Value"; valueInput.autocomplete = "off"; valueInput.value = value || "";
+    var remove = document.createElement("button"); remove.type = "button"; remove.className = "btn btn-danger"; remove.textContent = "Remove"; remove.addEventListener("click", function () { row.remove(); });
+    row.appendChild(keyInput); row.appendChild(valueInput); row.appendChild(remove); editor.appendChild(row);
+  }
+  function setMcpHeaderRows(headers) {
+    var editor = el("mcp-headers-editor"); if (!editor) return;
+    editor.textContent = "";
+    Object.keys(headers || {}).forEach(function (key) { addMcpHeaderRow(key, headers[key]); });
+  }
+  function readMcpHeaderRows() {
+    var headers = {};
+    var editor = el("mcp-headers-editor"); if (!editor) return headers;
+    editor.querySelectorAll("[data-header-row]").forEach(function (row) {
+      var inputs = row.querySelectorAll("input"); if (inputs.length < 2) return;
+      var key = inputs[0].value.trim(); if (!key) return;
+      headers[key] = inputs[1].value;
+    });
+    return headers;
+  }
+  function syncMcpHeaderVisibility() {
+    var transport = el("mcp-transport"); var field = el("mcp-headers-field");
+    if (field) field.hidden = !transport || (transport.value !== "http" && transport.value !== "sse");
+  }
   function openMcpForm(server) {
     state.editingMcp = server || null;
     var form = el("mcp-form"); if (!form) return;
     var fields = { id: server && server.id || "", name: server && server.name || "", transport: server && server.transport || "stdio", command: server && server.command || "", url: server && server.url || "", args: server && Array.isArray(server.args) ? server.args.join(", ") : "", env: server && server.env ? Object.keys(server.env).map(function (key) { return key + "=" + server.env[key]; }).join("\\n") : "", repositoryId: server && server.repositoryId || "", enabled: !server || server.enabled !== false };
     Object.keys(fields).forEach(function (key) { var field = form.elements.namedItem(key); if (!field) return; if (field.type === "checkbox") field.checked = fields[key]; else field.value = fields[key]; });
+    setMcpHeaderRows(server && server.headers ? server.headers : {});
+    syncMcpHeaderVisibility();
     var idField = el("mcp-id"); if (idField) idField.readOnly = !!(server && server.id);
     var error = el("mcp-form-error"); if (error) { error.textContent = ""; error.hidden = true; }
     form.hidden = false; var focus = server ? el("mcp-name") : idField; if (focus) focus.focus();
@@ -553,7 +588,7 @@ export const ADMIN_SCRIPT = `
   function serializeMcpForm() {
     var form = el("mcp-form"), fields = form.elements, env = {};
     (fields.namedItem("env").value || "").split("\\n").forEach(function (line) { var index = line.indexOf("="); if (index <= 0) return; env[line.slice(0, index).trim()] = line.slice(index + 1); });
-    return { id: fields.namedItem("id").value.trim(), name: fields.namedItem("name").value.trim(), transport: fields.namedItem("transport").value, command: fields.namedItem("command").value.trim() || null, url: fields.namedItem("url").value.trim() || null, args: parseList(fields.namedItem("args").value), env: env, repositoryId: fields.namedItem("repositoryId").value.trim() || null, enabled: !!fields.namedItem("enabled").checked };
+    return { id: fields.namedItem("id").value.trim(), name: fields.namedItem("name").value.trim(), transport: fields.namedItem("transport").value, command: fields.namedItem("command").value.trim() || null, url: fields.namedItem("url").value.trim() || null, args: parseList(fields.namedItem("args").value), env: env, headers: readMcpHeaderRows(), repositoryId: fields.namedItem("repositoryId").value.trim() || null, enabled: !!fields.namedItem("enabled").checked };
   }
   async function submitMcpForm(event) {
     event.preventDefault(); var payload = serializeMcpForm();
@@ -1089,6 +1124,10 @@ export const ADMIN_SCRIPT = `
     if (newMcpBtn) newMcpBtn.addEventListener("click", function () { openMcpForm(null); });
     var mcpCancel = el("mcp-cancel");
     if (mcpCancel) mcpCancel.addEventListener("click", closeMcpForm);
+    var addHeader = el("mcp-add-header");
+    if (addHeader) addHeader.addEventListener("click", function () { addMcpHeaderRow("", ""); });
+    var transport = el("mcp-transport");
+    if (transport) transport.addEventListener("change", syncMcpHeaderVisibility);
 
     var cancelBtn = el("form-cancel-btn");
     if (cancelBtn) cancelBtn.addEventListener("click", closeForm);
