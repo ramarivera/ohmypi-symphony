@@ -41,6 +41,8 @@ import { verifySignature, WebhookPipeline } from "../src/services/webhook.js";
 const secret = "webhook-secret";
 const tokenEncryptionKey = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 const config: GatewayConfigShape = {
+  githubAppId: undefined,
+  githubAppPrivateKey: undefined,
   linearClientId: "client",
   linearClientSecret: Redacted.make("client-secret"),
   linearWebhookSecret: Redacted.make(secret),
@@ -988,7 +990,7 @@ describe("Linear webhook input correctness", () => {
         );
         expect(response.status).toBe(401);
         expect(yield* Effect.promise(() => response.text())).toBe(
-          "OAuth client identity mismatch",
+          "OAuth client identity mismatch (received other-client)",
         );
       }),
     ),

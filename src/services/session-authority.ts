@@ -22,6 +22,7 @@ import {
   isDeferredNotificationStopPayload,
 } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
+import { GitHubApp } from "./github-app.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
@@ -341,9 +342,16 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               ).toString()
           : null;
 
+      const githubAppOption = yield* Effect.serviceOption(GitHubApp);
       const workspace = yield* makeWorkspace({
         workspaceRoot: config.workspaceRoot,
         repo: workspaceRepo,
+        githubApp:
+          config.githubAppId !== undefined &&
+          config.githubAppPrivateKey !== undefined &&
+          Option.isSome(githubAppOption)
+            ? githubAppOption.value
+            : undefined,
       });
       const ensureIssueLifecycle = (
         run: AgentRun,

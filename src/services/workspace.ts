@@ -10,8 +10,12 @@ import {
 import type { OrganizationId } from "../domain/ids.js";
 import type { RepositoryRecord } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
+import {
+  buildGitHubExtraHeader,
+  GitHubApp,
+  type GitHubAppTokenService,
+} from "./github-app.js";
 import { WorkspaceRepo } from "./store/repositories.js";
-
 export type RepositoryResolution =
   | { readonly kind: "match"; readonly repository: RepositoryRecord }
   | { readonly kind: "none" }
@@ -386,6 +390,7 @@ const validateMarker = (
 export const makeWorkspace = (input: {
   readonly workspaceRoot: string;
   readonly repo: WorkspaceRepoShape;
+  readonly githubApp: GitHubAppTokenService | undefined;
 }) =>
   Effect.gen(function* () {
     const resolve = Effect.fn("Workspace.resolve")(function* (
@@ -501,17 +506,73 @@ export const makeWorkspace = (input: {
         return canonicalTarget;
       }
 
-      yield* runGit(
-        [
-          "clone",
-          "--no-checkout",
-          "--filter=blob:none",
-          repository.url,
-          target,
-        ],
-        undefined,
-        sessionId,
+      let githubExtraHeader: string | undefined;
+      const repositoryCandidate = parseRepositorySuggestionCandidate(
+        repository.url,
       );
+      if (input.githubApp !== undefined) {
+        if (
+          repositoryCandidate === null ||
+          repositoryCandidate.hostname.toLowerCase() !== "github.com"
+        ) {
+          yield* Effect.logDebug(
+            "GitHub credentials skipped for non-GitHub repository",
+          );
+        } else {
+          const [owner, repositoryName] =
+            repositoryCandidate.repositoryFullName.split("/");
+          if (owner === undefined || repositoryName === undefined) {
+            return yield* Effect.fail(
+              workspaceFailure(
+                "Repository URL did not yield an owner and name",
+                "git_failed",
+                sessionId,
+              )(new Error("invalid repository full name")),
+            );
+          }
+          const token = yield* input.githubApp
+            .getInstallationToken(owner, repositoryName)
+            .pipe(
+              Effect.mapError(
+                workspaceFailure(
+                  "GitHub credentials could not be minted",
+                  "git_failed",
+                  sessionId,
+                ),
+              ),
+            );
+          // Git extraheader keeps the token out of remote URLs (which models
+          // echo) and out of process env (which the worker scrubber handles).
+          githubExtraHeader = buildGitHubExtraHeader(token);
+        }
+      }
+
+      const cloneArgs = [
+        ...(githubExtraHeader === undefined
+          ? []
+          : [
+              "-c",
+              `http.https://github.com/.extraheader=${githubExtraHeader}`,
+            ]),
+        "clone",
+        "--no-checkout",
+        "--filter=blob:none",
+        repository.url,
+        target,
+      ];
+      yield* runGit(cloneArgs, undefined, sessionId);
+      if (githubExtraHeader !== undefined) {
+        yield* runGit(
+          [
+            "config",
+            "--local",
+            "http.https://github.com/.extraheader",
+            githubExtraHeader,
+          ],
+          target,
+          sessionId,
+        );
+      }
       yield* runGit(
         ["fetch", "--depth=1", "origin", repository.ref],
         target,
@@ -556,10 +617,23 @@ export const makeWorkspace = (input: {
 
 export class Workspace extends Effect.Service<Workspace>()("Workspace", {
   accessors: true,
-  dependencies: [GatewayConfig.Default, WorkspaceRepo.Default],
+  dependencies: [
+    GatewayConfig.Default,
+    WorkspaceRepo.Default,
+    GitHubApp.Default,
+  ],
   effect: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const repo = yield* WorkspaceRepo;
-    return yield* makeWorkspace({ workspaceRoot: config.workspaceRoot, repo });
+    const githubApp =
+      config.githubAppId !== undefined &&
+      config.githubAppPrivateKey !== undefined
+        ? yield* GitHubApp
+        : undefined;
+    return yield* makeWorkspace({
+      workspaceRoot: config.workspaceRoot,
+      repo,
+      githubApp,
+    });
   }),
 }) {}

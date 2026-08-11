@@ -43,6 +43,8 @@ const repositoryId = Schema.decodeUnknownSync(WorkspaceId)("repo-main");
 const teamId = Schema.decodeUnknownSync(TeamId)("team-main");
 const projectId = Schema.decodeUnknownSync(ProjectId)("project-main");
 const config: GatewayConfigShape = {
+  githubAppId: undefined,
+  githubAppPrivateKey: undefined,
   linearClientId: "client",
   linearClientSecret: Redacted.make("secret"),
   linearWebhookSecret: Redacted.make("webhook"),

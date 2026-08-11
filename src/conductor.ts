@@ -4,6 +4,7 @@ import { Effect, Layer, Schedule } from "effect";
 import { router } from "./http/router.js";
 import { Admin } from "./services/admin.js";
 import { GatewayConfig } from "./services/config.js";
+import { GitHubApp } from "./services/github-app.js";
 import { LinearGateway } from "./services/linear-gateway.js";
 import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
 import { NixEnvironment } from "./services/nix-environment.js";
@@ -50,9 +51,10 @@ export const GatewayServicesLive = Layer.mergeAll(
   SessionAuthority.Default,
   NixEnvironment.Default,
   RpcWorker.Default,
+  GitHubApp.Default,
+  OAuth.Default,
   Reconciler.Default,
   Workspace.Default,
-  OAuth.Default,
   Admin.Default,
 ).pipe(
   Layer.provideMerge(sqliteClientLayer),

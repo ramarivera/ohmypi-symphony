@@ -118,6 +118,50 @@ describe("GatewayConfig", () => {
     expect(config.linearClientId).toBe("direct-client");
   });
 
+  test("loads optional GitHub App credentials and keeps the key redacted", async () => {
+    const configured = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(
+        Effect.provide(
+          configLayer(
+            valuesWith([
+              ["GITHUB_APP_ID", "12345"],
+              ["GITHUB_APP_PRIVATE_KEY", "private-key"],
+            ]),
+          ),
+        ),
+      ),
+    );
+    expect(configured.githubAppId).toBe("12345");
+    if (configured.githubAppPrivateKey === undefined) {
+      throw new Error("Expected GitHub App private key");
+    }
+    expect(Redacted.isRedacted(configured.githubAppPrivateKey)).toBe(true);
+    expect(Redacted.value(configured.githubAppPrivateKey)).toBe("private-key");
+    expect(String(configured.githubAppPrivateKey)).not.toContain("private-key");
+
+    const absent = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(Effect.provide(configLayer(baseValues))),
+    );
+    expect(absent.githubAppId).toBeUndefined();
+    expect(absent.githubAppPrivateKey).toBeUndefined();
+  });
+
+  test("rejects an unreadable optional GitHub App secret file", async () => {
+    const result = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["GITHUB_APP_ID", "12345"],
+          ["GITHUB_APP_PRIVATE_KEY_FILE", "/missing/github-app-key"],
+        ]),
+      ),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+  });
+
   test("applies all operational defaults", async () => {
     const config = await Effect.runPromise(
       Effect.gen(function* () {

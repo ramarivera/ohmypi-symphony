@@ -175,6 +175,7 @@ const resolveWith = (
       const workspace = yield* makeWorkspace({
         workspaceRoot: "/workspace-test",
         repo: { listRepositories: () => Effect.succeed(repositories) },
+        githubApp: undefined,
       });
       return yield* workspace.resolve(context);
     }),
@@ -459,6 +460,7 @@ describe("Workspace", () => {
           const linkedWorkspace = yield* makeWorkspace({
             workspaceRoot: linkedRoot,
             repo: repository,
+            githubApp: undefined,
           });
           expectWorkspaceFailure(
             yield* Effect.either(
@@ -480,6 +482,7 @@ describe("Workspace", () => {
           const workspace = yield* makeWorkspace({
             workspaceRoot: fixture.workspaceRoot,
             repo: repository,
+            githubApp: undefined,
           });
           expectWorkspaceFailure(
             yield* Effect.either(
