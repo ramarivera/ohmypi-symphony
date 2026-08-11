@@ -530,6 +530,65 @@ describe("Workspace", () => {
       }),
   );
 
+  it.scopedLive("scrubs GitHub credentials from clone failures", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const token = "credential-token";
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: {
+          getInstallationToken: () => Effect.succeed(token),
+        },
+      });
+      const result = yield* Effect.either(
+        workspace.materialize(
+          sessionId("github-clone-failure"),
+          repositoryRecord({
+            id: "github-clone-failure",
+            url: "https://github.com/octo-org/repository-that-does-not-exist.git",
+          }),
+        ),
+      );
+      expect(Either.isLeft(result)).toBe(true);
+      if (Either.isRight(result)) return;
+      expect(result.left.message).toContain("git clone");
+      expect(result.left.message).not.toContain(token);
+      expect(result.left.message).not.toContain(buildGitHubExtraHeader(token));
+    }),
+  );
+
+  it.scopedLive("cleans GitHub credentials from a terminal workspace", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const id = sessionId("github-terminal-cleanup");
+      yield* fixtureIo("workspace root creation", () =>
+        mkdir(fixture.workspaceRoot, { recursive: true }),
+      );
+      const target = join(fixture.workspaceRoot, safeSessionKey(id));
+      yield* fixtureIo("workspace target creation", () => mkdir(target));
+      yield* runGit(["init"], target);
+      yield* runGit(
+        [
+          "config",
+          "--local",
+          "http.https://github.com/.extraheader",
+          buildGitHubExtraHeader("terminal-token"),
+        ],
+        target,
+      );
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: undefined,
+      });
+      yield* workspace.clearGitHubExtraHeader(id, target);
+      expect(
+        yield* readGitConfig("http.https://github.com/.extraheader", target),
+      ).toBeUndefined();
+    }),
+  );
+
   it.scopedLive("does not mint credentials for SSH-style GitHub URLs", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;

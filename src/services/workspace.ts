@@ -275,6 +275,36 @@ const workspaceFailure =
       cause: cause instanceof Error ? cause.message : String(cause),
     });
 
+const GITHUB_EXTRA_HEADER_KEY = "http.https://github.com/.extraheader";
+
+const redactGitOutput = (
+  value: string,
+  args: ReadonlyArray<string> = [],
+): string => {
+  let redacted = value;
+  for (const arg of args) {
+    if (
+      arg.includes("AUTHORIZATION: basic") ||
+      arg.includes(`${GITHUB_EXTRA_HEADER_KEY}=`)
+    ) {
+      redacted = redacted.replaceAll(arg, "<redacted>");
+    }
+  }
+  return redacted
+    .replace(
+      /(http\.https:\/\/github\.com\/\.extraheader=)\S+/giu,
+      "$1<redacted>",
+    )
+    .replace(/(AUTHORIZATION:\s*basic\s+)\S+/giu, "$1<redacted>");
+};
+
+const gitSubcommand = (args: ReadonlyArray<string>): string => {
+  for (const command of ["clone", "config", "fetch", "checkout"]) {
+    if (args.includes(command)) return command;
+  }
+  return "command";
+};
+
 const runGit = (
   args: ReadonlyArray<string>,
   cwd: string | undefined,
@@ -292,11 +322,31 @@ const runGit = (
         new Response(process.stderr).text(),
       ]);
       if (exitCode !== 0) {
-        throw new Error(`git ${args[0] ?? "command"} failed: ${stderr.trim()}`);
+        throw new Error(
+          `git ${gitSubcommand(args)} failed: ${redactGitOutput(stderr.trim(), args)}`,
+        );
       }
     },
-    catch: workspaceFailure("git command failed", "git_failed", sessionId),
+    catch: (cause) =>
+      new WorkspaceError({
+        message:
+          cause instanceof Error
+            ? redactGitOutput(cause.message, args)
+            : "git command failed",
+        sessionId,
+        reason: "git_failed",
+      }),
   });
+
+const unsetGitHubExtraHeader = (
+  target: string,
+  sessionId: string,
+): Effect.Effect<void, never> =>
+  runGit(
+    ["config", "--local", "--unset", GITHUB_EXTRA_HEADER_KEY],
+    target,
+    sessionId,
+  ).pipe(Effect.catchAll(() => Effect.void));
 
 const lstatOrMissing = (
   path: string,
@@ -493,6 +543,36 @@ export const makeWorkspace = (input: {
 
       return resolution;
     });
+    const refreshGitHubExtraHeader = Effect.fn(
+      "Workspace.refreshGitHubExtraHeader",
+    )(function* (
+      sessionId: string,
+      repository: RepositoryRecord,
+      target: string,
+    ): Effect.fn.Return<void, WorkspaceError> {
+      const githubExtraHeader =
+        input.githubApp === undefined
+          ? undefined
+          : yield* mintGitHubExtraHeader(
+              input.githubApp,
+              repository,
+              sessionId,
+            );
+      if (githubExtraHeader === undefined) {
+        yield* unsetGitHubExtraHeader(target, sessionId);
+        return;
+      }
+      yield* runGit(
+        ["config", "--local", GITHUB_EXTRA_HEADER_KEY, githubExtraHeader],
+        target,
+        sessionId,
+      );
+    });
+
+    const clearGitHubExtraHeader = (
+      sessionId: string,
+      target: string,
+    ): Effect.Effect<void, never> => unsetGitHubExtraHeader(target, sessionId);
 
     const materialize = Effect.fn("Workspace.materialize")(function* (
       sessionId: string,
@@ -543,39 +623,7 @@ export const makeWorkspace = (input: {
           sessionId,
         );
         yield* validateMarker(markerPath, repository, sessionId);
-
-        if (isHttpsGitHubRepositoryUrl(repository.url)) {
-          if (input.githubApp !== undefined) {
-            const githubExtraHeader = yield* mintGitHubExtraHeader(
-              input.githubApp,
-              repository,
-              sessionId,
-            );
-            if (githubExtraHeader !== undefined) {
-              yield* runGit(
-                [
-                  "config",
-                  "--local",
-                  "http.https://github.com/.extraheader",
-                  githubExtraHeader,
-                ],
-                canonicalTarget,
-                sessionId,
-              );
-            }
-          } else {
-            yield* runGit(
-              [
-                "config",
-                "--local",
-                "--unset",
-                "http.https://github.com/.extraheader",
-              ],
-              canonicalTarget,
-              sessionId,
-            ).pipe(Effect.catchAll(() => Effect.void));
-          }
-        }
+        yield* refreshGitHubExtraHeader(sessionId, repository, canonicalTarget);
 
         yield* Effect.logInfo("Workspace ready (reused)").pipe(
           Effect.annotateLogs({
@@ -629,12 +677,7 @@ export const makeWorkspace = (input: {
       yield* runGit(cloneArgs, undefined, sessionId);
       if (githubExtraHeader !== undefined) {
         yield* runGit(
-          [
-            "config",
-            "--local",
-            "http.https://github.com/.extraheader",
-            githubExtraHeader,
-          ],
+          ["config", "--local", GITHUB_EXTRA_HEADER_KEY, githubExtraHeader],
           target,
           sessionId,
         );
@@ -678,9 +721,13 @@ export const makeWorkspace = (input: {
       return finalTarget;
     });
 
-    return { resolve, materialize };
+    return {
+      resolve,
+      materialize,
+      refreshGitHubExtraHeader,
+      clearGitHubExtraHeader,
+    };
   });
-
 export class Workspace extends Effect.Service<Workspace>()("Workspace", {
   accessors: true,
   dependencies: [

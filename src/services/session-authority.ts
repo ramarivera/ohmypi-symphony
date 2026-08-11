@@ -354,6 +354,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             ? githubAppOption.value
             : undefined,
       });
+      const clearWorkspaceCredentials = (
+        run: AgentRun,
+      ): Effect.Effect<void, never, never> =>
+        Option.match(run.workspacePath, {
+          onNone: () => Effect.void,
+          onSome: (path) =>
+            workspace.clearGitHubExtraHeader(run.sessionId, path),
+        });
       const ensureIssueLifecycle = (
         run: AgentRun,
         payload: unknown,
@@ -905,6 +913,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               next.delete(run.sessionId);
               return next;
             });
+            yield* clearWorkspaceCredentials(run);
             if (
               run.state !== "succeeded" &&
               run.state !== "failed" &&
@@ -980,6 +989,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               run.attempt,
               message,
             );
+            yield* clearWorkspaceCredentials(run);
             yield* runRepo.update(run.sessionId, {
               state: "failed",
               terminalReason: Option.some(`${message} [${correlationId}]`),
@@ -1196,6 +1206,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
             Effect.ensuring(
               Effect.gen(function* () {
+                yield* clearWorkspaceCredentials(run);
                 if (Option.isSome(worker)) {
                   yield* worker.value.worker.stop();
                 }
@@ -1517,6 +1528,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const startWorker = Effect.fn("SessionAuthority.startWorker")(function* (
         run: AgentRun,
         cwd: string,
+        refreshWorkspaceCredentials = false,
       ): Effect.fn.Return<
         RpcWorkerHandle,
         | DatabaseError
@@ -1525,6 +1537,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         | RpcSpawnError
         | RpcTimeoutError
         | NixEnvironmentError
+        | WorkspaceError
       > {
         const command: string[] = [config.ompCliPath];
         if (Option.isSome(run.ompSessionFile)) {
@@ -1583,6 +1596,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             environment.PATH = [...prepared.pathEntries, environment.PATH ?? ""]
               .filter((entry) => entry.length > 0)
               .join(":");
+            if (refreshWorkspaceCredentials) {
+              yield* workspace.refreshGitHubExtraHeader(
+                run.sessionId,
+                repository.value,
+                cwd,
+              );
+            }
           }
         }
 
@@ -1718,6 +1738,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   "Linear installation is unavailable",
                 ),
               });
+              yield* clearWorkspaceCredentials(run);
               yield* projector.terminal(
                 sessionId,
                 `installation-unavailable:${run.organizationId}`,
@@ -1769,6 +1790,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 state: "canceled",
                 terminalReason: Option.some("Linear team access was removed"),
               });
+              yield* clearWorkspaceCredentials(run);
               yield* projector.terminal(
                 sessionId,
                 `team-access-removed:${run.teamId.value}`,
@@ -1816,7 +1838,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     workspacePath: run.workspacePath.value,
                   }),
                 );
-                worker = yield* startWorker(resumed, run.workspacePath.value);
+                worker = yield* startWorker(
+                  resumed,
+                  run.workspacePath.value,
+                  true,
+                );
                 yield* projector.thought(
                   sessionId,
                   `retry:${resumed.attempt}`,
@@ -1961,6 +1987,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   worker = yield* startWorker(
                     updatedOption.value,
                     existingWorkspacePath.value,
+                    true,
                   );
                 } else {
                   const baseContext = inputContext(input.payload);

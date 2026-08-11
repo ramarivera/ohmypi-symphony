@@ -1,3 +1,4 @@
+import { mkdir, rm } from "node:fs/promises";
 import { describe, expect, it } from "@effect/vitest";
 import {
   ConfigProvider,
@@ -27,7 +28,11 @@ import {
 } from "../src/domain/ids.js";
 import { type Installation, NixPackageName } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
-import { GitHubApp } from "../src/services/github-app.js";
+import {
+  buildGitHubExtraHeader,
+  GitHubApp,
+  type GitHubAppTokenService,
+} from "../src/services/github-app.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
@@ -482,8 +487,8 @@ describe("SessionAuthority behavior invariants", () => {
   );
 });
 
-const testConfigProvider = ConfigProvider.fromMap(
-  new Map([
+const testConfigProvider = (githubEnabled = false) => {
+  const values: Array<readonly [string, string]> = [
     ["LINEAR_CLIENT_ID", "test-client"],
     ["LINEAR_CLIENT_SECRET", "test-secret"],
     ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
@@ -497,8 +502,15 @@ const testConfigProvider = ConfigProvider.fromMap(
       "WORKSPACE_ROOT",
       "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/authority-tests",
     ],
-  ]),
-);
+  ];
+  if (githubEnabled) {
+    values.push(
+      ["GITHUB_APP_ID", "test-app"],
+      ["GITHUB_APP_PRIVATE_KEY", "test-private-key"],
+    );
+  }
+  return ConfigProvider.fromMap(new Map(values));
+};
 let workerEventListener: ((event: RpcEvent) => void) | undefined;
 let projectionWaiter: Deferred.Deferred<void, never> | undefined;
 let projectionExpected = 0;
@@ -698,8 +710,14 @@ const withAuthority = <A, E>(
     | InstallationRepo
     | WorkspaceRepo
     | NixEnvironment
+    | GitHubApp
+    | ActivityProjector
+    | RpcWorker
   >,
-  options?: { readonly withLinearGateway?: boolean },
+  options?: {
+    readonly withLinearGateway?: boolean;
+    readonly githubApp?: GitHubAppTokenService;
+  },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -723,6 +741,14 @@ const withAuthority = <A, E>(
       commentRelease = undefined;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
+      const githubAppOverride: Layer.Layer<GitHubApp> =
+        options?.githubApp === undefined
+          ? (Layer.empty as Layer.Layer<GitHubApp>)
+          : Layer.succeed(GitHubApp, options.githubApp as GitHubApp);
+      const linearGatewayOverride: Layer.Layer<LinearGateway> =
+        options?.withLinearGateway === true
+          ? Layer.succeed(LinearGateway, mockToolsGateway)
+          : (Layer.empty as Layer.Layer<LinearGateway>);
       const dependencies = Layer.mergeAll(
         GatewayConfig.Default,
         TokenCrypto.Default,
@@ -732,17 +758,18 @@ const withAuthority = <A, E>(
         RunRepo.Default,
         WorkspaceRepo.Default,
         GitHubApp.Default,
+        githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
         Layer.succeed(RpcWorker, mockRpcWorker),
         Layer.succeed(NixEnvironment, mockNixEnvironment),
-        ...(options?.withLinearGateway === true
-          ? [Layer.succeed(LinearGateway, mockToolsGateway)]
-          : []),
+        linearGatewayOverride,
       ).pipe(
         Layer.provide(
           Layer.mergeAll(
             Layer.succeed(SqliteClient, sqlite),
-            Layer.setConfigProvider(testConfigProvider),
+            Layer.setConfigProvider(
+              testConfigProvider(options?.githubApp !== undefined),
+            ),
           ),
         ),
       );
@@ -754,6 +781,39 @@ const withAuthority = <A, E>(
       );
     }),
   );
+const authorityGit = (args: ReadonlyArray<string>, cwd: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const process = Bun.spawn(["git", ...args], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stderr] = await Promise.all([
+        process.exited,
+        new Response(process.stderr).text(),
+      ]);
+      if (exitCode !== 0) throw new Error(stderr);
+    },
+    catch: (error) => new Error(String(error)),
+  });
+
+const readAuthorityGitConfig = (key: string, cwd: string) =>
+  Effect.tryPromise({
+    try: async () => {
+      const process = Bun.spawn(["git", "config", "--local", "--get", key], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stdout] = await Promise.all([
+        process.exited,
+        new Response(process.stdout).text(),
+      ]);
+      return exitCode === 0 ? stdout.trim() : undefined;
+    },
+    catch: (error) => new Error(String(error)),
+  });
 
 const testSessionId = Schema.decodeUnknownSync(SessionId)("authority-session");
 const testIssueId = Schema.decodeUnknownSync(IssueId)("authority-issue");
@@ -772,6 +832,133 @@ const install = (organizationId: OrganizationId): Installation => ({
   canAccessAllPublicTeams: Option.none(),
 });
 
+describe("SessionAuthority workspace credentials", () => {
+  it.scopedLive("refreshes credentials on an orphan resume", () =>
+    Effect.gen(function* () {
+      const workspacePath = "/tmp/authority-resume-refresh";
+      const token = "resume-fresh-token";
+      yield* Effect.tryPromise(() =>
+        rm(workspacePath, { recursive: true, force: true }),
+      );
+      yield* Effect.tryPromise(() => mkdir(workspacePath, { recursive: true }));
+      yield* authorityGit(["init"], workspacePath);
+      yield* authorityGit(
+        [
+          "config",
+          "--local",
+          "http.https://github.com/.extraheader",
+          buildGitHubExtraHeader("resume-stale-token"),
+        ],
+        workspacePath,
+      );
+      let tokenCalls = 0;
+      const githubApp: GitHubAppTokenService = {
+        getInstallationToken: () =>
+          Effect.sync(() => {
+            tokenCalls += 1;
+            return token;
+          }),
+      };
+      yield* withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const installationRepo = yield* InstallationRepo;
+            const runRepo = yield* RunRepo;
+            const workspaceRepo = yield* WorkspaceRepo;
+            const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+              "resume-refresh-repository",
+            );
+            yield* installationRepo.put(install(testOrganizationId));
+            yield* workspaceRepo.createRepository({
+              organizationId: testOrganizationId,
+              id: repositoryId,
+              url: "https://github.com/octo-org/private-repo.git",
+              ref: "main",
+              nixPackages: [],
+            });
+            yield* runRepo.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            });
+            yield* runRepo.update(testSessionId, {
+              state: "orphaned",
+              repositoryId: Option.some(repositoryId),
+              workspacePath: Option.some(workspacePath),
+              ompSessionFile: Option.some(`${workspacePath}/session.jsonl`),
+            });
+            yield* authority.processSession(testSessionId);
+          }),
+        { githubApp },
+      );
+      expect(tokenCalls).toBe(1);
+      expect(
+        yield* readAuthorityGitConfig(
+          "http.https://github.com/.extraheader",
+          workspacePath,
+        ),
+      ).toBe(buildGitHubExtraHeader(token));
+    }),
+  );
+
+  it.scopedLive("unsets credentials on an orphan resume when disabled", () =>
+    Effect.gen(function* () {
+      const workspacePath = "/tmp/authority-resume-unset";
+      yield* Effect.tryPromise(() =>
+        rm(workspacePath, { recursive: true, force: true }),
+      );
+      yield* Effect.tryPromise(() => mkdir(workspacePath, { recursive: true }));
+      yield* authorityGit(["init"], workspacePath);
+      yield* authorityGit(
+        [
+          "config",
+          "--local",
+          "http.https://github.com/.extraheader",
+          buildGitHubExtraHeader("resume-stale-token"),
+        ],
+        workspacePath,
+      );
+      yield* withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const workspaceRepo = yield* WorkspaceRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "resume-unset-repository",
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* workspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://github.com/octo-org/private-repo.git",
+            ref: "main",
+            nixPackages: [],
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some(workspacePath),
+            ompSessionFile: Option.some(`${workspacePath}/session.jsonl`),
+          });
+          yield* authority.processSession(testSessionId);
+        }),
+      );
+      expect(
+        yield* readAuthorityGitConfig(
+          "http.https://github.com/.extraheader",
+          workspacePath,
+        ),
+      ).toBeUndefined();
+    }),
+  );
+});
 describe("SessionAuthority team-access gate", () => {
   it.scopedLive(
     "proceeds when the installation team-access snapshot is unknown (null)",
