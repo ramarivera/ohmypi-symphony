@@ -1064,6 +1064,128 @@ describe("SessionAuthority infrastructure failures", () => {
   );
 
   it.scopedLive(
+    "rolls back a run transition when its admin event cannot be persisted",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* Effect.sync(() =>
+            db.exec(
+              "CREATE TRIGGER reject_authority_state_event BEFORE INSERT ON run_event BEGIN SELECT RAISE(FAIL, 'state event persistence failed'); END",
+            ),
+          );
+
+          const result = yield* Effect.either(
+            authority.processSession(testSessionId),
+          );
+          expect(Either.isLeft(result)).toBe(true);
+          if (Either.isLeft(result)) {
+            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          }
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) expect(run.value.state).toBe("queued");
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "surfaces markProcessed failure after a successful worker action",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(
+              Schema.decodeUnknownSync(WorkspaceId)("repo-for-mark-failure"),
+            ),
+            workspacePath: Option.some("/tmp/mark-failure"),
+            ompSessionFile: Option.some("/tmp/mark-failure/session.jsonl"),
+          });
+          yield* authority.processSession(testSessionId);
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("mark-failure-input"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "continue",
+            payload: {},
+          });
+          yield* Effect.sync(() =>
+            db.exec(
+              "CREATE TRIGGER reject_input_processed BEFORE UPDATE OF processed_at ON run_input WHEN NEW.processed_at IS NOT NULL BEGIN SELECT RAISE(FAIL, 'mark processed failed'); END",
+            ),
+          );
+
+          const result = yield* Effect.either(
+            authority.processSession(testSessionId),
+          );
+          expect(Either.isLeft(result)).toBe(true);
+          if (Either.isLeft(result)) {
+            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          }
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) expect(run.value.state).toBe("running");
+          expect(yield* runInputRepo.pending(testSessionId)).toHaveLength(1);
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "continues terminal handling when best-effort lease release fails",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("lease-cleanup-input"),
+            sessionId: testSessionId,
+            kind: "stop",
+            body: "stop",
+            payload: {},
+          });
+          yield* Effect.sync(() =>
+            db.exec(
+              "CREATE TRIGGER reject_lease_release_success BEFORE UPDATE ON agent_run WHEN OLD.lease_owner IS NOT NULL AND NEW.lease_owner IS NULL BEGIN SELECT RAISE(FAIL, 'lease release failed'); END",
+            ),
+          );
+
+          yield* authority.processSession(testSessionId);
+
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.state).toBe("canceled");
+            expect(run.value.desiredState).toBe("canceled");
+          }
+        }),
+      ),
+  );
+
+  it.scopedLive(
     "keeps the primary projection failure when lease cleanup fails",
     () =>
       withAuthority((db) =>
