@@ -8,7 +8,7 @@ import {
   Ref,
   Schema,
 } from "effect";
-import { InputId } from "../domain/ids.js";
+import { InputId, type SessionId } from "../domain/ids.js";
 import { GatewayConfig } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { SessionAuthority } from "./session-authority.js";
@@ -42,6 +42,9 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
     const triggers = yield* Queue.dropping<void>(1);
 
     const catchupLastAt = yield* Ref.make<Option.Option<number>>(Option.none());
+    const catchupLastPolledAt = yield* Ref.make<Map<SessionId, number>>(
+      new Map(),
+    );
     const catchup = Effect.fn("Reconciler.catchup")(
       function* (): Effect.fn.Return<void, never> {
         const gatewayOption = yield* Effect.serviceOption(LinearGateway);
@@ -59,17 +62,17 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
           onNone: () => 2 * 60_000,
           onSome: (config) => config.reconcilerCatchupMinAgeMs ?? 2 * 60_000,
         });
+        const catchupIntervalMs = Option.match(configOption, {
+          onNone: () => 5 * 60_000,
+          onSome: (config) => config.reconcilerCatchupIntervalMs ?? 5 * 60_000,
+        });
         const gateway = gatewayOption.value;
         const runRepo = runRepoOption.value;
         const runInputRepo = runInputRepoOption.value;
         const now = yield* Clock.currentTimeMillis;
-        const candidatesResult = yield* Effect.all([
-          runRepo.listRunnable(now, true),
-          runRepo.listCancellationPending(),
-        ]).pipe(
+        const candidatesResult = yield* runRepo.listCatchupCandidates(now).pipe(
           Effect.matchCauseEffect({
-            onSuccess: ([runnable, cancellationPending]) =>
-              Effect.succeed([...runnable, ...cancellationPending]),
+            onSuccess: Effect.succeed,
             onFailure: (cause) =>
               Effect.gen(function* () {
                 yield* Effect.logWarning("reconciler.catchup.runs_failed").pipe(
@@ -94,6 +97,15 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
           ) {
             continue;
           }
+          const lastPolledAt = (yield* Ref.get(catchupLastPolledAt)).get(
+            run.sessionId,
+          );
+          if (
+            lastPolledAt !== undefined &&
+            now - lastPolledAt <= catchupIntervalMs
+          ) {
+            continue;
+          }
           // Bound per-sweep Linear traffic: catchup runs inline before
           // processRunnable and shares the per-org API queue, so a large
           // backlog must not starve live runs. Oldest candidates first
@@ -110,6 +122,11 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
             continue;
           }
           polled += 1;
+          yield* Ref.update(catchupLastPolledAt, (lastPolled) => {
+            const next = new Map(lastPolled);
+            next.set(run.sessionId, now);
+            return next;
+          });
           const activities = yield* gateway
             .listSessionActivities({
               sessionId: run.sessionId,

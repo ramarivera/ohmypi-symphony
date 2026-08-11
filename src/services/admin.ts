@@ -710,7 +710,23 @@ export const createAdminHandle = (deps: AdminDeps) =>
         if (Option.isNone(run.issueId)) {
           return Option.some(text("Run is not linked to an issue", 409));
         }
+        if (
+          run.state !== "succeeded" &&
+          run.state !== "failed" &&
+          run.state !== "canceled"
+        ) {
+          return Option.some(text("Run is not terminal", 409));
+        }
         const issueId = run.issueId.value;
+        const hasActiveRun = yield* deps.runRepo.hasActiveForIssue({
+          organizationId: run.organizationId,
+          issueId,
+        });
+        if (hasActiveRun) {
+          return Option.some(
+            text("A run for this issue is already active", 409),
+          );
+        }
         const newSessionId = yield* deps.linearGateway
           .createSessionOnIssue({
             organizationId: run.organizationId,

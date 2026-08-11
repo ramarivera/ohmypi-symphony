@@ -98,6 +98,7 @@ const deps: AdminDeps = {
     hasActiveForIssue: unreachable,
     listNonTerminalByIssue: unreachable,
     listRunnable: unreachable,
+    listCatchupCandidates: unreachable,
     listCancellationPending: unreachable,
     claimLease: unreachable,
     renewLease: unreachable,
@@ -447,16 +448,20 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(await noIssueResponseValue?.text()).toBe(
       "Run is not linked to an issue",
     );
+    let createSessionCalls = 0;
     const activeHandle = createAdminHandle({
       ...deps,
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(true),
         createIfNoActiveForIssue: () => Effect.succeed("active"),
       }),
       linearGateway: {
-        createSessionOnIssue: () =>
-          Effect.succeed("55555555-5555-4555-8555-555555555555"),
+        createSessionOnIssue: () => {
+          createSessionCalls += 1;
+          return Effect.succeed("55555555-5555-4555-8555-555555555555");
+        },
       },
     });
     const activeResponse = await Effect.runPromise(
@@ -467,11 +472,44 @@ describe("POST /api/admin/runs/:id/rerun", () => {
         ),
       ),
     );
+    expect(createSessionCalls).toBe(0);
     const activeResponseValue = Option.getOrElse(activeResponse, () => null);
     expect(activeResponseValue?.status).toBe(409);
     expect(await activeResponseValue?.text()).toBe(
       "A run for this issue is already active",
     );
+  });
+  it("rejects nonterminal reruns before creating a Linear session", async () => {
+    let createSessionCalls = 0;
+    const nonterminalRun: AgentRun = {
+      ...terminalRun,
+      state: "running",
+    };
+    const nonterminalHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(nonterminalRun)),
+      }),
+      linearGateway: {
+        createSessionOnIssue: () => {
+          createSessionCalls += 1;
+          return Effect.succeed("55555555-5555-4555-8555-555555555555");
+        },
+      },
+    });
+    const response = await Effect.runPromise(
+      nonterminalHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    const responseValue = Option.getOrElse(response, () => null);
+    expect(responseValue?.status).toBe(409);
+    expect(await responseValue?.text()).toBe("Run is not terminal");
+    expect(createSessionCalls).toBe(0);
   });
   it("returns 404 for runs belonging to another organization", async () => {
     const foreignRun: AgentRun = {
@@ -516,6 +554,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(false),
         createIfNoActiveForIssue: (input) => {
           created.createdRunInput = input;
           created.sessionId = input.sessionId;
@@ -571,6 +610,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(false),
       }),
       linearGateway: {
         createSessionOnIssue: () =>

@@ -214,6 +214,60 @@ describe("Store repositories", () => {
         }),
       ),
   );
+  it.scopedLive(
+    "catch-up candidates include live runs despite leases and retry delays",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* RunRepo;
+          const sessionId = makeSessionId("catchup-leased");
+          yield* repo.create({
+            sessionId,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+            now: 1_000,
+          });
+          yield* repo.update(sessionId, {
+            state: "running",
+            nextAttemptAt: Option.some(9_000),
+          });
+          expect(
+            yield* repo.claimLease(sessionId, "worker-a", 60_000, 1_000),
+          ).toBe(true);
+
+          const candidates = yield* repo.listCatchupCandidates(2_000);
+          expect(candidates.map((run) => run.sessionId)).toEqual([sessionId]);
+        }),
+      ),
+  );
+  it.scopedLive("keeps canceled catch-up candidates for seven days", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const repo = yield* RunRepo;
+        const sessionId = makeSessionId("catchup-canceled");
+        yield* repo.create({
+          sessionId,
+          organizationId: makeOrganizationId("org-1"),
+          issueId: Option.none(),
+          now: 0,
+        });
+        yield* repo.update(sessionId, { state: "canceled" });
+        const updatedAt = yield* Clock.currentTimeMillis;
+        const sixDays = 6 * 24 * 60 * 60_000;
+        const eightDays = 8 * 24 * 60 * 60_000;
+        expect(
+          (yield* repo.listCatchupCandidates(updatedAt + sixDays)).some(
+            (run) => run.sessionId === sessionId,
+          ),
+        ).toBe(true);
+        expect(
+          (yield* repo.listCatchupCandidates(updatedAt + eightDays)).some(
+            (run) => run.sessionId === sessionId,
+          ),
+        ).toBe(false);
+      }),
+    ),
+  );
 
   it.scopedLive("recovers active runs and leases after a process restart", () =>
     withRepos(

@@ -58,17 +58,13 @@ const makeLayer = (
   const inserted = new Set<string>();
   const ids: string[] = [];
   const bodies = new Map<string, string>();
-  const listRunnableCalls: Array<{
-    readonly now: number;
-    readonly includeUnleased: boolean;
-  }> = [];
+  const listCatchupCalls: Array<{ readonly now: number }> = [];
   const runRepo = {
-    listRunnable: (now: number, includeUnleased: boolean) =>
+    listCatchupCandidates: (now: number) =>
       Effect.sync(() => {
-        listRunnableCalls.push({ now, includeUnleased });
+        listCatchupCalls.push({ now });
         return runs;
       }),
-    listCancellationPending: () => Effect.succeed(runs),
   } as unknown as RunRepo;
   const runInputRepo = {
     enqueue: (input: { id: string; body?: string }) =>
@@ -93,7 +89,7 @@ const makeLayer = (
     Layer.provide(Layer.succeed(SessionAuthority, authority)),
   );
   const layer = Layer.mergeAll(reconciler, deps);
-  return { layer, ids, bodies, listRunnableCalls };
+  return { layer, ids, bodies, listCatchupCalls };
 };
 
 describe("Reconciler catch-up", () => {
@@ -101,7 +97,7 @@ describe("Reconciler catch-up", () => {
     "injects prompt and stop activities once, with unknown activities ignored",
     () =>
       Effect.gen(function* () {
-        const { layer, ids, bodies, listRunnableCalls } = makeLayer(
+        const { layer, ids, bodies, listCatchupCalls } = makeLayer(
           [run(sessionA)],
           () =>
             Effect.succeed([
@@ -139,9 +135,8 @@ describe("Reconciler catch-up", () => {
           yield* reconciler.catchup();
           yield* reconciler.catchup();
         }).pipe(Effect.provide(layer));
-        expect(listRunnableCalls.length).toBe(2);
-        expect(listRunnableCalls[0]?.includeUnleased).toBe(true);
-        expect(typeof listRunnableCalls[0]?.now).toBe("number");
+        expect(listCatchupCalls.length).toBe(2);
+        expect(typeof listCatchupCalls[0]?.now).toBe("number");
         expect(ids).toEqual([
           `${sessionA}:prompted:prompt-1`,
           `${sessionA}:stop:stop-1`,
@@ -152,6 +147,37 @@ describe("Reconciler catch-up", () => {
         );
         expect(bodies.get(`${sessionA}:stop:stop-1`)).toBe("stop");
       }),
+  );
+  it.effect("rotates bounded batches between catch-up sweeps", () =>
+    Effect.gen(function* () {
+      const runs = Array.from({ length: 30 }, (_, index) =>
+        run(
+          Schema.decodeUnknownSync(SessionId)(
+            `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+          ),
+        ),
+      );
+      const { layer, ids } = makeLayer(runs, (sessionId) =>
+        Effect.succeed([
+          {
+            id: `prompt-${sessionId}`,
+            type: "prompt",
+            body: sessionId,
+            title: null,
+            signal: null,
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ]),
+      );
+      yield* Effect.gen(function* () {
+        const reconciler = yield* Reconciler;
+        yield* TestClock.adjust("10 minutes");
+        yield* reconciler.catchup();
+        expect(ids).toHaveLength(25);
+        yield* reconciler.catchup();
+      }).pipe(Effect.provide(layer));
+      expect(ids).toHaveLength(30);
+    }),
   );
 
   it.effect(
