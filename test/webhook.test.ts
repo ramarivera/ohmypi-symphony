@@ -988,7 +988,7 @@ describe("Linear webhook input correctness", () => {
         );
         expect(response.status).toBe(401);
         expect(yield* Effect.promise(() => response.text())).toBe(
-          "OAuth client identity mismatch",
+          "OAuth client identity mismatch (received other-client)",
         );
       }),
     ),
@@ -1122,6 +1122,34 @@ describe("Linear webhook input correctness", () => {
             );
             expect(response.status, oauthClientId).toBe(200);
           }
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "PermissionChange accepts the OAuth client UUID form Linear actually sends",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          const now = yield* currentTime;
+          yield* install();
+          // Live capture 2026-08-11: PermissionChange carries the OAuth
+          // client's internal UUID (no shared hex with the console client_id).
+          // HMAC is the auth boundary; org + appUserId pin tenant and app.
+          const response = yield* WebhookPipeline.handle(
+            signedRequest(
+              permissionChangePayload(now, {
+                oauthClientId: "c2e52980-f2d4-4ecf-bc59-06c73dfb42b3",
+              }),
+            ),
+          );
+          expect(response.status).toBe(200);
+          const installation = expectSome(
+            yield* InstallationRepo.get(organizationId("org")),
+          );
+          expect(installation?.accessibleTeamIds).toEqual(
+            Option.some([teamId("team-a")]),
+          );
         }),
       ),
   );
