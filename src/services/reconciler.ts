@@ -83,6 +83,16 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
           }),
         );
         const seen = new Set<string>();
+        // Prune polling history for sessions no longer eligible (terminal or
+        // aged out of the canceled horizon) so the map can't grow forever.
+        const eligible = new Set(candidatesResult.map((run) => run.sessionId));
+        yield* Ref.update(catchupLastPolledAt, (lastPolled) => {
+          const next = new Map(lastPolled);
+          for (const sessionId of next.keys()) {
+            if (!eligible.has(sessionId)) next.delete(sessionId);
+          }
+          return next;
+        });
         let polled = 0;
         for (const run of candidatesResult) {
           if (seen.has(run.sessionId)) continue;
