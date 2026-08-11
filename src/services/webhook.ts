@@ -258,7 +258,7 @@ const validateAgentSessionIdentity = (
     if (!clientIdMatches(event.oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
-          message: "OAuth client identity mismatch",
+          message: `OAuth client identity mismatch (received ${event.oauthClientId})`,
         }),
       );
     }
@@ -492,7 +492,7 @@ const validateOAuthAppPayload = (
     if (!clientIdMatches(oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
-          message: "OAuth client identity mismatch",
+          message: `OAuth client identity mismatch (received ${oauthClientId})`,
         }),
       );
     }
@@ -564,7 +564,7 @@ const validatePermissionChangePayload = (
     if (!clientIdMatches(oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
-          message: "OAuth client identity mismatch",
+          message: `OAuth client identity mismatch (received ${oauthClientId})`,
         }),
       );
     }
@@ -691,7 +691,7 @@ const validateAppUserNotification = (
     if (!clientIdMatches(payload.oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
-          message: "OAuth client identity mismatch",
+          message: `OAuth client identity mismatch (received ${payload.oauthClientId})`,
         }),
       );
     }
