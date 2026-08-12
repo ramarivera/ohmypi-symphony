@@ -149,6 +149,13 @@ describe("MCP server storage and worker config", () => {
         });
         const cleared = yield* servers.getMcpServer(org, serverId("oauth"));
         expect(Option.isSome(cleared) && cleared.value.oauthClient).toBeNull();
+        yield* servers.updateMcpServer(org, serverId("oauth"), {
+          oauthClient: { scope: "read:tools" },
+        });
+        const dynamic = yield* servers.getMcpServer(org, serverId("oauth"));
+        expect(
+          Option.isSome(dynamic) ? dynamic.value.oauthClient : null,
+        ).toEqual({ scope: "read:tools" });
         expect(yield* servers.deleteMcpServer(org, serverId("off"))).toBe(true);
       }),
     ),
