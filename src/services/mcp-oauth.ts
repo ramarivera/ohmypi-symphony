@@ -172,6 +172,16 @@ const validateEndpoint = (endpoint: string, base: URL): string => {
     throw new Error("MCP OAuth endpoint has an untrusted origin");
   return value.toString();
 };
+const isLoopbackHost = (hostname: string): boolean => {
+  const normalized = hostname.toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "::1" ||
+    normalized === "[::1]" ||
+    normalized === "127.0.0.1" ||
+    normalized.startsWith("127.")
+  );
+};
 
 const fetchWithTimeout = async (
   fetchImpl: FetchLike,
@@ -346,7 +356,13 @@ const discoverMcpOAuthMetadataEffect = (
       tokenEndpoint,
       ...(registrationEndpoint ? { registrationEndpoint } : {}),
     };
-  });
+  }).pipe(
+    Effect.mapError((error) =>
+      error instanceof McpOAuthError
+        ? error
+        : new McpOAuthError({ message: error.message, reason: "discovery" }),
+    ),
+  );
 
 export const discoverMcpOAuthMetadata = async (
   serverUrl: string,
@@ -381,7 +397,8 @@ const registerClient = (
   metadata: McpOAuthMetadata,
   redirectUri: string,
   fetchImpl: FetchLike,
-): Effect.Effect<McpOAuthClientMetadata, DatabaseError> =>
+  scope?: string,
+): Effect.Effect<McpOAuthClientMetadata, DatabaseError | McpOAuthError> =>
   Effect.gen(function* () {
     if (!metadata.registrationEndpoint) {
       return yield* Effect.fail(
@@ -404,6 +421,7 @@ const registerClient = (
             grant_types: ["authorization_code", "refresh_token"],
             response_types: ["code"],
             client_name: "Oh My Pi Linear Gateway",
+            ...(scope !== undefined ? { scope } : {}),
           }),
         }),
       catch: (error) => new DatabaseError({ message: String(error) }),
@@ -434,7 +452,13 @@ const registerClient = (
         ? { registrationEndpoint: metadata.registrationEndpoint }
         : {}),
     };
-  });
+  }).pipe(
+    Effect.mapError((error) =>
+      error instanceof McpOAuthError
+        ? error
+        : new McpOAuthError({ message: error.message, reason: "registration" }),
+    ),
+  );
 
 const tokenEndpointAuth = (
   client: McpOAuthClientMetadata,
@@ -605,6 +629,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
             | McpOAuthTokenEndpointAuthMethod
             | undefined;
         },
+        requestedScope?: string,
       ) {
         const server = yield* mcpServerRepo.getMcpServer(
           organizationId,
@@ -622,6 +647,23 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           );
         }
         const serverUrl = server.value.url.value;
+        const resourceUrl = new URL(serverUrl);
+        if (
+          resourceUrl.protocol !== "https:" &&
+          !(
+            resourceUrl.protocol === "http:" &&
+            isLoopbackHost(resourceUrl.hostname)
+          )
+        ) {
+          return yield* Effect.fail(
+            new McpOAuthError({
+              message:
+                "MCP OAuth requires an HTTPS resource URL (HTTP is only allowed for loopback development)",
+              reason: "resource_validation",
+            }),
+          );
+        }
+        const scope = requestedScope ?? preRegisteredClient?.scope;
         const redirectUri = callbackUri(config.publicUrl);
         const discovered = yield* discoverMcpOAuthMetadataEffect(
           serverUrl,
@@ -636,7 +678,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
                 ? { registrationEndpoint: discovered.registrationEndpoint }
                 : {}),
             }
-          : yield* registerClient(discovered, redirectUri, fetch);
+          : yield* registerClient(discovered, redirectUri, fetch, scope);
         const state = randomBytes(32).toString("base64url");
         const verifier = createPkceVerifier();
         const now = yield* Clock.currentTimeMillis;
@@ -678,9 +720,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
             redirectUri,
             state,
             codeVerifier: verifier,
-            ...(preRegisteredClient?.scope
-              ? { scope: preRegisteredClient.scope }
-              : {}),
+            ...(scope ? { scope } : {}),
             resource: serverUrl,
           }),
         };
@@ -764,6 +804,25 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         now,
         row.server_url,
       );
+      const currentServer = yield* mcpServerRepo.getMcpServer(
+        row.organization_id as OrganizationId,
+        row.server_id as McpServerId,
+      );
+      if (
+        Option.isNone(currentServer) ||
+        !currentServer.value.enabled ||
+        currentServer.value.transport === "stdio" ||
+        Option.isNone(currentServer.value.url) ||
+        currentServer.value.url.value !== row.server_url
+      ) {
+        return yield* Effect.fail(
+          new McpOAuthError({
+            message:
+              "MCP server was removed, disabled, or changed while OAuth was in progress",
+            reason: "server_validation",
+          }),
+        );
+      }
       const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
       const refreshToken = token.refreshToken
         ? yield* tokenCrypto.encrypt(token.refreshToken)

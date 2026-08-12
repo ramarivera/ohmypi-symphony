@@ -86,7 +86,15 @@ describe("MCP OAuth primitives", () => {
       "https://issuer.example/.well-known/oauth-authorization-server",
     ]);
   });
-
+  it("returns a typed discovery reason for unavailable metadata", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response("unavailable", { status: 503 }));
+    await expect(
+      discoverMcpOAuthMetadata("https://mcp.example/server", fetchMock),
+    ).rejects.toThrow("protected-resource discovery failed (503)");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
   it("rejects an authorization server registration endpoint on another origin", async () => {
     const fetchMock = vi.fn<typeof fetch>();
     fetchMock

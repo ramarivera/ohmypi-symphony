@@ -427,9 +427,6 @@ function mcpServerPayload(
       "oauthClientId is required when oauthClientSecret is set",
     );
   }
-  if (oauthScope !== null && oauthClientId === null) {
-    return Either.left("oauthClientId is required when oauthScope is set");
-  }
   if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
     return Either.left("enabled must be a boolean");
   }
@@ -469,7 +466,7 @@ export function toApiMcpServer(
       server.oauthClient === undefined || server.oauthClient === null
         ? null
         : {
-            clientId: server.oauthClient.clientId,
+            clientId: server.oauthClient.clientId ?? null,
             clientSecret:
               server.oauthClient.clientSecret === undefined ? null : "•••",
             scope: server.oauthClient.scope ?? null,
@@ -1160,10 +1157,12 @@ export const createAdminHandle = (deps: AdminDeps) =>
           }),
         );
         const oauthClient =
-          payload.oauthClientId === null
+          payload.oauthClientId === null && payload.oauthScope === null
             ? null
             : {
-                clientId: payload.oauthClientId,
+                ...(payload.oauthClientId !== null
+                  ? { clientId: payload.oauthClientId }
+                  : {}),
                 ...(payload.oauthClientSecret !== null
                   ? { clientSecret: payload.oauthClientSecret }
                   : {}),
@@ -1221,7 +1220,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           .startMcpAuthorization(
             session.organizationId,
             id,
-            oauth !== undefined && oauth !== null
+            oauth?.clientId !== undefined
               ? {
                   clientId: oauth.clientId,
                   ...(oauth.clientSecret !== undefined
@@ -1235,12 +1234,13 @@ export const createAdminHandle = (deps: AdminDeps) =>
                     : {}),
                 }
               : undefined,
+            oauth?.scope,
           )
           .pipe(
             Effect.catchTag("@Gateway/McpOAuthError", (error) =>
               Effect.fail(
                 new AdminError({
-                  message: `MCP OAuth setup failed: ${error.message}`,
+                  message: `MCP OAuth setup failed (${error.reason}): ${error.message}`,
                   status: 400,
                 }),
               ),
@@ -1299,7 +1299,16 @@ export const createAdminHandle = (deps: AdminDeps) =>
           );
           return Option.some(
             json({
-              mcpServer: toApiMcpServer(server.value, statuses.get(id)),
+              mcpServer: toApiMcpServer(
+                server.value,
+                (() => {
+                  const status = statuses.get(id);
+                  const url = Option.getOrElse(server.value.url, () => null);
+                  return status !== undefined && status.serverUrl === url
+                    ? status
+                    : undefined;
+                })(),
+              ),
             }),
           );
         }

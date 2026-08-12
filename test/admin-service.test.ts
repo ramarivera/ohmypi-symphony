@@ -1,6 +1,10 @@
 import { Effect, Option, Redacted, Schema } from "effect";
 import { describe, expect, it } from "vitest";
-import { LinearRateLimitError, WorkspaceError } from "../src/domain/errors.js";
+import {
+  DatabaseError,
+  LinearRateLimitError,
+  WorkspaceError,
+} from "../src/domain/errors.js";
 import {
   IssueId,
   OrganizationId,
@@ -924,13 +928,13 @@ describe("MCP admin endpoints", () => {
     expect(response.status).toBe(400);
     expect(called).toBe(false);
   });
-  it("rejects OAuth scope without a client id", async () => {
+  it("accepts OAuth scope without a client id for dynamic registration", async () => {
     let called = false;
     const mcpServerRepo = {
       ...deps.mcpServerRepo,
       createMcpServer: () => {
         called = true;
-        return Effect.never;
+        return Effect.fail(new DatabaseError({ message: "sentinel" }));
       },
     } as AdminDeps["mcpServerRepo"];
     const handle = createAdminHandle({ ...deps, mcpServerRepo });
@@ -949,6 +953,7 @@ describe("MCP admin endpoints", () => {
               id: "scope-without-client",
               name: "scope-without-client",
               transport: "stdio",
+              args: [],
               command: "node",
               oauthScope: "read",
             }),
@@ -956,8 +961,8 @@ describe("MCP admin endpoints", () => {
         ),
       ),
     );
-    expect(response.status).toBe(400);
-    expect(called).toBe(false);
+    expect(response.status).toBe(500);
+    expect(called).toBe(true);
   });
   it("drops the previous OAuth secret when replacing the client id", async () => {
     const server = Schema.decodeUnknownSync(McpServerRecord)({

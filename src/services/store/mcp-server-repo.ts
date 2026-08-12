@@ -115,7 +115,10 @@ const normalizeOAuthClient = (value: unknown): McpOAuthClientConfig | null => {
     throw new Error("oauthClient must be an object or null");
   }
   const candidate = value as Record<string, unknown>;
-  const clientId = cleanString(candidate.clientId, "oauthClient.clientId");
+  const clientId =
+    candidate.clientId === undefined || candidate.clientId === null
+      ? undefined
+      : cleanString(candidate.clientId, "oauthClient.clientId");
   const clientSecret =
     candidate.clientSecret === undefined || candidate.clientSecret === null
       ? undefined
@@ -124,8 +127,14 @@ const normalizeOAuthClient = (value: unknown): McpOAuthClientConfig | null => {
     candidate.scope === undefined || candidate.scope === null
       ? undefined
       : cleanString(candidate.scope, "oauthClient.scope");
+  if (clientId === undefined && scope === undefined) {
+    throw new Error("oauthClient requires a clientId or scope");
+  }
+  if (clientId === undefined && clientSecret !== undefined) {
+    throw new Error("oauthClient.clientSecret requires a clientId");
+  }
   return {
-    clientId,
+    ...(clientId !== undefined ? { clientId } : {}),
     ...(clientSecret !== undefined ? { clientSecret } : {}),
     ...(scope !== undefined ? { scope } : {}),
   };

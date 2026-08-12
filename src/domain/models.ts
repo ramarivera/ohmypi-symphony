@@ -127,7 +127,7 @@ export const McpServerTransport = Schema.Literal("stdio", "http", "sse");
 export type McpServerTransport = Schema.Schema.Type<typeof McpServerTransport>;
 
 export const McpOAuthClientConfig = Schema.Struct({
-  clientId: Schema.String,
+  clientId: Schema.optional(Schema.String),
   clientSecret: Schema.optional(Schema.String),
   scope: Schema.optional(Schema.String),
   tokenEndpointAuthMethod: Schema.optional(
