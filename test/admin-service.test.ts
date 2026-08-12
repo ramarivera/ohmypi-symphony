@@ -11,6 +11,7 @@ import {
 } from "../src/domain/ids.js";
 import {
   type AgentRun,
+  McpServerRecord,
   RepositoryRecord,
   type RepositoryRecord as RepositoryRecordType,
 } from "../src/domain/models.js";
@@ -25,6 +26,7 @@ import { NixEnvironment } from "../src/services/nix-environment.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
+  McpServerRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -100,6 +102,7 @@ const deps: AdminDeps = {
     hasActiveForIssue: unreachable,
     listNonTerminalByIssue: unreachable,
     listRunnable: unreachable,
+    listCatchupCandidates: unreachable,
     listCancellationPending: unreachable,
     claimLease: unreachable,
     renewLease: unreachable,
@@ -110,6 +113,12 @@ const deps: AdminDeps = {
     upsert: unreachable,
     list: unreachable,
   }),
+  mcpServerRepo: {
+    listMcpServers: unreachable,
+    createMcpServer: unreachable,
+    updateMcpServer: unreachable,
+    deleteMcpServer: unreachable,
+  } as unknown as AdminDeps["mcpServerRepo"],
   runInputRepo: RunInputRepo.make({
     enqueue: unreachable,
     applyStop: unreachable,
@@ -142,6 +151,7 @@ const deps: AdminDeps = {
       ),
   },
   reconciler: {
+    trigger: () => Effect.void,
     status: () =>
       Effect.succeed({
         running: false,
@@ -449,16 +459,20 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(await noIssueResponseValue?.text()).toBe(
       "Run is not linked to an issue",
     );
+    let createSessionCalls = 0;
     const activeHandle = createAdminHandle({
       ...deps,
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(true),
         createIfNoActiveForIssue: () => Effect.succeed("active"),
       }),
       linearGateway: {
-        createSessionOnIssue: () =>
-          Effect.succeed("55555555-5555-4555-8555-555555555555"),
+        createSessionOnIssue: () => {
+          createSessionCalls += 1;
+          return Effect.succeed("55555555-5555-4555-8555-555555555555");
+        },
       },
     });
     const activeResponse = await Effect.runPromise(
@@ -469,11 +483,44 @@ describe("POST /api/admin/runs/:id/rerun", () => {
         ),
       ),
     );
+    expect(createSessionCalls).toBe(0);
     const activeResponseValue = Option.getOrElse(activeResponse, () => null);
     expect(activeResponseValue?.status).toBe(409);
     expect(await activeResponseValue?.text()).toBe(
       "A run for this issue is already active",
     );
+  });
+  it("rejects nonterminal reruns before creating a Linear session", async () => {
+    let createSessionCalls = 0;
+    const nonterminalRun: AgentRun = {
+      ...terminalRun,
+      state: "running",
+    };
+    const nonterminalHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(nonterminalRun)),
+      }),
+      linearGateway: {
+        createSessionOnIssue: () => {
+          createSessionCalls += 1;
+          return Effect.succeed("55555555-5555-4555-8555-555555555555");
+        },
+      },
+    });
+    const response = await Effect.runPromise(
+      nonterminalHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    const responseValue = Option.getOrElse(response, () => null);
+    expect(responseValue?.status).toBe(409);
+    expect(await responseValue?.text()).toBe("Run is not terminal");
+    expect(createSessionCalls).toBe(0);
   });
   it("returns 404 for runs belonging to another organization", async () => {
     const foreignRun: AgentRun = {
@@ -510,14 +557,17 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       createdRun?: boolean;
       enqueued?: boolean;
       createdRunInput?: unknown;
+      createdInputId?: unknown;
       payload?: unknown;
     } = {};
+    let reconcilerTriggers = 0;
     const newSessionId = "55555555-5555-4555-8555-555555555555";
     const rerunHandle = createAdminHandle({
       ...deps,
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(false),
         createIfNoActiveForIssue: (input) => {
           created.createdRunInput = input;
           created.sessionId = input.sessionId;
@@ -528,6 +578,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       runInputRepo: RunInputRepo.make({
         ...deps.runInputRepo,
         enqueue: (input) => {
+          created.createdInputId = input.id;
           created.payload = input.payload;
           created.enqueued = true;
           return Effect.succeed(true);
@@ -535,6 +586,13 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       }),
       linearGateway: {
         createSessionOnIssue: () => Effect.succeed(newSessionId),
+      },
+      reconciler: {
+        ...deps.reconciler,
+        trigger: () => {
+          reconcilerTriggers += 1;
+          return Effect.void;
+        },
       },
     });
     const response = await Effect.runPromise(
@@ -551,6 +609,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(created.sessionId).toBe(newSessionId);
     expect(created.createdRun).toBe(true);
     expect(created.enqueued).toBe(true);
+    expect(reconcilerTriggers).toBe(1);
     const createdInput = created.createdRunInput as {
       organizationId: unknown;
       issueId: unknown;
@@ -563,9 +622,77 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(createdInput.repositoryId).toEqual(Option.some(repositoryId));
     expect(createdInput.teamId).toEqual(Option.some(teamId));
     expect(createdInput.projectId).toEqual(Option.some(projectId));
+    expect(created.createdInputId).toBe(`${newSessionId}:created`);
     const payload = created.payload as Record<string, unknown>;
     expect(payload.repositoryId).toBe(repositoryId);
     expect(payload.automationDelegated).toBe(false);
+  });
+  it("serializes overlapping reruns for the same issue before creating a session", async () => {
+    let active = false;
+    let createSessionCalls = 0;
+    let releaseFirst = () => {};
+    let signalFirstStarted = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      signalFirstStarted = resolve;
+    });
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const newSessionId = "55555555-5555-4555-8555-555555555555";
+    const rerunHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(active),
+        createIfNoActiveForIssue: () => {
+          if (active) return Effect.succeed("active");
+          active = true;
+          return Effect.succeed("created");
+        },
+      }),
+      runInputRepo: RunInputRepo.make({
+        ...deps.runInputRepo,
+        enqueue: () => Effect.succeed(true),
+      }),
+      linearGateway: {
+        createSessionOnIssue: () => {
+          createSessionCalls += 1;
+          signalFirstStarted();
+          return createSessionCalls === 1
+            ? Effect.promise(() => firstReleased.then(() => newSessionId))
+            : Effect.succeed(newSessionId);
+        },
+      },
+    });
+
+    const firstResponsePromise = Effect.runPromise(
+      rerunHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    await firstStarted;
+    const secondResponsePromise = Effect.runPromise(
+      rerunHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    releaseFirst();
+    const [firstResponse, secondResponse] = await Promise.all([
+      firstResponsePromise,
+      secondResponsePromise,
+    ]);
+    const first = Option.getOrElse(firstResponse, () => null);
+    const second = Option.getOrElse(secondResponse, () => null);
+    expect(first?.status).toBe(200);
+    expect(second?.status).toBe(409);
+    expect(createSessionCalls).toBe(1);
   });
   it("maps Linear rate limits to 429 with retry delay", async () => {
     const rateLimitHandle = createAdminHandle({
@@ -573,6 +700,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       runRepo: RunRepo.make({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(false),
       }),
       linearGateway: {
         createSessionOnIssue: () =>
@@ -595,5 +723,300 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     const responseValue = Option.getOrElse(response, () => null);
     expect(responseValue?.status).toBe(429);
     expect(await responseValue?.text()).toContain("12345ms");
+  });
+});
+describe("MCP admin endpoints", () => {
+  it("requires CSRF and masks secret environment values", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-admin",
+      organizationId,
+      name: "github",
+      transport: "stdio",
+      command: "node",
+      args: ["server.js"],
+      url: null,
+      env: { API_TOKEN: "super-secret" },
+      headers: { Authorization: "header-secret" },
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const mcpServerRepo = McpServerRepo.make({
+      createMcpServer: unreachable,
+      getMcpServer: () => Effect.succeed(Option.some(server)),
+      listMcpServers: () => Effect.succeed([server]),
+      updateMcpServer: unreachable,
+      deleteMcpServer: unreachable,
+    });
+    const mcpHandle = createAdminHandle({
+      ...deps,
+      installationRepo: InstallationRepo.make({
+        ...deps.installationRepo,
+        get: () => Effect.succeed(Option.none()),
+      }),
+      workspaceRepo: WorkspaceRepo.make({
+        ...deps.workspaceRepo,
+        listRepositories: () => Effect.succeed([]),
+      }),
+      mcpServerRepo,
+    });
+    const noCsrf = await Effect.runPromise(
+      mcpHandle(
+        new Request(new URL("/api/admin/mcp-servers", config.publicUrl), {
+          method: "POST",
+          headers: {
+            Cookie: `omp_gateway_admin=${token}`,
+            Origin: config.publicUrl.toString(),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            id: "mcp-new",
+            name: "new",
+            transport: "stdio",
+            command: "node",
+            args: [],
+            env: {},
+          }),
+        }),
+      ),
+    );
+    expect(Option.getOrElse(noCsrf, () => null)?.status).toBe(403);
+
+    const bootstrap = Option.getOrThrow(
+      await Effect.runPromise(
+        mcpHandle(
+          new Request(new URL("/api/admin/bootstrap", config.publicUrl), {
+            headers: { Cookie: `omp_gateway_admin=${token}` },
+          }),
+        ),
+      ),
+    );
+    const bootstrapBody = await bootstrap.json();
+    expect(bootstrapBody.mcpServers[0].env).toEqual({ API_TOKEN: "•••" });
+    expect(bootstrapBody.mcpServers[0].headers).toEqual({
+      Authorization: "•••",
+    });
+    expect(JSON.stringify(bootstrapBody)).not.toContain("super-secret");
+
+    const detail = Option.getOrThrow(
+      await Effect.runPromise(
+        mcpHandle(
+          new Request(
+            new URL("/api/admin/mcp-servers/mcp-admin", config.publicUrl),
+            {
+              headers: { Cookie: `omp_gateway_admin=${token}` },
+            },
+          ),
+        ),
+      ),
+    );
+    const detailBody = await detail.json();
+    expect(detailBody.mcpServer.env).toEqual({ API_TOKEN: "•••" });
+    expect(detailBody.mcpServer.headers).toEqual({
+      Authorization: "•••",
+    });
+    expect(JSON.stringify(detailBody)).not.toContain("super-secret");
+  });
+  it("preserves masked headers on update and clears them with an explicit empty map", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-headers",
+      organizationId,
+      name: "remote",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://mcp.example.test",
+      env: { API_TOKEN: "super-secret" },
+      headers: { Authorization: "header-secret" },
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let received: Record<string, unknown> | undefined;
+    const mcpServerRepo = McpServerRepo.make({
+      listMcpServers: () => Effect.succeed([server]),
+      createMcpServer: unreachable,
+      getMcpServer: () => Effect.succeed(Option.some(server)),
+      updateMcpServer: (_org, _id, input) => {
+        received = input as Record<string, unknown>;
+        return Effect.succeed(server);
+      },
+      deleteMcpServer: unreachable,
+    });
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const put = (headers: Record<string, string>) =>
+      Effect.runPromise(
+        handle(
+          new Request(
+            new URL("/api/admin/mcp-servers/mcp-headers", config.publicUrl),
+            {
+              method: "PUT",
+              headers: {
+                Cookie: `omp_gateway_admin=${token}`,
+                Origin: config.publicUrl.toString(),
+                "Content-Type": "application/json",
+                "X-CSRF-Token": deriveCsrfToken(token),
+              },
+              body: JSON.stringify({
+                id: "mcp-headers",
+                name: "remote",
+                transport: "http",
+                command: null,
+                args: [],
+                url: "https://mcp.example.test",
+                env: { API_TOKEN: "•••" },
+                headers,
+                repositoryId: null,
+                enabled: true,
+              }),
+            },
+          ),
+        ),
+      );
+    await put({ Authorization: "•••", "X-Trace": "trace-secret" });
+    expect(received?.headers).toEqual({
+      Authorization: "header-secret",
+      "X-Trace": "trace-secret",
+    });
+    await put({});
+    expect(received?.headers).toEqual({});
+  });
+  it("rejects non-string repository ids before persistence", async () => {
+    let called = false;
+    const mcpServerRepo = McpServerRepo.make({
+      ...deps.mcpServerRepo,
+      createMcpServer: (..._args: ReadonlyArray<unknown>) => {
+        called = true;
+        return Effect.never;
+      },
+    });
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const response = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(
+          new Request(new URL("/api/admin/mcp-servers", config.publicUrl), {
+            method: "POST",
+            headers: {
+              Cookie: `omp_gateway_admin=${token}`,
+              Origin: config.publicUrl.toString(),
+              "Content-Type": "application/json",
+              "X-CSRF-Token": deriveCsrfToken(token),
+            },
+            body: JSON.stringify({
+              id: "numeric-repository",
+              name: "numeric-repository",
+              transport: "stdio",
+              command: "node",
+              repositoryId: 42,
+            }),
+          }),
+        ),
+      ),
+    );
+    expect(response.status).toBe(400);
+    expect(called).toBe(false);
+  });
+  it("requires enabled to be a boolean and defaults omitted to true", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-enabled",
+      organizationId,
+      name: "enabled",
+      transport: "stdio",
+      command: "node",
+      args: [],
+      url: null,
+      env: {},
+      headers: {},
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let receivedEnabled: boolean | undefined;
+    let receivedArgs: ReadonlyArray<string> | undefined;
+    const mcpServerRepo = {
+      ...deps.mcpServerRepo,
+      createMcpServer: (
+        input: Parameters<AdminDeps["mcpServerRepo"]["createMcpServer"]>[0],
+      ) => {
+        receivedEnabled = input.enabled;
+        receivedArgs = input.args;
+        return Effect.succeed(server);
+      },
+    } as AdminDeps["mcpServerRepo"];
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const runLocal = async (requestValue: Request) =>
+      Option.getOrThrow(await Effect.runPromise(handle(requestValue)));
+    const post = (
+      enabled: unknown,
+      includeEnabled = true,
+      args: ReadonlyArray<string> = [],
+    ) =>
+      runLocal(
+        request("/api/admin/mcp-servers", {
+          id: "mcp-enabled",
+          name: "enabled",
+          transport: "stdio",
+          command: "node",
+          args,
+          ...(includeEnabled ? { enabled } : {}),
+        }),
+      );
+    expect((await post("false")).status).toBe(400);
+    const commaArgs = ["--filter=a,b", '{"query":"x,y"}'];
+    expect((await post(true, true, commaArgs)).status).toBe(201);
+    expect(receivedArgs).toEqual(commaArgs);
+    expect(receivedEnabled).toBe(true);
+    expect((await post(false)).status).toBe(201);
+    expect(receivedEnabled).toBe(false);
+    expect((await post(undefined, false)).status).toBe(201);
+    expect(receivedEnabled).toBe(true);
+  });
+
+  it("rejects invalid MCP header names and accepts RFC token names", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-header-validation",
+      organizationId,
+      name: "header-validation",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://mcp.example.test",
+      env: {},
+      headers: {},
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const mcpServerRepo = {
+      ...deps.mcpServerRepo,
+      createMcpServer: () => Effect.succeed(server),
+    } as AdminDeps["mcpServerRepo"];
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const runLocal = async (requestValue: Request) =>
+      Option.getOrThrow(await Effect.runPromise(handle(requestValue)));
+    const post = (headers: Record<string, string>) =>
+      runLocal(
+        request("/api/admin/mcp-servers", {
+          id: "mcp-header-validation",
+          name: "header-validation",
+          transport: "http",
+          command: null,
+          args: [],
+          url: "https://mcp.example.test",
+          headers,
+        }),
+      );
+    for (const name of ["Bad:Name", "Bad,Name", "Bad Name"]) {
+      const response = await post({ [name]: "secret" });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain(name);
+    }
+    expect(
+      (await post({ Authorization: "secret", "X-Trace_2": "ok" })).status,
+    ).toBe(201);
   });
 });

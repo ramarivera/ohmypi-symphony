@@ -429,18 +429,31 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
           id: WorkspaceId,
         ): Effect.fn.Return<boolean, DatabaseError> {
           yield* Effect.annotateCurrentSpan("repositoryId", id);
-          const result = yield* tryDb(
-            () =>
-              db
-                .query(
-                  "DELETE FROM repository WHERE organization_id=? AND id=?",
-                )
-                .run(organizationId, id),
-            "WorkspaceRepo.deleteRepository",
-          );
-          return (
-            (yield* runChanges(result, "WorkspaceRepo.deleteRepository")) === 1
-          );
+          const tx = Effect.gen(function* () {
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "DELETE FROM mcp_server WHERE organization_id=? AND repository_id=?",
+                  )
+                  .run(organizationId, id),
+              "WorkspaceRepo.deleteRepository.mcpServers",
+            );
+            const result = yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "DELETE FROM repository WHERE organization_id=? AND id=?",
+                  )
+                  .run(organizationId, id),
+              "WorkspaceRepo.deleteRepository",
+            );
+            return (
+              (yield* runChanges(result, "WorkspaceRepo.deleteRepository")) ===
+              1
+            );
+          });
+          return yield* transact(db, tx);
         },
       );
 

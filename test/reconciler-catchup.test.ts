@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Option, Schema, TestClock } from "effect";
+import { Clock, Effect, Layer, Option, Schema, TestClock } from "effect";
 import { LinearApiError } from "../src/domain/errors.js";
 import { OrganizationId, SessionId } from "../src/domain/ids.js";
 import type { AgentRun } from "../src/domain/models.js";
@@ -45,8 +45,13 @@ const run = (
   updatedAt: 0,
 });
 
+const processedSessions: string[] = [];
 const authority = {
   processRunnable: () => Effect.void,
+  processSession: (sessionId: string) =>
+    Effect.sync(() => {
+      processedSessions.push(sessionId);
+    }),
 } as unknown as SessionAuthority;
 
 const makeLayer = (
@@ -58,25 +63,23 @@ const makeLayer = (
   const inserted = new Set<string>();
   const ids: string[] = [];
   const bodies = new Map<string, string>();
-  const listRunnableCalls: Array<{
-    readonly now: number;
-    readonly includeUnleased: boolean;
-  }> = [];
+  const payloads = new Map<string, unknown>();
+  const listCatchupCalls: Array<{ readonly now: number }> = [];
   const runRepo = {
-    listRunnable: (now: number, includeUnleased: boolean) =>
+    listCatchupCandidates: (now: number) =>
       Effect.sync(() => {
-        listRunnableCalls.push({ now, includeUnleased });
+        listCatchupCalls.push({ now });
         return runs;
       }),
-    listCancellationPending: () => Effect.succeed(runs),
   } as unknown as RunRepo;
   const runInputRepo = {
-    enqueue: (input: { id: string; body?: string }) =>
+    enqueue: (input: { id: string; body?: string; payload?: unknown }) =>
       Effect.sync(() => {
         if (inserted.has(input.id)) return false;
         inserted.add(input.id);
         ids.push(input.id);
         bodies.set(input.id, input.body ?? "");
+        payloads.set(input.id, input.payload);
         return true;
       }),
   } as unknown as RunInputRepo;
@@ -93,7 +96,7 @@ const makeLayer = (
     Layer.provide(Layer.succeed(SessionAuthority, authority)),
   );
   const layer = Layer.mergeAll(reconciler, deps);
-  return { layer, ids, bodies, listRunnableCalls };
+  return { layer, ids, bodies, payloads, listCatchupCalls };
 };
 
 describe("Reconciler catch-up", () => {
@@ -101,7 +104,7 @@ describe("Reconciler catch-up", () => {
     "injects prompt and stop activities once, with unknown activities ignored",
     () =>
       Effect.gen(function* () {
-        const { layer, ids, bodies, listRunnableCalls } = makeLayer(
+        const { layer, ids, bodies, listCatchupCalls } = makeLayer(
           [run(sessionA)],
           () =>
             Effect.succeed([
@@ -139,9 +142,8 @@ describe("Reconciler catch-up", () => {
           yield* reconciler.catchup();
           yield* reconciler.catchup();
         }).pipe(Effect.provide(layer));
-        expect(listRunnableCalls.length).toBe(2);
-        expect(listRunnableCalls[0]?.includeUnleased).toBe(true);
-        expect(typeof listRunnableCalls[0]?.now).toBe("number");
+        expect(listCatchupCalls.length).toBe(2);
+        expect(typeof listCatchupCalls[0]?.now).toBe("number");
         expect(ids).toEqual([
           `${sessionA}:prompted:prompt-1`,
           `${sessionA}:stop:stop-1`,
@@ -153,12 +155,43 @@ describe("Reconciler catch-up", () => {
         expect(bodies.get(`${sessionA}:stop:stop-1`)).toBe("stop");
       }),
   );
+  it.effect("rotates bounded batches between catch-up sweeps", () =>
+    Effect.gen(function* () {
+      const runs = Array.from({ length: 30 }, (_, index) =>
+        run(
+          Schema.decodeUnknownSync(SessionId)(
+            `00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+          ),
+        ),
+      );
+      const { layer, ids } = makeLayer(runs, (sessionId) =>
+        Effect.succeed([
+          {
+            id: `prompt-${sessionId}`,
+            type: "prompt",
+            body: sessionId,
+            title: null,
+            signal: null,
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ]),
+      );
+      yield* Effect.gen(function* () {
+        const reconciler = yield* Reconciler;
+        yield* TestClock.adjust("10 minutes");
+        yield* reconciler.catchup();
+        expect(ids).toHaveLength(25);
+        yield* reconciler.catchup();
+      }).pipe(Effect.provide(layer));
+      expect(ids).toHaveLength(30);
+    }),
+  );
 
   it.effect(
     "isolates activity fetch failures and preserves canceled prompt semantics",
     () =>
       Effect.gen(function* () {
-        const { layer, ids } = makeLayer(
+        const { layer, ids, payloads } = makeLayer(
           [run(sessionA), run(sessionB, "canceled")],
           (sessionId) =>
             sessionId === sessionA
@@ -192,24 +225,32 @@ describe("Reconciler catch-up", () => {
           yield* TestClock.adjust("10 minutes");
           yield* reconciler.catchup();
         }).pipe(Effect.provide(layer));
+        expect(processedSessions).toEqual([sessionB]);
         expect(ids).toEqual([`${sessionB}:prompted:cancel-prompt`]);
+        expect(
+          (
+            payloads.get(`${sessionB}:prompted:cancel-prompt`) as Record<
+              string,
+              unknown
+            >
+          ).automationDelegated,
+        ).toBe(true);
       }),
   );
   it.effect("skips runs with recent activity", () =>
     Effect.gen(function* () {
-      const { layer, ids } = makeLayer(
-        [run(sessionA, "running", Date.now())],
-        () =>
-          Effect.succeed([
-            {
-              id: "recent-prompt",
-              type: "prompt",
-              body: "ignored",
-              title: null,
-              signal: null,
-              createdAt: "2025-01-01T00:00:00.000Z",
-            },
-          ]),
+      const now = yield* Clock.currentTimeMillis;
+      const { layer, ids } = makeLayer([run(sessionA, "running", now)], () =>
+        Effect.succeed([
+          {
+            id: "recent-prompt",
+            type: "prompt",
+            body: "ignored",
+            title: null,
+            signal: null,
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ]),
       );
       yield* Effect.gen(function* () {
         const reconciler = yield* Reconciler;

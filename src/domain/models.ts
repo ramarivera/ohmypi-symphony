@@ -4,6 +4,7 @@ import {
   DeliveryId,
   InputId,
   IssueId,
+  McpServerId,
   OrganizationId,
   ProjectId,
   SessionId,
@@ -24,6 +25,12 @@ export const RunState = Schema.Literal(
   "orphaned",
 );
 export type RunState = Schema.Schema.Type<typeof RunState>;
+
+export const TERMINAL_RUN_STATES: ReadonlyArray<RunState> = [
+  "succeeded",
+  "failed",
+  "canceled",
+];
 export const DesiredRunState = Schema.Literal("running", "canceled");
 export type DesiredRunState = Schema.Schema.Type<typeof DesiredRunState>;
 export const InputKind = Schema.Literal("created", "prompted", "stop");
@@ -116,6 +123,28 @@ export const RepositoryRecord = Schema.extend(
   }),
 );
 export type RepositoryRecord = Schema.Schema.Type<typeof RepositoryRecord>;
+export const McpServerTransport = Schema.Literal("stdio", "http", "sse");
+export type McpServerTransport = Schema.Schema.Type<typeof McpServerTransport>;
+
+export const McpServerRecord = Schema.Struct({
+  id: McpServerId,
+  organizationId: OrganizationId,
+  name: Schema.String,
+  transport: McpServerTransport,
+  command: Schema.OptionFromNullOr(Schema.String),
+  args: Schema.Array(Schema.String),
+  url: Schema.OptionFromNullOr(Schema.String),
+  env: Schema.Record({ key: Schema.String, value: Schema.String }),
+  headers: Schema.optionalWith(
+    Schema.Record({ key: Schema.String, value: Schema.String }),
+    { default: () => ({}) },
+  ),
+  repositoryId: Schema.OptionFromNullOr(WorkspaceId),
+  enabled: Schema.Boolean,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+});
+export type McpServerRecord = Schema.Schema.Type<typeof McpServerRecord>;
 
 export const Installation = Schema.Struct({
   organizationId: OrganizationId,

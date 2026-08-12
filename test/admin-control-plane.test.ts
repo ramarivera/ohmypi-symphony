@@ -12,6 +12,7 @@ import { describe, expect } from "vitest";
 import type {
   AppUserId,
   IssueId,
+  McpServerId,
   OrganizationId,
   ProjectId,
   SessionId,
@@ -35,6 +36,7 @@ import {
   AdminSessionRepo,
   DeliveryRepo,
   InstallationRepo,
+  McpServerRepo,
   NixCacheRepo,
   RunEventRepo,
   RunInputRepo,
@@ -100,6 +102,7 @@ const withApp = <A, E>(
     | NixCacheRepo
     | NixEnvironment
     | OAuth
+    | McpServerRepo
     | RunEventRepo
     | RunInputRepo
     | RunRepo
@@ -121,6 +124,7 @@ const withApp = <A, E>(
       OAuth.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
+      McpServerRepo.Default,
       RunRepo.Default,
       WebhookPipeline.Default,
       WorkspaceRepo.Default,
@@ -311,6 +315,17 @@ describe("admin control plane", () => {
           labels: [],
           isDefault: false,
         });
+        const mcp = yield* McpServerRepo;
+        yield* mcp.createMcpServer({
+          organizationId: organization,
+          id: "mcp-scoped" as McpServerId,
+          name: "repo-only",
+          transport: "stdio",
+          command: "node",
+          args: ["server.js"],
+          repositoryId: Option.some(id),
+          now: 1,
+        });
         const updated = yield* repo.updateRepository(organization, id, {
           ref: "develop",
           labels: ["frontend"],
@@ -324,6 +339,7 @@ describe("admin control plane", () => {
         expect(Option.isNone(yield* repo.getRepository(organization, id))).toBe(
           true,
         );
+        expect(yield* mcp.listMcpServers(organization)).toHaveLength(0);
       }),
     ),
   );

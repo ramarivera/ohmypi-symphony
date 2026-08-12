@@ -138,7 +138,10 @@ export const parseRepositorySuggestionCandidate = (
     .replace(/^\/+/u, "")
     .replace(/\/+$/u, "")
     .replace(/\.git$/u, "");
-  if (hostname.length === 0 || !/^[^/]+\/[^/]+$/u.test(repositoryFullName)) {
+  if (
+    hostname.length === 0 ||
+    !/^[^/]+(?:\/[^/]+)+$/u.test(repositoryFullName)
+  ) {
     return null;
   }
   return { hostname, repositoryFullName };
@@ -210,7 +213,6 @@ const mintGitHubExtraHeader = (
     if (token === undefined) return undefined;
     return buildGitHubExtraHeader(token);
   });
-
 function onlyItem<A>(items: ReadonlyArray<A>): A | undefined {
   return items.length === 1 ? items[0] : undefined;
 }

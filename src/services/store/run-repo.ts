@@ -13,6 +13,7 @@ import {
   type AgentRun,
   AgentRun as AgentRunSchema,
   type RunState,
+  TERMINAL_RUN_STATES,
 } from "../../domain/models.js";
 import { RunEventRepo } from "./run-event-repo.js";
 import {
@@ -47,12 +48,6 @@ const AgentRunRow = Schema.Struct({
 });
 
 type AgentRunRow = Schema.Schema.Type<typeof AgentRunRow>;
-
-const TERMINAL_STATES: ReadonlyArray<RunState> = [
-  "succeeded",
-  "failed",
-  "canceled",
-];
 
 const rowToAgentRun = (
   row: AgentRunRow,
@@ -247,7 +242,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       const run = current.value;
 
       if (
-        TERMINAL_STATES.includes(run.state) &&
+        TERMINAL_RUN_STATES.includes(run.state) &&
         patch.state !== undefined &&
         patch.state !== run.state
       ) {
@@ -382,6 +377,33 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       const decoded = yield* decodeRows(AgentRunRow, rows, "AgentRun");
       return yield* Effect.forEach(decoded, rowToAgentRun);
     });
+    const listCatchupCandidates = Effect.fn("RunRepo.listCatchupCandidates")(
+      function* (
+        now: number,
+      ): Effect.fn.Return<
+        ReadonlyArray<AgentRun>,
+        DatabaseError | RowDecodeError
+      > {
+        // Keep canceled sessions for a week: a user can resume a days-old
+        // canceled session, and that fresh prompt may be the webhook we missed.
+        // This is intentionally independent of Linear's short retry budget.
+        const canceledHorizon = now - 7 * 24 * 60 * 60_000;
+        const rows = yield* tryDb(
+          () =>
+            db
+              .query<AgentRunRow, [number]>(`
+              SELECT * FROM agent_run
+              WHERE state IN ('queued','starting','running','waiting','stopping')
+                 OR (state='canceled' AND updated_at>=?)
+              ORDER BY created_at, session_id
+            `)
+              .all(canceledHorizon),
+          "RunRepo.listCatchupCandidates",
+        );
+        const decoded = yield* decodeRows(AgentRunRow, rows, "AgentRun");
+        return yield* Effect.forEach(decoded, rowToAgentRun);
+      },
+    );
 
     const listCancellationPending = Effect.fn(
       "RunRepo.listCancellationPending",
@@ -545,6 +567,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       reopen,
       hasActiveForIssue,
       listRunnable,
+      listCatchupCandidates,
       listCancellationPending,
       listNonTerminalByIssue,
       claimLease,
