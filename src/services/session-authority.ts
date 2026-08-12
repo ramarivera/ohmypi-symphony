@@ -91,8 +91,19 @@ const linearWorkerPromptWithTemplate = (
   organizationId: string,
   kind: "created" | "prompted" | "stop",
   body: string,
-): Effect.Effect<string, DatabaseError | RowDecodeError> =>
-  kind !== "created"
+): Effect.Effect<string, DatabaseError | RowDecodeError> => {
+  if (kind === "prompted") {
+    return repo.get(organizationId, "prompted").pipe(
+      Effect.map((template) =>
+        Option.isSome(template)
+          ? substitutePromptTemplate(template.value.body, {
+              userRequest: body,
+            })
+          : linearWorkerPrompt(kind, body),
+      ),
+    );
+  }
+  return kind !== "created"
     ? Effect.succeed(linearWorkerPrompt(kind, body))
     : repo
         .get(organizationId, "contract")
@@ -107,6 +118,7 @@ const linearWorkerPromptWithTemplate = (
             ),
           ),
         );
+};
 
 export const resolveDeviationExtensionPath = (): string | null => {
   const candidates = [
@@ -2252,10 +2264,20 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     next.delete(sessionId);
                     return next;
                   });
-                } else if (yield* worker.isStreaming) {
-                  yield* worker.steer(input.body);
                 } else {
-                  yield* worker.followUp(input.body);
+                  // Render the prompted template at send time: input.body
+                  // stays raw for repo-selection/UI-answer paths.
+                  const rendered = yield* linearWorkerPromptWithTemplate(
+                    promptTemplateRepo,
+                    latest.organizationId,
+                    "prompted",
+                    input.body,
+                  );
+                  if (yield* worker.isStreaming) {
+                    yield* worker.steer(rendered);
+                  } else {
+                    yield* worker.followUp(rendered);
+                  }
                 }
                 yield* runRepo.update(sessionId, { state: "running" });
               }

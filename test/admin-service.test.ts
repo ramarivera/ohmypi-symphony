@@ -119,6 +119,12 @@ const deps: AdminDeps = {
     updateMcpServer: unreachable,
     deleteMcpServer: unreachable,
   } as unknown as AdminDeps["mcpServerRepo"],
+  promptTemplateRepo: {
+    get: () => Effect.succeed(Option.none()),
+    put: unreachable,
+    remove: unreachable,
+    list: unreachable,
+  } as unknown as AdminDeps["promptTemplateRepo"],
   runInputRepo: RunInputRepo.make({
     enqueue: unreachable,
     applyStop: unreachable,

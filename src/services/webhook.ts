@@ -489,16 +489,11 @@ const handleAgentSessionEvent = (
         Option.getOrElse(activity.signal, () => "") === "stop"
           ? "stop"
           : "prompted";
-      const configured =
-        kind === "prompted"
-          ? yield* promptTemplateRepo.get(organizationId, "prompted")
-          : Option.none();
-      const body =
-        kind === "prompted" && Option.isSome(configured)
-          ? substitutePromptTemplate(configured.value.body, {
-              userRequest: extractPromptBody(activity),
-            })
-          : extractPromptBody(activity);
+      // Store the RAW body. The prompted template is applied at prompt
+      // construction (session-authority), because input.body is also read
+      // by repository selection and UI-answer paths that expect the user's
+      // literal text.
+      const body = extractPromptBody(activity);
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, kind),
       ).pipe(

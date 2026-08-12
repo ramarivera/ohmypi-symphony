@@ -651,7 +651,7 @@ describe("Linear webhook input correctness", () => {
       }),
     ),
   );
-  it.scopedLive("prompted template receives the extracted activity body", () =>
+  it.scopedLive("prompted inputs store the raw activity body", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
@@ -668,8 +668,11 @@ describe("Linear webhook input correctness", () => {
         );
         expect(response.status).toBe(200);
         const inputs = yield* RunInputRepo.pending(sessionId("session-1"));
+        // Raw body is stored even with a template configured: rendering
+        // happens at prompt construction so repository selection and UI
+        // answers see the user's literal text.
         expect(inputs.find((input) => input.kind === "prompted")?.body).toBe(
-          "Follow-up:\n# Follow-up prompt\n\nPlease add more tests",
+          "# Follow-up prompt\n\nPlease add more tests",
         );
       }),
     ),

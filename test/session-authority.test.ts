@@ -491,6 +491,69 @@ describe("SessionAuthority behavior invariants", () => {
       ),
     { timeout: 15_000 },
   );
+
+  it.scopedLive("renders the prompted template at prompt time", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const installationRepo = yield* InstallationRepo;
+        const runRepo = yield* RunRepo;
+        const runInputRepo = yield* RunInputRepo;
+        const templateRepo = yield* PromptTemplateRepo;
+        const workspaceRepo = yield* WorkspaceRepo;
+        yield* installationRepo.put(install(testOrganizationId));
+        yield* templateRepo.upsert({
+          organizationId: testOrganizationId,
+          kind: "prompted",
+          body: "Follow-up:\n{{userRequest}}",
+          updatedAt: 0,
+        });
+        const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+          "prompt-template-repository",
+        );
+        yield* workspaceRepo.createRepository({
+          organizationId: testOrganizationId,
+          id: repositoryId,
+          url: "https://example.com/repository.git",
+          ref: "main",
+          nixPackages: [],
+        });
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.none(),
+        });
+        yield* runRepo.update(testSessionId, {
+          state: "running",
+          repositoryId: Option.some(repositoryId),
+          workspacePath: Option.some("/tmp/resume-workspace"),
+          ompSessionFile: Option.some("/tmp/resume-workspace/session.jsonl"),
+        });
+
+        yield* runInputRepo.enqueue({
+          id: Schema.decodeUnknownSync(InputId)("stop-input"),
+          sessionId: testSessionId,
+          kind: "stop",
+          body: "stop",
+          payload: {},
+        });
+        yield* authority.processSession(testSessionId);
+
+        yield* runInputRepo.enqueue({
+          id: Schema.decodeUnknownSync(InputId)("resume-input"),
+          sessionId: testSessionId,
+          kind: "prompted",
+          body: "please continue the task",
+          payload: {},
+        });
+        yield* authority.processSession(testSessionId);
+
+        // The raw input body stays literal; the worker receives the
+        // template-rendered prompt.
+        expect(workerPrompts).toEqual(["Follow-up:\nplease continue the task"]);
+      }),
+    ),
+  );
   it.effect(
     "materializes configured MCP servers through the real authority layer",
     () =>
@@ -885,6 +948,7 @@ const withAuthority = <A, E>(
     | RunEventRepo
     | InstallationRepo
     | McpServerRepo
+    | PromptTemplateRepo
     | WorkspaceRepo
     | NixEnvironment
     | GitHubApp

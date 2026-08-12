@@ -197,7 +197,7 @@ export const ADMIN_BODY = `
           <div class="field full"><label for="prompt-template-prompted">Prompted input</label><textarea id="prompt-template-prompted" rows="4" data-prompt-kind="prompted"></textarea></div>
           <div class="field full"><label for="prompt-template-contract">Worker contract</label><textarea id="prompt-template-contract" rows="10" data-prompt-kind="contract"></textarea></div>
         </div>
-        <div class="hint">Leave a template blank to restore the built-in default. Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Prompted placeholder: <code>{{userRequest}}</code>. Unknown placeholders remain literal.</div>
+        <div class="hint">Leave a template blank to restore the built-in default. Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Prompted placeholder: <code>{{userRequest}}</code>. Unknown placeholders remain literal. Edits apply to new inputs — including follow-ups in already-running sessions.</div>
         <div class="field full"><label for="prompt-template-preview">Live preview (sample payload)</label><pre id="prompt-template-preview" aria-live="polite"></pre></div>
         <div class="form-actions"><button type="button" class="btn btn-primary" id="prompt-templates-save">Save prompt templates</button></div>
       </div>

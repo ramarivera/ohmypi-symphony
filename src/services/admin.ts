@@ -41,7 +41,10 @@ import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
-import { promptTemplateWarnings } from "./prompt-templates.js";
+import {
+  promptTemplateWarnings,
+  substitutePromptTemplate,
+} from "./prompt-templates.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
@@ -121,7 +124,7 @@ export interface AdminDeps {
     readonly createSessionOnIssue: LinearGateway["createSessionOnIssue"];
   };
   readonly workspaceRepo: WorkspaceRepo;
-  readonly promptTemplateRepo?: PromptTemplateRepo;
+  readonly promptTemplateRepo: PromptTemplateRepo;
   readonly mcpServerRepo: McpServerRepo;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
@@ -960,7 +963,27 @@ export const createAdminHandle = (deps: AdminDeps) =>
                   ),
               }),
             );
-            const body = `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
+            const rerunTemplate = yield* deps.promptTemplateRepo
+              .get(run.organizationId, "created")
+              .pipe(
+                Effect.catchTag(
+                  "@Gateway/DatabaseError",
+                  (error) =>
+                    new AdminError({
+                      message: error.message,
+                      status: 500,
+                    }),
+                ),
+              );
+            // Admin reruns honor a configured created template; the
+            // substitution mirrors the webhook's created body builder with
+            // the synthetic context.
+            const body = Option.isSome(rerunTemplate)
+              ? substitutePromptTemplate(rerunTemplate.value.body, {
+                  userRequest: "Work on the issue below.",
+                  issueContext: `Issue: ${issueId}`,
+                })
+              : `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
             yield* deps.runInputRepo.enqueue({
               id: inputId,
               sessionId: newRunSessionId,
