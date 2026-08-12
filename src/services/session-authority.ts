@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Clock, Effect, Fiber, Option, Queue, Ref } from "effect";
+import { Clock, Duration, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
   type DatabaseError,
   type InstallationRevokedError,
@@ -68,6 +68,8 @@ interface WorkerState {
   readonly consumer: Fiber.Fiber<never, AuthorityError>;
   readonly unsubscribe: () => Effect.Effect<void, never, never>;
 }
+
+const CANCEL_GATE_TIMEOUT_MS = 30_000;
 
 const LINEAR_WORKER_CONTRACT = `Linear integration:
 - Use OMP todos for meaningful multi-step work; they are displayed as the Linear agent plan.
@@ -615,6 +617,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const reportedPullRequestUrlsRef = yield* Ref.make<
         ReadonlyMap<SessionId, ReadonlySet<string>>
       >(new Map());
+      const assistantDraftRef = yield* Ref.make<ReadonlyMap<SessionId, string>>(
+        new Map(),
+      );
       const stopDeferralCountsRef = yield* Ref.make<
         ReadonlyMap<SessionId, ReadonlyMap<string, number>>
       >(new Map());
@@ -643,6 +648,32 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Effect.flatMap(sessionMutationGate(sessionId), (gate) =>
           gate.withPermits(1)(effect),
         );
+      const withCancelMutationGate = <A, E, R>(
+        sessionId: SessionId,
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E, R> =>
+        Effect.gen(function* () {
+          const gate = yield* sessionMutationGate(sessionId);
+          const acquired = yield* gate
+            .take(1)
+            .pipe(
+              Effect.as(true),
+              Effect.timeoutOption(Duration.millis(CANCEL_GATE_TIMEOUT_MS)),
+            );
+          if (Option.isNone(acquired)) {
+            yield* Effect.logWarning("authority.cancel_gate_timeout").pipe(
+              Effect.annotateLogs({
+                event: "authority.cancel_gate_timeout",
+                sessionId,
+                timeoutMs: CANCEL_GATE_TIMEOUT_MS,
+              }),
+            );
+            return yield* effect;
+          }
+          return yield* effect.pipe(
+            Effect.ensuring(gate.release(1).pipe(Effect.asVoid)),
+          );
+        });
       const releaseMutationGate = (
         sessionId: SessionId,
       ): Effect.Effect<void, never, never> =>
@@ -887,7 +918,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         // host-tool mutation completes first, and a mutation arriving
         // after the gate is acquired sees the canceled run in its in-gate
         // re-read and is refused.
-        yield* withSessionMutationGate(
+        yield* withCancelMutationGate(
           run.sessionId,
           Effect.gen(function* () {
             if (Option.isSome(run.workspacePath)) {
@@ -934,6 +965,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           }),
         );
         yield* releaseMutationGate(run.sessionId);
+        yield* clearSessionStopDeferrals(run.sessionId);
         yield* releaseIfNoWorker(run.sessionId);
       });
 
@@ -1007,6 +1039,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               `The OhMyPi run failed after ${run.attempt} attempts. Reference: ${correlationId}`,
             );
             yield* releaseMutationGate(sessionId);
+            yield* clearSessionStopDeferrals(sessionId);
             return;
           }
 
@@ -1141,7 +1174,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             }),
           );
         }
-
         const worker = yield* getWorker(sessionId);
         const terminalAgentEnd =
           event.type === "agent_end" && event.willContinue !== true;
@@ -1154,8 +1186,21 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* captureWorkerState(sessionId, worker.value.worker);
         }
 
+        if (event.type === "message_end") {
+          const draft = assistantResponseTextFromRpcEvent(event);
+          if (draft.length > 0) {
+            yield* Ref.update(assistantDraftRef, (current) => {
+              const next = new Map(current);
+              next.set(sessionId, draft);
+              return next;
+            });
+          }
+        }
+
         if (terminalAgentEnd) {
-          const finalText = assistantResponseTextFromRpcEvent(event);
+          const savedDraft = (yield* Ref.get(assistantDraftRef)).get(sessionId);
+          const finalText =
+            savedDraft ?? assistantResponseTextFromRpcEvent(event);
           const discovered = extractPullRequestUrls(finalText);
           if (discovered.length > 0 && Option.isSome(linearOption)) {
             const existing = yield* Ref.get(reportedPullRequestUrlsRef);
@@ -1215,6 +1260,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 });
                 yield* Ref.update(reportedPullRequestUrlsRef, (reported) => {
                   const next = new Map(reported);
+                  next.delete(sessionId);
+                  return next;
+                });
+                yield* Ref.update(assistantDraftRef, (drafts) => {
+                  const next = new Map(drafts);
                   next.delete(sessionId);
                   return next;
                 });
@@ -1428,8 +1478,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       return fail("label must be a non-empty string");
                     if (typeof url !== "string")
                       return fail("url must be an http(s) URL");
+                    const normalizedUrl = url.trim();
                     try {
-                      const parsed = new URL(url);
+                      const parsed = new URL(normalizedUrl);
                       if (
                         parsed.protocol !== "http:" &&
                         parsed.protocol !== "https:"
@@ -1441,14 +1492,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     return yield* linear
                       .addSessionExternalUrls({
                         sessionId: run.sessionId,
-                        urls: [{ label: label.trim(), url }],
+                        urls: [{ label: label.trim(), url: normalizedUrl }],
                       })
                       .pipe(
                         Effect.tap(() =>
                           Ref.update(reportedPullRequestUrlsRef, (current) => {
                             const next = new Map(current);
                             const urls = new Set(next.get(run.sessionId) ?? []);
-                            urls.add(url);
+                            urls.add(normalizedUrl);
                             next.set(run.sessionId, urls);
                             return next;
                           }),
@@ -1788,6 +1839,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 "The Linear installation is unavailable. Reinstall or reauthorize the app, then try again.",
               );
               yield* releaseMutationGate(sessionId);
+              yield* clearSessionStopDeferrals(sessionId);
               return;
             }
             // A null snapshot means "unknown" (installation predates the
@@ -1842,6 +1894,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 "Stopped because this Linear installation no longer has access to the issue's team.",
               );
               yield* releaseMutationGate(sessionId);
+              yield* clearSessionStopDeferrals(sessionId);
               return;
             }
             let worker: RpcWorkerHandle | undefined = Option.getOrElse(
@@ -1926,7 +1979,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               let latest = Option.isSome(latestOption)
                 ? latestOption.value
                 : run;
-              let stopDecision = yield* stopShouldApply(sessionId, input);
+              const stopDecision = yield* stopShouldApply(sessionId, input);
               if (Option.isNone(stopDecision)) {
                 const deferralCount = yield* recordStopDeferral(
                   sessionId,
@@ -1934,16 +1987,17 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 );
                 if (deferralCount < 10) return;
                 yield* Effect.logWarning(
-                  "authority.stop_deferral_bound_reached",
+                  "authority.stop_deferral_bound_reached_without_stop",
                 ).pipe(
                   Effect.annotateLogs({
-                    event: "authority.stop_deferral_bound_reached",
+                    event: "authority.stop_deferral_bound_reached_without_stop",
                     sessionId,
                     inputId: input.id,
                     deferralCount,
                   }),
                 );
-                stopDecision = Option.some(true);
+                yield* runInputRepo.markProcessed(input.id);
+                continue;
               }
               const shouldStop = Option.getOrElse(stopDecision, () => true);
               if (!shouldStop) {
@@ -2129,10 +2183,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               yield* runInputRepo.markProcessed(input.id);
             }
           }).pipe(
-            // NOTE: stop-deferral counts are NOT cleared here — they must
-            // survive across processSession invocations for the deferral
-            // bound to trip. They are cleared in the terminal agent_end
-            // cleanup block instead.
+            // NOTE: stop-deferral counts survive across processSession
+            // invocations so the deferral bound can trip. Terminal paths
+            // clear them alongside their mutation gate cleanup.
             Effect.ensuring(releaseIfNoWorker(sessionId)),
           );
         },

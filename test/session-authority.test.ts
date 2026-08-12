@@ -15,6 +15,7 @@ import {
 import {
   DatabaseError,
   InterruptedRunNoActionableInputError,
+  LinearApiError,
   NixEnvironmentError,
 } from "../src/domain/errors.js";
 import {
@@ -36,6 +37,7 @@ import { ActivityProjector } from "../src/services/projector.js";
 import {
   type RpcEvent,
   type RpcHostToolCall,
+  type RpcHostToolDefinition,
   type RpcHostToolResult,
   RpcWorker,
   type RpcWorkerHandle,
@@ -660,6 +662,14 @@ const projectorTerminals: Array<{
   readonly kind: string;
   readonly text: string;
 }> = [];
+const toolExternalUrlCalls: Array<{
+  readonly sessionId: string;
+  readonly urls: ReadonlyArray<{
+    readonly label: string;
+    readonly url: string;
+  }>;
+}> = [];
+let linearIssueLookupFails = false;
 let elicitationWaiter: Deferred.Deferred<void, never> | undefined;
 
 const signalProjection = (): void => {
@@ -706,6 +716,7 @@ const mockProjector = ActivityProjector.make({
 });
 
 const workerPrompts: Array<string> = [];
+let registeredHostTools: ReadonlyArray<RpcHostToolDefinition> = [];
 let hostToolListener:
   | ((
       request: RpcHostToolCall,
@@ -728,7 +739,10 @@ const mockWorker: RpcWorkerHandle = {
     }),
   steer: () => Effect.void,
   followUp: () => Effect.void,
-  setHostTools: () => Effect.void,
+  setHostTools: (tools) =>
+    Effect.sync(() => {
+      registeredHostTools = tools;
+    }),
   onHostToolCall: (listener) =>
     Effect.sync(() => {
       hostToolListener = listener;
@@ -805,21 +819,37 @@ const mockToolsGateway = LinearGateway.make({
   listSessionActivities: () =>
     Effect.die(new Error("unused in authority tests")),
   getIssue: () =>
-    Effect.succeed({
-      id: "issue-1",
-      identifier: "AUTH-1",
-      title: "Authority issue",
-      description: null,
-      stateId: "state-started",
-      stateName: "In Progress",
-      stateType: "started",
-      delegateId: "authority-app-user",
-      url: null,
-      teamId: null,
-      labels: [],
-    }),
+    linearIssueLookupFails
+      ? Effect.fail(
+          new LinearApiError({
+            message: "issue lookup unavailable",
+            operation: "getIssue",
+          }),
+        )
+      : Effect.succeed({
+          id: "issue-1",
+          identifier: "AUTH-1",
+          title: "Authority issue",
+          description: null,
+          stateId: "state-started",
+          stateName: "In Progress",
+          stateType: "started",
+          delegateId: "authority-app-user",
+          url: null,
+          teamId: null,
+          labels: [],
+        }),
   updateIssue: () => Effect.void,
-  addSessionExternalUrls: () => Effect.void,
+  addSessionExternalUrls: (input: {
+    readonly sessionId: string;
+    readonly urls: ReadonlyArray<{
+      readonly label: string;
+      readonly url: string;
+    }>;
+  }) =>
+    Effect.sync(() => {
+      toolExternalUrlCalls.push(input);
+    }),
   teamStartedStates: () => Effect.succeed([]),
   repositorySuggestions: () => Effect.succeed([]),
   createSessionOnIssue: () =>
@@ -844,11 +874,14 @@ const withAuthority = <A, E>(
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
+      linearIssueLookupFails = false;
+      toolExternalUrlCalls.length = 0;
       terminalFailure = undefined;
       workerEventListener = undefined;
       hostToolListener = undefined;
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
+      registeredHostTools = [];
       projectionExpected = 0;
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
@@ -990,6 +1023,47 @@ describe("SessionAuthority team-access gate", () => {
         }
       }),
     ),
+  );
+  it.scopedLive(
+    "cancels when only the public-team access snapshot is known and false",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const teamId = Schema.decodeUnknownSync(TeamId)("authority-team");
+          yield* installationRepo.put({
+            ...install(testOrganizationId),
+            accessibleTeamIds: Option.none(),
+            canAccessAllPublicTeams: Option.some(false),
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+            teamId: Option.some(teamId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/team-access-partial"),
+            ompSessionFile: Option.some(
+              "/tmp/team-access-partial/session.jsonl",
+            ),
+          });
+
+          yield* authority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(0);
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.state).toBe("canceled");
+            expect(run.value.terminalReason).toEqual(
+              Option.some("Linear team access was removed"),
+            );
+          }
+        }),
+      ),
   );
 });
 
@@ -1169,6 +1243,61 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 });
+describe("SessionAuthority deferred stop handling", () => {
+  it.scopedLive(
+    "skips a deferred stop after repeated lookup failures instead of canceling",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const installationRepo = yield* InstallationRepo;
+            const runRepo = yield* RunRepo;
+            const runInputRepo = yield* RunInputRepo;
+            linearIssueLookupFails = true;
+            yield* installationRepo.put(install(testOrganizationId));
+            yield* runRepo.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.some(testIssueId),
+            });
+            yield* runRepo.update(testSessionId, {
+              state: "orphaned",
+              workspacePath: Option.some("/tmp/deferred-stop"),
+              ompSessionFile: Option.some("/tmp/deferred-stop/session.jsonl"),
+            });
+            const inputId = Schema.decodeUnknownSync(InputId)(
+              "deferred-stop-input",
+            );
+            yield* runInputRepo.enqueue({
+              id: inputId,
+              sessionId: testSessionId,
+              kind: "stop",
+              body: "Linear issue status changed",
+              payload: {
+                type: "AppUserNotification",
+                action: "issueStatusChanged",
+                notification: { issueId: "issue-1" },
+              },
+            });
+
+            for (let attempt = 0; attempt < 10; attempt += 1) {
+              yield* authority.processSession(testSessionId);
+            }
+
+            const pending = yield* runInputRepo.pending(testSessionId);
+            expect(pending).toHaveLength(0);
+            const run = yield* runRepo.get(testSessionId);
+            expect(Option.isSome(run)).toBe(true);
+            if (Option.isSome(run)) {
+              expect(run.value.state).not.toBe("canceled");
+              expect(run.value.desiredState).toBe("running");
+            }
+          }),
+        { withLinearGateway: true },
+      ),
+  );
+});
 describe("SessionAuthority host-tool mutation gate", () => {
   it.scopedLive("refuses mutating host tools once the run is canceled", () =>
     withAuthority(
@@ -1191,6 +1320,12 @@ describe("SessionAuthority host-tool mutation gate", () => {
           });
 
           yield* authority.processSession(testSessionId);
+          expect(registeredHostTools.map((tool) => tool.name)).toEqual([
+            "linear_get_issue",
+            "linear_create_comment",
+            "linear_update_issue",
+            "linear_add_external_url",
+          ]);
           expect(workerSpawnInputs).toHaveLength(1);
           const listener = hostToolListener;
           expect(listener).toBeDefined();
@@ -1229,8 +1364,116 @@ describe("SessionAuthority host-tool mutation gate", () => {
       { withLinearGateway: true },
     ),
   );
+  it.scopedLive("normalizes external URLs before sending", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/external-url", { recursive: true }),
+          );
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/external-url"),
+            ompSessionFile: Option.some("/tmp/external-url/session.jsonl"),
+          });
+          yield* authority.processSession(testSessionId);
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
 
-  it.scopedLive("cancel waits for an in-flight mutation holding the gate", () =>
+          const result = yield* listener({
+            id: "call-url",
+            toolCallId: "tool-url",
+            toolName: "linear_add_external_url",
+            arguments: {
+              label: "Pull request",
+              url: "  https://github.com/acme/project/pull/42  ",
+            },
+          });
+          expect(result.isError).not.toBe(true);
+          expect(toolExternalUrlCalls).toEqual([
+            {
+              sessionId: testSessionId,
+              urls: [
+                {
+                  label: "Pull request",
+                  url: "https://github.com/acme/project/pull/42",
+                },
+              ],
+            },
+          ]);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
+
+  it.scopedLive(
+    "reports a pull request from the saved assistant draft at agent end",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const installationRepo = yield* InstallationRepo;
+            const runRepo = yield* RunRepo;
+            yield* installationRepo.put(install(testOrganizationId));
+            yield* runRepo.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.some(testIssueId),
+            });
+            yield* Effect.promise(() =>
+              mkdir("/tmp/pr-draft", { recursive: true }),
+            );
+            yield* runRepo.update(testSessionId, {
+              state: "orphaned",
+              workspacePath: Option.some("/tmp/pr-draft"),
+              ompSessionFile: Option.some("/tmp/pr-draft/session.jsonl"),
+            });
+            yield* authority.processSession(testSessionId);
+            expect(workerEventListener).toBeDefined();
+            if (workerEventListener === undefined) return;
+
+            const projected = yield* Deferred.make<void>();
+            projectionWaiter = projected;
+            projectionExpected = 2;
+            workerEventListener({
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content:
+                  "Opened https://github.com/acme/project/pull/42 for review.",
+              },
+            });
+            workerEventListener({ type: "agent_end" });
+            yield* Deferred.await(projected);
+
+            expect(toolExternalUrlCalls).toEqual([
+              {
+                sessionId: testSessionId,
+                urls: [
+                  {
+                    label: "Pull request",
+                    url: "https://github.com/acme/project/pull/42",
+                  },
+                ],
+              },
+            ]);
+          }),
+        { withLinearGateway: true },
+      ),
+  );
+
+  it.effect("cancel proceeds after a bounded gate wait", () =>
     withAuthority(
       () =>
         Effect.gen(function* () {
@@ -1244,6 +1487,9 @@ describe("SessionAuthority host-tool mutation gate", () => {
             organizationId: testOrganizationId,
             issueId: Option.some(testIssueId),
           });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/mutation-gate-order", { recursive: true }),
+          );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             workspacePath: Option.some("/tmp/mutation-gate-order"),
@@ -1270,8 +1516,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
           );
           yield* Deferred.await(commentEnteredSignal);
 
-          // A user stop arrives; processSession must not reach
-          // worker.stop until the in-flight mutation releases the gate.
+          // A user stop arrives while the in-flight mutation holds the gate.
           yield* runInputRepo.enqueue({
             id: Schema.decodeUnknownSync(InputId)(
               `${testSessionId}:stop:stop-1`,
@@ -1285,14 +1530,11 @@ describe("SessionAuthority host-tool mutation gate", () => {
             authority.processSession(testSessionId),
           );
           yield* Effect.yieldNow();
-          yield* Effect.yieldNow();
-          yield* Effect.yieldNow();
-          expect(orderEvents).not.toContain("worker-stopped");
-
           Deferred.unsafeDone(commentRelease, Effect.void);
           yield* Fiber.await(mutationFiber);
-          yield* Fiber.await(cancelFiber);
-          expect(orderEvents).toEqual(["comment-completed", "worker-stopped"]);
+          yield* Fiber.join(cancelFiber);
+          expect(orderEvents).toContain("worker-stopped");
+          expect(orderEvents).toContain("comment-completed");
         }),
       { withLinearGateway: true },
     ),

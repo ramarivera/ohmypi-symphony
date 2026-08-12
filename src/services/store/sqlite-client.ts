@@ -42,10 +42,18 @@ export const transact = <A, E, R>(
     return yield* effect.pipe(
       Effect.matchEffect({
         onSuccess: (value) =>
-          Effect.gen(function* () {
-            yield* tryDb(commit, "COMMIT");
-            return value;
-          }),
+          tryDb(commit, "COMMIT").pipe(
+            Effect.catchTag("@Gateway/DatabaseError", (error) =>
+              Effect.gen(function* () {
+                yield* Effect.orElse(
+                  tryDb(rollback, "ROLLBACK"),
+                  () => Effect.void,
+                );
+                return yield* Effect.fail(error);
+              }),
+            ),
+            Effect.map(() => value),
+          ),
         onFailure: (error) =>
           Effect.gen(function* () {
             yield* Effect.orElse(

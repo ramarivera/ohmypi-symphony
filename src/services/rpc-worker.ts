@@ -129,6 +129,8 @@ function sanitizedEnvironment(
 
 const MAX_CHUNK_SIZE = 67_108_864;
 const MAX_PROMPT_REQUEST_IDS = 256;
+const GRACEFUL_STOP_TIMEOUT_MS = 2_000;
+const FORCE_STOP_TIMEOUT_MS = 1_000;
 
 function configWithDefault(
   name: string,
@@ -939,9 +941,6 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         if (Option.isNone(process)) {
           return;
         }
-
-        yield* Ref.set(processRef, Option.none());
-
         yield* Effect.try(() => process.value.stdin.end()).pipe(
           Effect.matchEffect({
             onSuccess: () => Effect.void,
@@ -949,7 +948,26 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               Effect.sync(() => process.value.kill()).pipe(Effect.ignore),
           }),
         );
-        yield* Effect.sync(() => process.value.kill()).pipe(Effect.ignore);
+        const exitedGracefully = yield* Effect.promise(() =>
+          Promise.race([
+            process.value.exited.then(() => true),
+            new Promise<boolean>((resolve) =>
+              setTimeout(() => resolve(false), GRACEFUL_STOP_TIMEOUT_MS),
+            ),
+          ]),
+        );
+        if (!exitedGracefully) {
+          yield* Effect.sync(() => process.value.kill()).pipe(Effect.ignore);
+          yield* Effect.promise(() =>
+            Promise.race([
+              process.value.exited.then(() => undefined),
+              new Promise<void>((resolve) =>
+                setTimeout(() => resolve(), FORCE_STOP_TIMEOUT_MS),
+              ),
+            ]),
+          );
+        }
+        yield* Ref.set(processRef, Option.none());
         const stdoutFiber = yield* Ref.get(stdoutFiberRef);
         const stderrFiber = yield* Ref.get(stderrFiberRef);
         if (Option.isSome(stdoutFiber)) {
@@ -958,6 +976,8 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         if (Option.isSome(stderrFiber)) {
           yield* Fiber.interruptFork(stderrFiber.value);
         }
+        yield* Ref.set(stdoutFiberRef, Option.none());
+        yield* Ref.set(stderrFiberRef, Option.none());
 
         yield* rejectPending(
           new RpcProtocolError({

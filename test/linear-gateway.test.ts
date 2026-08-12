@@ -246,6 +246,7 @@ const gatewayDependencies = Layer.mergeAll(
       hasActiveForIssue: unusedRepoMethod,
       listNonTerminalByIssue: unusedRepoMethod,
       listRunnable: unusedRepoMethod,
+      listCatchupCandidates: unusedRepoMethod,
       listCancellationPending: unusedRepoMethod,
       claimLease: unusedRepoMethod,
       renewLease: unusedRepoMethod,

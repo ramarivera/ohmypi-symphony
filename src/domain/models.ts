@@ -25,6 +25,12 @@ export const RunState = Schema.Literal(
   "orphaned",
 );
 export type RunState = Schema.Schema.Type<typeof RunState>;
+
+export const TERMINAL_RUN_STATES: ReadonlyArray<RunState> = [
+  "succeeded",
+  "failed",
+  "canceled",
+];
 export const DesiredRunState = Schema.Literal("running", "canceled");
 export type DesiredRunState = Schema.Schema.Type<typeof DesiredRunState>;
 export const InputKind = Schema.Literal("created", "prompted", "stop");

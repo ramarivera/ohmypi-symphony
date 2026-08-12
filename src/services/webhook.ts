@@ -561,10 +561,18 @@ const validatePermissionChangePayload = (
       );
     }
 
+    // Live evidence (2026-08-11): PermissionChange payloads report the OAuth
+    // client's internal UUID, NOT the console client_id carried by
+    // AgentSessionEvent/AppUserNotification payloads — the two identifiers
+    // share no hex, so a direct comparison can never match. The HMAC
+    // signature is the auth boundary; the organization + appUserId checks
+    // below pin the tenant and app. Log the observed form for visibility.
     if (!clientIdMatches(oauthClientId, config.linearClientId)) {
-      return yield* Effect.fail(
-        new WebhookIdentityError({
-          message: `OAuth client identity mismatch (received ${oauthClientId})`,
+      yield* Effect.logInfo("webhook.permissionChange.client_id_form").pipe(
+        Effect.annotateLogs({
+          event: "webhook.permissionChange.client_id_form",
+          oauthClientId,
+          organizationId,
         }),
       );
     }

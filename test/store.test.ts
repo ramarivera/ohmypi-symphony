@@ -1,9 +1,11 @@
+import type { Database } from "bun:sqlite";
 import { it } from "@effect/vitest";
 import {
   Clock,
   ConfigProvider,
   Effect,
   Either,
+  Exit,
   Layer,
   Option,
   Schema,
@@ -30,7 +32,10 @@ import {
   RunInputRepo,
   RunRepo,
 } from "../src/services/store/repositories.js";
-import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
+import {
+  SqliteClientLive,
+  transact,
+} from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 
 const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
@@ -104,6 +109,33 @@ const NonEmptyDistinctStrings = Schema.Struct({
   first: Schema.String.pipe(Schema.minLength(1)),
   second: Schema.String.pipe(Schema.minLength(1)),
 }).pipe(Schema.filter((s) => s.first !== s.second));
+
+it("rolls back after a commit failure so the next write can proceed", async () => {
+  const statements: string[] = [];
+  let failCommit = true;
+  const db = {
+    exec: (statement: string) => {
+      statements.push(statement);
+      if (statement === "COMMIT" && failCommit) {
+        failCommit = false;
+        throw new Error("busy");
+      }
+    },
+  } as unknown as Database;
+
+  const first = await Effect.runPromiseExit(
+    transact(db, Effect.succeed("first")),
+  );
+  expect(Exit.isFailure(first)).toBe(true);
+  await Effect.runPromise(transact(db, Effect.succeed("second")));
+  expect(statements).toEqual([
+    "BEGIN IMMEDIATE",
+    "COMMIT",
+    "ROLLBACK",
+    "BEGIN IMMEDIATE",
+    "COMMIT",
+  ]);
+});
 
 describe("Store repositories", () => {
   it.scopedLive("encrypts tokens at rest and round-trips installations", () =>
@@ -213,6 +245,60 @@ describe("Store repositories", () => {
           ).toBe(true);
         }),
       ),
+  );
+  it.scopedLive(
+    "catch-up candidates include live runs despite leases and retry delays",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* RunRepo;
+          const sessionId = makeSessionId("catchup-leased");
+          yield* repo.create({
+            sessionId,
+            organizationId: makeOrganizationId("org-1"),
+            issueId: Option.none(),
+            now: 1_000,
+          });
+          yield* repo.update(sessionId, {
+            state: "running",
+            nextAttemptAt: Option.some(9_000),
+          });
+          expect(
+            yield* repo.claimLease(sessionId, "worker-a", 60_000, 1_000),
+          ).toBe(true);
+
+          const candidates = yield* repo.listCatchupCandidates(2_000);
+          expect(candidates.map((run) => run.sessionId)).toEqual([sessionId]);
+        }),
+      ),
+  );
+  it.scopedLive("keeps canceled catch-up candidates for seven days", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const repo = yield* RunRepo;
+        const sessionId = makeSessionId("catchup-canceled");
+        yield* repo.create({
+          sessionId,
+          organizationId: makeOrganizationId("org-1"),
+          issueId: Option.none(),
+          now: 0,
+        });
+        yield* repo.update(sessionId, { state: "canceled" });
+        const updatedAt = yield* Clock.currentTimeMillis;
+        const sixDays = 6 * 24 * 60 * 60_000;
+        const eightDays = 8 * 24 * 60 * 60_000;
+        expect(
+          (yield* repo.listCatchupCandidates(updatedAt + sixDays)).some(
+            (run) => run.sessionId === sessionId,
+          ),
+        ).toBe(true);
+        expect(
+          (yield* repo.listCatchupCandidates(updatedAt + eightDays)).some(
+            (run) => run.sessionId === sessionId,
+          ),
+        ).toBe(false);
+      }),
+    ),
   );
 
   it.scopedLive("recovers active runs and leases after a process restart", () =>
