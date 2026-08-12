@@ -4,6 +4,7 @@ import { Effect, Layer, Schedule } from "effect";
 import { router } from "./http/router.js";
 import { Admin } from "./services/admin.js";
 import { GatewayConfig } from "./services/config.js";
+import { Executor } from "./services/executor.js";
 import { GitHubApp } from "./services/github-app.js";
 import { LinearGateway } from "./services/linear-gateway.js";
 import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
@@ -17,6 +18,7 @@ import { SessionAuthority } from "./services/session-authority.js";
 import {
   AdminSessionRepo,
   DeliveryRepo,
+  ExecutorInstanceRepo,
   InstallationRepo,
   McpServerRepo,
   ProjectionRepo,
@@ -47,6 +49,8 @@ export const GatewayServicesLive = Layer.mergeAll(
   RunEventRepo.Default,
   ProjectionRepo.Default,
   WorkspaceRepo.Default,
+  ExecutorInstanceRepo.Default,
+  Executor.Default,
   McpServerRepo.Default,
   LinearGateway.Default,
   WebhookPipeline.Default,

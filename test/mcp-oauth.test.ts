@@ -338,6 +338,133 @@ describe("MCP OAuth primitives", () => {
     expect(String(init?.body)).not.toContain("client_secret");
   });
 
+  it("invalidates an earlier authorization before inserting a retry", async () => {
+    const organizationId = "org-retry-state" as OrganizationId;
+    const serverId = "mcp-retry-state" as McpServerId;
+    const fetchMock = vi.fn<typeof fetch>();
+    const responses = [
+      new Response(
+        JSON.stringify({
+          resource: "https://mcp.example/server",
+          authorization_servers: ["https://issuer.example"],
+        }),
+        { status: 200 },
+      ),
+      new Response(
+        JSON.stringify({
+          issuer: "https://issuer.example",
+          authorization_endpoint: "https://issuer.example/authorize",
+          token_endpoint: "https://issuer.example/token",
+        }),
+        { status: 200 },
+      ),
+      new Response(
+        JSON.stringify({
+          resource: "https://mcp.example/server",
+          authorization_servers: ["https://issuer.example"],
+        }),
+        { status: 200 },
+      ),
+      new Response(
+        JSON.stringify({
+          issuer: "https://issuer.example",
+          authorization_endpoint: "https://issuer.example/authorize",
+          token_endpoint: "https://issuer.example/token",
+        }),
+        { status: 200 },
+      ),
+    ];
+    fetchMock.mockImplementation(async () => {
+      const response = responses.shift();
+      return (
+        response ??
+        new Response("unexpected discovery request", { status: 500 })
+      );
+    });
+    const configProvider = ConfigProvider.fromMap(
+      new Map([
+        ["LINEAR_CLIENT_ID", "test-client"],
+        ["LINEAR_CLIENT_SECRET", "test-secret"],
+        ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
+        [
+          "TOKEN_ENCRYPTION_KEY",
+          Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),
+        ],
+        ["PUBLIC_URL", "http://localhost:3000"],
+        [
+          "NIXPKGS_FLAKE_REF",
+          "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
+        ],
+        ["WORKSPACE_ROOT", "/tmp/mcp-oauth-retry-state"],
+      ]),
+    );
+    const sqlite = SqliteClientLive(":memory:");
+    const configLayer = Layer.setConfigProvider(configProvider);
+    const token = TokenCrypto.Default.pipe(
+      Layer.provide(Layer.mergeAll(sqlite, configLayer)),
+    );
+    const gateway = GatewayConfig.Default.pipe(Layer.provide(configLayer));
+    const servers = McpServerRepo.Default.pipe(
+      Layer.provide(Layer.mergeAll(sqlite, token)),
+    );
+    const oauth = McpOAuth.Default.pipe(
+      Layer.provide(Layer.mergeAll(sqlite, token, gateway, servers)),
+    );
+    const dependencies = Layer.mergeAll(sqlite, token, gateway, servers, oauth);
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const serverRepo = yield* McpServerRepo;
+            const service = yield* McpOAuth;
+            const { db } = yield* SqliteClient;
+            yield* serverRepo.createMcpServer({
+              organizationId,
+              id: serverId,
+              name: "retry state",
+              transport: "http",
+              url: "https://mcp.example/server",
+            });
+            const client = {
+              clientId: "client-1",
+              authorizationEndpoint: "https://issuer.example/authorize",
+              tokenEndpoint: "https://issuer.example/token",
+            };
+            const first = yield* service.startMcpAuthorization(
+              organizationId,
+              serverId,
+              client,
+              undefined,
+              "admin-session",
+            );
+            const second = yield* service.startMcpAuthorization(
+              organizationId,
+              serverId,
+              client,
+              undefined,
+              "admin-session",
+            );
+            expect(second.state).not.toBe(first.state);
+            const row = db
+              .query<{ count: number }, [string, string]>(
+                "SELECT COUNT(*) AS count FROM mcp_oauth_state WHERE organization_id = ? AND server_id = ? AND consumed_at IS NULL",
+              )
+              .get(organizationId, serverId);
+            expect(row?.count).toBe(1);
+            const active = db
+              .query<{ state_hash: string }, [string, string]>(
+                "SELECT state_hash FROM mcp_oauth_state WHERE organization_id = ? AND server_id = ? AND consumed_at IS NULL",
+              )
+              .get(organizationId, serverId);
+            expect(active?.state_hash).toBe(hash(second.state));
+          }).pipe(Effect.provide(dependencies)),
+        ),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
   it("materializes an isolated Pi auth database with access-only MCP credentials", async () => {
     const workspace = `/tmp/mcp-oauth-test-${crypto.randomUUID()}`;
     const agentDir = await materializeMcpAgentDb(workspace, [

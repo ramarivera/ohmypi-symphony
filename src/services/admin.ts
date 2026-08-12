@@ -40,12 +40,18 @@ import type {
 } from "../domain/models.js";
 import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
+import {
+  Executor,
+  type ExecutorRequestError,
+  executorUrlForPath,
+} from "./executor.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { McpOAuth, type McpOAuthTokenEndpointAuthMethod } from "./mcp-oauth.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
+  ExecutorInstanceRepo,
   InstallationRepo,
   McpServerRepo,
   RunEventRepo,
@@ -109,10 +115,13 @@ export interface ReconcilerShape {
   readonly status: () => Effect.Effect<ReconcilerStatus, never>;
   readonly trigger: () => Effect.Effect<void, never>;
 }
-
 export interface AdminDeps {
   readonly config: GatewayConfigShape;
   readonly adminSessionRepo: AdminSessionRepo;
+  readonly executorInstanceRepo: ExecutorInstanceRepo;
+  readonly executor: {
+    readonly listToolkits: Executor["listToolkits"];
+  };
   readonly installationRepo: InstallationRepo;
   readonly runRepo: RunRepo;
   readonly runEventRepo: RunEventRepo;
@@ -143,7 +152,7 @@ class AdminError extends Schema.TaggedError<AdminError>()(
   "@Gateway/AdminError",
   {
     message: Schema.String,
-    status: Schema.Literal(400, 401, 403, 404, 409, 429, 500),
+    status: Schema.Literal(400, 401, 403, 404, 409, 429, 500, 502),
   },
 ) {}
 
@@ -516,6 +525,75 @@ export function toApiMcpServer(
     createdAt: server.createdAt,
     updatedAt: server.updatedAt,
   };
+}
+const EXECUTOR_ATTACHMENT_PREFIX = "executor:";
+
+const executorAttachmentSlug = (server: McpServerRecord): string | null => {
+  if (!server.name.startsWith(EXECUTOR_ATTACHMENT_PREFIX)) return null;
+  const marker = server.name
+    .slice(EXECUTOR_ATTACHMENT_PREFIX.length)
+    .split(":", 1)[0];
+  if (!marker) return null;
+  try {
+    return decodeURIComponent(marker);
+  } catch {
+    return null;
+  }
+};
+
+const synchronizeExecutorAttachments = (
+  deps: AdminDeps,
+  organizationId: OrganizationId,
+  endpoint: string | null,
+  token: string | null,
+  now: number,
+): Effect.Effect<void, DatabaseError | RowDecodeError | TokenCipherError> =>
+  Effect.gen(function* () {
+    const servers = yield* deps.mcpServerRepo.listMcpServers(organizationId);
+    yield* Effect.forEach(servers, (server) => {
+      if (executorAttachmentSlug(server) === null) return Effect.void;
+      if (endpoint === null || token === null) {
+        return deps.mcpServerRepo
+          .updateMcpServer(organizationId, server.id, {
+            enabled: false,
+            now,
+          })
+          .pipe(Effect.asVoid);
+      }
+      const slug = executorAttachmentSlug(server);
+      if (slug === null) return Effect.void;
+      return deps.mcpServerRepo
+        .updateMcpServer(organizationId, server.id, {
+          url: executorUrlForPath(
+            endpoint,
+            `mcp/toolkits/${encodeURIComponent(slug)}`,
+          ),
+          headers: { Authorization: `Bearer ${token}` },
+          now,
+        })
+        .pipe(Effect.asVoid);
+    });
+  });
+
+function toApiExecutorInstance(instance: {
+  readonly endpoint: string;
+  readonly updatedAt: number;
+}) {
+  return {
+    endpoint: instance.endpoint,
+    token: "•••",
+    updatedAt: instance.updatedAt,
+  };
+}
+
+function executorError(error: ExecutorRequestError): AdminError {
+  const status =
+    error.reason === "not_configured"
+      ? 404
+      : error.reason === "invalid_endpoint"
+        ? 400
+        : 502;
+  return new AdminError({ message: error.message, status });
 }
 
 function toAdminInstallation(installation: Installation) {
@@ -1075,6 +1153,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const oauthStatuses = yield* deps.mcpOAuth.listStatuses(
           session.organizationId,
         );
+        const executorInstance = yield* deps.executorInstanceRepo.get(
+          session.organizationId,
+        );
         const reconcilerStatus = yield* deps.reconciler.status();
         return Option.some(
           json({
@@ -1086,6 +1167,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
             },
             installation: adminInstallation,
             repositories: repositories.map(toApiRepository),
+            executorInstance: Option.match(executorInstance, {
+              onNone: () => null,
+              onSome: toApiExecutorInstance,
+            }),
             csrfToken: deriveCsrfToken(session.rawToken),
             mcpServers: mcpServers.map((server) =>
               toApiMcpServer(
@@ -1104,6 +1189,169 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
       }
 
+      if (
+        url.pathname === "/api/admin/executor-instance" &&
+        request.method === "GET"
+      ) {
+        const session = yield* requireSession(request);
+        const instance = yield* deps.executorInstanceRepo.get(
+          session.organizationId,
+        );
+        return Option.some(
+          json({
+            executorInstance: Option.match(instance, {
+              onNone: () => null,
+              onSome: toApiExecutorInstance,
+            }),
+          }),
+        );
+      }
+      if (
+        url.pathname === "/api/admin/executor-instance" &&
+        request.method === "PUT"
+      ) {
+        const session = yield* requireMutation(request);
+        const body = yield* parseJsonBody(request);
+        const endpoint = optionalString(body.endpoint);
+        if (endpoint === null)
+          return Option.some(text("endpoint is required", 400));
+        let parsedEndpoint: URL;
+        try {
+          parsedEndpoint = new URL(endpoint);
+        } catch {
+          return Option.some(text("endpoint must be a URL", 400));
+        }
+        if (parsedEndpoint.protocol !== "https:")
+          return Option.some(text("endpoint must use https", 400));
+        if (
+          parsedEndpoint.username ||
+          parsedEndpoint.password ||
+          parsedEndpoint.search ||
+          parsedEndpoint.hash
+        )
+          return Option.some(
+            text(
+              "endpoint must not contain credentials, query, or fragment",
+              400,
+            ),
+          );
+        const current = yield* deps.executorInstanceRepo.get(
+          session.organizationId,
+        );
+        const rawToken = optionalString(body.token);
+        const token =
+          rawToken === null || rawToken === "•••"
+            ? Option.match(current, {
+                onNone: () => null,
+                onSome: (entry) => entry.token,
+              })
+            : rawToken;
+        if (token === null) return Option.some(text("token is required", 400));
+        const instance = yield* deps.executorInstanceRepo.put({
+          organizationId: session.organizationId,
+          endpoint: parsedEndpoint.toString().replace(/\/+$/u, ""),
+          token,
+          updatedAt: now,
+        });
+        yield* synchronizeExecutorAttachments(
+          deps,
+          session.organizationId,
+          instance.endpoint,
+          instance.token,
+          now,
+        );
+        return Option.some(
+          json({ executorInstance: toApiExecutorInstance(instance) }),
+        );
+      }
+      if (
+        url.pathname === "/api/admin/executor-instance" &&
+        request.method === "DELETE"
+      ) {
+        const session = yield* requireMutation(request);
+        yield* deps.executorInstanceRepo.remove(session.organizationId);
+        yield* synchronizeExecutorAttachments(
+          deps,
+          session.organizationId,
+          null,
+          null,
+          now,
+        );
+        return Option.some(emptyResponse(204));
+      }
+      if (
+        url.pathname === "/api/admin/executor/toolkits" &&
+        request.method === "GET"
+      ) {
+        const session = yield* requireSession(request);
+        const toolkits = yield* deps.executor
+          .listToolkits(session.organizationId)
+          .pipe(Effect.mapError(executorError));
+        return Option.some(json({ toolkits }));
+      }
+      if (
+        url.pathname === "/api/admin/executor/attach" &&
+        request.method === "POST"
+      ) {
+        const session = yield* requireMutation(request);
+        const body = yield* parseJsonBody(request);
+        const slug = optionalString(body.slug);
+        if (slug === null) return Option.some(text("slug is required", 400));
+        const instance = yield* deps.executorInstanceRepo.get(
+          session.organizationId,
+        );
+        if (Option.isNone(instance))
+          return Option.some(text("Executor is not configured", 404));
+        const name = `${EXECUTOR_ATTACHMENT_PREFIX}${encodeURIComponent(slug)}:${optionalString(body.name) ?? slug}`;
+        const rawId = optionalString(body.id) ?? `executor-${slug}`;
+        const id = yield* Schema.decodeUnknown(McpServerId)(rawId).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid MCP server id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        let repositoryId = Option.none<WorkspaceId>();
+        if (body.repositoryId !== undefined && body.repositoryId !== null) {
+          const value = optionalString(body.repositoryId);
+          if (value === null)
+            return Option.some(
+              text("repositoryId must be a string or null", 400),
+            );
+          repositoryId = Option.some(
+            yield* Schema.decodeUnknown(WorkspaceId)(value).pipe(
+              Effect.catchTags({
+                ParseError: () =>
+                  Effect.fail(
+                    new AdminError({
+                      message: "Invalid repository id",
+                      status: 400,
+                    }),
+                  ),
+              }),
+            ),
+          );
+        }
+        const server = yield* deps.mcpServerRepo.createMcpServer({
+          organizationId: session.organizationId,
+          id,
+          name,
+          transport: "http",
+          url: executorUrlForPath(
+            instance.value.endpoint,
+            `mcp/toolkits/${encodeURIComponent(slug)}`,
+          ),
+          headers: { Authorization: `Bearer ${instance.value.token}` },
+          repositoryId,
+          enabled: true,
+          now,
+        });
+        return Option.some(json({ mcpServer: toApiMcpServer(server) }, 201));
+      }
       if (
         url.pathname === "/api/admin/repositories" &&
         request.method === "GET"
@@ -1747,6 +1995,8 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     GatewayConfig.Default,
     AdminSessionRepo.Default,
     InstallationRepo.Default,
+    ExecutorInstanceRepo.Default,
+    Executor.Default,
     RunRepo.Default,
     RunEventRepo.Default,
     RunInputRepo.Default,
@@ -1761,6 +2011,8 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
   effect: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const adminSessionRepo = yield* AdminSessionRepo;
+    const executorInstanceRepo = yield* ExecutorInstanceRepo;
+    const executor = yield* Executor;
     const installationRepo = yield* InstallationRepo;
     const runRepo = yield* RunRepo;
     const runEventRepo = yield* RunEventRepo;
@@ -1775,6 +2027,8 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const handle = createAdminHandle({
       config,
       adminSessionRepo,
+      executorInstanceRepo,
+      executor,
       installationRepo,
       runRepo,
       runEventRepo,
