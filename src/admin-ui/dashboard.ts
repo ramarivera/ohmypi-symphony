@@ -145,6 +145,36 @@ export const ADMIN_BODY = `
       </div>
     </section>
 
+    <section class="panel" aria-labelledby="mcp-heading">
+      <div class="panel-header">
+        <h2 id="mcp-heading">MCP servers</h2>
+        <button id="new-mcp-btn" type="button" class="btn">+ Add MCP server</button>
+      </div>
+      <div class="panel-body">
+        <div id="mcp-status" role="status" aria-live="polite"></div>
+        <div id="mcp-list" aria-busy="true"></div>
+        <form id="mcp-form" class="repo-form" novalidate hidden>
+          <div class="field"><label for="mcp-id">Server ID</label><input id="mcp-id" name="id" required autocomplete="off" placeholder="github"></div>
+          <div class="field"><label for="mcp-name">MCP name</label><input id="mcp-name" name="name" required autocomplete="off" placeholder="github"></div>
+          <div class="field"><label for="mcp-transport">Transport</label><select id="mcp-transport" name="transport"><option value="stdio">stdio</option><option value="http">http</option><option value="sse">sse</option></select></div>
+          <div class="field"><label for="mcp-command">Command</label><input id="mcp-command" name="command" autocomplete="off" placeholder="npx"></div>
+          <div class="field"><label for="mcp-url">URL</label><input id="mcp-url" name="url" type="url" autocomplete="off" placeholder="https://mcp.example.com"></div>
+          <div class="field"><label for="mcp-args">Arguments (JSON array or comma-separated)</label><input id="mcp-args" name="args" autocomplete="off"></div>
+          <div class="field"><label for="mcp-env">Environment (KEY=value per line)</label><textarea id="mcp-env" name="env" rows="3" autocomplete="off"></textarea><span class="hint">Secret values are write-only; existing values show as •••.</span></div>
+          <div class="field full" id="mcp-headers-field" hidden>
+            <label>Headers</label>
+            <div id="mcp-headers-editor" class="key-value-editor"></div>
+            <button type="button" class="btn" id="mcp-add-header">+ Add header</button>
+            <span class="hint">Secret values are write-only; existing values show as •••.</span>
+          </div>
+          <div class="field"><label for="mcp-repository">Repository ID (blank = installation-wide)</label><input id="mcp-repository" name="repositoryId" autocomplete="off"></div>
+          <div class="field"><label class="checkbox"><input id="mcp-enabled" name="enabled" type="checkbox" checked> Enabled</label></div>
+          <div id="mcp-form-error" class="error" role="alert" hidden></div>
+          <div class="form-actions"><button type="button" class="btn" id="mcp-cancel">Cancel</button><button type="submit" class="btn btn-primary" id="mcp-submit">Save MCP server</button></div>
+        </form>
+      </div>
+    </section>
+
     <section class="panel" aria-labelledby="nix-cache-heading">
       <div class="panel-header">
         <h2 id="nix-cache-heading">Nix package cache</h2>
@@ -219,12 +249,16 @@ export const ADMIN_SCRIPT = `
   var REPOSITORY_DETAIL = function (id) { return REPOSITORIES_BASE + "/" + encodeURIComponent(id); };
   var PREVIEW_URL = "/api/admin/preview";
   var NIX_CACHE_URL = "/api/admin/nix-cache";
+  var MCP_BASE = "/api/admin/mcp-servers";
+  var MCP_DETAIL = function (id) { return MCP_BASE + "/" + encodeURIComponent(id); };
   var LOGOUT_URL = "/api/admin/logout";
 
   var state = {
     csrfToken: "",
     installation: null,
     repositories: [],
+    mcpServers: [],
+    editingMcp: null,
     nixCache: [],
     editing: null,
     pendingDelete: null,
@@ -476,6 +510,106 @@ export const ADMIN_SCRIPT = `
     status.textContent = repositories.length + " repositories configured.";
   }
 
+  function renderMcpServers(servers) {
+    var list = el("mcp-list");
+    var status = el("mcp-status");
+    if (!list || !status) return;
+    list.textContent = "";
+    if (!Array.isArray(servers) || servers.length === 0) {
+      status.textContent = "No MCP servers configured.";
+      list.textContent = "Add an installation-wide or repository-scoped server.";
+      setAriaBusy("mcp-list", false);
+      return;
+    }
+    status.textContent = servers.length + " MCP servers configured.";
+    var table = document.createElement("table");
+    table.className = "repos";
+    var head = document.createElement("thead");
+    var row = document.createElement("tr");
+    ["Name", "Transport", "Scope", "Environment", "Status", ""].forEach(function (label) {
+      var th = document.createElement("th"); th.scope = "col"; th.textContent = label; row.appendChild(th);
+    });
+    head.appendChild(row); table.appendChild(head);
+    var body = document.createElement("tbody");
+    servers.forEach(function (server) {
+      var tr = document.createElement("tr");
+      var name = document.createElement("td"); name.textContent = server.name || server.id || "—"; tr.appendChild(name);
+      var transport = document.createElement("td"); transport.textContent = server.transport || "—"; tr.appendChild(transport);
+      var scope = document.createElement("td"); scope.textContent = server.repositoryId || "installation-wide"; tr.appendChild(scope);
+      var env = document.createElement("td"); env.textContent = server.env && Object.keys(server.env).length ? Object.keys(server.env).map(function (key) { return key + "=•••"; }).join(", ") : "—"; tr.appendChild(env);
+      var enabled = document.createElement("td"); enabled.textContent = server.enabled ? "enabled" : "disabled"; tr.appendChild(enabled);
+      var actions = document.createElement("td"); actions.className = "actions";
+      var edit = document.createElement("button"); edit.type = "button"; edit.dataset.action = "edit-mcp"; edit.dataset.mcpId = server.id || ""; edit.textContent = "Edit"; actions.appendChild(edit);
+      var toggle = document.createElement("button"); toggle.type = "button"; toggle.dataset.action = "toggle-mcp"; toggle.dataset.mcpId = server.id || ""; toggle.textContent = server.enabled ? "Disable" : "Enable"; actions.appendChild(toggle);
+      var remove = document.createElement("button"); remove.type = "button"; remove.className = "btn-danger"; remove.dataset.action = "delete-mcp"; remove.dataset.mcpId = server.id || ""; remove.textContent = "Delete"; actions.appendChild(remove);
+      tr.appendChild(actions); body.appendChild(tr);
+    });
+    table.appendChild(body); list.appendChild(table); setAriaBusy("mcp-list", false);
+  }
+  function addMcpHeaderRow(key, value) {
+    var editor = el("mcp-headers-editor"); if (!editor) return;
+    var row = document.createElement("div"); row.className = "key-value-row"; row.setAttribute("data-header-row", "true");
+    var keyInput = document.createElement("input"); keyInput.type = "text"; keyInput.placeholder = "Header name"; keyInput.autocomplete = "off"; keyInput.value = key || "";
+    var valueInput = document.createElement("input"); valueInput.type = "text"; valueInput.placeholder = "Value"; valueInput.autocomplete = "off"; valueInput.value = value || "";
+    var remove = document.createElement("button"); remove.type = "button"; remove.className = "btn btn-danger"; remove.textContent = "Remove"; remove.addEventListener("click", function () { row.remove(); });
+    row.appendChild(keyInput); row.appendChild(valueInput); row.appendChild(remove); editor.appendChild(row);
+  }
+  function setMcpHeaderRows(headers) {
+    var editor = el("mcp-headers-editor"); if (!editor) return;
+    editor.textContent = "";
+    Object.keys(headers || {}).forEach(function (key) { addMcpHeaderRow(key, headers[key]); });
+  }
+  function readMcpHeaderRows() {
+    var headers = {};
+    var editor = el("mcp-headers-editor"); if (!editor) return headers;
+    editor.querySelectorAll("[data-header-row]").forEach(function (row) {
+      var inputs = row.querySelectorAll("input"); if (inputs.length < 2) return;
+      var key = inputs[0].value.trim(); if (!key) return;
+      headers[key] = inputs[1].value;
+    });
+    return headers;
+  }
+  function syncMcpHeaderVisibility() {
+    var transport = el("mcp-transport"); var field = el("mcp-headers-field");
+    if (field) field.hidden = !transport || (transport.value !== "http" && transport.value !== "sse");
+  }
+  function openMcpForm(server) {
+    state.editingMcp = server || null;
+    var form = el("mcp-form"); if (!form) return;
+    var fields = { id: server && server.id || "", name: server && server.name || "", transport: server && server.transport || "stdio", command: server && server.command || "", url: server && server.url || "", args: server && Array.isArray(server.args) ? JSON.stringify(server.args) : "", env: server && server.env ? Object.keys(server.env).map(function (key) { return key + "=" + server.env[key]; }).join("\\n") : "", repositoryId: server && server.repositoryId || "", enabled: !server || server.enabled !== false };
+    Object.keys(fields).forEach(function (key) { var field = form.elements.namedItem(key); if (!field) return; if (field.type === "checkbox") field.checked = fields[key]; else field.value = fields[key]; });
+    setMcpHeaderRows(server && server.headers ? server.headers : {});
+    syncMcpHeaderVisibility();
+    var idField = el("mcp-id"); if (idField) idField.readOnly = !!(server && server.id);
+    var error = el("mcp-form-error"); if (error) { error.textContent = ""; error.hidden = true; }
+    form.hidden = false; var focus = server ? el("mcp-name") : idField; if (focus) focus.focus();
+  }
+  function closeMcpForm() { var form = el("mcp-form"); if (form) form.hidden = true; state.editingMcp = null; }
+  function serializeMcpForm() {
+    var form = el("mcp-form"), fields = form.elements, env = {};
+    (fields.namedItem("env").value || "").split("\\n").forEach(function (line) { var index = line.indexOf("="); if (index <= 0) return; env[line.slice(0, index).trim()] = line.slice(index + 1); });
+    return { id: fields.namedItem("id").value.trim(), name: fields.namedItem("name").value.trim(), transport: fields.namedItem("transport").value, command: fields.namedItem("command").value.trim() || null, url: fields.namedItem("url").value.trim() || null, args: parseMcpArgs(fields.namedItem("args").value), env: env, headers: readMcpHeaderRows(), repositoryId: fields.namedItem("repositoryId").value.trim() || null, enabled: !!fields.namedItem("enabled").checked };
+  }
+  async function submitMcpForm(event) {
+    event.preventDefault(); var payload = serializeMcpForm();
+    if (!payload.id || !payload.name) { var invalid = el("mcp-form-error"); invalid.textContent = "Server ID and name are required."; invalid.hidden = false; return; }
+    var button = el("mcp-submit"); if (button) button.disabled = true;
+    try { var update = !!(state.editingMcp && state.editingMcp.id); var result = await fetchJSON(update ? MCP_DETAIL(state.editingMcp.id) : MCP_BASE, { method: update ? "PUT" : "POST", body: payload }); if (result && result.redirecting) return; closeMcpForm(); showToast(update ? "MCP server updated." : "MCP server added.", "ok"); await loadBootstrap({ announce: false }); }
+    catch (err) { var box = el("mcp-form-error"); box.textContent = err && err.message ? err.message : "Could not save MCP server."; box.hidden = false; }
+    finally { if (button) button.disabled = false; }
+  }
+  async function deleteMcpServer(id) { var result = await fetchJSON(MCP_DETAIL(id), { method: "DELETE", body: {} }); if (result && result.redirecting) return; showToast("MCP server removed.", "ok"); await loadBootstrap({ announce: false }); }
+  async function toggleMcpServer(server) { var result = await fetchJSON(MCP_DETAIL(server.id), { method: "PUT", body: Object.assign({}, server, { enabled: !server.enabled }) }); if (result && result.redirecting) return; await loadBootstrap({ announce: false }); }
+  function handleMcpClick(event) {
+    var target = event.target; if (!(target instanceof HTMLElement)) return;
+    var button = target.closest("button[data-action]"); if (!button) return;
+    var id = button.getAttribute("data-mcp-id") || ""; var server = state.mcpServers.find(function (item) { return item && item.id === id; }); if (!server) return;
+    var action = button.getAttribute("data-action");
+    if (action === "edit-mcp") openMcpForm(server);
+    if (action === "toggle-mcp") toggleMcpServer(server);
+    if (action === "delete-mcp") openConfirm({ title: "Delete MCP server?", body: "Remove " + (server.name || id) + "?", onConfirm: function () { deleteMcpServer(id); } });
+  }
+
   function buildCopyCell(text) {
     var span = document.createElement("span");
     span.textContent = text;
@@ -632,6 +766,17 @@ export const ADMIN_SCRIPT = `
       .split(",")
       .map(function (entry) { return entry.trim(); })
       .filter(function (entry) { return entry.length > 0; });
+  }
+  function parseMcpArgs(value) {
+    if (typeof value !== "string") return [];
+    var trimmed = value.trim();
+    if (trimmed.charAt(0) === "[") {
+      try {
+        var parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed) && parsed.every(function (entry) { return typeof entry === "string"; })) return parsed;
+      } catch {}
+    }
+    return parseList(value);
   }
 
   function serializeForm(form) {
@@ -940,8 +1085,10 @@ export const ADMIN_SCRIPT = `
       state.csrfToken = typeof data.csrfToken === "string" ? data.csrfToken : "";
       state.installation = data.installation || null;
       state.repositories = Array.isArray(data.repositories) ? data.repositories : [];
+      state.mcpServers = Array.isArray(data.mcpServers) ? data.mcpServers : [];
       renderInstallation(state.installation);
       renderRepositories(state.repositories);
+      renderMcpServers(state.mcpServers);
       await loadNixCache();
       var badge = computeAccessibilityBadge(state.installation);
       setStatus(badge.state, badge.label);
@@ -984,6 +1131,14 @@ export const ADMIN_SCRIPT = `
   function init() {
     var newBtn = el("new-repo-btn");
     if (newBtn) newBtn.addEventListener("click", function () { openForm(null); });
+    var newMcpBtn = el("new-mcp-btn");
+    if (newMcpBtn) newMcpBtn.addEventListener("click", function () { openMcpForm(null); });
+    var mcpCancel = el("mcp-cancel");
+    if (mcpCancel) mcpCancel.addEventListener("click", closeMcpForm);
+    var addHeader = el("mcp-add-header");
+    if (addHeader) addHeader.addEventListener("click", function () { addMcpHeaderRow("", ""); });
+    var transport = el("mcp-transport");
+    if (transport) transport.addEventListener("change", syncMcpHeaderVisibility);
 
     var cancelBtn = el("form-cancel-btn");
     if (cancelBtn) cancelBtn.addEventListener("click", closeForm);
@@ -993,12 +1148,16 @@ export const ADMIN_SCRIPT = `
 
     var form = el("repo-form");
     if (form) form.addEventListener("submit", submitRepoForm);
+    var mcpForm = el("mcp-form");
+    if (mcpForm) mcpForm.addEventListener("submit", submitMcpForm);
 
     var previewForm = el("preview-form");
     if (previewForm) previewForm.addEventListener("submit", submitPreview);
 
     var list = el("repos-list");
     if (list) list.addEventListener("click", handleRepoRowClick);
+    var mcpList = el("mcp-list");
+    if (mcpList) mcpList.addEventListener("click", handleMcpClick);
     var nixCacheList = el("nix-cache-list");
     if (nixCacheList) nixCacheList.addEventListener("click", handleRepoRowClick);
 

@@ -4,6 +4,7 @@ import {
   DeliveryId,
   InputId,
   IssueId,
+  McpServerId,
   OrganizationId,
   ProjectId,
   SessionId,
@@ -122,6 +123,28 @@ export const RepositoryRecord = Schema.extend(
   }),
 );
 export type RepositoryRecord = Schema.Schema.Type<typeof RepositoryRecord>;
+export const McpServerTransport = Schema.Literal("stdio", "http", "sse");
+export type McpServerTransport = Schema.Schema.Type<typeof McpServerTransport>;
+
+export const McpServerRecord = Schema.Struct({
+  id: McpServerId,
+  organizationId: OrganizationId,
+  name: Schema.String,
+  transport: McpServerTransport,
+  command: Schema.OptionFromNullOr(Schema.String),
+  args: Schema.Array(Schema.String),
+  url: Schema.OptionFromNullOr(Schema.String),
+  env: Schema.Record({ key: Schema.String, value: Schema.String }),
+  headers: Schema.optionalWith(
+    Schema.Record({ key: Schema.String, value: Schema.String }),
+    { default: () => ({}) },
+  ),
+  repositoryId: Schema.OptionFromNullOr(WorkspaceId),
+  enabled: Schema.Boolean,
+  createdAt: Schema.Number,
+  updatedAt: Schema.Number,
+});
+export type McpServerRecord = Schema.Schema.Type<typeof McpServerRecord>;
 
 export const Installation = Schema.Struct({
   organizationId: OrganizationId,

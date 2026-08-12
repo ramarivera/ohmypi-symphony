@@ -20,9 +20,15 @@ import type { SessionId, SourceKey } from "../domain/ids.js";
 import {
   type AgentRun,
   isDeferredNotificationStopPayload,
+  type McpServerRecord,
 } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
+import {
+  removeMcpConfig,
+  resolveEffectiveMcpServers,
+  writeOmpMcpConfig,
+} from "./mcp-config.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import type {
@@ -35,6 +41,7 @@ import type {
 import { RpcWorker } from "./rpc-worker.js";
 import {
   InstallationRepo,
+  McpServerRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -267,6 +274,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
     dependencies: [
       ActivityProjector.Default,
       InstallationRepo.Default,
+      McpServerRepo.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
       RunRepo.Default,
@@ -287,6 +295,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
+      const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
 
       const stopShouldApply = Effect.fn("SessionAuthority.stopShouldApply")(
         function* (
@@ -907,9 +916,14 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
         // Hold the mutation gate for the whole cancellation: an in-flight
         // host-tool mutation completes first, and a mutation arriving
+        // after the gate is acquired sees the canceled run in its in-gate
+        // re-read and is refused.
         yield* withCancelMutationGate(
           run.sessionId,
           Effect.gen(function* () {
+            if (Option.isSome(run.workspacePath)) {
+              yield* removeMcpConfig(run.workspacePath.value);
+            }
             const state = yield* getWorker(run.sessionId);
             if (Option.isSome(state)) {
               yield* abortForCleanup(run.sessionId, state.value.worker);
@@ -996,6 +1010,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           }
 
           if (run.attempt >= maxAttempts) {
+            if (Option.isSome(run.workspacePath)) {
+              yield* removeMcpConfig(run.workspacePath.value);
+            }
             const correlationId = failureCorrelationId(
               sessionId,
               run.attempt,
@@ -1230,6 +1247,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* projector.projectRpcEvent(sessionId, sequence, event).pipe(
             Effect.ensuring(
               Effect.gen(function* () {
+                if (Option.isSome(run.workspacePath)) {
+                  yield* removeMcpConfig(run.workspacePath.value);
+                }
                 if (Option.isSome(worker)) {
                   yield* worker.value.worker.stop();
                 }
@@ -1270,6 +1290,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         run: AgentRun,
         worker: RpcWorkerHandle,
       ): Effect.fn.Return<void, RpcProtocolError> {
+        if (
+          typeof worker.onHostToolCall !== "function" ||
+          typeof worker.setHostTools !== "function"
+        ) {
+          return;
+        }
         const textResult = (
           text: string,
           details?: unknown,
@@ -1559,7 +1585,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         | RpcSpawnError
         | RpcTimeoutError
         | NixEnvironmentError
+        | TokenCipherError
       > {
+        if (!existsSync(cwd)) {
+          const error = new RpcSpawnError({
+            message: `Persisted workspace does not exist: ${cwd}`,
+          });
+          yield* handleFailure(run.sessionId, error);
+          return yield* Effect.fail(error);
+        }
         const command: string[] = [config.ompCliPath];
         if (Option.isSome(run.ompSessionFile)) {
           command.push("--session", run.ompSessionFile.value);
@@ -1614,11 +1648,54 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     ),
                 ),
               );
+
             environment.PATH = [...prepared.pathEntries, environment.PATH ?? ""]
               .filter((entry) => entry.length > 0)
               .join(":");
           }
         }
+        const listMcp: Effect.Effect<
+          ReadonlyArray<McpServerRecord>,
+          DatabaseError | RowDecodeError | TokenCipherError
+        > = Option.isNone(mcpServerRepoOption)
+          ? Effect.succeed([])
+          : mcpServerRepoOption.value.listMcpServers(run.organizationId);
+        const allMcpServers = yield* listMcp.pipe(
+          Effect.catchTag("@Gateway/TokenCipherError", (error) =>
+            Effect.logWarning("mcp.config.load_failed").pipe(
+              Effect.annotateLogs({
+                event: "mcp.config.load_failed",
+                sessionId: run.sessionId,
+                error: error.message,
+              }),
+              Effect.zipRight(handleFailure(run.sessionId, error)),
+              Effect.zipRight(Effect.fail(error)),
+            ),
+          ),
+        );
+        const effectiveMcpServers = resolveEffectiveMcpServers(
+          allMcpServers,
+          Option.isSome(run.repositoryId) ? run.repositoryId.value : null,
+        );
+        yield* writeOmpMcpConfig(cwd, effectiveMcpServers, run.sessionId).pipe(
+          Effect.mapError(
+            (error) =>
+              new RpcSpawnError({
+                message: `MCP config materialization failed: ${error.message}`,
+              }),
+          ),
+          Effect.catchTag("@Gateway/RpcSpawnError", (error) =>
+            Effect.logWarning("mcp.config.materialization_failed").pipe(
+              Effect.annotateLogs({
+                event: "mcp.config.materialization_failed",
+                sessionId: run.sessionId,
+                error: error.message,
+              }),
+              Effect.zipRight(handleFailure(run.sessionId, error)),
+              Effect.zipRight(Effect.fail(error)),
+            ),
+          ),
+        );
 
         const worker = yield* rpc.spawn({
           command,
@@ -1746,6 +1823,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               Option.isNone(installation) ||
               Option.isSome(installation.value.revokedAt)
             ) {
+              if (Option.isSome(run.workspacePath)) {
+                yield* removeMcpConfig(run.workspacePath.value);
+              }
               yield* runRepo.update(sessionId, {
                 state: "failed",
                 terminalReason: Option.some(
@@ -1800,6 +1880,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               !canAccessAll &&
               !teamAccess.includes(run.teamId.value)
             ) {
+              if (Option.isSome(run.workspacePath)) {
+                yield* removeMcpConfig(run.workspacePath.value);
+              }
               yield* runRepo.update(sessionId, {
                 state: "canceled",
                 terminalReason: Option.some("Linear team access was removed"),
@@ -2165,6 +2248,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           yield* Ref.set(reportedPullRequestUrlsRef, new Map());
           yield* Ref.set(stopDeferralCountsRef, new Map());
           yield* Ref.set(sessionMutationGatesRef, new Map());
+          // Shutdown intentionally does not remove mcp.json: it has no run
+          // or workspace context, so terminal-path cleanup owns deletion.
           yield* projector.flushPending();
         },
       );

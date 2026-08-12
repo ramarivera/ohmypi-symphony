@@ -216,6 +216,26 @@ const migrate = (db: Database): void => {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (organization_id, id)
     );
+    CREATE TABLE IF NOT EXISTS mcp_server (
+      organization_id TEXT NOT NULL,
+      id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      transport TEXT NOT NULL,
+      command TEXT,
+      args_json TEXT NOT NULL,
+      url TEXT,
+      env_json TEXT NOT NULL,
+      headers_json TEXT NOT NULL DEFAULT '{}',
+      repository_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, id)
+    );
+    CREATE INDEX IF NOT EXISTS mcp_server_scope
+      ON mcp_server(organization_id, repository_id, enabled);
+    CREATE UNIQUE INDEX IF NOT EXISTS mcp_server_scope_name_unique
+      ON mcp_server(organization_id, COALESCE(repository_id, ''), name);
     CREATE TABLE IF NOT EXISTS admin_session (
       token_hash TEXT PRIMARY KEY,
       organization_id TEXT NOT NULL,
@@ -251,6 +271,15 @@ const migrate = (db: Database): void => {
   if (!repositoryColumns.includes("nix_packages_json")) {
     db.exec(
       "ALTER TABLE repository ADD COLUMN nix_packages_json TEXT NOT NULL DEFAULT '[]'",
+    );
+  }
+  const mcpServerColumns = db
+    .query<{ name: string }, []>('PRAGMA table_info("mcp_server")')
+    .all()
+    .map((column) => column.name);
+  if (!mcpServerColumns.includes("headers_json")) {
+    db.exec(
+      "ALTER TABLE mcp_server ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'",
     );
   }
 

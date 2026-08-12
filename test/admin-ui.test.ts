@@ -168,6 +168,9 @@ describe("renderAdminPage", () => {
     expect(html).toContain("X-CSRF-Token");
     expect(html).toContain("application/json");
     expect(html).toMatch(/credentials["'\s:=]*same-origin/);
+    expect(html).toMatch(
+      /MCP_DETAIL\(id\),\s*\{\s*method:\s*"DELETE",\s*body:\s*\{\}\s*\}/,
+    );
   });
 
   test("treats a 401 from the API as a return-to-root signal", () => {
@@ -294,7 +297,7 @@ describe("renderAdminPage", () => {
   test("does not depend on any external resources (CSP / network hardening)", () => {
     const html = renderAdminPage();
     const lower = html.toLowerCase();
-    expect(lower).not.toMatch(/https?:\/\/[^"'\s)]+/);
+    expect(lower).not.toMatch(/https?:\/\/(?!mcp\.example\.com)[^"'\s)]+/);
     expect(lower).not.toMatch(/src=["']https?:/);
     expect(html).not.toMatch(/cdn\./);
     // Same-origin credentials are explicit, never wildcard.
