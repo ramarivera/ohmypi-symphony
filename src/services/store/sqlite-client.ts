@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Context, Effect, Layer, ParseResult, Schema } from "effect";
+import { Context, Effect, Exit, Layer, ParseResult, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 
 export interface SqliteClientShape {
@@ -32,15 +32,19 @@ export const transact = <A, E, R>(
   db: Database,
   effect: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E | DatabaseError, R> =>
-  Effect.gen(function* () {
-    const begin = () => db.exec("BEGIN IMMEDIATE");
-    const commit = () => db.exec("COMMIT");
-    const rollback = () => db.exec("ROLLBACK");
+  Effect.uninterruptibleMask((restore) =>
+    Effect.gen(function* () {
+      const begin = () => db.exec("BEGIN IMMEDIATE");
+      const commit = () => db.exec("COMMIT");
+      const rollback = () => db.exec("ROLLBACK");
 
-    yield* tryDb(begin, "BEGIN");
+      // Keep the begin operation interruptible, then mask the hand-off to the
+      // use/release section so an interrupt cannot land between BEGIN and the
+      // finalizer that rolls it back.
+      yield* restore(tryDb(begin, "BEGIN"));
+      const result = yield* Effect.exit(restore(effect));
 
-    return yield* effect.pipe(
-      Effect.matchEffect({
+      return yield* Exit.matchEffect(result, {
         onSuccess: (value) =>
           tryDb(commit, "COMMIT").pipe(
             Effect.catchTag("@Gateway/DatabaseError", (error) =>
@@ -54,17 +58,14 @@ export const transact = <A, E, R>(
             ),
             Effect.map(() => value),
           ),
-        onFailure: (error) =>
-          Effect.gen(function* () {
-            yield* Effect.orElse(
-              tryDb(rollback, "ROLLBACK"),
-              () => Effect.void,
-            );
-            return yield* Effect.fail(error);
-          }),
-      }),
-    );
-  });
+        onFailure: (cause) =>
+          tryDb(rollback, "ROLLBACK").pipe(
+            Effect.orElse(() => Effect.void),
+            Effect.zipRight(Effect.failCause(cause)),
+          ),
+      });
+    }),
+  );
 
 export const decodeRow = <A, I, R>(
   schema: Schema.Schema<A, I, R>,

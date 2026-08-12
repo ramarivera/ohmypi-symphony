@@ -1,11 +1,13 @@
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { it } from "@effect/vitest";
 import {
   Clock,
   ConfigProvider,
+  Deferred,
   Effect,
   Either,
   Exit,
+  Fiber,
   Layer,
   Option,
   Schema,
@@ -73,6 +75,39 @@ const withRepos = <A, E>(effect: Effect.Effect<A, E, RepoServices>) =>
     );
     return yield* effect.pipe(Effect.provide(repos));
   });
+
+describe("SQLite transactions", () => {
+  it.scopedLive("rolls back when the transaction fiber is interrupted", () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.acquireRelease(
+        Effect.sync(() => new Database(":memory:")),
+        (database) => Effect.sync(() => database.close()),
+      );
+      yield* Effect.sync(() => db.exec("CREATE TABLE item (value TEXT)"));
+      const entered = yield* Deferred.make<void>();
+      const fiber = yield* Effect.fork(
+        transact(
+          db,
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Effect.never;
+          }),
+        ),
+      );
+      yield* Deferred.await(entered);
+      yield* Fiber.interrupt(fiber);
+
+      yield* transact(
+        db,
+        Effect.sync(() => db.exec("INSERT INTO item VALUES ('usable')")),
+      );
+      const row = db.query("SELECT COUNT(*) AS count FROM item").get() as {
+        count: number;
+      };
+      expect(row.count).toBe(1);
+    }),
+  );
+});
 
 const makeSessionId = (value: string): SessionId => value as SessionId;
 const makeDeliveryId = (value: string): DeliveryId => value as DeliveryId;

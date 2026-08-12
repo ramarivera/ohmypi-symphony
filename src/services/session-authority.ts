@@ -342,6 +342,29 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       );
 
       const owner = `authority:${yield* Effect.sync(() => randomUUID())}`;
+      /**
+       * Swallow only failures from non-critical cleanup or explicitly
+       * best-effort external side effects. State transitions and persistence
+       * effects must stay outside this helper so their failures remain typed
+       * and visible to the authority caller.
+       */
+      const bestEffort = <A, E>(
+        description: string,
+        effect: Effect.Effect<A, E, never>,
+      ): Effect.Effect<void, never, never> =>
+        effect.pipe(
+          Effect.catchAll((error) =>
+            Effect.logWarning("authority.best_effort_failed").pipe(
+              Effect.annotateLogs({
+                event: "authority.best_effort_failed",
+                description,
+                error: String(error),
+              }),
+            ),
+          ),
+          Effect.asVoid,
+        );
+
       const leaseDurationMs = config.leaseDurationMs;
       const maxAttempts = 5;
 
@@ -733,17 +756,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Effect.gen(function* () {
           const workers = yield* Ref.get(workersRef);
           if (!workers.has(sessionId)) {
-            yield* runRepo.releaseLease(sessionId, owner).pipe(
-              Effect.catchTag("@Gateway/DatabaseError", (error) =>
-                Effect.logWarning("authority.cleanup_failed").pipe(
-                  Effect.annotateLogs({
-                    event: "authority.cleanup_failed",
-                    sessionId,
-                    operation: "releaseLease",
-                    error: error.message,
-                  }),
-                ),
-              ),
+            yield* bestEffort(
+              "release lease after authority cleanup",
+              runRepo.releaseLease(sessionId, owner),
             );
           }
         });
@@ -892,19 +907,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         sessionId: SessionId,
         worker: RpcWorkerHandle,
       ): Effect.Effect<void, never, never> =>
-        worker.abort().pipe(
-          Effect.catchTags({
-            "@Gateway/RpcProtocolError": (error) =>
-              Effect.logWarning("authority.cleanup_failed").pipe(
-                Effect.annotateLogs({
-                  event: "authority.cleanup_failed",
-                  sessionId,
-                  operation: "abort",
-                  error: error.message,
-                }),
-              ),
-          }),
-        );
+        bestEffort(`abort worker for ${sessionId}`, worker.abort());
 
       const finishLocalCommand = Effect.fn(
         "SessionAuthority.finishLocalCommand",
@@ -1233,23 +1236,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 next.set(sessionId, nextSet);
                 return next;
               });
-              yield* linearOption.value
-                .addSessionExternalUrls({
+              yield* bestEffort(
+                `report ${fresh.length} pull request URL(s) to Linear`,
+                linearOption.value.addSessionExternalUrls({
                   sessionId,
                   urls: fresh.map((url) => ({ label: "Pull request", url })),
-                })
-                .pipe(
-                  Effect.catchAll((error) =>
-                    Effect.logWarning("pull_request_url.report_failed").pipe(
-                      Effect.annotateLogs({
-                        event: "pull_request_url.report_failed",
-                        sessionId,
-                        count: fresh.length,
-                        error: String(error),
-                      }),
-                    ),
-                  ),
-                );
+                }),
+              );
             }
           }
           yield* Effect.logInfo("run.completed").pipe(
@@ -1389,13 +1382,22 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               return fail("Linear gateway is unavailable");
             }
             const raw = request.arguments;
-            const current = yield* runRepo
-              .get(run.sessionId)
-              .pipe(
-                Effect.catchAll(() => Effect.succeed(Option.none<AgentRun>())),
-              );
-            if (Option.isNone(current)) return fail("Run no longer exists");
-            const currentRun = current.value;
+            // Host-tool callbacks intentionally turn infrastructure failures
+            // into an isError result for the model; they must not masquerade
+            // as an absent run.
+            const current = yield* runRepo.get(run.sessionId).pipe(
+              Effect.map((value) => ({ ok: true as const, value })),
+              Effect.catchAll((error) =>
+                Effect.succeed({
+                  ok: false as const,
+                  result: fail(`Unable to read run state: ${String(error)}`),
+                }),
+              ),
+            );
+            if (!current.ok) return current.result;
+            if (Option.isNone(current.value))
+              return fail("Run no longer exists");
+            const currentRun = current.value.value;
             const issueId = Option.isSome(currentRun.issueId)
               ? currentRun.issueId.value
               : null;
@@ -1546,22 +1548,29 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             return yield* withSessionMutationGate(
               run.sessionId,
               Effect.gen(function* () {
-                const fresh = yield* runRepo
-                  .get(run.sessionId)
-                  .pipe(
-                    Effect.catchAll(() =>
-                      Effect.succeed(Option.none<AgentRun>()),
-                    ),
-                  );
-                if (Option.isNone(fresh)) return fail("Run no longer exists");
+                const fresh = yield* runRepo.get(run.sessionId).pipe(
+                  Effect.map((value) => ({ ok: true as const, value })),
+                  Effect.catchAll((error) =>
+                    Effect.succeed({
+                      ok: false as const,
+                      result: fail(
+                        `Unable to read run state: ${String(error)}`,
+                      ),
+                    }),
+                  ),
+                );
+                if (!fresh.ok) return fresh.result;
+                if (Option.isNone(fresh.value))
+                  return fail("Run no longer exists");
+                const freshRun = fresh.value.value;
                 // Reject terminal runs too: the team-access-removal and
                 // failure paths write terminal states without flipping
                 // desiredState.
                 if (
-                  fresh.value.desiredState === "canceled" ||
-                  fresh.value.state === "succeeded" ||
-                  fresh.value.state === "failed" ||
-                  fresh.value.state === "canceled"
+                  freshRun.desiredState === "canceled" ||
+                  freshRun.state === "succeeded" ||
+                  freshRun.state === "failed" ||
+                  freshRun.state === "canceled"
                 ) {
                   return fail(
                     "Run is finished; mutating Linear tools are refused",
@@ -1581,17 +1590,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             ),
           ),
         );
-        yield* worker.setHostTools(definitions).pipe(
-          Effect.catchTag("@Gateway/RpcProtocolError", (error) =>
-            Effect.logWarning("linear.host_tools_registration_failed").pipe(
-              Effect.annotateLogs({
-                event: "linear.host_tools_registration_failed",
-                sessionId: run.sessionId,
-                error: error.message,
-              }),
-            ),
-          ),
-        );
+        // Host-tool registration is part of the worker contract. A failure
+        // must fail startup rather than silently running without Linear tools.
+        yield* worker.setHostTools(definitions);
       });
 
       const startWorker = Effect.fn("SessionAuthority.startWorker")(function* (
@@ -1765,7 +1766,23 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         });
 
         yield* worker.start();
-        yield* registerLinearHostTools(run, worker);
+        yield* registerLinearHostTools(run, worker).pipe(
+          Effect.catchAll((error) =>
+            Effect.gen(function* () {
+              // Registration happens after the worker is started and indexed;
+              // tear down that state before propagating the contract failure.
+              yield* Fiber.interrupt(consumer);
+              yield* unsubscribe();
+              yield* worker.stop();
+              yield* Ref.update(workersRef, (workers) => {
+                const next = new Map(workers);
+                next.delete(run.sessionId);
+                return next;
+              });
+              return yield* Effect.fail(error);
+            }),
+          ),
+        );
         yield* runRepo.update(run.sessionId, { state: "running" });
         yield* captureWorkerState(run.sessionId, worker);
 

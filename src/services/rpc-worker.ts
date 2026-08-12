@@ -222,6 +222,26 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           }),
         ),
       );
+      /**
+       * Process teardown and diagnostic streams are intentionally best effort:
+       * their failures must not hide the typed worker failure being reported.
+       */
+      const bestEffort = <A, E>(
+        description: string,
+        effect: Effect.Effect<A, E, never>,
+      ): Effect.Effect<void, never, never> =>
+        effect.pipe(
+          Effect.catchAll((error) =>
+            Effect.logWarning("rpc-worker.best_effort_failed").pipe(
+              Effect.annotateLogs({
+                event: "rpc-worker.best_effort_failed",
+                description,
+                error: String(error),
+              }),
+            ),
+          ),
+          Effect.asVoid,
+        );
 
       const rejectPending = (
         error: RpcProtocolError,
@@ -252,7 +272,10 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               );
             }
 
-            yield* Effect.try(() => process.value.kill()).pipe(Effect.ignore);
+            yield* bestEffort(
+              "kill failed worker process",
+              Effect.try(() => process.value.kill()),
+            );
 
             const stderr = (yield* Ref.get(stderrTailRef)).trim();
             const normalized = stderr ? `${base}: ${stderr}` : base;
@@ -677,37 +700,40 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const readStderr = (
         process: Subprocess<"pipe", "pipe", "pipe">,
       ): Effect.Effect<void, never, never> =>
-        Effect.gen(function* () {
-          const reader = process.stderr.getReader();
-          const decoder = new TextDecoder();
+        bestEffort(
+          "capture worker stderr",
+          Effect.gen(function* () {
+            const reader = process.stderr.getReader();
+            const decoder = new TextDecoder();
 
-          while (true) {
-            const result = yield* Effect.tryPromise({
-              try: () => reader.read(),
-              catch: (error) =>
-                new RpcProtocolError({
-                  method: "readStderr",
-                  message:
-                    error instanceof Error ? error.message : String(error),
+            while (true) {
+              const result = yield* Effect.tryPromise({
+                try: () => reader.read(),
+                catch: (error) =>
+                  new RpcProtocolError({
+                    method: "readStderr",
+                    message:
+                      error instanceof Error ? error.message : String(error),
+                  }),
+              }).pipe(
+                Effect.catchTags({
+                  "@Gateway/RpcProtocolError": () => Effect.succeed(undefined),
                 }),
-            }).pipe(
-              Effect.catchTags({
-                "@Gateway/RpcProtocolError": () => Effect.succeed(undefined),
-              }),
-            );
+              );
 
-            if (result === undefined || result.done) break;
+              if (result === undefined || result.done) break;
 
-            const text = yield* Effect.try({
-              try: () => decoder.decode(result.value, { stream: true }),
-              catch: () => "",
-            });
+              const text = yield* Effect.try({
+                try: () => decoder.decode(result.value, { stream: true }),
+                catch: () => "",
+              });
 
-            yield* Ref.update(stderrTailRef, (tail) =>
-              `${tail}${text}`.slice(-16_384),
-            );
-          }
-        }).pipe(Effect.ignore);
+              yield* Ref.update(stderrTailRef, (tail) =>
+                `${tail}${text}`.slice(-16_384),
+              );
+            }
+          }),
+        );
 
       const writeFrame = (
         frame: Record<string, unknown>,
@@ -766,16 +792,18 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       ): Effect.Effect<void, never, never> =>
         Effect.gen(function* () {
           const resultFiber = yield* Effect.fork(
-            result.pipe(
-              Effect.flatMap((toolResult) =>
-                writeFrame({
-                  type: "host_tool_result",
-                  id: callId,
-                  result: toolResult,
-                  ...(toolResult.isError === true ? { isError: true } : {}),
-                }),
+            bestEffort(
+              "write host-tool result",
+              result.pipe(
+                Effect.flatMap((toolResult) =>
+                  writeFrame({
+                    type: "host_tool_result",
+                    id: callId,
+                    result: toolResult,
+                    ...(toolResult.isError === true ? { isError: true } : {}),
+                  }),
+                ),
               ),
-              Effect.catchAll(() => Effect.void),
             ),
           );
           yield* Ref.update(hostToolResultFibersRef, (fibers) => {
@@ -783,14 +811,16 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             return fibers;
           });
           yield* Effect.fork(
-            Fiber.join(resultFiber).pipe(
-              Effect.flatMap(() =>
-                Ref.update(hostToolResultFibersRef, (fibers) => {
-                  fibers.delete(resultFiber);
-                  return fibers;
-                }),
+            bestEffort(
+              "track host-tool result fiber",
+              Fiber.join(resultFiber).pipe(
+                Effect.flatMap(() =>
+                  Ref.update(hostToolResultFibersRef, (fibers) => {
+                    fibers.delete(resultFiber);
+                    return fibers;
+                  }),
+                ),
               ),
-              Effect.catchAll(() => Effect.void),
             ),
           );
         });
@@ -945,7 +975,10 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           Effect.matchEffect({
             onSuccess: () => Effect.void,
             onFailure: () =>
-              Effect.sync(() => process.value.kill()).pipe(Effect.ignore),
+              bestEffort(
+                "force-kill after stdin close failure",
+                Effect.try(() => process.value.kill()),
+              ),
           }),
         );
         const exitedGracefully = yield* Effect.promise(() =>
@@ -957,7 +990,10 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           ]),
         );
         if (!exitedGracefully) {
-          yield* Effect.sync(() => process.value.kill()).pipe(Effect.ignore);
+          yield* bestEffort(
+            "force-kill worker after graceful stop timeout",
+            Effect.try(() => process.value.kill()),
+          );
           yield* Effect.promise(() =>
             Promise.race([
               process.value.exited.then(() => undefined),

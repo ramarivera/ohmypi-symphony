@@ -272,44 +272,53 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       );
       const nextAttemptAt = getNullable(run.nextAttemptAt, patch.nextAttemptAt);
 
-      yield* tryDb(
-        () =>
-          db
-            .query(`
+      // State transitions and their admin-visible events are one atomic
+      // operation. Otherwise a run_event failure leaves the run advanced
+      // without the event that explains the transition.
+      yield* transact(
+        db,
+        Effect.gen(function* () {
+          yield* tryDb(
+            () =>
+              db
+                .query(`
               UPDATE agent_run SET state=?, repository_id=?, workspace_path=?, omp_session_id=?, omp_session_file=?,
                 terminal_reason=?, last_activity_at=?, next_attempt_at=?, attempt=attempt+?, updated_at=? WHERE session_id=?
             `)
-            .run(
-              state,
-              optionToSql(repositoryId),
-              optionToSql(workspacePath),
-              optionToSql(ompSessionId),
-              optionToSql(ompSessionFile),
-              optionToSql(terminalReason),
-              optionToSql(lastActivityAt),
-              optionToSql(nextAttemptAt),
-              patch.incrementAttempt ? 1 : 0,
-              now,
+                .run(
+                  state,
+                  optionToSql(repositoryId),
+                  optionToSql(workspacePath),
+                  optionToSql(ompSessionId),
+                  optionToSql(ompSessionFile),
+                  optionToSql(terminalReason),
+                  optionToSql(lastActivityAt),
+                  optionToSql(nextAttemptAt),
+                  patch.incrementAttempt ? 1 : 0,
+                  now,
+                  sessionId,
+                ),
+            "RunRepo.update",
+          );
+          if (state !== run.state) {
+            const sourceKey = Schema.decodeUnknownSync(SourceKey)(
+              `state:${sessionId}:${attempt}:${state}`,
+            );
+            yield* runEventRepo.upsert({
+              sourceKey,
               sessionId,
-            ),
-        "RunRepo.update",
+              kind: "state",
+              level:
+                state === "failed" || state === "canceled" ? "error" : "info",
+              text: `${run.state} → ${state}`,
+              payload: { from: run.state, to: state, attempt },
+              status: "observed",
+              error: optionToSql(terminalReason),
+              now,
+            });
+          }
+        }),
       );
-      if (state !== run.state) {
-        const sourceKey = Schema.decodeUnknownSync(SourceKey)(
-          `state:${sessionId}:${attempt}:${state}`,
-        );
-        yield* runEventRepo.upsert({
-          sourceKey,
-          sessionId,
-          kind: "state",
-          level: state === "failed" || state === "canceled" ? "error" : "info",
-          text: `${run.state} → ${state}`,
-          payload: { from: run.state, to: state, attempt },
-          status: "observed",
-          error: optionToSql(terminalReason),
-          now,
-        });
-      }
     });
 
     // Reopens a user-stopped run so a follow-up Linear prompt can resume it.

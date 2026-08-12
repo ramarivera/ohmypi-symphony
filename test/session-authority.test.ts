@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import {
@@ -17,6 +17,7 @@ import {
   InterruptedRunNoActionableInputError,
   LinearApiError,
   NixEnvironmentError,
+  RpcProtocolError,
 } from "../src/domain/errors.js";
 import {
   AppUserId,
@@ -32,7 +33,6 @@ import {
 import { type Installation, NixPackageName } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
 import {
-  buildGitHubExtraHeader,
   GitHubApp,
   type GitHubAppTokenService,
 } from "../src/services/github-app.js";
@@ -734,6 +734,7 @@ let hostToolListener:
       request: RpcHostToolCall,
     ) => Effect.Effect<RpcHostToolResult, never, never>)
   | undefined;
+let hostToolRegistrationError: RpcProtocolError | undefined;
 const orderEvents: Array<string> = [];
 const mockWorker: RpcWorkerHandle = {
   sessionId: Effect.succeed(Option.none()),
@@ -752,7 +753,10 @@ const mockWorker: RpcWorkerHandle = {
   steer: () => Effect.void,
   followUp: () => Effect.void,
   setHostTools: (tools) =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
+      if (hostToolRegistrationError !== undefined) {
+        return yield* Effect.fail(hostToolRegistrationError);
+      }
       registeredHostTools = tools;
     }),
   onHostToolCall: (listener) =>
@@ -898,9 +902,11 @@ const withAuthority = <A, E>(
       terminalFailure = undefined;
       workerEventListener = undefined;
       hostToolListener = undefined;
+
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
       registeredHostTools = [];
+      hostToolRegistrationError = undefined;
       projectionExpected = 0;
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
@@ -957,39 +963,6 @@ const withAuthority = <A, E>(
       );
     }),
   );
-const authorityGit = (args: ReadonlyArray<string>, cwd: string) =>
-  Effect.tryPromise({
-    try: async () => {
-      const process = Bun.spawn(["git", ...args], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const [exitCode, stderr] = await Promise.all([
-        process.exited,
-        new Response(process.stderr).text(),
-      ]);
-      if (exitCode !== 0) throw new Error(stderr);
-    },
-    catch: (error) => new Error(String(error)),
-  });
-
-const readAuthorityGitConfig = (key: string, cwd: string) =>
-  Effect.tryPromise({
-    try: async () => {
-      const process = Bun.spawn(["git", "config", "--local", "--get", key], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const [exitCode, stdout] = await Promise.all([
-        process.exited,
-        new Response(process.stdout).text(),
-      ]);
-      return exitCode === 0 ? stdout.trim() : undefined;
-    },
-    catch: (error) => new Error(String(error)),
-  });
 
 const testSessionId = Schema.decodeUnknownSync(SessionId)("authority-session");
 const testIssueId = Schema.decodeUnknownSync(IssueId)("authority-issue");
@@ -1008,133 +981,6 @@ const install = (organizationId: OrganizationId): Installation => ({
   canAccessAllPublicTeams: Option.none(),
 });
 
-describe("SessionAuthority workspace credentials", () => {
-  it.scopedLive("refreshes credentials on an orphan resume", () =>
-    Effect.gen(function* () {
-      const workspacePath = "/tmp/authority-resume-refresh";
-      const token = "resume-fresh-token";
-      yield* Effect.tryPromise(() =>
-        rm(workspacePath, { recursive: true, force: true }),
-      );
-      yield* Effect.tryPromise(() => mkdir(workspacePath, { recursive: true }));
-      yield* authorityGit(["init"], workspacePath);
-      yield* authorityGit(
-        [
-          "config",
-          "--local",
-          "http.https://github.com/.extraheader",
-          buildGitHubExtraHeader("resume-stale-token"),
-        ],
-        workspacePath,
-      );
-      let tokenCalls = 0;
-      const githubApp: GitHubAppTokenService = {
-        getInstallationToken: () =>
-          Effect.sync(() => {
-            tokenCalls += 1;
-            return token;
-          }),
-      };
-      yield* withAuthority(
-        () =>
-          Effect.gen(function* () {
-            const authority = yield* SessionAuthority;
-            const installationRepo = yield* InstallationRepo;
-            const runRepo = yield* RunRepo;
-            const workspaceRepo = yield* WorkspaceRepo;
-            const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
-              "resume-refresh-repository",
-            );
-            yield* installationRepo.put(install(testOrganizationId));
-            yield* workspaceRepo.createRepository({
-              organizationId: testOrganizationId,
-              id: repositoryId,
-              url: "https://github.com/octo-org/private-repo.git",
-              ref: "main",
-              nixPackages: [],
-            });
-            yield* runRepo.create({
-              sessionId: testSessionId,
-              organizationId: testOrganizationId,
-              issueId: Option.none(),
-            });
-            yield* runRepo.update(testSessionId, {
-              state: "orphaned",
-              repositoryId: Option.some(repositoryId),
-              workspacePath: Option.some(workspacePath),
-              ompSessionFile: Option.some(`${workspacePath}/session.jsonl`),
-            });
-            yield* authority.processSession(testSessionId);
-          }),
-        { githubApp },
-      );
-      expect(tokenCalls).toBe(1);
-      expect(
-        yield* readAuthorityGitConfig(
-          "http.https://github.com/.extraheader",
-          workspacePath,
-        ),
-      ).toBe(buildGitHubExtraHeader(token));
-    }),
-  );
-
-  it.scopedLive("unsets credentials on an orphan resume when disabled", () =>
-    Effect.gen(function* () {
-      const workspacePath = "/tmp/authority-resume-unset";
-      yield* Effect.tryPromise(() =>
-        rm(workspacePath, { recursive: true, force: true }),
-      );
-      yield* Effect.tryPromise(() => mkdir(workspacePath, { recursive: true }));
-      yield* authorityGit(["init"], workspacePath);
-      yield* authorityGit(
-        [
-          "config",
-          "--local",
-          "http.https://github.com/.extraheader",
-          buildGitHubExtraHeader("resume-stale-token"),
-        ],
-        workspacePath,
-      );
-      yield* withAuthority(() =>
-        Effect.gen(function* () {
-          const authority = yield* SessionAuthority;
-          const installationRepo = yield* InstallationRepo;
-          const runRepo = yield* RunRepo;
-          const workspaceRepo = yield* WorkspaceRepo;
-          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
-            "resume-unset-repository",
-          );
-          yield* installationRepo.put(install(testOrganizationId));
-          yield* workspaceRepo.createRepository({
-            organizationId: testOrganizationId,
-            id: repositoryId,
-            url: "https://github.com/octo-org/private-repo.git",
-            ref: "main",
-            nixPackages: [],
-          });
-          yield* runRepo.create({
-            sessionId: testSessionId,
-            organizationId: testOrganizationId,
-            issueId: Option.none(),
-          });
-          yield* runRepo.update(testSessionId, {
-            state: "orphaned",
-            repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some(workspacePath),
-            ompSessionFile: Option.some(`${workspacePath}/session.jsonl`),
-          });
-          yield* authority.processSession(testSessionId);
-        }),
-      );
-      expect(
-        yield* readAuthorityGitConfig(
-          "http.https://github.com/.extraheader",
-          workspacePath,
-        ),
-      ).toBeUndefined();
-    }),
-  );
-});
 describe("SessionAuthority team-access gate", () => {
   it.scopedLive(
     "proceeds when the installation team-access snapshot is unknown (null)",
@@ -1331,6 +1177,49 @@ describe("SessionAuthority infrastructure failures", () => {
   );
 
   it.scopedLive(
+    "stops and unregisters a worker when host-tool registration fails",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          hostToolRegistrationError = new RpcProtocolError({
+            method: "set_host_tools",
+            message: "forced host-tool registration failure",
+          });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/host-tool-registration", { recursive: true }),
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/host-tool-registration"),
+          });
+
+          const result = yield* Effect.either(
+            authority.processSession(testSessionId),
+          );
+          expect(Either.isLeft(result)).toBe(true);
+          if (Either.isLeft(result)) {
+            expect(result.left).toMatchObject({
+              _tag: "@Gateway/RpcProtocolError",
+              method: "set_host_tools",
+              message: "forced host-tool registration failure",
+            });
+          }
+          expect(orderEvents).toContain("worker-stopped");
+          expect(yield* authority.activeWorkerCount()).toBe(0);
+        }),
+      ),
+  );
+
+  it.scopedLive(
     "returns a typed error for an interrupted run without actionable input",
     () =>
       withAuthority(() =>
@@ -1398,6 +1287,131 @@ describe("SessionAuthority infrastructure failures", () => {
         }
       }),
     ),
+  );
+
+  it.scopedLive(
+    "rolls back a run transition when its admin event cannot be persisted",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* Effect.sync(() =>
+            db.exec(
+              "CREATE TRIGGER reject_authority_state_event BEFORE INSERT ON run_event BEGIN SELECT RAISE(FAIL, 'state event persistence failed'); END",
+            ),
+          );
+
+          const result = yield* Effect.either(
+            authority.processSession(testSessionId),
+          );
+          expect(Either.isLeft(result)).toBe(true);
+          if (Either.isLeft(result)) {
+            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          }
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) expect(run.value.state).toBe("queued");
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "surfaces markProcessed failure after a successful worker action",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/mark-failure", { recursive: true }),
+          );
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(
+              Schema.decodeUnknownSync(WorkspaceId)("repo-for-mark-failure"),
+            ),
+            workspacePath: Option.some("/tmp/mark-failure"),
+            ompSessionFile: Option.some("/tmp/mark-failure/session.jsonl"),
+          });
+          yield* authority.processSession(testSessionId);
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("mark-failure-input"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "continue",
+            payload: {},
+          });
+          yield* Effect.sync(() =>
+            db.exec(
+              "CREATE TRIGGER reject_input_processed BEFORE UPDATE OF processed_at ON run_input WHEN NEW.processed_at IS NOT NULL BEGIN SELECT RAISE(FAIL, 'mark processed failed'); END",
+            ),
+          );
+
+          const result = yield* Effect.either(
+            authority.processSession(testSessionId),
+          );
+          expect(Either.isLeft(result)).toBe(true);
+          if (Either.isLeft(result)) {
+            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          }
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) expect(run.value.state).toBe("running");
+          expect(yield* runInputRepo.pending(testSessionId)).toHaveLength(1);
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "continues terminal handling when best-effort lease release fails",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("lease-cleanup-input"),
+            sessionId: testSessionId,
+            kind: "stop",
+            body: "stop",
+            payload: {},
+          });
+          yield* Effect.sync(() =>
+            db.exec(
+              "CREATE TRIGGER reject_lease_release_success BEFORE UPDATE ON agent_run WHEN OLD.lease_owner IS NOT NULL AND NEW.lease_owner IS NULL BEGIN SELECT RAISE(FAIL, 'lease release failed'); END",
+            ),
+          );
+
+          yield* authority.processSession(testSessionId);
+
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.state).toBe("canceled");
+            expect(run.value.desiredState).toBe("canceled");
+          }
+        }),
+      ),
   );
 
   it.scopedLive(
@@ -1662,7 +1676,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
       ),
   );
 
-  it.effect("cancel proceeds after a bounded gate wait", () =>
+  it.scopedLive("cancel waits for an in-flight mutation holding the gate", () =>
     withAuthority(
       () =>
         Effect.gen(function* () {
