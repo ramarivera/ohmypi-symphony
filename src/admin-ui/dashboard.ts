@@ -1098,7 +1098,7 @@ export const ADMIN_SCRIPT = `
     var filtered = String(template || "").split("\n").filter(function (line) {
       return !emptyTokens[line.trim()];
     }).join("\n");
-    return filtered.replace(/\{\{([A-Za-z][A-Za-z0-9_]*)\}\}/gu, function (token, name) {
+    return filtered.replace(/[{][{]([A-Za-z][A-Za-z0-9_]*)[}][}]/gu, function (token, name) {
       return Object.prototype.hasOwnProperty.call(values, name) ? (values[name] || "") : token;
     });
   }
