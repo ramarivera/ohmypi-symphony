@@ -35,7 +35,7 @@ import type {
   RepositoryRecord,
   RunEvent,
 } from "../domain/models.js";
-import { normalizeNixPackages } from "../domain/models.js";
+import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
@@ -710,11 +710,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
         if (Option.isNone(run.issueId)) {
           return Option.some(text("Run is not linked to an issue", 409));
         }
-        if (
-          run.state !== "succeeded" &&
-          run.state !== "failed" &&
-          run.state !== "canceled"
-        ) {
+        if (!TERMINAL_RUN_STATES.includes(run.state)) {
           return Option.some(text("Run is not terminal", 409));
         }
         const issueId = run.issueId.value;

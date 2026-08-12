@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { Clock, Effect, Fiber, Option, Queue, Ref } from "effect";
+import { Clock, Duration, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
   type DatabaseError,
   type InstallationRevokedError,
@@ -61,6 +61,8 @@ interface WorkerState {
   readonly consumer: Fiber.Fiber<never, AuthorityError>;
   readonly unsubscribe: () => Effect.Effect<void, never, never>;
 }
+
+const CANCEL_GATE_TIMEOUT_MS = 30_000;
 
 const LINEAR_WORKER_CONTRACT = `Linear integration:
 - Use OMP todos for meaningful multi-step work; they are displayed as the Linear agent plan.
@@ -637,6 +639,32 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Effect.flatMap(sessionMutationGate(sessionId), (gate) =>
           gate.withPermits(1)(effect),
         );
+      const withCancelMutationGate = <A, E, R>(
+        sessionId: SessionId,
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E, R> =>
+        Effect.gen(function* () {
+          const gate = yield* sessionMutationGate(sessionId);
+          const acquired = yield* gate
+            .take(1)
+            .pipe(
+              Effect.as(true),
+              Effect.timeoutOption(Duration.millis(CANCEL_GATE_TIMEOUT_MS)),
+            );
+          if (Option.isNone(acquired)) {
+            yield* Effect.logWarning("authority.cancel_gate_timeout").pipe(
+              Effect.annotateLogs({
+                event: "authority.cancel_gate_timeout",
+                sessionId,
+                timeoutMs: CANCEL_GATE_TIMEOUT_MS,
+              }),
+            );
+            return yield* effect;
+          }
+          return yield* effect.pipe(
+            Effect.ensuring(gate.release(1).pipe(Effect.asVoid)),
+          );
+        });
       const releaseMutationGate = (
         sessionId: SessionId,
       ): Effect.Effect<void, never, never> =>
@@ -879,9 +907,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
         // Hold the mutation gate for the whole cancellation: an in-flight
         // host-tool mutation completes first, and a mutation arriving
-        // after the gate is acquired sees the canceled run in its in-gate
-        // re-read and is refused.
-        yield* withSessionMutationGate(
+        yield* withCancelMutationGate(
           run.sessionId,
           Effect.gen(function* () {
             const state = yield* getWorker(run.sessionId);
@@ -1244,12 +1270,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         run: AgentRun,
         worker: RpcWorkerHandle,
       ): Effect.fn.Return<void, RpcProtocolError> {
-        if (
-          typeof worker.onHostToolCall !== "function" ||
-          typeof worker.setHostTools !== "function"
-        ) {
-          return;
-        }
         const textResult = (
           text: string,
           details?: unknown,

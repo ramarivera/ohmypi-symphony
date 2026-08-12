@@ -13,6 +13,7 @@ import {
   type AgentRun,
   AgentRun as AgentRunSchema,
   type RunState,
+  TERMINAL_RUN_STATES,
 } from "../../domain/models.js";
 import { RunEventRepo } from "./run-event-repo.js";
 import {
@@ -47,12 +48,6 @@ const AgentRunRow = Schema.Struct({
 });
 
 type AgentRunRow = Schema.Schema.Type<typeof AgentRunRow>;
-
-const TERMINAL_STATES: ReadonlyArray<RunState> = [
-  "succeeded",
-  "failed",
-  "canceled",
-];
 
 const rowToAgentRun = (
   row: AgentRunRow,
@@ -247,7 +242,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       const run = current.value;
 
       if (
-        TERMINAL_STATES.includes(run.state) &&
+        TERMINAL_RUN_STATES.includes(run.state) &&
         patch.state !== undefined &&
         patch.state !== run.state
       ) {

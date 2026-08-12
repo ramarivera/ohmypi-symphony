@@ -1,9 +1,11 @@
+import type { Database } from "bun:sqlite";
 import { it } from "@effect/vitest";
 import {
   Clock,
   ConfigProvider,
   Effect,
   Either,
+  Exit,
   Layer,
   Option,
   Schema,
@@ -30,7 +32,10 @@ import {
   RunInputRepo,
   RunRepo,
 } from "../src/services/store/repositories.js";
-import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
+import {
+  SqliteClientLive,
+  transact,
+} from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 
 const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
@@ -104,6 +109,33 @@ const NonEmptyDistinctStrings = Schema.Struct({
   first: Schema.String.pipe(Schema.minLength(1)),
   second: Schema.String.pipe(Schema.minLength(1)),
 }).pipe(Schema.filter((s) => s.first !== s.second));
+
+it("rolls back after a commit failure so the next write can proceed", async () => {
+  const statements: string[] = [];
+  let failCommit = true;
+  const db = {
+    exec: (statement: string) => {
+      statements.push(statement);
+      if (statement === "COMMIT" && failCommit) {
+        failCommit = false;
+        throw new Error("busy");
+      }
+    },
+  } as unknown as Database;
+
+  const first = await Effect.runPromiseExit(
+    transact(db, Effect.succeed("first")),
+  );
+  expect(Exit.isFailure(first)).toBe(true);
+  await Effect.runPromise(transact(db, Effect.succeed("second")));
+  expect(statements).toEqual([
+    "BEGIN IMMEDIATE",
+    "COMMIT",
+    "ROLLBACK",
+    "BEGIN IMMEDIATE",
+    "COMMIT",
+  ]);
+});
 
 describe("Store repositories", () => {
   it.scopedLive("encrypts tokens at rest and round-trips installations", () =>

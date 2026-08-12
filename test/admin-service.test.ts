@@ -546,6 +546,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       createdRun?: boolean;
       enqueued?: boolean;
       createdRunInput?: unknown;
+      createdInputId?: unknown;
       payload?: unknown;
     } = {};
     const newSessionId = "55555555-5555-4555-8555-555555555555";
@@ -565,6 +566,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       runInputRepo: RunInputRepo.make({
         ...deps.runInputRepo,
         enqueue: (input) => {
+          created.createdInputId = input.id;
           created.payload = input.payload;
           created.enqueued = true;
           return Effect.succeed(true);
@@ -600,6 +602,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(createdInput.repositoryId).toEqual(Option.some(repositoryId));
     expect(createdInput.teamId).toEqual(Option.some(teamId));
     expect(createdInput.projectId).toEqual(Option.some(projectId));
+    expect(created.createdInputId).toBe(`${newSessionId}:created`);
     const payload = created.payload as Record<string, unknown>;
     expect(payload.repositoryId).toBe(repositoryId);
     expect(payload.automationDelegated).toBe(false);
