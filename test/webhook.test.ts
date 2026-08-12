@@ -30,6 +30,7 @@ import { makePinoEffectLogger } from "../src/services/logger.js";
 import {
   DeliveryRepo,
   InstallationRepo,
+  PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -105,6 +106,7 @@ const makeLayer = (gatewayConfig: GatewayConfigShape) =>
     DeliveryRepo.Default,
     RunEventRepo.Default,
     RunRepo.Default,
+    PromptTemplateRepo.Default,
     RunInputRepo.Default,
     WebhookPipeline.Default,
   ).pipe(
@@ -120,7 +122,12 @@ const withWebhook = <A, E>(
   effect: Effect.Effect<
     A,
     E,
-    WebhookPipeline | InstallationRepo | RunRepo | RunInputRepo | DeliveryRepo
+    | WebhookPipeline
+    | InstallationRepo
+    | RunRepo
+    | RunInputRepo
+    | DeliveryRepo
+    | PromptTemplateRepo
   >,
   gatewayConfig = config,
 ) =>
@@ -641,6 +648,29 @@ describe("Linear webhook input correctness", () => {
         expect(
           inputs.find((input) => input.kind === "prompted")?.body,
         ).toContain("Please add more tests");
+      }),
+    ),
+  );
+  it.scopedLive("prompted template receives the extracted activity body", () =>
+    withWebhook(
+      Effect.gen(function* () {
+        const now = yield* currentTime;
+        yield* install();
+        yield* PromptTemplateRepo.upsert({
+          organizationId: organizationId("org"),
+          kind: "prompted",
+          body: "Follow-up:\n{{userRequest}}",
+          updatedAt: now,
+        });
+        yield* WebhookPipeline.handle(signedRequest(createdPayload(now)));
+        const response = yield* WebhookPipeline.handle(
+          signedRequest(promptedPayload(now, { webhookId: "prompt-template" })),
+        );
+        expect(response.status).toBe(200);
+        const inputs = yield* RunInputRepo.pending(sessionId("session-1"));
+        expect(inputs.find((input) => input.kind === "prompted")?.body).toBe(
+          "Follow-up:\n# Follow-up prompt\n\nPlease add more tests",
+        );
       }),
     ),
   );

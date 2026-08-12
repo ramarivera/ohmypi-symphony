@@ -16,12 +16,22 @@ export type PromptTemplateValues = Readonly<Record<string, string>>;
 export const substitutePromptTemplate = (
   template: string,
   values: PromptTemplateValues,
-): string =>
-  template.replace(
+): string => {
+  const emptyTokens = new Set(
+    Object.entries(values)
+      .filter(([, value]) => value === "")
+      .map(([name]) => `{{${name}}}`),
+  );
+  const filtered = template
+    .split("\n")
+    .filter((line) => !emptyTokens.has(line.trim()))
+    .join("\n");
+  return filtered.replace(
     /\{\{([A-Za-z][A-Za-z0-9_]*)\}\}/gu,
     (token, name: string) =>
       Object.hasOwn(values, name) ? (values[name] ?? "") : token,
   );
+};
 
 export const promptTemplatePlaceholders = (
   kind: PromptTemplateKind,
@@ -34,15 +44,21 @@ export const promptTemplatePlaceholders = (
         "{{previousComments}}",
         "{{guidance}}",
       ]
-    : [];
+    : kind === "prompted"
+      ? ["{{userRequest}}"]
+      : [];
 
 export const promptTemplateWarnings = (
   kind: PromptTemplateKind,
   body: string,
 ): ReadonlyArray<string> => {
-  if (kind !== "created") return [];
   const placeholders = promptTemplatePlaceholders(kind);
-  if (placeholders.some((placeholder) => body.includes(placeholder))) return [];
+  if (
+    placeholders.length === 0 ||
+    placeholders.some((placeholder) => body.includes(placeholder))
+  ) {
+    return [];
+  }
   return [
     `Template does not contain any recognized ${kind} placeholders; dynamic sections may be omitted.`,
   ];

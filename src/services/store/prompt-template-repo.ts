@@ -41,6 +41,9 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
     accessors: true,
     effect: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
+      const cache = new Map<string, Option.Option<PromptTemplateRecord>>();
+      const cacheKey = (organizationId: string, kind: PromptTemplateKind) =>
+        `${organizationId}:${kind}`;
 
       const get = Effect.fn("PromptTemplateRepo.get")(function* (
         organizationId: string,
@@ -49,6 +52,9 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
         Option.Option<PromptTemplateRecord>,
         DatabaseError | RowDecodeError
       > {
+        const key = cacheKey(organizationId, kind);
+        const cached = cache.get(key);
+        if (cached !== undefined) return cached;
         const row = yield* tryDb(
           () =>
             db
@@ -58,12 +64,17 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
               .get(organizationId, kind),
           "PromptTemplateRepo.get",
         );
-        if (row === null) return Option.none();
-        return Option.some(
+        if (row === null) {
+          cache.set(key, Option.none());
+          return Option.none();
+        }
+        const value = Option.some(
           yield* rowToPromptTemplate(
             yield* decodeRow(PromptTemplateRow, row, "PromptTemplate"),
           ),
         );
+        cache.set(key, value);
+        return value;
       });
 
       const list = Effect.fn("PromptTemplateRepo.list")(function* (
@@ -115,6 +126,7 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
               ),
           "PromptTemplateRepo.upsert",
         );
+        cache.delete(cacheKey(valid.organizationId, valid.kind));
       });
 
       const remove = Effect.fn("PromptTemplateRepo.remove")(function* (
@@ -134,6 +146,7 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
             runChanges(result, "PromptTemplateRepo.remove"),
           ),
         );
+        cache.delete(cacheKey(organizationId, kind));
         return changes > 0;
       });
 

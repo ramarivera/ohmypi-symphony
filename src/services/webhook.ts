@@ -381,7 +381,7 @@ const handleAgentSessionEvent = (
   timestamp: number,
   runRepo: RunRepo,
   runInputRepo: RunInputRepo,
-  promptTemplateRepo: Option.Option<PromptTemplateRepo>,
+  promptTemplateRepo: PromptTemplateRepo,
 ): Effect.Effect<
   void,
   WebhookPayloadError | WebhookIdentityError | DatabaseError | RowDecodeError,
@@ -437,9 +437,10 @@ const handleAgentSessionEvent = (
     });
 
     if (event.action === "created") {
-      const configured = Option.isSome(promptTemplateRepo)
-        ? yield* promptTemplateRepo.value.get(organizationId, "created")
-        : Option.none();
+      const configured = yield* promptTemplateRepo.get(
+        organizationId,
+        "created",
+      );
       const body = buildCreatedInputBodyWithTemplate(
         event,
         Option.isSome(configured) ? configured.value.body : undefined,
@@ -489,12 +490,15 @@ const handleAgentSessionEvent = (
           ? "stop"
           : "prompted";
       const configured =
-        kind === "prompted" && Option.isSome(promptTemplateRepo)
-          ? yield* promptTemplateRepo.value.get(organizationId, "prompted")
+        kind === "prompted"
+          ? yield* promptTemplateRepo.get(organizationId, "prompted")
           : Option.none();
-      const body = Option.isSome(configured)
-        ? configured.value.body
-        : extractPromptBody(activity);
+      const body =
+        kind === "prompted" && Option.isSome(configured)
+          ? substitutePromptTemplate(configured.value.body, {
+              userRequest: extractPromptBody(activity),
+            })
+          : extractPromptBody(activity);
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, kind),
       ).pipe(
@@ -955,6 +959,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       RunRepo.Default,
       RunInputRepo.Default,
       DeliveryRepo.Default,
+      PromptTemplateRepo.Default,
     ],
     effect: Effect.gen(function* () {
       const config = yield* GatewayConfig;
@@ -962,8 +967,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       const runRepo = yield* RunRepo;
       const runInputRepo = yield* RunInputRepo;
       const deliveryRepo = yield* DeliveryRepo;
-      const promptTemplateRepo =
-        yield* Effect.serviceOption(PromptTemplateRepo);
+      const promptTemplateRepo = yield* PromptTemplateRepo;
 
       const handle = Effect.fn("WebhookPipeline.handle")(function* (
         request: Request,

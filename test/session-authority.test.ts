@@ -56,6 +56,7 @@ import {
 import {
   InstallationRepo,
   McpServerRepo,
+  PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -935,6 +936,7 @@ const withAuthority = <A, E>(
         TokenCrypto.Default,
         InstallationRepo.Default,
         McpServerRepo.Default,
+        PromptTemplateRepo.Default,
         RunEventRepo.Default,
         RunInputRepo.Default,
         RunRepo.Default,

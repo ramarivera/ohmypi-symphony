@@ -87,14 +87,14 @@ export const linearWorkerPrompt = (
   kind === "created" ? `${contract}\n\nLinear task:\n${body}` : body;
 
 const linearWorkerPromptWithTemplate = (
-  repoOption: Option.Option<PromptTemplateRepo>,
+  repo: PromptTemplateRepo,
   organizationId: string,
   kind: "created" | "prompted" | "stop",
   body: string,
 ): Effect.Effect<string, DatabaseError | RowDecodeError> =>
-  kind !== "created" || Option.isNone(repoOption)
+  kind !== "created"
     ? Effect.succeed(linearWorkerPrompt(kind, body))
-    : repoOption.value
+    : repo
         .get(organizationId, "contract")
         .pipe(
           Effect.map((template) =>
@@ -293,6 +293,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       ActivityProjector.Default,
       InstallationRepo.Default,
       McpServerRepo.Default,
+      PromptTemplateRepo.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
       RunRepo.Default,
@@ -306,8 +307,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
     effect: Effect.gen(function* () {
       const runRepo = yield* RunRepo;
       const runInputRepo = yield* RunInputRepo;
-      const promptTemplateRepo =
-        yield* Effect.serviceOption(PromptTemplateRepo);
+      const promptTemplateRepo = yield* PromptTemplateRepo;
       const installationRepo = yield* InstallationRepo;
       const runEventRepo = yield* RunEventRepo;
       const workspaceRepo = yield* WorkspaceRepo;

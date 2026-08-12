@@ -197,7 +197,7 @@ export const ADMIN_BODY = `
           <div class="field full"><label for="prompt-template-prompted">Prompted input</label><textarea id="prompt-template-prompted" rows="4" data-prompt-kind="prompted"></textarea></div>
           <div class="field full"><label for="prompt-template-contract">Worker contract</label><textarea id="prompt-template-contract" rows="10" data-prompt-kind="contract"></textarea></div>
         </div>
-        <div class="hint">Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Unknown placeholders remain literal.</div>
+        <div class="hint">Leave a template blank to restore the built-in default. Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Prompted placeholder: <code>{{userRequest}}</code>. Unknown placeholders remain literal.</div>
         <div class="field full"><label for="prompt-template-preview">Live preview (sample payload)</label><pre id="prompt-template-preview" aria-live="polite"></pre></div>
         <div class="form-actions"><button type="button" class="btn btn-primary" id="prompt-templates-save">Save prompt templates</button></div>
       </div>
@@ -1087,9 +1087,19 @@ export const ADMIN_SCRIPT = `
     guidance: "Guidance:\n1. Keep the change focused.",
   };
 
+  // Must mirror substitutePromptTemplate in src/services/prompt-templates.ts:
+  // unknown tokens pass through and empty token-only sections are dropped.
   function substitutePromptPreview(template) {
-    return String(template || "").replace(/{{([A-Za-z][A-Za-z0-9_]*)}}/g, function (token, name) {
-      return Object.prototype.hasOwnProperty.call(PROMPT_SAMPLE, name) ? PROMPT_SAMPLE[name] : token;
+    var values = PROMPT_SAMPLE;
+    var emptyTokens = {};
+    Object.keys(values).forEach(function (name) {
+      if (!values[name]) emptyTokens["{{" + name + "}}"] = true;
+    });
+    var filtered = String(template || "").split("\n").filter(function (line) {
+      return !emptyTokens[line.trim()];
+    }).join("\n");
+    return filtered.replace(/\{\{([A-Za-z][A-Za-z0-9_]*)\}\}/gu, function (token, name) {
+      return Object.prototype.hasOwnProperty.call(values, name) ? (values[name] || "") : token;
     });
   }
 
@@ -1101,6 +1111,10 @@ export const ADMIN_SCRIPT = `
 
   function renderPromptTemplates(templates) {
     state.promptTemplates = {};
+    ["created", "prompted", "contract"].forEach(function (kind) {
+      var field = el("prompt-template-" + kind);
+      if (field) field.value = "";
+    });
     (Array.isArray(templates) ? templates : []).forEach(function (template) {
       state.promptTemplates[template.kind] = template.body;
       var field = el("prompt-template-" + template.kind);
@@ -1117,21 +1131,34 @@ export const ADMIN_SCRIPT = `
 
   async function savePromptTemplates() {
     var status = el("prompt-templates-status");
-    try {
-      var kinds = ["created", "prompted", "contract"];
-      for (var i = 0; i < kinds.length; i += 1) {
-        var kind = kinds[i];
-        var field = el("prompt-template-" + kind);
-        await fetchJSON(PROMPT_TEMPLATES_URL, {
+    var kinds = ["created", "prompted", "contract"];
+    var failures = [];
+    var warnings = [];
+    for (var i = 0; i < kinds.length; i += 1) {
+      var kind = kinds[i];
+      var field = el("prompt-template-" + kind);
+      try {
+        var result = await fetchJSON(PROMPT_TEMPLATES_URL, {
           method: "PUT",
           body: { kind: kind, body: field ? field.value : "" },
         });
+        var returnedWarnings = result && result.data && result.data.warnings;
+        if (Array.isArray(returnedWarnings)) {
+          returnedWarnings.forEach(function (warning) {
+            warnings.push(kind + ": " + warning);
+          });
+        }
+      } catch (err) {
+        failures.push(kind + ": " + (err && err.message ? err.message : "save failed"));
       }
-      if (status) status.textContent = "Prompt templates saved.";
-      await loadPromptTemplates();
-    } catch (err) {
-      if (status) status.textContent = err && err.message ? err.message : "Unable to save prompt templates.";
     }
+    if (status) {
+      var messages = failures.concat(warnings);
+      status.textContent = messages.length > 0
+        ? messages.join(" | ")
+        : "Prompt templates saved.";
+    }
+    await loadPromptTemplates();
   }
 
   // ---- bootstrap loader ----------------------------------------------------

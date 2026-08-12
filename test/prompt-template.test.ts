@@ -27,12 +27,12 @@ describe("prompt template substitution", () => {
     ).toBe("request|issue|thread|previous|guidance|{{unknown}}");
   });
 
-  it("allows empty sections without evaluating template text", () => {
+  it("drops empty token-only sections and preserves unknown tokens", () => {
     expect(
-      substitutePromptTemplate("before\n{{threadComment}}\nafter", {
+      substitutePromptTemplate("before\n{{threadComment}}\nafter|{{unknown}}", {
         threadComment: "",
       }),
-    ).toBe("before\n\nafter");
+    ).toBe("before\nafter|{{unknown}}");
     expect(promptTemplateWarnings("created", "{{unknown}}")).toHaveLength(1);
     expect(promptTemplateWarnings("created", "{{guidance}}")).toEqual([]);
   });

@@ -11,8 +11,13 @@ import {
 import { InputId, type SessionId } from "../domain/ids.js";
 import { GatewayConfig } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
+import { substitutePromptTemplate } from "./prompt-templates.js";
 import { SessionAuthority } from "./session-authority.js";
-import { RunInputRepo, RunRepo } from "./store/repositories.js";
+import {
+  PromptTemplateRepo,
+  RunInputRepo,
+  RunRepo,
+} from "./store/repositories.js";
 export interface ReconcilerStatus {
   readonly running: boolean;
   readonly lastStartedAt: Option.Option<number>;
@@ -27,7 +32,7 @@ const MAX_CATCHUP_CANDIDATES_PER_SWEEP = 25;
 
 export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
   accessors: true,
-  dependencies: [SessionAuthority.Default],
+  dependencies: [SessionAuthority.Default, PromptTemplateRepo.Default],
   effect: Effect.gen(function* () {
     const statusRef = yield* Ref.make<ReconcilerStatus>({
       running: true,
@@ -48,6 +53,8 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
     const catchup = Effect.fn("Reconciler.catchup")(
       function* (): Effect.fn.Return<void, never> {
         const gatewayOption = yield* Effect.serviceOption(LinearGateway);
+        const promptTemplateRepoOption =
+          yield* Effect.serviceOption(PromptTemplateRepo);
         const runRepoOption = yield* Effect.serviceOption(RunRepo);
         const runInputRepoOption = yield* Effect.serviceOption(RunInputRepo);
         const configOption = yield* Effect.serviceOption(GatewayConfig);
@@ -169,10 +176,22 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
             // Mirror the webhook's extractPromptBody: title-prefixed when the
             // activity carries a title, so a catch-up-first injection reads
             // identically to a webhook-delivered prompt.
-            const body =
+            const rawBody =
               activity.title !== null && activity.body !== null
                 ? `# ${activity.title}\n\n${activity.body}`
                 : (activity.body ?? activity.title ?? "");
+            const configured =
+              kind === "prompted" && Option.isSome(promptTemplateRepoOption)
+                ? yield* promptTemplateRepoOption.value
+                    .get(run.organizationId, "prompted")
+                    .pipe(Effect.orElse(() => Effect.succeed(Option.none())))
+                : Option.none();
+            const body =
+              kind === "prompted" && Option.isSome(configured)
+                ? substitutePromptTemplate(configured.value.body, {
+                    userRequest: rawBody,
+                  })
+                : rawBody;
             const activityCreatedAt = Date.parse(activity.createdAt);
             const inserted = yield* runInputRepo
               .enqueue({

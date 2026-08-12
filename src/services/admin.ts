@@ -1033,9 +1033,12 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "GET"
       ) {
         const session = yield* requireSession(request);
-        const templates = deps.promptTemplateRepo
-          ? yield* deps.promptTemplateRepo.list(session.organizationId)
-          : [];
+        if (deps.promptTemplateRepo === undefined) {
+          return Option.some(text("Prompt templates unavailable", 500));
+        }
+        const templates = yield* deps.promptTemplateRepo.list(
+          session.organizationId,
+        );
         return Option.some(json({ templates }));
       }
       if (
@@ -1064,11 +1067,26 @@ export const createAdminHandle = (deps: AdminDeps) =>
             text("Prompt template body must be a string", 400),
           );
         }
+        const body = payload.body.trim().length === 0 ? "" : payload.body;
+        if (body.length > 16_384) {
+          return Option.some(
+            text("Prompt template body exceeds the 16 KiB limit", 400),
+          );
+        }
         const updatedAt = yield* Clock.currentTimeMillis;
+        if (body.length === 0) {
+          yield* deps.promptTemplateRepo.remove(session.organizationId, kind);
+          return Option.some(
+            json({
+              template: null,
+              warnings: [],
+            }),
+          );
+        }
         yield* deps.promptTemplateRepo.upsert({
           organizationId: session.organizationId,
           kind,
-          body: payload.body,
+          body,
           updatedAt,
         });
         return Option.some(
@@ -1076,10 +1094,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
             template: {
               organizationId: session.organizationId,
               kind,
-              body: payload.body,
+              body,
               updatedAt,
             },
-            warnings: promptTemplateWarnings(kind, payload.body),
+            warnings: promptTemplateWarnings(kind, body),
           }),
         );
       }
@@ -1535,6 +1553,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     RunInputRepo.Default,
     LinearGateway.Default,
     WorkspaceRepo.Default,
+    PromptTemplateRepo.Default,
     McpServerRepo.Default,
     Workspace.Default,
     Reconciler.Default,
@@ -1548,7 +1567,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const runEventRepo = yield* RunEventRepo;
     const workspaceRepo = yield* WorkspaceRepo;
     const mcpServerRepo = yield* McpServerRepo;
-    const promptTemplateRepo = yield* Effect.serviceOption(PromptTemplateRepo);
+    const promptTemplateRepo = yield* PromptTemplateRepo;
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
     const nixEnvironment = yield* NixEnvironment;
@@ -1563,9 +1582,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
       runInputRepo,
       linearGateway,
       workspaceRepo,
-      ...(Option.isSome(promptTemplateRepo)
-        ? { promptTemplateRepo: promptTemplateRepo.value }
-        : {}),
+      promptTemplateRepo,
       mcpServerRepo,
       workspace,
       reconciler,
