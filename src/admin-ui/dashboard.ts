@@ -526,7 +526,7 @@ export const ADMIN_SCRIPT = `
     table.className = "repos";
     var head = document.createElement("thead");
     var row = document.createElement("tr");
-    ["Name", "Transport", "Scope", "Environment", "Status", ""].forEach(function (label) {
+    ["Name", "Transport", "Scope", "Environment", "OAuth", "Status", ""].forEach(function (label) {
       var th = document.createElement("th"); th.scope = "col"; th.textContent = label; row.appendChild(th);
     });
     head.appendChild(row); table.appendChild(head);
@@ -537,10 +537,14 @@ export const ADMIN_SCRIPT = `
       var transport = document.createElement("td"); transport.textContent = server.transport || "—"; tr.appendChild(transport);
       var scope = document.createElement("td"); scope.textContent = server.repositoryId || "installation-wide"; tr.appendChild(scope);
       var env = document.createElement("td"); env.textContent = server.env && Object.keys(server.env).length ? Object.keys(server.env).map(function (key) { return key + "=•••"; }).join(", ") : "—"; tr.appendChild(env);
+      var oauth = document.createElement("td"); var oauthState = server.oauth || { connected: false, expired: false }; oauth.textContent = oauthState.connected ? (oauthState.expired ? "expired" : "connected") : "not connected"; tr.appendChild(oauth);
       var enabled = document.createElement("td"); enabled.textContent = server.enabled ? "enabled" : "disabled"; tr.appendChild(enabled);
       var actions = document.createElement("td"); actions.className = "actions";
       var edit = document.createElement("button"); edit.type = "button"; edit.dataset.action = "edit-mcp"; edit.dataset.mcpId = server.id || ""; edit.textContent = "Edit"; actions.appendChild(edit);
       var toggle = document.createElement("button"); toggle.type = "button"; toggle.dataset.action = "toggle-mcp"; toggle.dataset.mcpId = server.id || ""; toggle.textContent = server.enabled ? "Disable" : "Enable"; actions.appendChild(toggle);
+      if (server.transport === "http" || server.transport === "sse") {
+        var auth = document.createElement("button"); auth.type = "button"; auth.dataset.action = oauthState.connected ? "disconnect-mcp" : "connect-mcp"; auth.dataset.mcpId = server.id || ""; auth.textContent = oauthState.connected ? "Disconnect" : "Connect"; actions.appendChild(auth);
+      }
       var remove = document.createElement("button"); remove.type = "button"; remove.className = "btn-danger"; remove.dataset.action = "delete-mcp"; remove.dataset.mcpId = server.id || ""; remove.textContent = "Delete"; actions.appendChild(remove);
       tr.appendChild(actions); body.appendChild(tr);
     });
@@ -598,6 +602,16 @@ export const ADMIN_SCRIPT = `
     catch (err) { var box = el("mcp-form-error"); box.textContent = err && err.message ? err.message : "Could not save MCP server."; box.hidden = false; }
     finally { if (button) button.disabled = false; }
   }
+  async function connectMcpServer(id) {
+    var result = await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/connect", { method: "POST", body: {} });
+    if (result && result.authorizationUrl) { window.location.assign(result.authorizationUrl); return; }
+    await loadBootstrap({ announce: false });
+  }
+  async function disconnectMcpServer(id) {
+    await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/disconnect", { method: "POST", body: {} });
+    showToast("MCP OAuth disconnected.", "ok");
+    await loadBootstrap({ announce: false });
+  }
   async function deleteMcpServer(id) { var result = await fetchJSON(MCP_DETAIL(id), { method: "DELETE", body: {} }); if (result && result.redirecting) return; showToast("MCP server removed.", "ok"); await loadBootstrap({ announce: false }); }
   async function toggleMcpServer(server) { var result = await fetchJSON(MCP_DETAIL(server.id), { method: "PUT", body: Object.assign({}, server, { enabled: !server.enabled }) }); if (result && result.redirecting) return; await loadBootstrap({ announce: false }); }
   function handleMcpClick(event) {
@@ -607,6 +621,8 @@ export const ADMIN_SCRIPT = `
     var action = button.getAttribute("data-action");
     if (action === "edit-mcp") openMcpForm(server);
     if (action === "toggle-mcp") toggleMcpServer(server);
+    if (action === "connect-mcp") connectMcpServer(id);
+    if (action === "disconnect-mcp") disconnectMcpServer(id);
     if (action === "delete-mcp") openConfirm({ title: "Delete MCP server?", body: "Remove " + (server.name || id) + "?", onConfirm: function () { deleteMcpServer(id); } });
   }
 

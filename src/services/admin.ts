@@ -40,6 +40,7 @@ import type {
 import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
+import { McpOAuth } from "./mcp-oauth.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
@@ -120,6 +121,7 @@ export interface AdminDeps {
   };
   readonly workspaceRepo: WorkspaceRepo;
   readonly mcpServerRepo: McpServerRepo;
+  readonly mcpOAuth: McpOAuth;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
   readonly nixEnvironment: NixEnvironment;
@@ -430,8 +432,14 @@ function mcpServerPayload(
     enabled: optionalBoolean(body.enabled),
   });
 }
-
-export function toApiMcpServer(server: McpServerRecord) {
+export function toApiMcpServer(
+  server: McpServerRecord,
+  oauthStatus?: {
+    readonly connected: boolean;
+    readonly expired: boolean;
+    readonly expiresAt: number;
+  },
+) {
   const env: Record<string, string> = {};
   for (const name of Object.keys(server.env)) env[name] = "•••";
   const headers: Record<string, string> = {};
@@ -450,6 +458,11 @@ export function toApiMcpServer(server: McpServerRecord) {
     headers,
     repositoryId: Option.getOrElse(server.repositoryId, () => null),
     enabled: server.enabled,
+    oauth: oauthStatus ?? {
+      connected: false,
+      expired: false,
+      expiresAt: null,
+    },
     createdAt: server.createdAt,
     updatedAt: server.updatedAt,
   };
@@ -1008,6 +1021,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const mcpServers = yield* deps.mcpServerRepo.listMcpServers(
           session.organizationId,
         );
+        const oauthStatuses = yield* deps.mcpOAuth.listStatuses(
+          session.organizationId,
+        );
         const reconcilerStatus = yield* deps.reconciler.status();
         return Option.some(
           json({
@@ -1019,8 +1035,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
             },
             installation: adminInstallation,
             repositories: repositories.map(toApiRepository),
-            mcpServers: mcpServers.map(toApiMcpServer),
             csrfToken: deriveCsrfToken(session.rawToken),
+            mcpServers: mcpServers.map((server) =>
+              toApiMcpServer(server, oauthStatuses.get(server.id)),
+            ),
           }),
         );
       }
@@ -1042,11 +1060,18 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "GET"
       ) {
         const session = yield* requireSession(request);
+        const oauthStatuses = yield* deps.mcpOAuth.listStatuses(
+          session.organizationId,
+        );
         const mcpServers = yield* deps.mcpServerRepo.listMcpServers(
           session.organizationId,
         );
         return Option.some(
-          json({ mcpServers: mcpServers.map(toApiMcpServer) }),
+          json({
+            mcpServers: mcpServers.map((server) =>
+              toApiMcpServer(server, oauthStatuses.get(server.id)),
+            ),
+          }),
         );
       }
 
@@ -1104,6 +1129,57 @@ export const createAdminHandle = (deps: AdminDeps) =>
         return Option.some(json({ mcpServer: toApiMcpServer(server) }, 201));
       }
 
+      const mcpOauthConnect =
+        /^\/api\/admin\/mcp-servers\/([^/]+)\/oauth\/connect$/u.exec(
+          url.pathname,
+        );
+      if (mcpOauthConnect !== null && request.method === "POST") {
+        const session = yield* requireMutation(request);
+        const rawId = mcpOauthConnect[1];
+        if (rawId === undefined) return Option.some(text("Not found", 404));
+        const id = yield* Schema.decodeUnknown(McpServerId)(
+          decodeURIComponent(rawId),
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid MCP server id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        const result = yield* deps.mcpOAuth.startMcpAuthorization(
+          session.organizationId,
+          id,
+        );
+        return Option.some(json({ authorizationUrl: result.url.toString() }));
+      }
+      const mcpOauthDisconnect =
+        /^\/api\/admin\/mcp-servers\/([^/]+)\/oauth\/disconnect$/u.exec(
+          url.pathname,
+        );
+      if (mcpOauthDisconnect !== null && request.method === "POST") {
+        const session = yield* requireMutation(request);
+        const rawId = mcpOauthDisconnect[1];
+        if (rawId === undefined) return Option.some(text("Not found", 404));
+        const id = yield* Schema.decodeUnknown(McpServerId)(
+          decodeURIComponent(rawId),
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid MCP server id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        yield* deps.mcpOAuth.disconnect(session.organizationId, id);
+        return Option.some(json({ disconnected: true }));
+      }
       if (url.pathname.startsWith("/api/admin/mcp-servers/")) {
         const rawId = decodeURIComponent(
           url.pathname.slice("/api/admin/mcp-servers/".length),
@@ -1125,9 +1201,15 @@ export const createAdminHandle = (deps: AdminDeps) =>
             session.organizationId,
             id,
           );
-          return Option.isNone(server)
-            ? Option.some(text("Not found", 404))
-            : Option.some(json({ mcpServer: toApiMcpServer(server.value) }));
+          if (Option.isNone(server)) return Option.some(text("Not found", 404));
+          const statuses = deps.mcpOAuth
+            ? yield* deps.mcpOAuth.listStatuses(session.organizationId)
+            : new Map();
+          return Option.some(
+            json({
+              mcpServer: toApiMcpServer(server.value, statuses.get(id)),
+            }),
+          );
         }
         if (request.method === "PUT") {
           const session = yield* requireMutation(request);
@@ -1477,6 +1559,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     LinearGateway.Default,
     WorkspaceRepo.Default,
     McpServerRepo.Default,
+    McpOAuth.Default,
     Workspace.Default,
     Reconciler.Default,
     NixEnvironment.Default,
@@ -1489,6 +1572,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const runEventRepo = yield* RunEventRepo;
     const workspaceRepo = yield* WorkspaceRepo;
     const mcpServerRepo = yield* McpServerRepo;
+    const mcpOAuth = yield* McpOAuth;
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
     const nixEnvironment = yield* NixEnvironment;
@@ -1505,6 +1589,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
       workspaceRepo,
       mcpServerRepo,
       workspace,
+      mcpOAuth,
       reconciler,
       nixEnvironment,
     });

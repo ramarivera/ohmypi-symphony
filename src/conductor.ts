@@ -7,6 +7,7 @@ import { GatewayConfig } from "./services/config.js";
 import { GitHubApp } from "./services/github-app.js";
 import { LinearGateway } from "./services/linear-gateway.js";
 import { GatewayLogger, PinoLoggerLive } from "./services/logger.js";
+import { McpOAuth } from "./services/mcp-oauth.js";
 import { NixEnvironment } from "./services/nix-environment.js";
 import { OAuth } from "./services/oauth.js";
 import { ActivityProjector } from "./services/projector.js";
@@ -55,6 +56,7 @@ export const GatewayServicesLive = Layer.mergeAll(
   RpcWorker.Default,
   GitHubApp.Default,
   OAuth.Default,
+  McpOAuth.Default,
   Reconciler.Default,
   Workspace.Default,
   Admin.Default,

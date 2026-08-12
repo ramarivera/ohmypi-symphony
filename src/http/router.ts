@@ -11,6 +11,7 @@ import {
   setAdminCookie,
 } from "../services/admin.js";
 import { GatewayConfig } from "../services/config.js";
+import { McpOAuth } from "../services/mcp-oauth.js";
 import { OAuth } from "../services/oauth.js";
 import { Reconciler } from "../services/reconciler.js";
 import { AdminSessionRepo } from "../services/store/repositories.js";
@@ -107,6 +108,16 @@ export const oauthCallback = Effect.gen(function* () {
     ),
   );
 });
+export const mcpOauthCallback = Effect.gen(function* () {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  yield* McpOAuth.completeMcpAuthorization(
+    new URL(request.url, "http://localhost"),
+  );
+  return HttpServerResponse.redirect("/admin?mcp=connected", {
+    status: 302,
+    headers: SECURITY_HEADERS,
+  });
+});
 
 const admin = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -121,6 +132,7 @@ export const router = HttpRouter.empty.pipe(
   HttpRouter.all("/webhooks/linear", webhook),
   HttpRouter.get("/oauth/start", oauthStart),
   HttpRouter.get("/oauth/callback", oauthCallback),
+  HttpRouter.get("/oauth/mcp/callback", mcpOauthCallback),
   HttpRouter.get("/", admin),
   HttpRouter.get("/admin", admin),
   HttpRouter.get("/runs/:id", admin),

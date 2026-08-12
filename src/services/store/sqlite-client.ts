@@ -263,6 +263,31 @@ const migrate = (db: Database): void => {
     );
     CREATE INDEX IF NOT EXISTS run_event_session
       ON run_event(session_id, created_at, source_key);
+    CREATE TABLE IF NOT EXISTS mcp_oauth_state (
+      state_hash TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL,
+      server_id TEXT NOT NULL,
+      server_url TEXT NOT NULL,
+      code_verifier TEXT NOT NULL,
+      redirect_uri TEXT NOT NULL,
+      client_json TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      consumed_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS mcp_oauth_credential (
+      organization_id TEXT NOT NULL,
+      server_id TEXT NOT NULL,
+      server_url TEXT NOT NULL,
+      client_json TEXT NOT NULL,
+      access_token TEXT NOT NULL,
+      refresh_token TEXT,
+      expires_at INTEGER NOT NULL,
+      token_type TEXT,
+      scope TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, server_id)
+    );
   `);
 
   const repositoryColumns = db

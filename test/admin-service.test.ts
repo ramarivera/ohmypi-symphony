@@ -119,6 +119,12 @@ const deps: AdminDeps = {
     updateMcpServer: unreachable,
     deleteMcpServer: unreachable,
   } as unknown as AdminDeps["mcpServerRepo"],
+  mcpOAuth: {
+    listStatuses: () => Effect.succeed(new Map()),
+    startMcpAuthorization: unreachable,
+    completeMcpAuthorization: unreachable,
+    disconnect: unreachable,
+  } as unknown as AdminDeps["mcpOAuth"],
   runInputRepo: RunInputRepo.make({
     enqueue: unreachable,
     applyStop: unreachable,
