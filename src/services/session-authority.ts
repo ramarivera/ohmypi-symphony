@@ -2128,6 +2128,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   ? reopenedOption.value
                   : latest;
               }
+              const initialPrompt =
+                input.kind === "created"
+                  ? yield* linearWorkerPromptWithTemplate(
+                      promptTemplateRepo,
+                      latest.organizationId,
+                      input.kind,
+                      input.body,
+                    )
+                  : undefined;
               if (worker === undefined) {
                 if (runUrlForSession !== null) {
                   yield* projector.externalUrls(
@@ -2234,12 +2243,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   );
                 }
                 const agentInvoked = yield* worker.prompt(
-                  yield* linearWorkerPromptWithTemplate(
-                    promptTemplateRepo,
-                    latest.organizationId,
-                    input.kind,
-                    input.body,
-                  ),
+                  initialPrompt ??
+                    (yield* linearWorkerPromptWithTemplate(
+                      promptTemplateRepo,
+                      latest.organizationId,
+                      input.kind,
+                      input.body,
+                    )),
                 );
                 if (!agentInvoked) {
                   yield* finishLocalCommand(sessionId, worker, input.id);

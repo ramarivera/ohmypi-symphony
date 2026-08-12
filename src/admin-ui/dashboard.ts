@@ -188,7 +188,7 @@ export const ADMIN_BODY = `
     <section class="panel" aria-labelledby="prompt-templates-heading">
       <div class="panel-header">
         <h2 id="prompt-templates-heading">Worker prompt templates</h2>
-        <span class="hint">Changes apply to new Linear agent sessions.</span>
+        <span class="hint">Changes apply to new inputs, including follow-ups in running sessions.</span>
       </div>
       <div class="panel-body">
         <div id="prompt-templates-status" role="status" aria-live="polite"></div>
@@ -197,7 +197,7 @@ export const ADMIN_BODY = `
           <div class="field full"><label for="prompt-template-prompted">Prompted input</label><textarea id="prompt-template-prompted" rows="4" data-prompt-kind="prompted"></textarea></div>
           <div class="field full"><label for="prompt-template-contract">Worker contract</label><textarea id="prompt-template-contract" rows="10" data-prompt-kind="contract"></textarea></div>
         </div>
-        <div class="hint">Leave a template blank to restore the built-in default. Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Prompted placeholder: <code>{{userRequest}}</code>. Unknown placeholders remain literal. Edits apply to new inputs — including follow-ups in already-running sessions.</div>
+        <div class="hint">Changes apply to new inputs, including follow-ups in running sessions. Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Prompted placeholder: <code>{{userRequest}}</code>. Unknown placeholders remain literal.</div>
         <div class="field full"><label for="prompt-template-preview">Created preview (sample payload)</label><pre id="prompt-template-preview" aria-live="polite"></pre></div>
         <div class="field full"><label for="prompt-template-preview-prompted">Prompted preview (sample payload)</label><pre id="prompt-template-preview-prompted" aria-live="polite"></pre></div>
         <div class="field full"><label for="prompt-template-preview-contract">Contract preview</label><pre id="prompt-template-preview-contract" aria-live="polite"></pre></div>
@@ -1082,18 +1082,24 @@ export const ADMIN_SCRIPT = `
     }
   }
 
-  var PROMPT_SAMPLE = {
-    userRequest: "User request:\nSample task from Linear",
-    issueContext: "Issue context:\nIssue: Sample issue (SYM-1)",
-    threadComment: "Thread comment:\nPlease investigate this.",
-    previousComments: "Previous comments:\n1. Earlier discussion",
-    guidance: "Guidance:\n1. Keep the change focused.",
+  var PROMPT_SAMPLES = {
+    created: {
+      userRequest: "User request:\nSample task from Linear",
+      issueContext: "Issue context:\nIssue: Sample issue (SYM-1)",
+      threadComment: "Thread comment:\nPlease investigate this.",
+      previousComments: "Previous comments:\n1. Earlier discussion",
+      guidance: "Guidance:\n1. Keep the change focused.",
+    },
+    prompted: {
+      userRequest: "User request:\nSample follow-up from Linear",
+    },
+    contract: {},
   };
 
   // Must mirror substitutePromptTemplate in src/services/prompt-templates.ts:
   // unknown tokens pass through and empty token-only sections are dropped.
-  function substitutePromptPreview(template) {
-    var values = PROMPT_SAMPLE;
+  function substitutePromptPreview(template, kind) {
+    var values = PROMPT_SAMPLES[kind] || {};
     var emptyTokens = {};
     Object.keys(values).forEach(function (name) {
       if (!values[name]) emptyTokens["{{" + name + "}}"] = true;
@@ -1113,7 +1119,7 @@ export const ADMIN_SCRIPT = `
       var preview = templateKind === "created"
         ? el("prompt-template-preview")
         : el("prompt-template-preview-" + templateKind);
-      if (source && preview) preview.textContent = substitutePromptPreview(source.value);
+      if (source && preview) preview.textContent = substitutePromptPreview(source.value, templateKind);
     });
   }
 

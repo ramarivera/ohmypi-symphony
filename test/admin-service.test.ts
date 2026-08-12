@@ -121,7 +121,7 @@ const deps: AdminDeps = {
   } as unknown as AdminDeps["mcpServerRepo"],
   promptTemplateRepo: {
     get: () => Effect.succeed(Option.none()),
-    put: unreachable,
+    upsert: unreachable,
     remove: unreachable,
     list: unreachable,
   } as unknown as AdminDeps["promptTemplateRepo"],
@@ -589,8 +589,10 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       enqueued?: boolean;
       createdRunInput?: unknown;
       createdInputId?: unknown;
+      createdInputBody?: string;
       payload?: unknown;
     } = {};
+    const callOrder: Array<string> = [];
     let reconcilerTriggers = 0;
     const newSessionId = "55555555-5555-4555-8555-555555555555";
     const rerunHandle = createAdminHandle({
@@ -600,6 +602,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
         get: () => Effect.succeed(Option.some(terminalRun)),
         hasActiveForIssue: () => Effect.succeed(false),
         createIfNoActiveForIssue: (input) => {
+          callOrder.push("run");
           created.createdRunInput = input;
           created.sessionId = input.sessionId;
           created.createdRun = true;
@@ -610,13 +613,33 @@ describe("POST /api/admin/runs/:id/rerun", () => {
         ...deps.runInputRepo,
         enqueue: (input) => {
           created.createdInputId = input.id;
+          created.createdInputBody = input.body;
           created.payload = input.payload;
           created.enqueued = true;
           return Effect.succeed(true);
         },
       }),
+      promptTemplateRepo: {
+        get: () => {
+          callOrder.push("template");
+          return Effect.succeed(
+            Option.some({
+              organizationId,
+              kind: "created" as const,
+              body: "{{userRequest}}\n{{issueContext}}\n{{threadComment}}\n{{previousComments}}\n{{guidance}}",
+              updatedAt: 1,
+            }),
+          );
+        },
+        upsert: unreachable,
+        remove: unreachable,
+        list: unreachable,
+      } as unknown as AdminDeps["promptTemplateRepo"],
       linearGateway: {
-        createSessionOnIssue: () => Effect.succeed(newSessionId),
+        createSessionOnIssue: () => {
+          callOrder.push("session");
+          return Effect.succeed(newSessionId);
+        },
       },
       reconciler: {
         ...deps.reconciler,
@@ -637,9 +660,13 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     const res = Option.getOrElse(response, () => null);
     expect(res?.status).toBe(200);
     expect(await res?.json()).toEqual({ sessionId: newSessionId });
+    expect(callOrder).toEqual(["template", "session", "run"]);
     expect(created.sessionId).toBe(newSessionId);
     expect(created.createdRun).toBe(true);
     expect(created.enqueued).toBe(true);
+    expect(created.createdInputBody).toBe(
+      "Work on the issue below.\nIssue: 44444444-4444-4444-8444-444444444444",
+    );
     expect(reconcilerTriggers).toBe(1);
     const createdInput = created.createdRunInput as {
       organizationId: unknown;

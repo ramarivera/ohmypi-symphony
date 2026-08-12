@@ -11,10 +11,8 @@ import {
 import { InputId, type SessionId } from "../domain/ids.js";
 import { GatewayConfig } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
-import { substitutePromptTemplate } from "./prompt-templates.js";
 import { SessionAuthority } from "./session-authority.js";
 import {
-  PromptTemplateRepo,
   RunInputRepo,
   RunRepo,
 } from "./store/repositories.js";
@@ -32,7 +30,7 @@ const MAX_CATCHUP_CANDIDATES_PER_SWEEP = 25;
 
 export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
   accessors: true,
-  dependencies: [SessionAuthority.Default, PromptTemplateRepo.Default],
+  dependencies: [SessionAuthority.Default],
   effect: Effect.gen(function* () {
     const statusRef = yield* Ref.make<ReconcilerStatus>({
       running: true,
@@ -53,8 +51,6 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
     const catchup = Effect.fn("Reconciler.catchup")(
       function* (): Effect.fn.Return<void, never> {
         const gatewayOption = yield* Effect.serviceOption(LinearGateway);
-        const promptTemplateRepoOption =
-          yield* Effect.serviceOption(PromptTemplateRepo);
         const runRepoOption = yield* Effect.serviceOption(RunRepo);
         const runInputRepoOption = yield* Effect.serviceOption(RunInputRepo);
         const configOption = yield* Effect.serviceOption(GatewayConfig);
@@ -181,25 +177,13 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
               title && activityBody
                 ? `# ${title}\n\n${activityBody}`
                 : activityBody || title;
-            const configured =
-              kind === "prompted" && Option.isSome(promptTemplateRepoOption)
-                ? yield* promptTemplateRepoOption.value
-                    .get(run.organizationId, "prompted")
-                    .pipe(Effect.orElse(() => Effect.succeed(Option.none())))
-                : Option.none();
-            const body =
-              kind === "prompted" && Option.isSome(configured)
-                ? substitutePromptTemplate(configured.value.body, {
-                    userRequest: rawBody,
-                  })
-                : rawBody;
             const activityCreatedAt = Date.parse(activity.createdAt);
             const inserted = yield* runInputRepo
               .enqueue({
                 id,
                 sessionId: run.sessionId,
                 kind,
-                body,
+                body: rawBody,
                 payload: {
                   source: "reconciler.catchup",
                   sessionId: run.sessionId,

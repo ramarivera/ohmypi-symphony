@@ -900,6 +900,30 @@ export const createAdminHandle = (deps: AdminDeps) =>
                 text("A run for this issue is already active", 409),
               );
             }
+            const rerunTemplate = yield* deps.promptTemplateRepo
+              .get(run.organizationId, "created")
+              .pipe(
+                Effect.catchTag(
+                  "@Gateway/DatabaseError",
+                  (error) =>
+                    new AdminError({
+                      message: error.message,
+                      status: 500,
+                    }),
+                ),
+              );
+            // Admin reruns honor a configured created template; the
+            // substitution mirrors the webhook's created body builder with
+            // the synthetic context.
+            const body = Option.isSome(rerunTemplate)
+              ? substitutePromptTemplate(rerunTemplate.value.body, {
+                  userRequest: "Work on the issue below.",
+                  issueContext: `Issue: ${issueId}`,
+                  threadComment: "",
+                  previousComments: "",
+                  guidance: "",
+                })
+              : `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
             const newSessionId = yield* deps.linearGateway
               .createSessionOnIssue({
                 organizationId: run.organizationId,
@@ -963,27 +987,6 @@ export const createAdminHandle = (deps: AdminDeps) =>
                   ),
               }),
             );
-            const rerunTemplate = yield* deps.promptTemplateRepo
-              .get(run.organizationId, "created")
-              .pipe(
-                Effect.catchTag(
-                  "@Gateway/DatabaseError",
-                  (error) =>
-                    new AdminError({
-                      message: error.message,
-                      status: 500,
-                    }),
-                ),
-              );
-            // Admin reruns honor a configured created template; the
-            // substitution mirrors the webhook's created body builder with
-            // the synthetic context.
-            const body = Option.isSome(rerunTemplate)
-              ? substitutePromptTemplate(rerunTemplate.value.body, {
-                  userRequest: "Work on the issue below.",
-                  issueContext: `Issue: ${issueId}`,
-                })
-              : `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
             yield* deps.runInputRepo.enqueue({
               id: inputId,
               sessionId: newRunSessionId,
