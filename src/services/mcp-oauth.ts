@@ -527,7 +527,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
     const tokenCrypto = yield* TokenCrypto;
     const sqlite = yield* SqliteClient;
     const { db } = sqlite;
-    const refreshFlights = yield* Ref.make(
+    const refreshState = yield* Ref.make(
       new Map<
         string,
         Deferred.Deferred<McpOAuthToken, DatabaseError | TokenCipherError>
@@ -851,7 +851,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         McpOAuthToken,
         DatabaseError | TokenCipherError
       >();
-      const claim = yield* Ref.modify(refreshFlights, (flights) => {
+      const claim = yield* Ref.modify(refreshState, (flights) => {
         const existing = flights.get(key);
         if (existing) return [Option.some(existing), flights] as const;
         const next = new Map(flights);
@@ -878,7 +878,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         Effect.tapError((error) => Deferred.fail(mine, error)),
         Effect.onExit((exit) => Deferred.done(mine, exit)),
         Effect.ensuring(
-          Ref.update(refreshFlights, (flights) => {
+          Ref.update(refreshState, (flights) => {
             const next = new Map(flights);
             next.delete(key);
             return next;
