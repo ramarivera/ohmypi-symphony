@@ -40,3 +40,7 @@ export const WorkspaceId = Schema.String.pipe(
   Schema.brand("@Gateway/WorkspaceId"),
 );
 export type WorkspaceId = Schema.Schema.Type<typeof WorkspaceId>;
+export const McpServerId = Schema.String.pipe(
+  Schema.brand("@Gateway/McpServerId"),
+);
+export type McpServerId = Schema.Schema.Type<typeof McpServerId>;

@@ -83,6 +83,16 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
           }),
         );
         const seen = new Set<string>();
+        // Prune polling history for sessions no longer eligible (terminal or
+        // aged out of the canceled horizon) so the map can't grow forever.
+        const eligible = new Set(candidatesResult.map((run) => run.sessionId));
+        yield* Ref.update(catchupLastPolledAt, (lastPolled) => {
+          const next = new Map(lastPolled);
+          for (const sessionId of next.keys()) {
+            if (!eligible.has(sessionId)) next.delete(sessionId);
+          }
+          return next;
+        });
         let polled = 0;
         for (const run of candidatesResult) {
           if (seen.has(run.sessionId)) continue;
@@ -148,6 +158,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                   }),
               }),
             );
+          let injected = false;
           for (const activity of activities) {
             if (activity.type !== "prompt") continue;
             const kind = activity.signal === "stop" ? "stop" : "prompted";
@@ -174,6 +185,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                   sessionId: run.sessionId,
                   activityId: activity.id,
                   activity,
+                  automationDelegated: true,
                 },
                 createdAt: Number.isFinite(activityCreatedAt)
                   ? activityCreatedAt
@@ -198,6 +210,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                 }),
               );
             if (inserted) {
+              injected = true;
               yield* Effect.logInfo("reconciler.catchup.injected").pipe(
                 Effect.annotateLogs({
                   sessionId: run.sessionId,
@@ -205,6 +218,20 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                 }),
               );
             }
+          }
+          if (run.state === "canceled" && injected) {
+            yield* authority.processSession(run.sessionId).pipe(
+              Effect.matchCauseEffect({
+                onSuccess: Effect.succeed,
+                onFailure: (cause) =>
+                  Effect.logWarning("reconciler.catchup.process_failed").pipe(
+                    Effect.annotateLogs({
+                      sessionId: run.sessionId,
+                      error: Cause.pretty(cause),
+                    }),
+                  ),
+              }),
+            );
           }
         }
       },

@@ -18,6 +18,8 @@ export interface GatewayConfigShape {
   readonly linearClientSecret: Redacted.Redacted<string>;
   readonly linearWebhookSecret: Redacted.Redacted<string>;
   readonly tokenEncryptionKey: Redacted.Redacted<string>;
+  readonly githubAppId: string | undefined;
+  readonly githubAppPrivateKey: Redacted.Redacted<string> | undefined;
   readonly publicUrl: URL;
   readonly logLevel: LogLevel;
   readonly logFile: Option.Option<LogFileConfig>;
@@ -247,6 +249,33 @@ const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
   );
 });
 
+const optionalValue = Effect.fn("GatewayConfig.optionalValue")(function* (
+  name: string,
+): Effect.fn.Return<string | undefined, ConfigError.ConfigError> {
+  const direct = yield* Config.option(Config.string(name));
+  if (Option.isSome(direct)) {
+    const value = direct.value.trim();
+    if (value.length > 0) return value;
+  }
+
+  const filePath = yield* Config.option(Config.string(`${name}_FILE`));
+  if (Option.isNone(filePath) || filePath.value.trim().length === 0) {
+    return undefined;
+  }
+
+  const path = filePath.value.trim();
+  const value = yield* Effect.tryPromise({
+    try: () => Bun.file(path).text(),
+    catch: (error) =>
+      ConfigError.InvalidData(
+        [`${name}_FILE`],
+        `Could not read ${name} from ${path}: ${String(error)}`,
+      ),
+  });
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+});
+
 export class GatewayConfig extends Effect.Service<GatewayConfig>()(
   "GatewayConfig",
   {
@@ -257,6 +286,24 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
       const linearClientSecret = yield* requiredValue("LINEAR_CLIENT_SECRET");
       const linearWebhookSecret = yield* requiredValue("LINEAR_WEBHOOK_SECRET");
       const tokenEncryptionKey = yield* requiredValue("TOKEN_ENCRYPTION_KEY");
+      const githubAppId = yield* optionalValue("GITHUB_APP_ID");
+      const githubAppPrivateKey = yield* optionalValue(
+        "GITHUB_APP_PRIVATE_KEY",
+      );
+      if ((githubAppId === undefined) !== (githubAppPrivateKey === undefined)) {
+        const missing =
+          githubAppId === undefined
+            ? "GITHUB_APP_ID"
+            : "GITHUB_APP_PRIVATE_KEY";
+        yield* Effect.logWarning(
+          `GitHub App configuration is partial; missing ${missing}`,
+        ).pipe(
+          Effect.annotateLogs({
+            event: "config.github_app.partial",
+            missing,
+          }),
+        );
+      }
       const publicUrlValue = yield* requiredValue("PUBLIC_URL");
       const publicUrl = yield* Effect.try({
         try: () => new URL(publicUrlValue),
@@ -280,6 +327,11 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
       return {
         ...values,
         linearClientId,
+        githubAppId,
+        githubAppPrivateKey:
+          githubAppPrivateKey === undefined
+            ? undefined
+            : Redacted.make(githubAppPrivateKey),
         linearClientSecret: Redacted.make(linearClientSecret),
         linearWebhookSecret: Redacted.make(linearWebhookSecret),
         tokenEncryptionKey: Redacted.make(tokenEncryptionKey),

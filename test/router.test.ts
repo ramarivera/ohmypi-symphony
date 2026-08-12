@@ -238,6 +238,8 @@ describe("HTTP router parity", () => {
     };
     const config: GatewayConfig = {
       _tag: "GatewayConfig",
+      githubAppId: undefined,
+      githubAppPrivateKey: undefined,
       linearClientId: "client",
       linearClientSecret: Redacted.make("secret"),
       linearWebhookSecret: Redacted.make("webhook"),
@@ -324,6 +326,8 @@ describe("HTTP router parity", () => {
         Effect.provideService(OAuth, oauth),
         Effect.provideService(GatewayConfig, {
           _tag: "GatewayConfig",
+          githubAppId: undefined,
+          githubAppPrivateKey: undefined,
           linearClientId: "client",
           linearClientSecret: Redacted.make("secret"),
           linearWebhookSecret: Redacted.make("webhook"),

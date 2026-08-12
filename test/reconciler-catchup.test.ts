@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Option, Schema, TestClock } from "effect";
+import { Clock, Effect, Layer, Option, Schema, TestClock } from "effect";
 import { LinearApiError } from "../src/domain/errors.js";
 import { OrganizationId, SessionId } from "../src/domain/ids.js";
 import type { AgentRun } from "../src/domain/models.js";
@@ -45,8 +45,13 @@ const run = (
   updatedAt: 0,
 });
 
+const processedSessions: string[] = [];
 const authority = {
   processRunnable: () => Effect.void,
+  processSession: (sessionId: string) =>
+    Effect.sync(() => {
+      processedSessions.push(sessionId);
+    }),
 } as unknown as SessionAuthority;
 
 const makeLayer = (
@@ -58,6 +63,7 @@ const makeLayer = (
   const inserted = new Set<string>();
   const ids: string[] = [];
   const bodies = new Map<string, string>();
+  const payloads = new Map<string, unknown>();
   const listCatchupCalls: Array<{ readonly now: number }> = [];
   const runRepo = {
     listCatchupCandidates: (now: number) =>
@@ -67,12 +73,13 @@ const makeLayer = (
       }),
   } as unknown as RunRepo;
   const runInputRepo = {
-    enqueue: (input: { id: string; body?: string }) =>
+    enqueue: (input: { id: string; body?: string; payload?: unknown }) =>
       Effect.sync(() => {
         if (inserted.has(input.id)) return false;
         inserted.add(input.id);
         ids.push(input.id);
         bodies.set(input.id, input.body ?? "");
+        payloads.set(input.id, input.payload);
         return true;
       }),
   } as unknown as RunInputRepo;
@@ -89,7 +96,7 @@ const makeLayer = (
     Layer.provide(Layer.succeed(SessionAuthority, authority)),
   );
   const layer = Layer.mergeAll(reconciler, deps);
-  return { layer, ids, bodies, listCatchupCalls };
+  return { layer, ids, bodies, payloads, listCatchupCalls };
 };
 
 describe("Reconciler catch-up", () => {
@@ -184,7 +191,7 @@ describe("Reconciler catch-up", () => {
     "isolates activity fetch failures and preserves canceled prompt semantics",
     () =>
       Effect.gen(function* () {
-        const { layer, ids } = makeLayer(
+        const { layer, ids, payloads } = makeLayer(
           [run(sessionA), run(sessionB, "canceled")],
           (sessionId) =>
             sessionId === sessionA
@@ -218,24 +225,32 @@ describe("Reconciler catch-up", () => {
           yield* TestClock.adjust("10 minutes");
           yield* reconciler.catchup();
         }).pipe(Effect.provide(layer));
+        expect(processedSessions).toEqual([sessionB]);
         expect(ids).toEqual([`${sessionB}:prompted:cancel-prompt`]);
+        expect(
+          (
+            payloads.get(`${sessionB}:prompted:cancel-prompt`) as Record<
+              string,
+              unknown
+            >
+          ).automationDelegated,
+        ).toBe(true);
       }),
   );
   it.effect("skips runs with recent activity", () =>
     Effect.gen(function* () {
-      const { layer, ids } = makeLayer(
-        [run(sessionA, "running", Date.now())],
-        () =>
-          Effect.succeed([
-            {
-              id: "recent-prompt",
-              type: "prompt",
-              body: "ignored",
-              title: null,
-              signal: null,
-              createdAt: "2025-01-01T00:00:00.000Z",
-            },
-          ]),
+      const now = yield* Clock.currentTimeMillis;
+      const { layer, ids } = makeLayer([run(sessionA, "running", now)], () =>
+        Effect.succeed([
+          {
+            id: "recent-prompt",
+            type: "prompt",
+            body: "ignored",
+            title: null,
+            signal: null,
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ]),
       );
       yield* Effect.gen(function* () {
         const reconciler = yield* Reconciler;

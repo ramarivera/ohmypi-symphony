@@ -737,6 +737,18 @@ export const PAGE_STYLES = `
     border-top: 1px solid var(--rule-soft);
     padding-top: 16px;
   }
+  form.repo-form .key-value-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  form.repo-form .key-value-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
+    gap: 8px;
+    align-items: center;
+  }
+  form.repo-form .key-value-row .btn { white-space: nowrap; }
   form .error {
     color: var(--danger);
     font-family: var(--mono);

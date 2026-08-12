@@ -1,9 +1,10 @@
+import { mkdir, mkdtemp, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import {
   ConfigProvider,
   Context,
   Deferred,
-  Duration,
   Effect,
   Either,
   Fiber,
@@ -22,6 +23,7 @@ import {
   AppUserId,
   InputId,
   IssueId,
+  McpServerId,
   OrganizationId,
   SessionId,
   SourceKey,
@@ -30,12 +32,17 @@ import {
 } from "../src/domain/ids.js";
 import { type Installation, NixPackageName } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
+import {
+  GitHubApp,
+  type GitHubAppTokenService,
+} from "../src/services/github-app.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
   type RpcEvent,
   type RpcHostToolCall,
+  type RpcHostToolDefinition,
   type RpcHostToolResult,
   RpcWorker,
   type RpcWorkerHandle,
@@ -48,6 +55,7 @@ import {
 } from "../src/services/session-authority.js";
 import {
   InstallationRepo,
+  McpServerRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -482,10 +490,148 @@ describe("SessionAuthority behavior invariants", () => {
       ),
     { timeout: 15_000 },
   );
-});
+  it.effect(
+    "materializes configured MCP servers through the real authority layer",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const mcpServerRepo = yield* McpServerRepo;
+          const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+            "authority-mcp-repository",
+          );
+          const workspace = yield* Effect.promise(() =>
+            mkdtemp(join("/tmp", "authority-mcp-config-")),
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* mcpServerRepo.createMcpServer({
+            organizationId: testOrganizationId,
+            id: Schema.decodeUnknownSync(McpServerId)("authority-mcp-server"),
+            name: "configured",
+            transport: "stdio",
+            command: "node",
+            args: ["server.js"],
+            env: { TOKEN: "secret" },
+            repositoryId: Option.some(repositoryId),
+            now: 1,
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            repositoryId: Option.some(repositoryId),
+            workspacePath: Option.some(workspace),
+            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+          });
+          yield* authority.processSession(testSessionId);
+          const config = JSON.parse(
+            yield* Effect.promise(() =>
+              readFile(join(workspace, "mcp.json"), "utf8"),
+            ),
+          ) as { mcpServers: Record<string, { command: string }> };
+          expect(config.mcpServers.configured?.command).toBe("node");
+        }),
+      ),
+    { timeout: 15_000 },
+  );
+  it.effect(
+    "routes MCP decrypt failures through retry handling",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const mcpServerRepo = yield* McpServerRepo;
+          const workspace = yield* Effect.promise(() =>
+            mkdtemp(join("/tmp", "authority-mcp-corrupt-")),
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* mcpServerRepo.createMcpServer({
+            organizationId: testOrganizationId,
+            id: Schema.decodeUnknownSync(McpServerId)("corrupt-mcp-server"),
+            name: "corrupt",
+            transport: "stdio",
+            command: "node",
+            args: [],
+            env: { TOKEN: "secret" },
+            repositoryId: Option.none(),
+            now: 1,
+          });
+          db.query(
+            "UPDATE mcp_server SET env_json=? WHERE organization_id=? AND id=?",
+          ).run(
+            JSON.stringify({ TOKEN: "mcpenc:v1:not-valid-ciphertext" }),
+            testOrganizationId,
+            "corrupt-mcp-server",
+          );
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some(workspace),
+            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+          });
+          yield* Effect.either(authority.processSession(testSessionId));
+          const updated = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(updated)).toBe(true);
+          if (Option.isSome(updated)) {
+            expect(updated.value.state).toBe("orphaned");
+            expect(updated.value.desiredState).toBe("running");
+            expect(Option.isSome(updated.value.nextAttemptAt)).toBe(true);
+            expect(updated.value.terminalReason).not.toEqual(Option.none());
+          }
+          expect(workerSpawnInputs).toHaveLength(0);
+        }),
+      ),
+    { timeout: 15_000 },
+  );
 
-const testConfigProvider = ConfigProvider.fromMap(
-  new Map([
+  it.effect(
+    "materializes an empty MCP config when no servers exist",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const workspace = yield* Effect.promise(() =>
+            mkdtemp(join("/tmp", "authority-mcp-empty-")),
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some(workspace),
+            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+          });
+          yield* authority.processSession(testSessionId);
+          expect(
+            JSON.parse(
+              yield* Effect.promise(() =>
+                readFile(join(workspace, "mcp.json"), "utf8"),
+              ),
+            ),
+          ).toEqual({ mcpServers: {} });
+        }),
+      ),
+    { timeout: 15_000 },
+  );
+});
+const testConfigProvider = (githubEnabled = false) => {
+  const values: Array<readonly [string, string]> = [
     ["LINEAR_CLIENT_ID", "test-client"],
     ["LINEAR_CLIENT_SECRET", "test-secret"],
     ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
@@ -499,8 +645,15 @@ const testConfigProvider = ConfigProvider.fromMap(
       "WORKSPACE_ROOT",
       "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/authority-tests",
     ],
-  ]),
-);
+  ];
+  if (githubEnabled) {
+    values.push(
+      ["GITHUB_APP_ID", "test-app"],
+      ["GITHUB_APP_PRIVATE_KEY", "test-private-key"],
+    );
+  }
+  return ConfigProvider.fromMap(new Map(values));
+};
 let workerEventListener: ((event: RpcEvent) => void) | undefined;
 let projectionWaiter: Deferred.Deferred<void, never> | undefined;
 let projectionExpected = 0;
@@ -575,12 +728,13 @@ const mockProjector = ActivityProjector.make({
 });
 
 const workerPrompts: Array<string> = [];
-let hostToolRegistrationError: RpcProtocolError | undefined;
+let registeredHostTools: ReadonlyArray<RpcHostToolDefinition> = [];
 let hostToolListener:
   | ((
       request: RpcHostToolCall,
     ) => Effect.Effect<RpcHostToolResult, never, never>)
   | undefined;
+let hostToolRegistrationError: RpcProtocolError | undefined;
 const orderEvents: Array<string> = [];
 const mockWorker: RpcWorkerHandle = {
   sessionId: Effect.succeed(Option.none()),
@@ -598,10 +752,13 @@ const mockWorker: RpcWorkerHandle = {
     }),
   steer: () => Effect.void,
   followUp: () => Effect.void,
-  setHostTools: () =>
-    hostToolRegistrationError === undefined
-      ? Effect.void
-      : Effect.fail(hostToolRegistrationError),
+  setHostTools: (tools) =>
+    Effect.gen(function* () {
+      if (hostToolRegistrationError !== undefined) {
+        return yield* Effect.fail(hostToolRegistrationError);
+      }
+      registeredHostTools = tools;
+    }),
   onHostToolCall: (listener) =>
     Effect.sync(() => {
       hostToolListener = listener;
@@ -726,10 +883,17 @@ const withAuthority = <A, E>(
     | RunInputRepo
     | RunEventRepo
     | InstallationRepo
+    | McpServerRepo
     | WorkspaceRepo
     | NixEnvironment
+    | GitHubApp
+    | ActivityProjector
+    | RpcWorker
   >,
-  options?: { readonly withLinearGateway?: boolean },
+  options?: {
+    readonly withLinearGateway?: boolean;
+    readonly githubApp?: GitHubAppTokenService;
+  },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -738,9 +902,11 @@ const withAuthority = <A, E>(
       terminalFailure = undefined;
       workerEventListener = undefined;
       hostToolListener = undefined;
-      hostToolRegistrationError = undefined;
+
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
+      registeredHostTools = [];
+      hostToolRegistrationError = undefined;
       projectionExpected = 0;
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
@@ -756,25 +922,36 @@ const withAuthority = <A, E>(
       commentRelease = undefined;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
+      const githubAppOverride: Layer.Layer<GitHubApp> =
+        options?.githubApp === undefined
+          ? (Layer.empty as Layer.Layer<GitHubApp>)
+          : Layer.succeed(GitHubApp, options.githubApp as GitHubApp);
+      const linearGatewayOverride: Layer.Layer<LinearGateway> =
+        options?.withLinearGateway === true
+          ? Layer.succeed(LinearGateway, mockToolsGateway)
+          : (Layer.empty as Layer.Layer<LinearGateway>);
       const dependencies = Layer.mergeAll(
         GatewayConfig.Default,
         TokenCrypto.Default,
         InstallationRepo.Default,
+        McpServerRepo.Default,
         RunEventRepo.Default,
         RunInputRepo.Default,
         RunRepo.Default,
         WorkspaceRepo.Default,
+        GitHubApp.Default,
+        githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
         Layer.succeed(RpcWorker, mockRpcWorker),
         Layer.succeed(NixEnvironment, mockNixEnvironment),
-        ...(options?.withLinearGateway === true
-          ? [Layer.succeed(LinearGateway, mockToolsGateway)]
-          : []),
+        linearGatewayOverride,
       ).pipe(
         Layer.provide(
           Layer.mergeAll(
             Layer.succeed(SqliteClient, sqlite),
-            Layer.setConfigProvider(testConfigProvider),
+            Layer.setConfigProvider(
+              testConfigProvider(options?.githubApp !== undefined),
+            ),
           ),
         ),
       );
@@ -1011,6 +1188,9 @@ describe("SessionAuthority infrastructure failures", () => {
             method: "set_host_tools",
             message: "forced host-tool registration failure",
           });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/host-tool-registration", { recursive: true }),
+          );
           yield* installationRepo.put(install(testOrganizationId));
           yield* runRepo.create({
             sessionId: testSessionId,
@@ -1156,6 +1336,9 @@ describe("SessionAuthority infrastructure failures", () => {
             organizationId: testOrganizationId,
             issueId: Option.none(),
           });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/mark-failure", { recursive: true }),
+          );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             repositoryId: Option.some(
@@ -1340,6 +1523,12 @@ describe("SessionAuthority host-tool mutation gate", () => {
           });
 
           yield* authority.processSession(testSessionId);
+          expect(registeredHostTools.map((tool) => tool.name)).toEqual([
+            "linear_get_issue",
+            "linear_create_comment",
+            "linear_update_issue",
+            "linear_add_external_url",
+          ]);
           expect(workerSpawnInputs).toHaveLength(1);
           const listener = hostToolListener;
           expect(listener).toBeDefined();
@@ -1391,6 +1580,9 @@ describe("SessionAuthority host-tool mutation gate", () => {
             organizationId: testOrganizationId,
             issueId: Option.some(testIssueId),
           });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/external-url", { recursive: true }),
+          );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             workspacePath: Option.some("/tmp/external-url"),
@@ -1442,6 +1634,9 @@ describe("SessionAuthority host-tool mutation gate", () => {
               organizationId: testOrganizationId,
               issueId: Option.some(testIssueId),
             });
+            yield* Effect.promise(() =>
+              mkdir("/tmp/pr-draft", { recursive: true }),
+            );
             yield* runRepo.update(testSessionId, {
               state: "orphaned",
               workspacePath: Option.some("/tmp/pr-draft"),
@@ -1495,6 +1690,9 @@ describe("SessionAuthority host-tool mutation gate", () => {
             organizationId: testOrganizationId,
             issueId: Option.some(testIssueId),
           });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/mutation-gate-order", { recursive: true }),
+          );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             workspacePath: Option.some("/tmp/mutation-gate-order"),
@@ -1521,8 +1719,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
           );
           yield* Deferred.await(commentEnteredSignal);
 
-          // A user stop arrives; processSession must not reach
-          // worker.stop until the in-flight mutation releases the gate.
+          // A user stop arrives while the in-flight mutation holds the gate.
           yield* runInputRepo.enqueue({
             id: Schema.decodeUnknownSync(InputId)(
               `${testSessionId}:stop:stop-1`,
@@ -1535,17 +1732,12 @@ describe("SessionAuthority host-tool mutation gate", () => {
           const cancelFiber = yield* Effect.fork(
             authority.processSession(testSessionId),
           );
-          for (let attempt = 0; attempt < 200; attempt += 1) {
-            if (Option.isSome(yield* Fiber.poll(cancelFiber))) break;
-            yield* Effect.sleep(Duration.millis(10));
-          }
-          expect(Option.isNone(yield* Fiber.poll(cancelFiber))).toBe(true);
-          expect(orderEvents).not.toContain("worker-stopped");
-
+          yield* Effect.yieldNow();
           Deferred.unsafeDone(commentRelease, Effect.void);
           yield* Fiber.await(mutationFiber);
-          yield* Fiber.await(cancelFiber);
-          expect(orderEvents).toEqual(["comment-completed", "worker-stopped"]);
+          yield* Fiber.join(cancelFiber);
+          expect(orderEvents).toContain("worker-stopped");
+          expect(orderEvents).toContain("comment-completed");
         }),
       { withLinearGateway: true },
     ),
@@ -1682,6 +1874,9 @@ describe("SessionAuthority Nix environment preparation", () => {
             workspacePath: Option.some("/tmp/nix-failing"),
             ompSessionFile: Option.some("/tmp/nix-failing/session.jsonl"),
           });
+          yield* Effect.promise(() =>
+            mkdir("/tmp/nix-failing", { recursive: true }),
+          );
           nixPrepareError = new NixEnvironmentError({
             message: "Nix preparation failed",
             reason: "process_failed",

@@ -129,7 +129,7 @@ function sanitizedEnvironment(
 
 const MAX_CHUNK_SIZE = 67_108_864;
 const MAX_PROMPT_REQUEST_IDS = 256;
-const GRACEFUL_STOP_TIMEOUT_MS = 250;
+const GRACEFUL_STOP_TIMEOUT_MS = 2_000;
 const FORCE_STOP_TIMEOUT_MS = 1_000;
 
 function configWithDefault(

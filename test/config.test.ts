@@ -7,6 +7,7 @@ import {
   Effect,
   Either,
   Layer,
+  Logger,
   Redacted,
   Schema,
 } from "effect";
@@ -118,6 +119,74 @@ describe("GatewayConfig", () => {
     expect(config.linearClientId).toBe("direct-client");
   });
 
+  test("loads optional GitHub App credentials and keeps the key redacted", async () => {
+    const configured = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(
+        Effect.provide(
+          configLayer(
+            valuesWith([
+              ["GITHUB_APP_ID", "12345"],
+              ["GITHUB_APP_PRIVATE_KEY", "private-key"],
+            ]),
+          ),
+        ),
+      ),
+    );
+    expect(configured.githubAppId).toBe("12345");
+    if (configured.githubAppPrivateKey === undefined) {
+      throw new Error("Expected GitHub App private key");
+    }
+    expect(Redacted.isRedacted(configured.githubAppPrivateKey)).toBe(true);
+    expect(Redacted.value(configured.githubAppPrivateKey)).toBe("private-key");
+    expect(String(configured.githubAppPrivateKey)).not.toContain("private-key");
+
+    const absent = await Effect.runPromise(
+      Effect.gen(function* () {
+        return yield* GatewayConfig;
+      }).pipe(Effect.provide(configLayer(baseValues))),
+    );
+    expect(absent.githubAppId).toBeUndefined();
+    expect(absent.githubAppPrivateKey).toBeUndefined();
+  });
+
+  test.each([
+    [["GITHUB_APP_ID", "12345"] as const, "GITHUB_APP_PRIVATE_KEY"],
+    [["GITHUB_APP_PRIVATE_KEY", "private-key"] as const, "GITHUB_APP_ID"],
+  ])("warns when GitHub App config is partial", async (configured, missing) => {
+    const logs: string[] = [];
+    const logger = Logger.make(({ message }) => {
+      logs.push(
+        Array.isArray(message)
+          ? message.map(String).join(" ")
+          : String(message),
+      );
+    });
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* GatewayConfig;
+      }).pipe(
+        Effect.provide(configLayer(valuesWith([configured]))),
+        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+      ),
+    );
+    expect(logs.join("\n")).toContain("GitHub App configuration is partial");
+    expect(logs.join("\n")).toContain(missing);
+  });
+
+  test("rejects an unreadable optional GitHub App secret file", async () => {
+    const result = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["GITHUB_APP_ID", "12345"],
+          ["GITHUB_APP_PRIVATE_KEY_FILE", "/missing/github-app-key"],
+        ]),
+      ),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+  });
+
   test("applies all operational defaults", async () => {
     const config = await Effect.runPromise(
       Effect.gen(function* () {
@@ -156,10 +225,10 @@ describe("GatewayConfig", () => {
     );
     expect(Either.isLeft(result)).toBe(true);
   });
-  test("rejects a blank repository suggestion confidence threshold", async () => {
+  test("rejects a spaces-only repository suggestion confidence threshold", async () => {
     const result = await Effect.runPromise(
       configResult(
-        valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", " ​ "]]),
+        valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", "   "]]),
       ),
     );
     expect(Either.isLeft(result)).toBe(true);
