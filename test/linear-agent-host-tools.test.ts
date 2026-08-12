@@ -107,7 +107,6 @@ describe("Linear host tools", () => {
     ]);
   });
 
-
   it.effect(
     "malformed host_tool_call gets an error result and the worker survives",
     () =>
