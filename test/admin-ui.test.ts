@@ -294,6 +294,20 @@ describe("renderAdminPage", () => {
     );
   });
 
+  test("protects Executor credentials and preserves toolkit actions after attach", () => {
+    const html = renderAdminPage();
+    expect(html).toContain("Remove Executor credentials?");
+    expect(html).toMatch(
+      /executorDelete[\s\S]*openConfirm\(\s*\{[\s\S]*deleteExecutor/,
+    );
+    expect(html).toMatch(
+      /async function saveExecutor[\s\S]*error\.textContent = ""[\s\S]*error\.hidden = true/,
+    );
+    expect(html).toMatch(
+      /async function attachExecutorToolkit[\s\S]*redirecting[\s\S]*preserveExecutorToolkits: true/,
+    );
+  });
+
   test("does not depend on any external resources (CSP / network hardening)", () => {
     const html = renderAdminPage();
     const lower = html.toLowerCase();

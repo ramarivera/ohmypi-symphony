@@ -584,20 +584,40 @@ export const ADMIN_SCRIPT = `
   }
   async function listExecutorToolkits() {
     var status = el("executor-status"); if (status) status.textContent = "Loading toolkits…";
-    try { var result = await fetchJSON(EXECUTOR_TOOLKITS, { method: "GET" }); state.executorToolkits = result.data && Array.isArray(result.data.toolkits) ? result.data.toolkits : []; renderExecutor(state.executorInstance, state.executorToolkits); }
+    try {
+      var result = await fetchJSON(EXECUTOR_TOOLKITS, { method: "GET" });
+      if (result && result.redirecting) return;
+      state.executorToolkits = result.data && Array.isArray(result.data.toolkits) ? result.data.toolkits : [];
+      renderExecutor(state.executorInstance, state.executorToolkits);
+    }
     catch (err) { if (status) status.textContent = err && err.message ? err.message : "Could not list Executor toolkits."; }
   }
   async function saveExecutor(event) {
     event.preventDefault(); var form = el("executor-form"); var error = el("executor-form-error");
-    try { await fetchJSON(EXECUTOR_BASE, { method: "PUT", body: { endpoint: form.elements.namedItem("endpoint").value.trim(), token: form.elements.namedItem("token").value } }); showToast("Executor saved.", "ok"); await loadBootstrap({ announce: false }); }
-    catch (err) { error.textContent = err && err.message ? err.message : "Could not save Executor."; error.hidden = false; }
+    if (!form) return;
+    if (error) { error.textContent = ""; error.hidden = true; }
+    try {
+      var result = await fetchJSON(EXECUTOR_BASE, { method: "PUT", body: { endpoint: form.elements.namedItem("endpoint").value.trim(), token: form.elements.namedItem("token").value } });
+      if (result && result.redirecting) return;
+      if (error) { error.textContent = ""; error.hidden = true; }
+      showToast("Executor saved.", "ok"); await loadBootstrap({ announce: false });
+    }
+    catch (err) { if (error) { error.textContent = err && err.message ? err.message : "Could not save Executor."; error.hidden = false; } }
   }
   async function deleteExecutor() {
-    try { await fetchJSON(EXECUTOR_BASE, { method: "DELETE", body: {} }); showToast("Executor removed.", "ok"); await loadBootstrap({ announce: false }); }
+    try {
+      var result = await fetchJSON(EXECUTOR_BASE, { method: "DELETE", body: {} });
+      if (result && result.redirecting) return;
+      showToast("Executor removed.", "ok"); await loadBootstrap({ announce: false });
+    }
     catch (err) { showToast(err && err.message ? err.message : "Could not remove Executor.", "error"); }
   }
   async function attachExecutorToolkit(slug) {
-    try { await fetchJSON(EXECUTOR_ATTACH, { method: "POST", body: { slug: slug } }); showToast("Toolkit attached as MCP.", "ok"); await loadBootstrap({ announce: false }); }
+    try {
+      var result = await fetchJSON(EXECUTOR_ATTACH, { method: "POST", body: { slug: slug } });
+      if (result && result.redirecting) return;
+      showToast("Toolkit attached as MCP.", "ok"); await loadBootstrap({ announce: false, preserveExecutorToolkits: true });
+    }
     catch (err) { showToast(err && err.message ? err.message : "Could not attach toolkit.", "error"); }
   }
   function handleExecutorClick(event) {
@@ -1122,6 +1142,7 @@ export const ADMIN_SCRIPT = `
   async function loadBootstrap(options) {
     options = options || {};
     var announce = options.announce !== false;
+    var preserveExecutorToolkits = options.preserveExecutorToolkits === true;
     if (announce) {
       setStatus("loading", "loading…");
       announceStatus("repos-status", "Loading repositories…");
@@ -1145,7 +1166,7 @@ export const ADMIN_SCRIPT = `
       state.repositories = Array.isArray(data.repositories) ? data.repositories : [];
       state.mcpServers = Array.isArray(data.mcpServers) ? data.mcpServers : [];
       state.executorInstance = data.executorInstance || null;
-      state.executorToolkits = [];
+      if (!preserveExecutorToolkits) state.executorToolkits = [];
       renderInstallation(state.installation);
       renderRepositories(state.repositories);
       renderMcpServers(state.mcpServers);
@@ -1174,6 +1195,7 @@ export const ADMIN_SCRIPT = `
       setStatus("warn", "load error");
     }
   }
+
 
   // ---- logout --------------------------------------------------------------
 
@@ -1205,7 +1227,13 @@ export const ADMIN_SCRIPT = `
     var executorList = el("executor-list-btn");
     if (executorList) executorList.addEventListener("click", listExecutorToolkits);
     var executorDelete = el("executor-delete-btn");
-    if (executorDelete) executorDelete.addEventListener("click", deleteExecutor);
+    if (executorDelete) executorDelete.addEventListener("click", function () {
+      openConfirm({
+        title: "Remove Executor credentials?",
+        body: "This removes the saved Executor endpoint and bearer token.",
+        onConfirm: deleteExecutor,
+      });
+    });
     var executorToolkitList = el("executor-toolkit-list");
     if (executorToolkitList) executorToolkitList.addEventListener("click", handleExecutorClick);
 

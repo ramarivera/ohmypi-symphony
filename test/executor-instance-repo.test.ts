@@ -2,7 +2,10 @@ import { describe, expect, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
 import { OrganizationId } from "../src/domain/ids.js";
 import { ExecutorInstanceRepo } from "../src/services/store/executor-instance-repo.js";
-import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
+import {
+  SqliteClient,
+  SqliteClientLive,
+} from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 
 const org = Schema.decodeUnknownSync(OrganizationId)("org_executor");
@@ -10,14 +13,15 @@ const key = Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64");
 const configProvider = ConfigProvider.fromMap(
   new Map<string, string>([["TOKEN_ENCRYPTION_KEY", key]]),
 );
-const live = ExecutorInstanceRepo.Default.pipe(
-  Layer.provide(
-    Layer.mergeAll(
-      SqliteClientLive(":memory:"),
-      TokenCrypto.Default.pipe(
-        Layer.provide(Layer.setConfigProvider(configProvider)),
-      ),
-    ),
+const sqlite = SqliteClientLive(":memory:");
+const tokenLayer = TokenCrypto.Default.pipe(
+  Layer.provide(Layer.setConfigProvider(configProvider)),
+);
+const live = Layer.mergeAll(
+  sqlite,
+  tokenLayer,
+  ExecutorInstanceRepo.Default.pipe(
+    Layer.provide(Layer.mergeAll(sqlite, tokenLayer)),
   ),
 );
 
@@ -33,6 +37,14 @@ describe("ExecutorInstanceRepo", () => {
           token: "secret",
           updatedAt: 10,
         });
+        const { db } = yield* SqliteClient;
+        const persisted = db
+          .query<{ token: string }, [string]>(
+            "SELECT token FROM executor_instance WHERE organization_id=?",
+          )
+          .get(org)?.token;
+        expect(persisted).toMatch(/^mcpenc:v1:/);
+        expect(persisted).not.toContain("secret");
         expect(saved.token).toBe("secret");
         expect(yield* repo.get(org)).toEqual(Option.some(saved));
         const updated = yield* repo.put({

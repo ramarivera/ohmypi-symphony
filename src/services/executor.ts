@@ -27,8 +27,15 @@ const Toolkit = Schema.Struct({
 const ToolkitResponse = Schema.Struct({ toolkits: Schema.Array(Toolkit) });
 export type ExecutorToolkit = typeof Toolkit.Type;
 
+export const executorUrlForPath = (base: string, path: string): string => {
+  const endpoint = new URL(base);
+  const basePath = endpoint.pathname.replace(/\/+$/u, "");
+  endpoint.pathname = `${basePath}/${path.replace(/^\/+/u, "")}`;
+  return endpoint.toString();
+};
+
 const endpointFor = (base: string): string =>
-  `${base.replace(/\/+$/u, "")}/api/toolkits`;
+  executorUrlForPath(base, "api/toolkits");
 
 export class Executor extends Effect.Service<Executor>()("Executor", {
   accessors: true,
@@ -77,51 +84,53 @@ export class Executor extends Effect.Service<Executor>()("Executor", {
       }
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 5000);
-      const response = yield* Effect.tryPromise({
-        try: () =>
-          fetch(endpointFor(endpoint.toString()), {
-            headers: {
-              authorization: `Bearer ${instance.value.token}`,
-              accept: "application/json",
-            },
-            signal: controller.signal,
-          }),
-        catch: (error) =>
-          new ExecutorRequestError({
-            reason:
-              (error instanceof Error && error.name === "AbortError") ||
-              String(error).startsWith("AbortError")
-                ? "timeout"
-                : "http",
-            message: String(error),
-          }),
-      }).pipe(Effect.ensuring(Effect.sync(() => clearTimeout(timeout))));
-      if (!response.ok) {
-        return yield* Effect.fail(
-          new ExecutorRequestError({
-            reason: "http",
-            message: `Executor returned HTTP ${response.status}`,
-          }),
-        );
-      }
-      const body = yield* Effect.tryPromise({
-        try: () => response.json(),
-        catch: (error) =>
-          new ExecutorRequestError({
-            reason: "invalid_response",
-            message: String(error),
-          }),
-      });
-      return yield* Schema.decodeUnknown(ToolkitResponse)(body).pipe(
-        Effect.map((result) => result.toolkits),
-        Effect.mapError(
-          (error) =>
+      const isAbortError = (error: unknown): boolean =>
+        (error instanceof Error && error.name === "AbortError") ||
+        String(error).startsWith("AbortError");
+      const result = yield* Effect.gen(function* () {
+        const response = yield* Effect.tryPromise({
+          try: () =>
+            fetch(endpointFor(endpoint.toString()), {
+              headers: {
+                Authorization: `Bearer ${instance.value.token}`,
+                accept: "application/json",
+              },
+              signal: controller.signal,
+            }),
+          catch: (error) =>
             new ExecutorRequestError({
-              reason: "invalid_response",
+              reason: isAbortError(error) ? "timeout" : "http",
               message: String(error),
             }),
-        ),
-      );
+        });
+        if (!response.ok) {
+          return yield* Effect.fail(
+            new ExecutorRequestError({
+              reason: "http",
+              message: `Executor returned HTTP ${response.status}`,
+            }),
+          );
+        }
+        const body = yield* Effect.tryPromise({
+          try: () => response.json(),
+          catch: (error) =>
+            new ExecutorRequestError({
+              reason: isAbortError(error) ? "timeout" : "invalid_response",
+              message: String(error),
+            }),
+        });
+        return yield* Schema.decodeUnknown(ToolkitResponse)(body).pipe(
+          Effect.map((decoded) => decoded.toolkits),
+          Effect.mapError(
+            (error) =>
+              new ExecutorRequestError({
+                reason: "invalid_response",
+                message: String(error),
+              }),
+          ),
+        );
+      }).pipe(Effect.ensuring(Effect.sync(() => clearTimeout(timeout))));
+      return result;
     });
     return { listToolkits };
   }),

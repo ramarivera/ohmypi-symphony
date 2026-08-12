@@ -39,7 +39,11 @@ import type {
 } from "../domain/models.js";
 import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
-import { Executor, type ExecutorRequestError } from "./executor.js";
+import {
+  Executor,
+  type ExecutorRequestError,
+  executorUrlForPath,
+} from "./executor.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
@@ -113,7 +117,7 @@ export interface AdminDeps {
   readonly config: GatewayConfigShape;
   readonly adminSessionRepo: AdminSessionRepo;
   readonly executorInstanceRepo: ExecutorInstanceRepo;
-  readonly executor?: {
+  readonly executor: {
     readonly listToolkits: Executor["listToolkits"];
   };
   readonly installationRepo: InstallationRepo;
@@ -459,6 +463,55 @@ export function toApiMcpServer(server: McpServerRecord) {
     updatedAt: server.updatedAt,
   };
 }
+const EXECUTOR_ATTACHMENT_PREFIX = "executor:";
+
+const executorAttachmentSlug = (server: McpServerRecord): string | null => {
+  if (!server.name.startsWith(EXECUTOR_ATTACHMENT_PREFIX)) return null;
+  const marker = server.name
+    .slice(EXECUTOR_ATTACHMENT_PREFIX.length)
+    .split(":", 1)[0];
+  if (!marker) return null;
+  try {
+    return decodeURIComponent(marker);
+  } catch {
+    return null;
+  }
+};
+
+const synchronizeExecutorAttachments = (
+  deps: AdminDeps,
+  organizationId: OrganizationId,
+  endpoint: string | null,
+  token: string | null,
+  now: number,
+): Effect.Effect<void, DatabaseError | RowDecodeError | TokenCipherError> =>
+  Effect.gen(function* () {
+    const servers = yield* deps.mcpServerRepo.listMcpServers(organizationId);
+    yield* Effect.forEach(servers, (server) => {
+      if (executorAttachmentSlug(server) === null) return Effect.void;
+      if (endpoint === null || token === null) {
+        return deps.mcpServerRepo
+          .updateMcpServer(organizationId, server.id, {
+            enabled: false,
+            now,
+          })
+          .pipe(Effect.asVoid);
+      }
+      const slug = executorAttachmentSlug(server);
+      if (slug === null) return Effect.void;
+      return deps.mcpServerRepo
+        .updateMcpServer(organizationId, server.id, {
+          url: executorUrlForPath(
+            endpoint,
+            `mcp/toolkits/${encodeURIComponent(slug)}`,
+          ),
+          headers: { Authorization: `Bearer ${token}` },
+          now,
+        })
+        .pipe(Effect.asVoid);
+    });
+  });
+
 function toApiExecutorInstance(instance: {
   readonly endpoint: string;
   readonly updatedAt: number;
@@ -1091,6 +1144,18 @@ export const createAdminHandle = (deps: AdminDeps) =>
         }
         if (parsedEndpoint.protocol !== "https:")
           return Option.some(text("endpoint must use https", 400));
+        if (
+          parsedEndpoint.username ||
+          parsedEndpoint.password ||
+          parsedEndpoint.search ||
+          parsedEndpoint.hash
+        )
+          return Option.some(
+            text(
+              "endpoint must not contain credentials, query, or fragment",
+              400,
+            ),
+          );
         const current = yield* deps.executorInstanceRepo.get(
           session.organizationId,
         );
@@ -1109,6 +1174,13 @@ export const createAdminHandle = (deps: AdminDeps) =>
           token,
           updatedAt: now,
         });
+        yield* synchronizeExecutorAttachments(
+          deps,
+          session.organizationId,
+          instance.endpoint,
+          instance.token,
+          now,
+        );
         return Option.some(
           json({ executorInstance: toApiExecutorInstance(instance) }),
         );
@@ -1119,6 +1191,13 @@ export const createAdminHandle = (deps: AdminDeps) =>
       ) {
         const session = yield* requireMutation(request);
         yield* deps.executorInstanceRepo.remove(session.organizationId);
+        yield* synchronizeExecutorAttachments(
+          deps,
+          session.organizationId,
+          null,
+          null,
+          now,
+        );
         return Option.some(emptyResponse(204));
       }
       if (
@@ -1126,14 +1205,6 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "GET"
       ) {
         const session = yield* requireSession(request);
-        if (deps.executor === undefined) {
-          return yield* Effect.fail(
-            new AdminError({
-              message: "Executor integration unavailable",
-              status: 502,
-            }),
-          );
-        }
         const toolkits = yield* deps.executor
           .listToolkits(session.organizationId)
           .pipe(Effect.mapError(executorError));
@@ -1152,7 +1223,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
         if (Option.isNone(instance))
           return Option.some(text("Executor is not configured", 404));
-        const name = optionalString(body.name) ?? `executor-${slug}`;
+        const name = `${EXECUTOR_ATTACHMENT_PREFIX}${encodeURIComponent(slug)}:${optionalString(body.name) ?? slug}`;
         const rawId = optionalString(body.id) ?? `executor-${slug}`;
         const id = yield* Schema.decodeUnknown(McpServerId)(rawId).pipe(
           Effect.catchTags({
@@ -1191,7 +1262,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
           id,
           name,
           transport: "http",
-          url: `${instance.value.endpoint.replace(/\/+$/u, "")}/mcp/toolkits/${encodeURIComponent(slug)}`,
+          url: executorUrlForPath(
+            instance.value.endpoint,
+            `mcp/toolkits/${encodeURIComponent(slug)}`,
+          ),
           headers: { Authorization: `Bearer ${instance.value.token}` },
           repositoryId,
           enabled: true,
