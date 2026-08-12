@@ -10,6 +10,7 @@ import {
   createPkceChallenge,
   createPkceVerifier,
   discoverMcpOAuthMetadata,
+  isLoopbackHost,
   MCP_OAUTH_ENCRYPTED_PREFIX,
   McpOAuth,
   materializeMcpAgentDb,
@@ -50,6 +51,12 @@ describe("MCP OAuth primitives", () => {
     );
     expect(createPkceVerifier()).toMatch(/^[A-Za-z0-9_-]{43}$/u);
   });
+  it("only accepts parsed IPv4 loopback addresses", () => {
+    expect(isLoopbackHost("127.0.0.1")).toBe(true);
+    expect(isLoopbackHost("127.255.255.255")).toBe(true);
+    expect(isLoopbackHost("127.attacker.example")).toBe(false);
+    expect(isLoopbackHost("127.0.0.1.attacker.example")).toBe(false);
+  });
 
   it("discovers protected-resource and authorization-server metadata", async () => {
     const fetchMock = vi.fn<typeof fetch>();
@@ -66,6 +73,7 @@ describe("MCP OAuth primitives", () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
+            issuer: "https://issuer.example",
             authorization_endpoint: "https://issuer.example/authorize",
             token_endpoint: "https://issuer.example/token",
             registration_endpoint: "https://issuer.example/register",
@@ -85,6 +93,32 @@ describe("MCP OAuth primitives", () => {
       "https://mcp.example/.well-known/oauth-protected-resource/server",
       "https://issuer.example/.well-known/oauth-authorization-server",
     ]);
+  });
+  it("rejects authorization metadata for a different issuer", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            resource: "https://mcp.example/server",
+            authorization_servers: ["https://issuer.example"],
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            issuer: "https://other.example",
+            authorization_endpoint: "https://issuer.example/authorize",
+            token_endpoint: "https://issuer.example/token",
+          }),
+          { status: 200 },
+        ),
+      );
+    await expect(
+      discoverMcpOAuthMetadata("https://mcp.example/server", fetchMock),
+    ).rejects.toThrow("metadata issuer");
   });
   it("returns a typed discovery reason for unavailable metadata", async () => {
     const fetchMock = vi
@@ -110,6 +144,7 @@ describe("MCP OAuth primitives", () => {
       .mockResolvedValueOnce(
         new Response(
           JSON.stringify({
+            issuer: "https://issuer.example",
             authorization_endpoint: "https://issuer.example/authorize",
             token_endpoint: "https://issuer.example/token",
             registration_endpoint: "https://attacker.example/register",
@@ -348,6 +383,31 @@ describe("MCP OAuth primitives", () => {
       }),
     });
     expect(JSON.parse(row?.data ?? "{}")).not.toHaveProperty("type");
+    db.close();
+    await rm(workspace, { recursive: true, force: true });
+  });
+  it("materializes refresh material for a live MCP connection", async () => {
+    const workspace = `/tmp/mcp-oauth-refresh-${crypto.randomUUID()}`;
+    const agentDir = await materializeMcpAgentDb(workspace, [
+      {
+        serverUrl: "https://mcp.example/server",
+        accessToken: "access-token",
+        refreshToken: "refresh-token",
+        expiresAt: 1_700_000_000_000,
+        tokenEndpoint: "https://issuer.example/token",
+        clientId: "client-1",
+      },
+    ]);
+    const db = new Database(`${agentDir}/agent.db`);
+    const row = db
+      .query<{ data: string }, []>("SELECT data FROM auth_credentials")
+      .get();
+    expect(JSON.parse(row?.data ?? "{}")).toMatchObject({
+      access: "access-token",
+      refresh: "refresh-token",
+      tokenUrl: "https://issuer.example/token",
+      clientId: "client-1",
+    });
     db.close();
     await rm(workspace, { recursive: true, force: true });
   });

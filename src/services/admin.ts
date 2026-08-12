@@ -1246,6 +1246,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           session.organizationId,
           id,
         );
+        if (Option.isNone(server)) return Option.some(text("Not found", 404));
         const oauth = Option.isSome(server)
           ? server.value.oauthClient
           : undefined;
@@ -1419,7 +1420,8 @@ export const createAdminHandle = (deps: AdminDeps) =>
                         : {}),
                     ...(payload.oauthScope !== null
                       ? { scope: payload.oauthScope }
-                      : current.value.oauthClient?.clientId ===
+                      : body.oauthScope === undefined &&
+                          current.value.oauthClient?.clientId ===
                             payload.oauthClientId &&
                           current.value.oauthClient?.scope !== undefined
                         ? { scope: current.value.oauthClient.scope }

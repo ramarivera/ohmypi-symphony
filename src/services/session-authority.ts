@@ -1731,14 +1731,33 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 run.organizationId,
                 server.id,
               );
+              const details = yield* mcpOAuth.getCredentialDetails(
+                run.organizationId,
+                server.id,
+              );
               return {
                 server,
                 credential: Option.match(token, {
                   onNone: () => null,
-                  onSome: (value) => ({
-                    accessToken: value.accessToken,
-                    expiresAt: value.expiresAt,
-                  }),
+                  onSome: (value) => {
+                    const detail = Option.getOrUndefined(details);
+                    return {
+                      accessToken: value.accessToken,
+                      expiresAt: value.expiresAt,
+                      ...(value.refreshToken !== undefined
+                        ? { refreshToken: value.refreshToken }
+                        : {}),
+                      ...(detail?.client.tokenEndpoint !== undefined
+                        ? { tokenEndpoint: detail.client.tokenEndpoint }
+                        : {}),
+                      ...(detail?.client.clientId !== undefined
+                        ? { clientId: detail.client.clientId }
+                        : {}),
+                      ...(detail?.client.clientSecret !== undefined
+                        ? { clientSecret: detail.client.clientSecret }
+                        : {}),
+                    };
+                  },
                 }),
               };
             }),
@@ -1757,6 +1776,18 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   serverUrl: entry.server.url.value,
                   accessToken: entry.credential.accessToken,
                   expiresAt: entry.credential.expiresAt,
+                  ...(entry.credential.refreshToken !== undefined
+                    ? { refreshToken: entry.credential.refreshToken }
+                    : {}),
+                  ...(entry.credential.tokenEndpoint !== undefined
+                    ? { tokenEndpoint: entry.credential.tokenEndpoint }
+                    : {}),
+                  ...(entry.credential.clientId !== undefined
+                    ? { clientId: entry.credential.clientId }
+                    : {}),
+                  ...(entry.credential.clientSecret !== undefined
+                    ? { clientSecret: entry.credential.clientSecret }
+                    : {}),
                 },
               ]
             : [],

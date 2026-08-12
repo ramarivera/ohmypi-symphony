@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import type { Stats } from "node:fs";
 import { chmod, lstat, mkdir, rm, unlink, writeFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { Clock, Deferred, Effect, Option, Ref, Schema } from "effect";
 import {
@@ -89,6 +90,7 @@ const ProtectedResourceResponse = Schema.Struct({
   authorization_server: Schema.optional(Schema.String),
 });
 const AuthorizationServerResponse = Schema.Struct({
+  issuer: Schema.String,
   authorization_endpoint: Schema.String,
   token_endpoint: Schema.String,
   registration_endpoint: Schema.optional(Schema.String),
@@ -174,15 +176,15 @@ const validateEndpoint = (endpoint: string, base: URL): string => {
     throw new Error("MCP OAuth endpoint has an untrusted origin");
   return value.toString();
 };
-const isLoopbackHost = (hostname: string): boolean => {
+export const isLoopbackHost = (hostname: string): boolean => {
   const normalized = hostname.toLowerCase();
-  return (
+  if (
     normalized === "localhost" ||
     normalized === "::1" ||
-    normalized === "[::1]" ||
-    normalized === "127.0.0.1" ||
-    normalized.startsWith("127.")
-  );
+    normalized === "[::1]"
+  )
+    return true;
+  return isIP(normalized) === 4 && normalized.split(".")[0] === "127";
 };
 
 const fetchWithTimeout = async (
@@ -193,7 +195,16 @@ const fetchWithTimeout = async (
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
-    return await fetchImpl(input, { ...init, signal: controller.signal });
+    const response = await fetchImpl(input, {
+      ...init,
+      signal: controller.signal,
+    });
+    const body = await response.arrayBuffer();
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
   } finally {
     clearTimeout(timeout);
   }
@@ -332,6 +343,25 @@ const discoverMcpOAuthMetadataEffect = (
       authResponse,
       "MCP OAuth authorization-server discovery",
     );
+    let metadataIssuer: string;
+    try {
+      metadataIssuer = new URL(metadata.issuer).toString();
+    } catch {
+      return yield* Effect.fail(
+        new McpOAuthError({
+          message: "MCP OAuth metadata issuer is not a valid URL",
+          reason: "endpoint_validation",
+        }),
+      );
+    }
+    if (metadataIssuer !== authServerUrl.toString()) {
+      return yield* Effect.fail(
+        new McpOAuthError({
+          message: `MCP OAuth metadata issuer ${metadata.issuer} does not match ${authServerUrl}`,
+          reason: "endpoint_validation",
+        }),
+      );
+    }
     let authorizationEndpoint: string;
     let tokenEndpoint: string;
     let registrationEndpoint: string | undefined;
@@ -742,6 +772,15 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           () =>
             db
               .query(
+                "DELETE FROM mcp_oauth_state WHERE organization_id = ? AND server_id = ? AND consumed_at IS NULL",
+              )
+              .run(organizationId, serverId),
+          "McpOAuth.startMcpAuthorization.invalidate",
+        );
+        yield* tryDb(
+          () =>
+            db
+              .query(
                 "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, admin_session_hash, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
               )
               .run(
@@ -897,33 +936,32 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         now,
         row.server_url,
       );
-      const currentServer = yield* mcpServerRepo.getMcpServer(
-        row.organization_id as OrganizationId,
-        row.server_id as McpServerId,
-      );
-      if (
-        Option.isNone(currentServer) ||
-        !currentServer.value.enabled ||
-        currentServer.value.transport === "stdio" ||
-        Option.isNone(currentServer.value.url) ||
-        currentServer.value.url.value !== row.server_url
-      ) {
-        return yield* Effect.fail(
-          new McpOAuthError({
-            message:
-              "MCP server was removed, disabled, or changed while OAuth was in progress",
-            reason: "server_validation",
-          }),
-        );
-      }
-      const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
-      const refreshToken = token.refreshToken
-        ? yield* tokenCrypto.encrypt(token.refreshToken)
-        : null;
-
       const result = yield* transact(
         db,
         Effect.gen(function* () {
+          const currentServer = yield* mcpServerRepo.getMcpServer(
+            row.organization_id as OrganizationId,
+            row.server_id as McpServerId,
+          );
+          if (
+            Option.isNone(currentServer) ||
+            !currentServer.value.enabled ||
+            currentServer.value.transport === "stdio" ||
+            Option.isNone(currentServer.value.url) ||
+            currentServer.value.url.value !== row.server_url
+          ) {
+            return yield* Effect.fail(
+              new McpOAuthError({
+                message:
+                  "MCP server was removed, disabled, or changed while OAuth was in progress",
+                reason: "server_validation",
+              }),
+            );
+          }
+          const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
+          const refreshToken = token.refreshToken
+            ? yield* tokenCrypto.encrypt(token.refreshToken)
+            : null;
           yield* tryDb(
             () =>
               db
@@ -1224,6 +1262,10 @@ export const materializeMcpAgentDb = async (
     readonly serverUrl: string;
     readonly accessToken: string;
     readonly expiresAt: number;
+    readonly refreshToken?: string | undefined;
+    readonly tokenEndpoint?: string | undefined;
+    readonly clientId?: string | undefined;
+    readonly clientSecret?: string | undefined;
   }>,
 ): Promise<string> => {
   const providers = new Set<string>();
@@ -1269,6 +1311,18 @@ export const materializeMcpAgentDb = async (
             JSON.stringify({
               access: credential.accessToken,
               expires: credential.expiresAt,
+              ...(credential.refreshToken !== undefined
+                ? { refresh: credential.refreshToken }
+                : {}),
+              ...(credential.tokenEndpoint !== undefined
+                ? { tokenUrl: credential.tokenEndpoint }
+                : {}),
+              ...(credential.clientId !== undefined
+                ? { clientId: credential.clientId }
+                : {}),
+              ...(credential.clientSecret !== undefined
+                ? { clientSecret: credential.clientSecret }
+                : {}),
             }),
           );
         }
