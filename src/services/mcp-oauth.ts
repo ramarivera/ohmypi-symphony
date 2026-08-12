@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, rm, unlink, writeFile } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { chmod, lstat, mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { Clock, Deferred, Effect, Option, Ref, Schema } from "effect";
 import {
@@ -88,7 +89,7 @@ const RegistrationResponse = Schema.Struct({
 const TokenResponse = Schema.Struct({
   access_token: Schema.String,
   refresh_token: Schema.optional(Schema.String),
-  expires_in: Schema.optional(Schema.Number),
+  expires_in: Schema.Number.pipe(Schema.nonNegative()),
   token_type: Schema.optional(Schema.String),
   scope: Schema.optional(Schema.String),
 });
@@ -118,6 +119,7 @@ type CredentialRow = Schema.Schema.Type<typeof CredentialRow>;
 
 const StatusRow = Schema.Struct({
   server_id: Schema.String,
+  server_url: Schema.String,
   expires_at: Schema.Number,
 });
 type StatusRow = Schema.Schema.Type<typeof StatusRow>;
@@ -448,7 +450,7 @@ const redeemCode = (
       ...(body.refresh_token !== undefined
         ? { refreshToken: body.refresh_token }
         : {}),
-      expiresAt: now + (body.expires_in ?? 3600) * 1000,
+      expiresAt: now + body.expires_in * 1000,
       ...(body.token_type !== undefined ? { tokenType: body.token_type } : {}),
       ...(body.scope !== undefined ? { scope: body.scope } : {}),
     };
@@ -496,7 +498,7 @@ const refreshAccessToken = (
     return {
       accessToken: body.access_token,
       refreshToken: body.refresh_token ?? refreshToken,
-      expiresAt: now + (body.expires_in ?? 3600) * 1000,
+      expiresAt: now + body.expires_in * 1000,
       ...(body.token_type !== undefined ? { tokenType: body.token_type } : {}),
       ...(body.scope !== undefined ? { scope: body.scope } : {}),
     };
@@ -922,7 +924,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         () =>
           db
             .query<StatusRow, [string]>(
-              "SELECT server_id, expires_at FROM mcp_oauth_credential WHERE organization_id = ?",
+              "SELECT server_id, server_url, expires_at FROM mcp_oauth_credential WHERE organization_id = ?",
             )
             .all(organizationId),
         "McpOAuth.listStatuses",
@@ -933,6 +935,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           row.server_id,
           {
             connected: true,
+            serverUrl: row.server_url,
             expired: row.expires_at <= now,
             expiresAt: row.expires_at,
           },
@@ -951,6 +954,21 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
     };
   }),
 }) {}
+const lstatIfExists = async (path: string): Promise<Stats | undefined> => {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return undefined;
+    }
+    throw error;
+  }
+};
 
 export const materializeMcpAgentDb = async (
   workspace: string,
@@ -962,8 +980,19 @@ export const materializeMcpAgentDb = async (
 ): Promise<string> => {
   const agentDir = join(workspace, ".omp-gateway");
   const path = join(agentDir, "agent.db");
+  const existingDir = await lstatIfExists(agentDir);
+  if (existingDir !== undefined && !existingDir.isDirectory()) {
+    throw new Error("MCP OAuth agent directory must be a real directory");
+  }
   await mkdir(agentDir, { recursive: true, mode: 0o700 });
   await chmod(agentDir, 0o700);
+  const existingPath = await lstatIfExists(path);
+  if (existingPath?.isSymbolicLink()) {
+    throw new Error("MCP OAuth agent database must not be a symlink");
+  }
+  if (existingPath !== undefined && !existingPath.isFile()) {
+    throw new Error("MCP OAuth agent database must be a regular file");
+  }
   await rm(path, { force: true });
   let db: Database | undefined;
   try {

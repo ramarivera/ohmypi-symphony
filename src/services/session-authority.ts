@@ -303,9 +303,9 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const rpc = yield* RpcWorker;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      const mcpOAuthOption = yield* Effect.serviceOption(McpOAuth);
       const linearOption = yield* Effect.serviceOption(LinearGateway);
       const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
-      const mcpOAuthOption = yield* Effect.serviceOption(McpOAuth);
 
       const stopShouldApply = Effect.fn("SessionAuthority.stopShouldApply")(
         function* (
@@ -1746,6 +1746,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               };
             }),
           { concurrency: "unbounded" },
+        ).pipe(
+          Effect.catchAll((error) =>
+            handleFailure(run.sessionId, error).pipe(
+              Effect.zipRight(Effect.fail(error)),
+            ),
+          ),
         );
         const credentials = mintedMcp.flatMap((entry) =>
           entry.credential !== null && Option.isSome(entry.server.url)

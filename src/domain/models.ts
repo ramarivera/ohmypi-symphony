@@ -126,6 +126,14 @@ export type RepositoryRecord = Schema.Schema.Type<typeof RepositoryRecord>;
 export const McpServerTransport = Schema.Literal("stdio", "http", "sse");
 export type McpServerTransport = Schema.Schema.Type<typeof McpServerTransport>;
 
+export const McpOAuthClientConfig = Schema.Struct({
+  clientId: Schema.String,
+  clientSecret: Schema.optional(Schema.String),
+  scope: Schema.optional(Schema.String),
+});
+export type McpOAuthClientConfig = Schema.Schema.Type<
+  typeof McpOAuthClientConfig
+>;
 export const McpServerRecord = Schema.Struct({
   id: McpServerId,
   organizationId: OrganizationId,
@@ -139,6 +147,7 @@ export const McpServerRecord = Schema.Struct({
     Schema.Record({ key: Schema.String, value: Schema.String }),
     { default: () => ({}) },
   ),
+  oauthClient: Schema.optional(Schema.NullOr(McpOAuthClientConfig)),
   repositoryId: Schema.OptionFromNullOr(WorkspaceId),
   enabled: Schema.Boolean,
   createdAt: Schema.Number,

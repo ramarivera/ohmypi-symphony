@@ -336,6 +336,9 @@ interface McpServerPayload {
   readonly url: string | null;
   readonly env: Readonly<Record<string, string>>;
   readonly headers: Readonly<Record<string, string>>;
+  readonly oauthClientId: string | null;
+  readonly oauthClientSecret: string | null;
+  readonly oauthScope: string | null;
   readonly repositoryId: string | null;
   readonly enabled: boolean | undefined;
 }
@@ -416,6 +419,14 @@ function mcpServerPayload(
       headers[key] = value;
     }
   }
+  const oauthClientId = optionalString(body.oauthClientId);
+  const oauthClientSecret = optionalString(body.oauthClientSecret);
+  const oauthScope = optionalString(body.oauthScope);
+  if (oauthClientSecret !== null && oauthClientId === null) {
+    return Either.left(
+      "oauthClientId is required when oauthClientSecret is set",
+    );
+  }
   if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
     return Either.left("enabled must be a boolean");
   }
@@ -428,6 +439,9 @@ function mcpServerPayload(
     url,
     env,
     headers,
+    oauthClientId,
+    oauthClientSecret,
+    oauthScope,
     repositoryId,
     enabled: optionalBoolean(body.enabled),
   });
@@ -436,8 +450,9 @@ export function toApiMcpServer(
   server: McpServerRecord,
   oauthStatus?: {
     readonly connected: boolean;
+    readonly serverUrl?: string;
     readonly expired: boolean;
-    readonly expiresAt: number;
+    readonly expiresAt: number | null;
   },
 ) {
   const env: Record<string, string> = {};
@@ -447,6 +462,15 @@ export function toApiMcpServer(
     headers[name] = "•••";
   }
   return {
+    oauthClient:
+      server.oauthClient === undefined || server.oauthClient === null
+        ? null
+        : {
+            clientId: server.oauthClient.clientId,
+            clientSecret:
+              server.oauthClient.clientSecret === undefined ? null : "•••",
+            scope: server.oauthClient.scope ?? null,
+          },
     id: server.id,
     organizationId: server.organizationId,
     name: server.name,
@@ -1037,7 +1061,17 @@ export const createAdminHandle = (deps: AdminDeps) =>
             repositories: repositories.map(toApiRepository),
             csrfToken: deriveCsrfToken(session.rawToken),
             mcpServers: mcpServers.map((server) =>
-              toApiMcpServer(server, oauthStatuses.get(server.id)),
+              toApiMcpServer(
+                server,
+                (() => {
+                  const status = oauthStatuses.get(server.id);
+                  const url = Option.getOrElse(server.url, () => null);
+                  return status !== undefined &&
+                    (status.serverUrl === undefined || status.serverUrl === url)
+                    ? status
+                    : undefined;
+                })(),
+              ),
             ),
           }),
         );
@@ -1069,7 +1103,17 @@ export const createAdminHandle = (deps: AdminDeps) =>
         return Option.some(
           json({
             mcpServers: mcpServers.map((server) =>
-              toApiMcpServer(server, oauthStatuses.get(server.id)),
+              toApiMcpServer(
+                server,
+                (() => {
+                  const status = oauthStatuses.get(server.id);
+                  const url = Option.getOrElse(server.url, () => null);
+                  return status !== undefined &&
+                    (status.serverUrl === undefined || status.serverUrl === url)
+                    ? status
+                    : undefined;
+                })(),
+              ),
             ),
           }),
         );
@@ -1112,6 +1156,18 @@ export const createAdminHandle = (deps: AdminDeps) =>
               ),
           }),
         );
+        const oauthClient =
+          payload.oauthClientId === null
+            ? null
+            : {
+                clientId: payload.oauthClientId,
+                ...(payload.oauthClientSecret !== null
+                  ? { clientSecret: payload.oauthClientSecret }
+                  : {}),
+                ...(payload.oauthScope !== null
+                  ? { scope: payload.oauthScope }
+                  : {}),
+              };
         const server = yield* deps.mcpServerRepo.createMcpServer({
           organizationId: session.organizationId,
           id,
@@ -1122,6 +1178,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           url: payload.url,
           env: payload.env,
           headers: payload.headers,
+          oauthClient,
           repositoryId,
           enabled: payload.enabled ?? true,
           now,
@@ -1150,8 +1207,27 @@ export const createAdminHandle = (deps: AdminDeps) =>
               ),
           }),
         );
+        const server = yield* deps.mcpServerRepo.getMcpServer(
+          session.organizationId,
+          id,
+        );
+        const oauth = Option.isSome(server)
+          ? server.value.oauthClient
+          : undefined;
         const result = yield* deps.mcpOAuth
-          .startMcpAuthorization(session.organizationId, id)
+          .startMcpAuthorization(
+            session.organizationId,
+            id,
+            oauth !== undefined && oauth !== null
+              ? {
+                  clientId: oauth.clientId,
+                  ...(oauth.clientSecret !== undefined
+                    ? { clientSecret: oauth.clientSecret }
+                    : {}),
+                  ...(oauth.scope !== undefined ? { scope: oauth.scope } : {}),
+                }
+              : undefined,
+          )
           .pipe(
             Effect.catchTag("@Gateway/McpOAuthError", (error) =>
               Effect.fail(
@@ -1270,6 +1346,26 @@ export const createAdminHandle = (deps: AdminDeps) =>
                 value === "•••" && preserved !== undefined ? preserved : value;
             }
           }
+          const oauthClient =
+            body.oauthClientId === undefined
+              ? (current.value.oauthClient ?? null)
+              : payload.oauthClientId === null
+                ? null
+                : {
+                    clientId: payload.oauthClientId,
+                    ...(payload.oauthClientSecret !== null &&
+                    payload.oauthClientSecret !== "•••"
+                      ? { clientSecret: payload.oauthClientSecret }
+                      : current.value.oauthClient?.clientSecret !== undefined
+                        ? {
+                            clientSecret:
+                              current.value.oauthClient.clientSecret,
+                          }
+                        : {}),
+                    ...(payload.oauthScope !== null
+                      ? { scope: payload.oauthScope }
+                      : {}),
+                  };
           const server = yield* deps.mcpServerRepo.updateMcpServer(
             session.organizationId,
             id,
@@ -1281,6 +1377,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
               url: payload.url,
               env,
               headers,
+              oauthClient,
               enabled: payload.enabled,
               repositoryId,
               now,

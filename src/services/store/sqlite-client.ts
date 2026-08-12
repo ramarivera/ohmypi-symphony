@@ -227,6 +227,7 @@ const migrate = (db: Database): void => {
       url TEXT,
       env_json TEXT NOT NULL,
       headers_json TEXT NOT NULL DEFAULT '{}',
+      oauth_client_json TEXT,
       repository_id TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL,
@@ -307,6 +308,9 @@ const migrate = (db: Database): void => {
     db.exec(
       "ALTER TABLE mcp_server ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'",
     );
+  }
+  if (!mcpServerColumns.includes("oauth_client_json")) {
+    db.exec("ALTER TABLE mcp_server ADD COLUMN oauth_client_json TEXT");
   }
 
   db.exec(`
