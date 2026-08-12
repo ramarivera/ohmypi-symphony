@@ -60,6 +60,9 @@ export interface McpOAuthCredential {
   readonly client: McpOAuthClientMetadata;
   readonly token: McpOAuthToken;
 }
+type StoredMcpOAuthCredential = McpOAuthCredential & {
+  readonly updatedAt: number;
+};
 
 const McpOAuthMetadataSchema = Schema.Struct({
   authorizationEndpoint: Schema.String,
@@ -114,6 +117,7 @@ const CredentialRow = Schema.Struct({
   expires_at: Schema.Number,
   token_type: Schema.NullOr(Schema.String),
   scope: Schema.NullOr(Schema.String),
+  updated_at: Schema.Number,
 });
 type CredentialRow = Schema.Schema.Type<typeof CredentialRow>;
 
@@ -289,12 +293,17 @@ const discoverMcpOAuthMetadataEffect = (
     );
     let authorizationEndpoint: string;
     let tokenEndpoint: string;
+    let registrationEndpoint: string | undefined;
     try {
       authorizationEndpoint = validateEndpoint(
         metadata.authorization_endpoint,
         authServerUrl,
       );
       tokenEndpoint = validateEndpoint(metadata.token_endpoint, authServerUrl);
+      registrationEndpoint =
+        metadata.registration_endpoint === undefined
+          ? undefined
+          : validateEndpoint(metadata.registration_endpoint, authServerUrl);
     } catch (error) {
       return yield* Effect.fail(
         new McpOAuthError({
@@ -306,14 +315,7 @@ const discoverMcpOAuthMetadataEffect = (
     return {
       authorizationEndpoint,
       tokenEndpoint,
-      ...(metadata.registration_endpoint !== undefined
-        ? {
-            registrationEndpoint: validateEndpoint(
-              metadata.registration_endpoint,
-              authServerUrl,
-            ),
-          }
-        : {}),
+      ...(registrationEndpoint ? { registrationEndpoint } : {}),
     };
   });
 
@@ -530,7 +532,10 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
     const refreshState = yield* Ref.make(
       new Map<
         string,
-        Deferred.Deferred<McpOAuthToken, DatabaseError | TokenCipherError>
+        Deferred.Deferred<
+          McpOAuthToken,
+          DatabaseError | TokenCipherError | TokenRefreshError
+        >
       >(),
     );
 
@@ -761,18 +766,18 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           serverId,
         );
         if (Option.isNone(server) || Option.isNone(server.value.url))
-          return Option.none<McpOAuthCredential>();
+          return Option.none<StoredMcpOAuthCredential>();
         const serverUrl = server.value.url.value;
         const row = yield* tryDb(
           () =>
             db
               .query<CredentialRow, [string, string, string]>(
-                "SELECT server_url, client_json, access_token, refresh_token, expires_at, token_type, scope FROM mcp_oauth_credential WHERE organization_id = ? AND server_id = ? AND server_url = ?",
+                "SELECT server_url, client_json, access_token, refresh_token, expires_at, token_type, scope, updated_at FROM mcp_oauth_credential WHERE organization_id = ? AND server_id = ? AND server_url = ?",
               )
               .get(organizationId, serverId, serverUrl),
           "McpOAuth.getCredentialDetails",
         );
-        if (row === null) return Option.none<McpOAuthCredential>();
+        if (row === null) return Option.none<StoredMcpOAuthCredential>();
         const decoded = yield* decodeRow(
           CredentialRow,
           row,
@@ -797,7 +802,12 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           yield* decryptValue(tokenCrypto, decoded.client_json),
           "McpOAuth.getCredentialDetails.client",
         );
-        return Option.some({ serverUrl: decoded.server_url, client, token });
+        return Option.some({
+          serverUrl: decoded.server_url,
+          client,
+          token,
+          updatedAt: decoded.updated_at,
+        });
       },
     );
 
@@ -814,17 +824,18 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       serverId: McpServerId,
       token: McpOAuthToken,
       now: number,
-    ): Effect.Effect<void, DatabaseError | TokenCipherError> =>
+      expectedUpdatedAt: number,
+    ): Effect.Effect<boolean, DatabaseError | TokenCipherError> =>
       Effect.gen(function* () {
         const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
         const refreshToken = token.refreshToken
           ? yield* tokenCrypto.encrypt(token.refreshToken)
           : null;
-        yield* tryDb(
+        const result = yield* tryDb(
           () =>
             db
               .query(
-                "UPDATE mcp_oauth_credential SET access_token = ?, refresh_token = ?, expires_at = ?, token_type = ?, scope = ?, updated_at = ? WHERE organization_id = ? AND server_id = ?",
+                "UPDATE mcp_oauth_credential SET access_token = ?, refresh_token = ?, expires_at = ?, token_type = ?, scope = ?, updated_at = ? WHERE organization_id = ? AND server_id = ? AND updated_at = ?",
               )
               .run(
                 encrypted(accessToken),
@@ -835,21 +846,28 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
                 now,
                 organizationId,
                 serverId,
+                expectedUpdatedAt,
               ),
           "McpOAuth.persistRefreshedToken",
+        );
+        return (
+          (yield* runChanges(result, "McpOAuth.persistRefreshedToken")) === 1
         );
       });
 
     const refreshTokens = Effect.fn("McpOAuth.refreshTokens")(function* (
       organizationId: OrganizationId,
       serverId: McpServerId,
-      current: McpOAuthCredential,
+      current: StoredMcpOAuthCredential,
       now: number,
-    ): Effect.fn.Return<McpOAuthToken, DatabaseError | TokenCipherError> {
+    ): Effect.fn.Return<
+      McpOAuthToken,
+      DatabaseError | TokenCipherError | TokenRefreshError
+    > {
       const key = `${organizationId}:${serverId}`;
       const mine = yield* Deferred.make<
         McpOAuthToken,
-        DatabaseError | TokenCipherError
+        DatabaseError | TokenCipherError | TokenRefreshError
       >();
       const claim = yield* Ref.modify(refreshState, (flights) => {
         const existing = flights.get(key);
@@ -858,7 +876,10 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         next.set(key, mine);
         return [
           Option.none<
-            Deferred.Deferred<McpOAuthToken, DatabaseError | TokenCipherError>
+            Deferred.Deferred<
+              McpOAuthToken,
+              DatabaseError | TokenCipherError | TokenRefreshError
+            >
           >(),
           next,
         ] as const;
@@ -872,7 +893,25 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         current.serverUrl,
       ).pipe(
         Effect.tap((token) =>
-          persistRefreshedToken(organizationId, serverId, token, now),
+          persistRefreshedToken(
+            organizationId,
+            serverId,
+            token,
+            now,
+            current.updatedAt,
+          ).pipe(
+            Effect.flatMap((persisted) =>
+              persisted
+                ? Effect.succeed(undefined)
+                : Effect.fail(
+                    new TokenRefreshError({
+                      organizationId,
+                      message:
+                        "MCP OAuth credential changed while refreshing; discarded refreshed token",
+                    }),
+                  ),
+            ),
+          ),
         ),
         Effect.tap((token) => Deferred.succeed(mine, token)),
         Effect.tapError((error) => Deferred.fail(mine, error)),
