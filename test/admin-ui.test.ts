@@ -162,6 +162,12 @@ describe("renderAdminPage", () => {
     expect(html).toMatch(/method:\s*"DELETE"/);
     expect(html).toMatch(/method:\s*"GET"/);
   });
+  test("only renders MCP OAuth connect actions for enabled remote servers", () => {
+    const html = renderAdminPage();
+    expect(html).toMatch(
+      /server\.transport\s*===\s*"http"\s*\|\|\s*server\.transport\s*===\s*"sse"\)\s*&&\s*server\.enabled/,
+    );
+  });
 
   test("sends application/json, X-CSRF-Token, and same-origin credentials on every mutation", () => {
     const html = renderAdminPage();

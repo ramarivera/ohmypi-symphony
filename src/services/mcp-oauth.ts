@@ -113,6 +113,7 @@ const StateRow = Schema.Struct({
   organization_id: Schema.String,
   server_id: Schema.String,
   server_url: Schema.String,
+  admin_session_hash: Schema.NullOr(Schema.String),
   code_verifier: Schema.String,
   redirect_uri: Schema.String,
   client_json: Schema.String,
@@ -656,7 +657,15 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
             | undefined;
         },
         requestedScope?: string,
+        adminSessionHash?: string,
       ) {
+        if (adminSessionHash === undefined) {
+          return yield* Effect.fail(
+            new OAuthStateError({
+              message: "MCP OAuth requires an authenticated admin session",
+            }),
+          );
+        }
         const server = yield* mcpServerRepo.getMcpServer(
           organizationId,
           serverId,
@@ -669,6 +678,14 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           return yield* Effect.fail(
             new DatabaseError({
               message: "MCP server is not an OAuth-capable HTTP/SSE server",
+            }),
+          );
+        }
+        if (!server.value.enabled) {
+          return yield* Effect.fail(
+            new McpOAuthError({
+              message: "MCP server is disabled",
+              reason: "server_disabled",
             }),
           );
         }
@@ -725,13 +742,14 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           () =>
             db
               .query(
-                "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, admin_session_hash, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
               )
               .run(
                 hash(state),
                 organizationId,
                 serverId,
                 serverUrl,
+                adminSessionHash,
                 encrypted(encryptedVerifier),
                 redirectUri,
                 encrypted(encryptedClient),
@@ -752,15 +770,18 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         };
       },
     );
-
     const completeMcpAuthorization = Effect.fn(
       "McpOAuth.completeMcpAuthorization",
-    )(function* (callbackUrl: URL) {
-      const code = callbackUrl.searchParams.get("code");
+    )(function* (callbackUrl: URL, adminSessionHash?: string) {
       const state = callbackUrl.searchParams.get("state");
-      if (!code || !state) {
+      const oauthError = callbackUrl.searchParams.get("error");
+      if (!state) {
         return yield* Effect.fail(
-          new OAuthStateError({ message: "Missing MCP OAuth code or state" }),
+          new OAuthStateError({
+            message: oauthError
+              ? `MCP OAuth authorization failed: ${oauthError} (missing state)`
+              : "Missing MCP OAuth code or state",
+          }),
         );
       }
       const now = yield* Clock.currentTimeMillis;
@@ -768,7 +789,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         () =>
           db
             .query<StateRow, [string, number]>(
-              "SELECT state_hash, organization_id, server_id, server_url, code_verifier, redirect_uri, client_json, expires_at FROM mcp_oauth_state WHERE state_hash = ? AND consumed_at IS NULL AND expires_at >= ?",
+              "SELECT state_hash, organization_id, server_id, server_url, admin_session_hash, code_verifier, redirect_uri, client_json, expires_at FROM mcp_oauth_state WHERE state_hash = ? AND consumed_at IS NULL AND expires_at >= ?",
             )
             .get(hash(state), now),
         "McpOAuth.completeMcpAuthorization.state",
@@ -781,6 +802,52 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         );
       }
       const row = yield* decodeRow(StateRow, rawRow, "McpOAuthState");
+      if (
+        row.admin_session_hash !== null &&
+        row.admin_session_hash !== adminSessionHash
+      ) {
+        return yield* Effect.fail(
+          new OAuthStateError({
+            message: "MCP OAuth state does not belong to this admin session",
+          }),
+        );
+      }
+      if (oauthError !== null) {
+        const consumed = yield* tryDb(
+          () =>
+            db
+              .query(
+                "UPDATE mcp_oauth_state SET consumed_at = ? WHERE state_hash = ? AND consumed_at IS NULL AND expires_at >= ?",
+              )
+              .run(now, hash(state), now),
+          "McpOAuth.completeMcpAuthorization.error.consume",
+        );
+        if (
+          (yield* runChanges(
+            consumed,
+            "McpOAuth.completeMcpAuthorization.error.consume",
+          )) !== 1
+        ) {
+          return yield* Effect.fail(
+            new OAuthStateError({
+              message: "Invalid or expired MCP OAuth state",
+            }),
+          );
+        }
+        const description =
+          callbackUrl.searchParams.get("error_description") ?? oauthError;
+        return yield* Effect.fail(
+          new OAuthStateError({
+            message: `MCP OAuth authorization failed: ${description}`,
+          }),
+        );
+      }
+      const code = callbackUrl.searchParams.get("code");
+      if (!code) {
+        return yield* Effect.fail(
+          new OAuthStateError({ message: "Missing MCP OAuth code or state" }),
+        );
+      }
       const client = yield* decodeStoredJson(
         McpOAuthClientMetadataSchema,
         yield* decryptValue(tokenCrypto, row.client_json),

@@ -269,6 +269,7 @@ const migrate = (db: Database): void => {
       organization_id TEXT NOT NULL,
       server_id TEXT NOT NULL,
       server_url TEXT NOT NULL,
+      admin_session_hash TEXT,
       code_verifier TEXT NOT NULL,
       redirect_uri TEXT NOT NULL,
       client_json TEXT NOT NULL,
@@ -311,6 +312,13 @@ const migrate = (db: Database): void => {
   }
   if (!mcpServerColumns.includes("oauth_client_json")) {
     db.exec("ALTER TABLE mcp_server ADD COLUMN oauth_client_json TEXT");
+  }
+  const mcpOAuthStateColumns = db
+    .query<{ name: string }, []>('PRAGMA table_info("mcp_oauth_state")')
+    .all()
+    .map((column) => column.name);
+  if (!mcpOAuthStateColumns.includes("admin_session_hash")) {
+    db.exec("ALTER TABLE mcp_oauth_state ADD COLUMN admin_session_hash TEXT");
   }
 
   db.exec(`

@@ -9,6 +9,7 @@ import {
   Admin,
   createAdminSession,
   setAdminCookie,
+  tokenHash,
 } from "../services/admin.js";
 import { GatewayConfig } from "../services/config.js";
 import { McpOAuth } from "../services/mcp-oauth.js";
@@ -112,10 +113,25 @@ export const mcpOauthCallback = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const callback = new URL(request.url, "http://localhost");
   const config = yield* GatewayConfig;
+  const adminSessionRepo = yield* AdminSessionRepo;
   const adminUrl = new URL(config.publicUrl.toString());
   adminUrl.pathname = `${adminUrl.pathname.replace(/\/$/u, "")}/admin`;
   adminUrl.search = "";
-  return yield* McpOAuth.completeMcpAuthorization(callback).pipe(
+  const cookie = BunHttpServerRequest.toRequest(request).headers.get("cookie");
+  const rawToken = cookie?.match(/(?:^|;\s*)omp_gateway_admin=([^;]*)/u)?.[1];
+  if (rawToken === undefined) {
+    return yield* Effect.fail(new Error("Unauthorized MCP OAuth callback"));
+  }
+  const adminSessionHash = tokenHash(decodeURIComponent(rawToken));
+  const now = yield* Clock.currentTimeMillis;
+  const session = yield* adminSessionRepo.get(adminSessionHash, now);
+  if (Option.isNone(session)) {
+    return yield* Effect.fail(new Error("Unauthorized MCP OAuth callback"));
+  }
+  return yield* McpOAuth.completeMcpAuthorization(
+    callback,
+    adminSessionHash,
+  ).pipe(
     Effect.as(
       HttpServerResponse.redirect(`${adminUrl.pathname}?mcp=connected`, {
         status: 302,

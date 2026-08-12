@@ -546,7 +546,7 @@ export const ADMIN_SCRIPT = `
       var actions = document.createElement("td"); actions.className = "actions";
       var edit = document.createElement("button"); edit.type = "button"; edit.dataset.action = "edit-mcp"; edit.dataset.mcpId = server.id || ""; edit.textContent = "Edit"; actions.appendChild(edit);
       var toggle = document.createElement("button"); toggle.type = "button"; toggle.dataset.action = "toggle-mcp"; toggle.dataset.mcpId = server.id || ""; toggle.textContent = server.enabled ? "Disable" : "Enable"; actions.appendChild(toggle);
-      if (server.transport === "http" || server.transport === "sse") {
+      if ((server.transport === "http" || server.transport === "sse") && server.enabled) {
         var auth = document.createElement("button"); auth.type = "button"; auth.dataset.action = oauthState.connected ? "disconnect-mcp" : "connect-mcp"; auth.dataset.mcpId = server.id || ""; auth.textContent = oauthState.connected ? "Disconnect" : "Connect"; actions.appendChild(auth);
       }
       var remove = document.createElement("button"); remove.type = "button"; remove.className = "btn-danger"; remove.dataset.action = "delete-mcp"; remove.dataset.mcpId = server.id || ""; remove.textContent = "Delete"; actions.appendChild(remove);

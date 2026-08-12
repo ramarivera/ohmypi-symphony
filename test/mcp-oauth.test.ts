@@ -229,27 +229,64 @@ describe("MCP OAuth primitives", () => {
             const encryptedVerifier = yield* crypto.encrypt(verifier);
             const now = Date.now();
             db.query(
-              "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+              "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, admin_session_hash, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ).run(
               hash(state),
               organizationId,
               serverId,
               "https://mcp.example/server",
+              "admin-session-hash",
               `${MCP_OAUTH_ENCRYPTED_PREFIX}${encryptedVerifier}`,
               "http://localhost:3000/oauth/mcp/callback",
               `${MCP_OAUTH_ENCRYPTED_PREFIX}${client}`,
               now + 60_000,
             );
             const service = yield* McpOAuth;
+            const wrongSession = yield* Effect.either(
+              service.completeMcpAuthorization(
+                new URL(
+                  "http://localhost:3000/oauth/mcp/callback?code=auth-code&state=state-basic-auth",
+                ),
+                "other-admin-session",
+              ),
+            );
+            expect(Either.isLeft(wrongSession)).toBe(true);
             yield* service.completeMcpAuthorization(
               new URL(
                 "http://localhost:3000/oauth/mcp/callback?code=auth-code&state=state-basic-auth",
               ),
+              "admin-session-hash",
             );
             const credential = yield* service.getCredentialDetails(
               organizationId,
               serverId,
             );
+            const deniedState = "state-denied";
+            db.query(
+              "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, admin_session_hash, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ).run(
+              hash(deniedState),
+              organizationId,
+              serverId,
+              "https://mcp.example/server",
+              "admin-session-hash",
+              `${MCP_OAUTH_ENCRYPTED_PREFIX}${encryptedVerifier}`,
+              "http://localhost:3000/oauth/mcp/callback",
+              `${MCP_OAUTH_ENCRYPTED_PREFIX}${client}`,
+              Date.now() + 60_000,
+            );
+            const denied = yield* Effect.either(
+              service.completeMcpAuthorization(
+                new URL(
+                  "http://localhost:3000/oauth/mcp/callback?error=access_denied&error_description=User%20denied%20consent&state=state-denied",
+                ),
+                "admin-session-hash",
+              ),
+            );
+            expect(Either.isLeft(denied)).toBe(true);
+            if (Either.isLeft(denied)) {
+              expect(denied.left.message).toContain("User denied consent");
+            }
             expect(Option.getOrThrow(credential).token.expiresAt).toBe(
               Number.MAX_SAFE_INTEGER,
             );

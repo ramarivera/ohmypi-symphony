@@ -28,9 +28,13 @@ function route(method: string, path: string) {
 function request(
   method: string,
   path: string,
+  cookie?: string,
 ): HttpServerRequest.HttpServerRequest {
   return HttpServerRequest.fromWeb(
-    new Request(`https://gateway.example${path}`, { method }),
+    new Request(`https://gateway.example${path}`, {
+      method,
+      ...(cookie ? { headers: { Cookie: cookie } } : {}),
+    }),
   );
 }
 
@@ -400,13 +404,30 @@ describe("HTTP router parity", () => {
       _tag: "McpOAuth",
       completeMcpAuthorization: () => Effect.succeed(undefined),
     } as unknown as McpOAuth;
+    const adminSessionRepo: AdminSessionRepo = {
+      _tag: "AdminSessionRepo",
+      create: (_input) => Effect.void,
+      get: (_tokenHash, _now) =>
+        Effect.succeed(
+          Option.some({
+            organizationId: "router-org" as OrganizationId,
+            csrfTokenHash: "csrf",
+          }),
+        ),
+      deleteAdminSession: (_tokenHash) => Effect.succeed(false),
+    };
     const response = await Effect.runPromise(
       mcpOauthCallback.pipe(
         Effect.provideService(
           HttpServerRequest.HttpServerRequest,
-          request("GET", "/oauth/mcp/callback?code=code&state=state"),
+          request(
+            "GET",
+            "/oauth/mcp/callback?code=code&state=state",
+            "omp_gateway_admin=admin-token",
+          ),
         ),
         Effect.provideService(GatewayConfig, config),
+        Effect.provideService(AdminSessionRepo, adminSessionRepo),
         Effect.provideService(McpOAuth, mcpOAuth),
       ),
     );

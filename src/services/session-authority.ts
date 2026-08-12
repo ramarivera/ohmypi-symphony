@@ -283,6 +283,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       ActivityProjector.Default,
       InstallationRepo.Default,
       McpServerRepo.Default,
+      McpOAuth.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
       RunRepo.Default,
@@ -303,7 +304,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const rpc = yield* RpcWorker;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
-      const mcpOAuthOption = yield* Effect.serviceOption(McpOAuth);
+      const mcpOAuth = yield* McpOAuth;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
       const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
 
@@ -1723,14 +1724,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           effectiveMcpServers,
           (server) =>
             Effect.gen(function* () {
-              if (
-                Option.isNone(mcpOAuthOption) ||
-                Option.isNone(server.url) ||
-                server.transport === "stdio"
-              ) {
+              if (Option.isNone(server.url) || server.transport === "stdio") {
                 return { server, credential: null };
               }
-              const token = yield* mcpOAuthOption.value.mintCredential(
+              const token = yield* mcpOAuth.mintCredential(
                 run.organizationId,
                 server.id,
               );

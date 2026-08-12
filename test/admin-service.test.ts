@@ -1048,6 +1048,43 @@ describe("MCP admin endpoints", () => {
       tokenEndpointAuthMethod: "client_secret_post",
     });
     expect(disconnected).toBe(true);
+    const scopeOnlyResponse = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(
+          new Request(
+            new URL(
+              "/api/admin/mcp-servers/mcp-oauth-replace",
+              config.publicUrl,
+            ),
+            {
+              method: "PUT",
+              headers: {
+                Cookie: `omp_gateway_admin=${token}`,
+                Origin: config.publicUrl.toString(),
+                "Content-Type": "application/json",
+                "X-CSRF-Token": deriveCsrfToken(token),
+              },
+              body: JSON.stringify({
+                id: "mcp-oauth-replace",
+                name: "oauth replace",
+                transport: "http",
+                command: null,
+                args: [],
+                url: "https://mcp.example.test",
+                env: {},
+                headers: {},
+                repositoryId: null,
+                enabled: true,
+                oauthClientId: null,
+                oauthScope: "read",
+              }),
+            },
+          ),
+        ),
+      ),
+    );
+    expect(scopeOnlyResponse.status).toBe(200);
+    expect(received?.oauthClient).toEqual({ scope: "read" });
   });
   it("requires enabled to be a boolean and defaults omitted to true", async () => {
     const server = Schema.decodeUnknownSync(McpServerRecord)({

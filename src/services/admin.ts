@@ -15,6 +15,7 @@ import {
 import {
   DatabaseError,
   type NixEnvironmentError,
+  type OAuthStateError,
   RowDecodeError,
   type TokenCipherError,
   type WorkspaceError,
@@ -154,7 +155,7 @@ function adminCookieAttributes(
   config: { publicUrl: URL },
   expiresAt?: number,
 ): string {
-  const base = "HttpOnly; SameSite=Strict; Path=/";
+  const base = "HttpOnly; SameSite=Lax; Path=/";
   const secure = isSecure(config) ? "; Secure" : "";
   const expiry =
     expiresAt === undefined
@@ -772,6 +773,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
       Option.Option<Response>,
       | AdminError
       | DatabaseError
+      | OAuthStateError
       | NixEnvironmentError
       | RowDecodeError
       | TokenCipherError
@@ -1266,6 +1268,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
                 }
               : undefined,
             oauth?.scope,
+            tokenHash(session.rawToken),
           )
           .pipe(
             Effect.catchTag("@Gateway/McpOAuthError", (error) =>
@@ -1397,10 +1400,12 @@ export const createAdminHandle = (deps: AdminDeps) =>
           const oauthClient =
             body.oauthClientId === undefined
               ? (current.value.oauthClient ?? null)
-              : payload.oauthClientId === null
+              : payload.oauthClientId === null && payload.oauthScope === null
                 ? null
                 : {
-                    clientId: payload.oauthClientId,
+                    ...(payload.oauthClientId !== null
+                      ? { clientId: payload.oauthClientId }
+                      : {}),
                     ...(payload.oauthClientSecret !== null &&
                     payload.oauthClientSecret !== "•••"
                       ? { clientSecret: payload.oauthClientSecret }
