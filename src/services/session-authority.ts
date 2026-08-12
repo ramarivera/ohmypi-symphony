@@ -341,7 +341,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       ): Effect.Effect<void, never, never> =>
         effect.pipe(
           Effect.catchAll((error) =>
-            Effect.logDebug("authority.best_effort_failed").pipe(
+            Effect.logWarning("authority.best_effort_failed").pipe(
               Effect.annotateLogs({
                 event: "authority.best_effort_failed",
                 description,
@@ -1640,7 +1640,23 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         });
 
         yield* worker.start();
-        yield* registerLinearHostTools(run, worker);
+        yield* registerLinearHostTools(run, worker).pipe(
+          Effect.catchAll((error) =>
+            Effect.gen(function* () {
+              // Registration happens after the worker is started and indexed;
+              // tear down that state before propagating the contract failure.
+              yield* Fiber.interrupt(consumer);
+              yield* unsubscribe();
+              yield* worker.stop();
+              yield* Ref.update(workersRef, (workers) => {
+                const next = new Map(workers);
+                next.delete(run.sessionId);
+                return next;
+              });
+              return yield* Effect.fail(error);
+            }),
+          ),
+        );
         yield* runRepo.update(run.sessionId, { state: "running" });
         yield* captureWorkerState(run.sessionId, worker);
 

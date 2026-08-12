@@ -232,7 +232,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       ): Effect.Effect<void, never, never> =>
         effect.pipe(
           Effect.catchAll((error) =>
-            Effect.logDebug("rpc-worker.best_effort_failed").pipe(
+            Effect.logWarning("rpc-worker.best_effort_failed").pipe(
               Effect.annotateLogs({
                 event: "rpc-worker.best_effort_failed",
                 description,
@@ -977,7 +977,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             onFailure: () =>
               bestEffort(
                 "force-kill after stdin close failure",
-                Effect.sync(() => process.value.kill()),
+                Effect.try(() => process.value.kill()),
               ),
           }),
         );
@@ -992,7 +992,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         if (!exitedGracefully) {
           yield* bestEffort(
             "force-kill worker after graceful stop timeout",
-            Effect.sync(() => process.value.kill()),
+            Effect.try(() => process.value.kill()),
           );
           yield* Effect.promise(() =>
             Promise.race([

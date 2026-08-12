@@ -16,6 +16,7 @@ import {
   InterruptedRunNoActionableInputError,
   LinearApiError,
   NixEnvironmentError,
+  RpcProtocolError,
 } from "../src/domain/errors.js";
 import {
   AppUserId,
@@ -574,6 +575,7 @@ const mockProjector = ActivityProjector.make({
 });
 
 const workerPrompts: Array<string> = [];
+let hostToolRegistrationError: RpcProtocolError | undefined;
 let hostToolListener:
   | ((
       request: RpcHostToolCall,
@@ -596,7 +598,10 @@ const mockWorker: RpcWorkerHandle = {
     }),
   steer: () => Effect.void,
   followUp: () => Effect.void,
-  setHostTools: () => Effect.void,
+  setHostTools: () =>
+    hostToolRegistrationError === undefined
+      ? Effect.void
+      : Effect.fail(hostToolRegistrationError),
   onHostToolCall: (listener) =>
     Effect.sync(() => {
       hostToolListener = listener;
@@ -733,6 +738,7 @@ const withAuthority = <A, E>(
       terminalFailure = undefined;
       workerEventListener = undefined;
       hostToolListener = undefined;
+      hostToolRegistrationError = undefined;
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
       projectionExpected = 0;
@@ -989,6 +995,46 @@ describe("SessionAuthority infrastructure failures", () => {
           if (Either.isLeft(result)) {
             expect(result.left._tag).toBe("@Gateway/DatabaseError");
           }
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "stops and unregisters a worker when host-tool registration fails",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          hostToolRegistrationError = new RpcProtocolError({
+            method: "set_host_tools",
+            message: "forced host-tool registration failure",
+          });
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/host-tool-registration"),
+          });
+
+          const result = yield* Effect.either(
+            authority.processSession(testSessionId),
+          );
+          expect(Either.isLeft(result)).toBe(true);
+          if (Either.isLeft(result)) {
+            expect(result.left).toMatchObject({
+              _tag: "@Gateway/RpcProtocolError",
+              method: "set_host_tools",
+              message: "forced host-tool registration failure",
+            });
+          }
+          expect(orderEvents).toContain("worker-stopped");
+          expect(yield* authority.activeWorkerCount()).toBe(0);
         }),
       ),
   );
