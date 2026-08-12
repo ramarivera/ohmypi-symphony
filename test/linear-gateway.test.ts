@@ -269,6 +269,8 @@ const gatewayDependencies = Layer.mergeAll(
   Layer.succeed(
     GatewayConfig,
     GatewayConfig.make({
+      githubAppId: undefined,
+      githubAppPrivateKey: undefined,
       linearClientId: "client-id",
       linearClientSecret: Redacted.make("client-secret"),
       linearWebhookSecret: Redacted.make("webhook-secret"),

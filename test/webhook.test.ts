@@ -41,6 +41,8 @@ import { verifySignature, WebhookPipeline } from "../src/services/webhook.js";
 const secret = "webhook-secret";
 const tokenEncryptionKey = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 const config: GatewayConfigShape = {
+  githubAppId: undefined,
+  githubAppPrivateKey: undefined,
   linearClientId: "client",
   linearClientSecret: Redacted.make("client-secret"),
   linearWebhookSecret: Redacted.make(secret),
@@ -1153,7 +1155,6 @@ describe("Linear webhook input correctness", () => {
         }),
       ),
   );
-
   it.scopedLive("acknowledges unknown event types without side effects", () =>
     withWebhook(
       Effect.gen(function* () {

@@ -6,13 +6,13 @@ import { extractPullRequestUrls } from "../src/services/session-authority.js";
 const hostToolFixture = (mode: "valid" | "malformed") => {
   const hostToolCalls =
     mode === "malformed"
-      ? String.raw`send({ type: "host_tool_call", id: "bad-1", toolCallId: "tool-bad" });
+      ? `send({ type: "host_tool_call", id: "bad-1", toolCallId: "tool-bad" });
         send({ type: "host_tool_call", id: "call-2", toolCallId: "tool-2", toolName: "linear_test", arguments: {} });`
-      : String.raw`send({ type: "host_tool_call", id: "call-1", toolCallId: "tool-1", toolName: "linear_test", arguments: { value: "ok" } });`;
+      : `send({ type: "host_tool_call", id: "call-1", toolCallId: "tool-1", toolName: "linear_test", arguments: { value: "ok" } });`;
   const resultSeen =
     mode === "malformed"
-      ? String.raw`send({ type: "host_tool_result_seen", id: input.id, isError: input.isError === true, result: input.result });`
-      : String.raw`send({ type: "host_tool_result_seen", id: input.id, result: input.result });`;
+      ? `send({ type: "host_tool_result_seen", id: input.id, isError: input.isError === true, result: input.result });`
+      : `send({ type: "host_tool_result_seen", id: input.id, result: input.result });`;
   return String.raw`
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\n");
 send({ type: "ready", protocolVersion: 2, supportedProtocolVersions: [1, 2] });

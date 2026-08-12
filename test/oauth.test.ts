@@ -46,6 +46,8 @@ vi.mock("../src/services/store/repositories.js", async () => {
 });
 
 const testConfig: GatewayConfigShape = {
+  githubAppId: undefined,
+  githubAppPrivateKey: undefined,
   linearClientId: "client-id",
   linearClientSecret: Redacted.make("client-secret"),
   linearWebhookSecret: Redacted.make("webhook-secret"),

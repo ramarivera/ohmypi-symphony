@@ -10,8 +10,12 @@ import {
 import type { OrganizationId } from "../domain/ids.js";
 import type { RepositoryRecord } from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
+import {
+  buildGitHubExtraHeader,
+  GitHubApp,
+  type GitHubAppTokenService,
+} from "./github-app.js";
 import { WorkspaceRepo } from "./store/repositories.js";
-
 export type RepositoryResolution =
   | { readonly kind: "match"; readonly repository: RepositoryRecord }
   | { readonly kind: "none" }
@@ -143,6 +147,72 @@ export const parseRepositorySuggestionCandidate = (
   return { hostname, repositoryFullName };
 };
 
+const isHttpsGitHubRepositoryUrl = (repositoryUrl: string): boolean => {
+  try {
+    const parsed = new URL(repositoryUrl);
+    return (
+      parsed.protocol === "https:" &&
+      parsed.hostname.toLowerCase() === "github.com"
+    );
+  } catch {
+    return false;
+  }
+};
+
+const mintGitHubExtraHeader = (
+  githubApp: GitHubAppTokenService,
+  repository: RepositoryRecord,
+  sessionId: string,
+) =>
+  Effect.gen(function* () {
+    const candidate = parseRepositorySuggestionCandidate(repository.url);
+    if (
+      candidate === null ||
+      candidate.hostname.toLowerCase() !== "github.com" ||
+      !isHttpsGitHubRepositoryUrl(repository.url)
+    ) {
+      return undefined;
+    }
+    const [owner, repositoryName] = candidate.repositoryFullName.split("/");
+    if (owner === undefined || repositoryName === undefined) {
+      return yield* Effect.fail(
+        workspaceFailure(
+          "Repository URL did not yield an owner and name",
+          "git_failed",
+          sessionId,
+        )(new Error("invalid repository full name")),
+      );
+    }
+    const token = yield* githubApp
+      .getInstallationToken(owner, repositoryName, repository.organizationId)
+      .pipe(
+        // App not installed on this repo: clone anonymously instead of
+        // failing (public repos, or repos outside the App's installations).
+        Effect.catchIf(
+          (error) =>
+            error._tag === "@Gateway/GitHubAppError" &&
+            error.reason === "not_installed",
+          (_error) =>
+            Effect.logInfo("workspace.github_credentials_not_installed").pipe(
+              Effect.annotateLogs({
+                event: "workspace.github_credentials_not_installed",
+                sessionId,
+                repositoryId: repository.id,
+              }),
+              Effect.as(undefined),
+            ),
+        ),
+        Effect.mapError(
+          workspaceFailure(
+            "GitHub credentials could not be minted",
+            "git_failed",
+            sessionId,
+          ),
+        ),
+      );
+    if (token === undefined) return undefined;
+    return buildGitHubExtraHeader(token);
+  });
 function onlyItem<A>(items: ReadonlyArray<A>): A | undefined {
   return items.length === 1 ? items[0] : undefined;
 }
@@ -224,6 +294,36 @@ const workspaceFailure =
       cause: cause instanceof Error ? cause.message : String(cause),
     });
 
+const GITHUB_EXTRA_HEADER_KEY = "http.https://github.com/.extraheader";
+
+const redactGitOutput = (
+  value: string,
+  args: ReadonlyArray<string> = [],
+): string => {
+  let redacted = value;
+  for (const arg of args) {
+    if (
+      arg.includes("AUTHORIZATION: basic") ||
+      arg.includes(`${GITHUB_EXTRA_HEADER_KEY}=`)
+    ) {
+      redacted = redacted.replaceAll(arg, "<redacted>");
+    }
+  }
+  return redacted
+    .replace(
+      /(http\.https:\/\/github\.com\/\.extraheader=)\S+/giu,
+      "$1<redacted>",
+    )
+    .replace(/(AUTHORIZATION:\s*basic\s+)\S+/giu, "$1<redacted>");
+};
+
+const gitSubcommand = (args: ReadonlyArray<string>): string => {
+  for (const command of ["clone", "config", "fetch", "checkout"]) {
+    if (args.includes(command)) return command;
+  }
+  return "command";
+};
+
 const runGit = (
   args: ReadonlyArray<string>,
   cwd: string | undefined,
@@ -241,10 +341,100 @@ const runGit = (
         new Response(process.stderr).text(),
       ]);
       if (exitCode !== 0) {
-        throw new Error(`git ${args[0] ?? "command"} failed: ${stderr.trim()}`);
+        throw new Error(
+          `git ${gitSubcommand(args)} failed: ${redactGitOutput(stderr.trim(), args)}`,
+        );
       }
     },
-    catch: workspaceFailure("git command failed", "git_failed", sessionId),
+    catch: (cause) =>
+      new WorkspaceError({
+        message:
+          cause instanceof Error
+            ? redactGitOutput(cause.message, args)
+            : "git command failed",
+        sessionId,
+        reason: "git_failed",
+      }),
+  });
+
+const isGatewayGitHubExtraHeader = (value: string): boolean => {
+  const match = /^AUTHORIZATION: basic ([A-Za-z0-9+/]+={0,2})$/u.exec(value);
+  if (match === null) return false;
+  const encoded = match[1];
+  if (encoded === undefined) return false;
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  return (
+    decoded.startsWith("x-access-token:") &&
+    Buffer.from(decoded, "utf8").toString("base64") === encoded
+  );
+};
+
+const runGitOutput = (
+  args: ReadonlyArray<string>,
+  cwd: string | undefined,
+  sessionId: string,
+) =>
+  Effect.tryPromise({
+    try: async () => {
+      const process = Bun.spawn(["git", ...args], {
+        ...(cwd ? { cwd } : {}),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        process.exited,
+        new Response(process.stdout).text(),
+        new Response(process.stderr).text(),
+      ]);
+      if (exitCode !== 0) {
+        throw new Error(
+          `git ${gitSubcommand(args)} failed: ${redactGitOutput(stderr.trim(), args)}`,
+        );
+      }
+      return stdout;
+    },
+    catch: (cause) =>
+      new WorkspaceError({
+        message:
+          cause instanceof Error
+            ? redactGitOutput(cause.message, args)
+            : "git command failed",
+        sessionId,
+        reason: "git_failed",
+      }),
+  });
+
+const unsetGitHubExtraHeader = (
+  target: string,
+  sessionId: string,
+): Effect.Effect<void, never> =>
+  Effect.gen(function* () {
+    const configuredHeaders = yield* runGitOutput(
+      ["config", "--local", "--get-all", GITHUB_EXTRA_HEADER_KEY],
+      target,
+      sessionId,
+    ).pipe(Effect.catchAll(() => Effect.succeed("")));
+    const headers = configuredHeaders
+      .split(/\r?\n/u)
+      .map((header) => header.trim())
+      .filter((header) => header.length > 0);
+    if (headers.length === 0) return;
+    if (!headers.every(isGatewayGitHubExtraHeader)) {
+      yield* Effect.logDebug(
+        "GitHub extraheader preserved because it contains user-installed values",
+      ).pipe(
+        Effect.annotateLogs({
+          event: "workspace.github_credentials_preserved",
+          sessionId,
+        }),
+      );
+      return;
+    }
+    yield* runGit(
+      ["config", "--local", "--unset-all", GITHUB_EXTRA_HEADER_KEY],
+      target,
+      sessionId,
+    ).pipe(Effect.catchAll(() => Effect.void));
   });
 
 const lstatOrMissing = (
@@ -389,6 +579,7 @@ const validateMarker = (
 export const makeWorkspace = (input: {
   readonly workspaceRoot: string;
   readonly repo: WorkspaceRepoShape;
+  readonly githubApp: GitHubAppTokenService | undefined;
 }) =>
   Effect.gen(function* () {
     const resolve = Effect.fn("Workspace.resolve")(function* (
@@ -441,6 +632,36 @@ export const makeWorkspace = (input: {
 
       return resolution;
     });
+    const refreshGitHubExtraHeader = Effect.fn(
+      "Workspace.refreshGitHubExtraHeader",
+    )(function* (
+      sessionId: string,
+      repository: RepositoryRecord,
+      target: string,
+    ): Effect.fn.Return<void, WorkspaceError> {
+      const githubExtraHeader =
+        input.githubApp === undefined
+          ? undefined
+          : yield* mintGitHubExtraHeader(
+              input.githubApp,
+              repository,
+              sessionId,
+            );
+      if (githubExtraHeader === undefined) {
+        yield* unsetGitHubExtraHeader(target, sessionId);
+        return;
+      }
+      yield* runGit(
+        ["config", "--local", GITHUB_EXTRA_HEADER_KEY, githubExtraHeader],
+        target,
+        sessionId,
+      );
+    });
+
+    const clearGitHubExtraHeader = (
+      sessionId: string,
+      target: string,
+    ): Effect.Effect<void, never> => unsetGitHubExtraHeader(target, sessionId);
 
     const materialize = Effect.fn("Workspace.materialize")(function* (
       sessionId: string,
@@ -491,6 +712,7 @@ export const makeWorkspace = (input: {
           sessionId,
         );
         yield* validateMarker(markerPath, repository, sessionId);
+        yield* refreshGitHubExtraHeader(sessionId, repository, canonicalTarget);
 
         yield* Effect.logInfo("Workspace ready (reused)").pipe(
           Effect.annotateLogs({
@@ -504,28 +726,72 @@ export const makeWorkspace = (input: {
         return canonicalTarget;
       }
 
-      yield* runGit(
-        [
-          "clone",
-          "--no-checkout",
-          "--filter=blob:none",
-          repository.url,
+      let githubExtraHeader: string | undefined;
+      const repositoryCandidate = parseRepositorySuggestionCandidate(
+        repository.url,
+      );
+      if (input.githubApp !== undefined) {
+        if (isHttpsGitHubRepositoryUrl(repository.url)) {
+          githubExtraHeader = yield* mintGitHubExtraHeader(
+            input.githubApp,
+            repository,
+            sessionId,
+          );
+        } else if (
+          repositoryCandidate?.hostname.toLowerCase() === "github.com"
+        ) {
+          yield* Effect.logDebug(
+            "GitHub credentials skipped for SSH repository URL; SSH repositories are unsupported for GitHub App credentials",
+          );
+        } else {
+          yield* Effect.logDebug(
+            "GitHub credentials skipped for non-GitHub repository",
+          );
+        }
+      }
+
+      const cloneArgs = [
+        ...(githubExtraHeader === undefined
+          ? []
+          : [
+              "-c",
+              `http.https://github.com/.extraheader=${githubExtraHeader}`,
+            ]),
+        "clone",
+        "--no-checkout",
+        "--filter=blob:none",
+        repository.url,
+        target,
+      ];
+      yield* runGit(cloneArgs, undefined, sessionId);
+      if (githubExtraHeader !== undefined) {
+        yield* runGit(
+          ["config", "--local", GITHUB_EXTRA_HEADER_KEY, githubExtraHeader],
           target,
-        ],
-        undefined,
-        sessionId,
+          sessionId,
+        );
+      }
+      // If anything after persisting the header fails, drop it so the next
+      // attempt doesn't inherit a stale/expired credential.
+      yield* Effect.gen(function* () {
+        yield* runGit(
+          ["fetch", "--depth=1", "origin", repository.ref],
+          target,
+          sessionId,
+        );
+        yield* runGit(
+          ["checkout", "--detach", "--force", "FETCH_HEAD"],
+          target,
+          sessionId,
+        );
+        yield* writeMarker(markerPath, repository, sessionId);
+      }).pipe(
+        Effect.onError(() =>
+          githubExtraHeader === undefined
+            ? Effect.void
+            : unsetGitHubExtraHeader(target, sessionId),
+        ),
       );
-      yield* runGit(
-        ["fetch", "--depth=1", "origin", repository.ref],
-        target,
-        sessionId,
-      );
-      yield* runGit(
-        ["checkout", "--detach", "--force", "FETCH_HEAD"],
-        target,
-        sessionId,
-      );
-      yield* writeMarker(markerPath, repository, sessionId);
 
       const finalTarget = yield* realpathOrFail(
         target,
@@ -554,15 +820,32 @@ export const makeWorkspace = (input: {
       return finalTarget;
     });
 
-    return { resolve, materialize };
+    return {
+      resolve,
+      materialize,
+      refreshGitHubExtraHeader,
+      clearGitHubExtraHeader,
+    };
   });
-
 export class Workspace extends Effect.Service<Workspace>()("Workspace", {
   accessors: true,
-  dependencies: [GatewayConfig.Default, WorkspaceRepo.Default],
+  dependencies: [
+    GatewayConfig.Default,
+    WorkspaceRepo.Default,
+    GitHubApp.Default,
+  ],
   effect: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const repo = yield* WorkspaceRepo;
-    return yield* makeWorkspace({ workspaceRoot: config.workspaceRoot, repo });
+    const githubApp =
+      config.githubAppId !== undefined &&
+      config.githubAppPrivateKey !== undefined
+        ? yield* GitHubApp
+        : undefined;
+    return yield* makeWorkspace({
+      workspaceRoot: config.workspaceRoot,
+      repo,
+      githubApp,
+    });
   }),
 }) {}
