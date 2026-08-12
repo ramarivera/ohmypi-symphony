@@ -1,5 +1,6 @@
 export { AdminSessionRepo } from "./admin-session-repo.js";
 export { DeliveryRepo } from "./delivery-repo.js";
+export { ExecutorInstanceRepo } from "./executor-instance-repo.js";
 export { InstallationRepo } from "./installation-repo.js";
 export { McpServerRepo } from "./mcp-server-repo.js";
 export { NixCacheRepo } from "./nix-cache-repo.js";

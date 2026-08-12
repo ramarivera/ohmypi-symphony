@@ -554,51 +554,54 @@ describe("SessionAuthority behavior invariants", () => {
       }),
     ),
   );
-  it.scopedLive("renders a prompted template when retrying an orphaned run", () =>
-    withAuthority(() =>
-      Effect.gen(function* () {
-        const authority = yield* SessionAuthority;
-        const installationRepo = yield* InstallationRepo;
-        const runRepo = yield* RunRepo;
-        const runInputRepo = yield* RunInputRepo;
-        const templateRepo = yield* PromptTemplateRepo;
-        yield* installationRepo.put(install(testOrganizationId));
-        yield* templateRepo.upsert({
-          organizationId: testOrganizationId,
-          kind: "prompted",
-          body: "Retry:\n{{userRequest}}",
-          updatedAt: 0,
-        });
-        yield* runRepo.create({
-          sessionId: testSessionId,
-          organizationId: testOrganizationId,
-          issueId: Option.none(),
-        });
-        const inputId = Schema.decodeUnknownSync(InputId)(
-          "orphan-retry-input",
-        );
-        yield* runInputRepo.enqueue({
-          id: inputId,
-          sessionId: testSessionId,
-          kind: "prompted",
-          body: "continue after interruption",
-          payload: {},
-        });
-        yield* runInputRepo.markProcessed(inputId);
-        yield* Effect.promise(() =>
-          mkdir("/tmp/orphan-retry-template", { recursive: true }),
-        );
-        yield* runRepo.update(testSessionId, {
-          state: "orphaned",
-          workspacePath: Option.some("/tmp/orphan-retry-template"),
-        });
+  it.scopedLive(
+    "renders a prompted template when retrying an orphaned run",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          const templateRepo = yield* PromptTemplateRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* templateRepo.upsert({
+            organizationId: testOrganizationId,
+            kind: "prompted",
+            body: "Retry:\n{{userRequest}}",
+            updatedAt: 0,
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          const inputId =
+            Schema.decodeUnknownSync(InputId)("orphan-retry-input");
+          yield* runInputRepo.enqueue({
+            id: inputId,
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "continue after interruption",
+            payload: {},
+          });
+          yield* runInputRepo.markProcessed(inputId);
+          yield* Effect.promise(() =>
+            mkdir("/tmp/orphan-retry-template", { recursive: true }),
+          );
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/orphan-retry-template"),
+          });
 
-        yield* authority.processSession(testSessionId);
+          yield* authority.processSession(testSessionId);
 
-        expect(workerSpawnInputs).toHaveLength(1);
-        expect(workerPrompts).toEqual(["Retry:\ncontinue after interruption"]);
-      }),
-    ),
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(workerPrompts).toEqual([
+            "Retry:\ncontinue after interruption",
+          ]);
+        }),
+      ),
   );
   it.effect(
     "materializes configured MCP servers through the real authority layer",

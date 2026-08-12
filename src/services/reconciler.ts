@@ -12,10 +12,7 @@ import { InputId, type SessionId } from "../domain/ids.js";
 import { GatewayConfig } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { SessionAuthority } from "./session-authority.js";
-import {
-  RunInputRepo,
-  RunRepo,
-} from "./store/repositories.js";
+import { RunInputRepo, RunRepo } from "./store/repositories.js";
 export interface ReconcilerStatus {
   readonly running: boolean;
   readonly lastStartedAt: Option.Option<number>;
