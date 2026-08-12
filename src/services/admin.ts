@@ -46,12 +46,17 @@ import {
 } from "./executor.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
+import {
+  promptTemplateWarnings,
+  substitutePromptTemplate,
+} from "./prompt-templates.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
   ExecutorInstanceRepo,
   InstallationRepo,
   McpServerRepo,
+  PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -128,6 +133,7 @@ export interface AdminDeps {
     readonly createSessionOnIssue: LinearGateway["createSessionOnIssue"];
   };
   readonly workspaceRepo: WorkspaceRepo;
+  readonly promptTemplateRepo: PromptTemplateRepo;
   readonly mcpServerRepo: McpServerRepo;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
@@ -972,6 +978,30 @@ export const createAdminHandle = (deps: AdminDeps) =>
                 text("A run for this issue is already active", 409),
               );
             }
+            const rerunTemplate = yield* deps.promptTemplateRepo
+              .get(run.organizationId, "created")
+              .pipe(
+                Effect.catchTag(
+                  "@Gateway/DatabaseError",
+                  (error) =>
+                    new AdminError({
+                      message: error.message,
+                      status: 500,
+                    }),
+                ),
+              );
+            // Admin reruns honor a configured created template; the
+            // substitution mirrors the webhook's created body builder with
+            // the synthetic context.
+            const body = Option.isSome(rerunTemplate)
+              ? substitutePromptTemplate(rerunTemplate.value.body, {
+                  userRequest: "User request:\nWork on the issue below.",
+                  issueContext: `Issue context:\nIssue: ${issueId}`,
+                  threadComment: "",
+                  previousComments: "",
+                  guidance: "",
+                })
+              : `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
             const newSessionId = yield* deps.linearGateway
               .createSessionOnIssue({
                 organizationId: run.organizationId,
@@ -1035,7 +1065,6 @@ export const createAdminHandle = (deps: AdminDeps) =>
                   ),
               }),
             );
-            const body = `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
             yield* deps.runInputRepo.enqueue({
               id: inputId,
               sessionId: newRunSessionId,
@@ -1110,6 +1139,79 @@ export const createAdminHandle = (deps: AdminDeps) =>
         );
       }
 
+      if (
+        url.pathname === "/api/admin/prompt-templates" &&
+        request.method === "GET"
+      ) {
+        const session = yield* requireSession(request);
+        if (deps.promptTemplateRepo === undefined) {
+          return Option.some(text("Prompt templates unavailable", 500));
+        }
+        const templates = yield* deps.promptTemplateRepo.list(
+          session.organizationId,
+        );
+        return Option.some(json({ templates }));
+      }
+      if (
+        url.pathname === "/api/admin/prompt-templates" &&
+        request.method === "PUT"
+      ) {
+        const session = yield* requireMutation(request);
+        if (deps.promptTemplateRepo === undefined) {
+          return Option.some(text("Prompt templates unavailable", 500));
+        }
+        const payload = yield* parseJsonBody(request);
+        const kind = yield* Schema.decodeUnknown(
+          Schema.Literal("created", "prompted", "contract"),
+        )(payload.kind).pipe(
+          Effect.catchTag(
+            "ParseError",
+            () =>
+              new AdminError({
+                message: "Invalid prompt template kind",
+                status: 400,
+              }),
+          ),
+        );
+        if (typeof payload.body !== "string") {
+          return Option.some(
+            text("Prompt template body must be a string", 400),
+          );
+        }
+        const body = payload.body.trim().length === 0 ? "" : payload.body;
+        if (new TextEncoder().encode(body).byteLength > 16_384) {
+          return Option.some(
+            text("Prompt template body exceeds the 16 KiB limit", 400),
+          );
+        }
+        const updatedAt = yield* Clock.currentTimeMillis;
+        if (body.length === 0) {
+          yield* deps.promptTemplateRepo.remove(session.organizationId, kind);
+          return Option.some(
+            json({
+              template: null,
+              warnings: [],
+            }),
+          );
+        }
+        yield* deps.promptTemplateRepo.upsert({
+          organizationId: session.organizationId,
+          kind,
+          body,
+          updatedAt,
+        });
+        return Option.some(
+          json({
+            template: {
+              organizationId: session.organizationId,
+              kind,
+              body,
+              updatedAt,
+            },
+            warnings: promptTemplateWarnings(kind, body),
+          }),
+        );
+      }
       if (
         url.pathname === "/api/admin/executor-instance" &&
         request.method === "GET"
@@ -1726,6 +1828,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     RunInputRepo.Default,
     LinearGateway.Default,
     WorkspaceRepo.Default,
+    PromptTemplateRepo.Default,
     McpServerRepo.Default,
     Workspace.Default,
     Reconciler.Default,
@@ -1741,6 +1844,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const runEventRepo = yield* RunEventRepo;
     const workspaceRepo = yield* WorkspaceRepo;
     const mcpServerRepo = yield* McpServerRepo;
+    const promptTemplateRepo = yield* PromptTemplateRepo;
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
     const nixEnvironment = yield* NixEnvironment;
@@ -1757,6 +1861,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
       runInputRepo,
       linearGateway,
       workspaceRepo,
+      promptTemplateRepo,
       mcpServerRepo,
       workspace,
       reconciler,

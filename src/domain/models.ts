@@ -91,6 +91,21 @@ export const NixCacheEntry = Schema.Struct({
 });
 export type NixCacheEntry = Schema.Schema.Type<typeof NixCacheEntry>;
 
+export const PromptTemplateKind = Schema.Literal(
+  "created",
+  "prompted",
+  "contract",
+);
+export type PromptTemplateKind = Schema.Schema.Type<typeof PromptTemplateKind>;
+
+export const PromptTemplate = Schema.Struct({
+  organizationId: OrganizationId,
+  kind: PromptTemplateKind,
+  body: Schema.String,
+  updatedAt: Schema.Number,
+});
+export type PromptTemplate = Schema.Schema.Type<typeof PromptTemplate>;
+
 export const normalizeNixPackages = (
   packages: ReadonlyArray<unknown>,
 ): ReadonlyArray<NixPackageName> => {

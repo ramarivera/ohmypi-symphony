@@ -35,9 +35,11 @@ import {
   isString,
   redactStringValues,
 } from "./linear-helpers.js";
+import { substitutePromptTemplate } from "./prompt-templates.js";
 import {
   DeliveryRepo,
   InstallationRepo,
+  PromptTemplateRepo,
   RunInputRepo,
   RunRepo,
 } from "./store/repositories.js";
@@ -178,6 +180,72 @@ const buildCreatedInputBody = (event: AgentSessionEventType): string => {
 
   return sections.join("\n\n");
 };
+const createdTemplateValues = (
+  event: AgentSessionEventType,
+): Readonly<Record<string, string>> => {
+  const promptContext = event.promptContext.pipe(
+    Option.map((s) => s.trim()),
+    Option.flatMap((s) => (s.length > 0 ? Option.some(s) : Option.none())),
+  );
+  const summary = event.agentSession.summary.pipe(
+    Option.map((s) => s.trim()),
+    Option.flatMap((s) => (s.length > 0 ? Option.some(s) : Option.none())),
+  );
+  const userPrompt = Option.orElse(promptContext, () =>
+    Option.orElse(summary, () => Option.none()),
+  ).pipe(Option.getOrElse(() => ""));
+  const previousComments = Option.getOrElse(event.previousComments, () => []);
+  const guidance = Option.getOrElse(event.guidance, () => []);
+  const issue = event.agentSession.issue.pipe(Option.getOrElse(() => null));
+  const comment = event.agentSession.comment.pipe(Option.getOrElse(() => null));
+  const hasContext =
+    Boolean(userPrompt) ||
+    issue !== null ||
+    comment !== null ||
+    previousComments.length > 0 ||
+    guidance.length > 0;
+
+  let issueContext = "";
+  if (issue) {
+    const lines: string[] = [
+      `Issue: ${issue.title}${issue.identifier ? ` (${issue.identifier})` : ""}`,
+    ];
+    if (issue.url) lines.push(`URL: ${issue.url}`);
+    if (issue.teamId) lines.push(`Team: ${issue.teamId}`);
+    if (issue.projectId) lines.push(`Project: ${issue.projectId}`);
+    if (issue.description) lines.push(`\nDescription:\n${issue.description}`);
+    issueContext = lines.join("\n");
+  }
+  return {
+    userRequest: userPrompt
+      ? `User request:\n${userPrompt}`
+      : hasContext
+        ? "User request:\nWork on the issue below."
+        : "",
+    issueContext: issueContext ? `Issue context:\n${issueContext}` : "",
+    threadComment: comment ? `Thread comment:\n${comment.body}` : "",
+    previousComments:
+      previousComments.length > 0
+        ? `Previous comments:\n${previousComments
+            .map((c, index) => `${index + 1}. ${c.body}`)
+            .join("\n")}`
+        : "",
+    guidance:
+      guidance.length > 0
+        ? `Guidance:\n${guidance
+            .map((g, index) => `${index + 1}. ${g.body}`)
+            .join("\n")}`
+        : "",
+  };
+};
+
+export const buildCreatedInputBodyWithTemplate = (
+  event: AgentSessionEventType,
+  template: string | undefined,
+): string =>
+  template === undefined
+    ? buildCreatedInputBody(event)
+    : substitutePromptTemplate(template, createdTemplateValues(event));
 
 const buildInputId = (
   event: AgentSessionEventType,
@@ -313,6 +381,7 @@ const handleAgentSessionEvent = (
   timestamp: number,
   runRepo: RunRepo,
   runInputRepo: RunInputRepo,
+  promptTemplateRepo: PromptTemplateRepo,
 ): Effect.Effect<
   void,
   WebhookPayloadError | WebhookIdentityError | DatabaseError | RowDecodeError,
@@ -368,7 +437,14 @@ const handleAgentSessionEvent = (
     });
 
     if (event.action === "created") {
-      const body = buildCreatedInputBody(event);
+      const configured = yield* promptTemplateRepo.get(
+        organizationId,
+        "created",
+      );
+      const body = buildCreatedInputBodyWithTemplate(
+        event,
+        Option.isSome(configured) ? configured.value.body : undefined,
+      );
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, "created"),
       ).pipe(
@@ -409,11 +485,15 @@ const handleAgentSessionEvent = (
           }),
         );
       }
-      const body = extractPromptBody(activity);
       const kind: "prompted" | "stop" =
         Option.getOrElse(activity.signal, () => "") === "stop"
           ? "stop"
           : "prompted";
+      // Store the RAW body. The prompted template is applied at prompt
+      // construction (session-authority), because input.body is also read
+      // by repository selection and UI-answer paths that expect the user's
+      // literal text.
+      const body = extractPromptBody(activity);
       const id = yield* Schema.decodeUnknown(InputId)(
         buildInputId(event, kind),
       ).pipe(
@@ -874,6 +954,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       RunRepo.Default,
       RunInputRepo.Default,
       DeliveryRepo.Default,
+      PromptTemplateRepo.Default,
     ],
     effect: Effect.gen(function* () {
       const config = yield* GatewayConfig;
@@ -881,6 +962,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       const runRepo = yield* RunRepo;
       const runInputRepo = yield* RunInputRepo;
       const deliveryRepo = yield* DeliveryRepo;
+      const promptTemplateRepo = yield* PromptTemplateRepo;
 
       const handle = Effect.fn("WebhookPipeline.handle")(function* (
         request: Request,
@@ -1121,6 +1203,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                   timestamp,
                   runRepo,
                   runInputRepo,
+                  promptTemplateRepo,
                 );
                 break;
               }

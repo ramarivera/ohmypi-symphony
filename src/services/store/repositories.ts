@@ -5,6 +5,7 @@ export { InstallationRepo } from "./installation-repo.js";
 export { McpServerRepo } from "./mcp-server-repo.js";
 export { NixCacheRepo } from "./nix-cache-repo.js";
 export { ProjectionRepo } from "./projection-repo.js";
+export { PromptTemplateRepo } from "./prompt-template-repo.js";
 export { RunEventRepo } from "./run-event-repo.js";
 export { RunInputRepo } from "./run-input-repo.js";
 export { RunRepo } from "./run-repo.js";
