@@ -427,6 +427,9 @@ function mcpServerPayload(
       "oauthClientId is required when oauthClientSecret is set",
     );
   }
+  if (oauthScope !== null && oauthClientId === null) {
+    return Either.left("oauthClientId is required when oauthScope is set");
+  }
   if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
     return Either.left("enabled must be a boolean");
   }
@@ -1225,6 +1228,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
                     ? { clientSecret: oauth.clientSecret }
                     : {}),
                   ...(oauth.scope !== undefined ? { scope: oauth.scope } : {}),
+                  ...(oauth.tokenEndpointAuthMethod !== undefined
+                    ? {
+                        tokenEndpointAuthMethod: oauth.tokenEndpointAuthMethod,
+                      }
+                    : {}),
                 }
               : undefined,
           )
@@ -1356,7 +1364,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
                     ...(payload.oauthClientSecret !== null &&
                     payload.oauthClientSecret !== "•••"
                       ? { clientSecret: payload.oauthClientSecret }
-                      : current.value.oauthClient?.clientSecret !== undefined
+                      : current.value.oauthClient?.clientId ===
+                            payload.oauthClientId &&
+                          current.value.oauthClient?.clientSecret !== undefined
                         ? {
                             clientSecret:
                               current.value.oauthClient.clientSecret,
@@ -1364,6 +1374,15 @@ export const createAdminHandle = (deps: AdminDeps) =>
                         : {}),
                     ...(payload.oauthScope !== null
                       ? { scope: payload.oauthScope }
+                      : {}),
+                    ...(current.value.oauthClient?.clientId ===
+                      payload.oauthClientId &&
+                    current.value.oauthClient?.tokenEndpointAuthMethod !==
+                      undefined
+                      ? {
+                          tokenEndpointAuthMethod:
+                            current.value.oauthClient.tokenEndpointAuthMethod,
+                        }
                       : {}),
                   };
           const server = yield* deps.mcpServerRepo.updateMcpServer(

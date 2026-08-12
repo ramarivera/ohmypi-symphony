@@ -130,6 +130,9 @@ export const McpOAuthClientConfig = Schema.Struct({
   clientId: Schema.String,
   clientSecret: Schema.optional(Schema.String),
   scope: Schema.optional(Schema.String),
+  tokenEndpointAuthMethod: Schema.optional(
+    Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+  ),
 });
 export type McpOAuthClientConfig = Schema.Schema.Type<
   typeof McpOAuthClientConfig

@@ -111,11 +111,9 @@ export const oauthCallback = Effect.gen(function* () {
 export const mcpOauthCallback = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const callback = new URL(request.url, "http://localhost");
-  const adminUrl = new URL(callback.toString());
-  adminUrl.pathname = adminUrl.pathname.replace(
-    /\/oauth\/mcp\/callback$/u,
-    "/admin",
-  );
+  const config = yield* GatewayConfig;
+  const adminUrl = new URL(config.publicUrl.toString());
+  adminUrl.pathname = `${adminUrl.pathname.replace(/\/$/u, "")}/admin`;
   adminUrl.search = "";
   return yield* McpOAuth.completeMcpAuthorization(callback).pipe(
     Effect.as(

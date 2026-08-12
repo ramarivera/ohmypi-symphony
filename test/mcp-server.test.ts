@@ -131,6 +131,24 @@ describe("MCP server storage and worker config", () => {
           enabled: false,
         });
         expect(updated.enabled).toBe(false);
+        const oauthServer = yield* servers.createMcpServer({
+          organizationId: org,
+          id: serverId("oauth"),
+          name: "oauth",
+          transport: "http",
+          url: "https://oauth.example.test",
+          oauthClient: {
+            clientId: "client",
+            clientSecret: "secret",
+          },
+          now: 4,
+        });
+        expect(oauthServer.oauthClient?.clientId).toBe("client");
+        yield* servers.updateMcpServer(org, serverId("oauth"), {
+          oauthClient: null,
+        });
+        const cleared = yield* servers.getMcpServer(org, serverId("oauth"));
+        expect(Option.isSome(cleared) && cleared.value.oauthClient).toBeNull();
         expect(yield* servers.deleteMcpServer(org, serverId("off"))).toBe(true);
       }),
     ),

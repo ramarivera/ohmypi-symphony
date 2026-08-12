@@ -508,7 +508,10 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
               args: input.args ?? existing.args,
               env: input.env ?? existing.env,
               headers: input.headers ?? existing.headers,
-              oauthClient: input.oauthClient ?? existing.oauthClient ?? null,
+              oauthClient:
+                input.oauthClient === undefined
+                  ? (existing.oauthClient ?? null)
+                  : input.oauthClient,
               url:
                 input.url === undefined
                   ? Option.getOrNull(existing.url)

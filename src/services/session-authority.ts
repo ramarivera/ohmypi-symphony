@@ -1770,7 +1770,19 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             new RpcSpawnError({
               message: `MCP credential materialization failed: ${String(error)}`,
             }),
-        });
+        }).pipe(
+          Effect.catchTag("@Gateway/RpcSpawnError", (error) =>
+            Effect.logWarning("mcp.credentials.materialization_failed").pipe(
+              Effect.annotateLogs({
+                event: "mcp.credentials.materialization_failed",
+                sessionId: run.sessionId,
+                error: error.message,
+              }),
+              Effect.zipRight(handleFailure(run.sessionId, error)),
+              Effect.zipRight(Effect.fail(error)),
+            ),
+          ),
+        );
         const configServers = mintedMcp.map((entry) => {
           if (entry.credential === null) return entry.server;
           return {

@@ -39,9 +39,17 @@ export interface McpOAuthMetadata {
   readonly registrationEndpoint?: string | undefined;
 }
 
+export type McpOAuthTokenEndpointAuthMethod =
+  | "none"
+  | "client_secret_basic"
+  | "client_secret_post";
+
 export interface McpOAuthClientMetadata {
   readonly clientId: string;
   readonly clientSecret?: string | undefined;
+  readonly tokenEndpointAuthMethod?:
+    | McpOAuthTokenEndpointAuthMethod
+    | undefined;
   readonly authorizationEndpoint: string;
   readonly tokenEndpoint: string;
   readonly registrationEndpoint?: string | undefined;
@@ -64,19 +72,18 @@ type StoredMcpOAuthCredential = McpOAuthCredential & {
   readonly updatedAt: number;
 };
 
-const McpOAuthMetadataSchema = Schema.Struct({
-  authorizationEndpoint: Schema.String,
-  tokenEndpoint: Schema.String,
-  registrationEndpoint: Schema.optional(Schema.String),
-});
 const McpOAuthClientMetadataSchema = Schema.Struct({
   clientId: Schema.String,
   clientSecret: Schema.optional(Schema.String),
+  tokenEndpointAuthMethod: Schema.optional(
+    Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+  ),
   authorizationEndpoint: Schema.String,
   tokenEndpoint: Schema.String,
   registrationEndpoint: Schema.optional(Schema.String),
 });
 const ProtectedResourceResponse = Schema.Struct({
+  resource: Schema.String,
   authorization_servers: Schema.optional(Schema.Array(Schema.String)),
   authorization_server: Schema.optional(Schema.String),
 });
@@ -88,6 +95,9 @@ const AuthorizationServerResponse = Schema.Struct({
 const RegistrationResponse = Schema.Struct({
   client_id: Schema.String,
   client_secret: Schema.optional(Schema.String),
+  token_endpoint_auth_method: Schema.optional(
+    Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+  ),
 });
 const TokenResponse = Schema.Struct({
   access_token: Schema.String,
@@ -248,6 +258,25 @@ const discoverMcpOAuthMetadataEffect = (
       resourceResponse,
       "MCP OAuth protected-resource discovery",
     );
+    let resourceIdentifier: URL;
+    try {
+      resourceIdentifier = new URL(resource.resource);
+    } catch (error) {
+      return yield* Effect.fail(
+        new McpOAuthError({
+          message: `Invalid protected-resource identifier: ${String(error)}`,
+          reason: "endpoint_validation",
+        }),
+      );
+    }
+    if (resourceIdentifier.toString() !== base.toString()) {
+      return yield* Effect.fail(
+        new McpOAuthError({
+          message: `Protected-resource metadata describes ${resourceIdentifier}, not ${base}`,
+          reason: "endpoint_validation",
+        }),
+      );
+    }
     const issuer =
       resource.authorization_servers?.[0] ??
       resource.authorization_server ??
@@ -396,6 +425,9 @@ const registerClient = (
       ...(body.client_secret !== undefined
         ? { clientSecret: body.client_secret }
         : {}),
+      ...(body.token_endpoint_auth_method !== undefined
+        ? { tokenEndpointAuthMethod: body.token_endpoint_auth_method }
+        : {}),
       authorizationEndpoint: metadata.authorizationEndpoint,
       tokenEndpoint: metadata.tokenEndpoint,
       ...(metadata.registrationEndpoint !== undefined
@@ -403,6 +435,26 @@ const registerClient = (
         : {}),
     };
   });
+
+const tokenEndpointAuth = (
+  client: McpOAuthClientMetadata,
+  params: URLSearchParams,
+): Record<string, string> => {
+  const method =
+    client.tokenEndpointAuthMethod ??
+    (client.clientSecret === undefined ? "none" : "client_secret_basic");
+  if (method === "client_secret_basic" && client.clientSecret !== undefined) {
+    return {
+      Authorization: `Basic ${Buffer.from(
+        `${client.clientId}:${client.clientSecret}`,
+      ).toString("base64")}`,
+    };
+  }
+  if (method === "client_secret_post" && client.clientSecret !== undefined) {
+    params.set("client_secret", client.clientSecret);
+  }
+  return {};
+};
 
 const redeemCode = (
   client: McpOAuthClientMetadata,
@@ -422,7 +474,7 @@ const redeemCode = (
       code_verifier: verifier,
       resource,
     });
-    if (client.clientSecret) params.set("client_secret", client.clientSecret);
+    const authHeaders = tokenEndpointAuth(client, params);
     const response = yield* Effect.tryPromise({
       try: () =>
         fetchWithTimeout(fetchImpl, client.tokenEndpoint, {
@@ -430,6 +482,7 @@ const redeemCode = (
           headers: {
             "content-type": "application/x-www-form-urlencoded",
             accept: "application/json",
+            ...authHeaders,
           },
           body: params.toString(),
         }),
@@ -472,7 +525,7 @@ const refreshAccessToken = (
       client_id: client.clientId,
       resource,
     });
-    if (client.clientSecret) params.set("client_secret", client.clientSecret);
+    const authHeaders = tokenEndpointAuth(client, params);
     const response = yield* Effect.tryPromise({
       try: () =>
         fetchWithTimeout(fetchImpl, client.tokenEndpoint, {
@@ -480,6 +533,7 @@ const refreshAccessToken = (
           headers: {
             "content-type": "application/x-www-form-urlencoded",
             accept: "application/json",
+            ...authHeaders,
           },
           body: params.toString(),
         }),
@@ -547,6 +601,9 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           readonly clientId: string;
           readonly clientSecret?: string;
           readonly scope?: string;
+          readonly tokenEndpointAuthMethod?:
+            | McpOAuthTokenEndpointAuthMethod
+            | undefined;
         },
       ) {
         const server = yield* mcpServerRepo.getMcpServer(
@@ -1017,6 +1074,16 @@ export const materializeMcpAgentDb = async (
     readonly expiresAt: number;
   }>,
 ): Promise<string> => {
+  const providers = new Set<string>();
+  for (const credential of credentials) {
+    const provider = mcpProviderForServerUrl(credential.serverUrl);
+    if (providers.has(provider)) {
+      throw new Error(
+        `Duplicate MCP OAuth provider key for ${credential.serverUrl}`,
+      );
+    }
+    providers.add(provider);
+  }
   const agentDir = join(workspace, ".omp-gateway");
   const path = join(agentDir, "agent.db");
   const existingDir = await lstatIfExists(agentDir);

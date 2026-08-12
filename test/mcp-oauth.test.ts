@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { rm } from "node:fs/promises";
 import { ConfigProvider, Effect, Either, Fiber, Layer, Option } from "effect";
 import { describe, expect, it, vi } from "vitest";
@@ -20,6 +21,9 @@ import {
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+
+const hash = (value: string) =>
+  createHash("sha256").update(value).digest("base64url");
 
 describe("MCP OAuth primitives", () => {
   it("builds an RFC 7636 S256 authorize URL", () => {
@@ -52,7 +56,10 @@ describe("MCP OAuth primitives", () => {
     fetchMock
       .mockResolvedValueOnce(
         new Response(
-          JSON.stringify({ authorization_servers: ["https://issuer.example"] }),
+          JSON.stringify({
+            resource: "https://mcp.example/server",
+            authorization_servers: ["https://issuer.example"],
+          }),
           { status: 200 },
         ),
       )
@@ -85,7 +92,10 @@ describe("MCP OAuth primitives", () => {
     fetchMock
       .mockResolvedValueOnce(
         new Response(
-          JSON.stringify({ authorization_servers: ["https://issuer.example"] }),
+          JSON.stringify({
+            resource: "https://mcp.example/server",
+            authorization_servers: ["https://issuer.example"],
+          }),
           { status: 200 },
         ),
       )
@@ -105,6 +115,141 @@ describe("MCP OAuth primitives", () => {
       fetchMock,
     );
     await expect(result).rejects.toThrow("untrusted origin");
+  });
+  it("rejects protected-resource metadata for a different resource", async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          resource: "https://mcp.example/other",
+          authorization_servers: ["https://issuer.example"],
+        }),
+        { status: 200 },
+      ),
+    );
+    await expect(
+      discoverMcpOAuthMetadata("https://mcp.example/server", fetchMock),
+    ).rejects.toThrow("Protected-resource metadata describes");
+  });
+
+  it("rejects duplicate provider keys during credential materialization", async () => {
+    const workspace = `/tmp/mcp-oauth-duplicate-${crypto.randomUUID()}`;
+    await expect(
+      materializeMcpAgentDb(workspace, [
+        {
+          serverUrl: "https://mcp.example/server",
+          accessToken: "access-one",
+          expiresAt: 1_700_000_000_000,
+        },
+        {
+          serverUrl: "https://mcp.example/server",
+          accessToken: "access-two",
+          expiresAt: 1_700_000_000_001,
+        },
+      ]),
+    ).rejects.toThrow("Duplicate MCP OAuth provider key");
+    await rm(workspace, { recursive: true, force: true });
+  });
+  it("uses Basic authentication for confidential pre-registered clients", async () => {
+    const organizationId = "org-basic-auth" as OrganizationId;
+    const serverId = "mcp-basic-auth" as McpServerId;
+    const state = "state-basic-auth";
+    const verifier = "verifier-basic-auth";
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          access_token: "access-token",
+          refresh_token: "refresh-token",
+          expires_in: 3600,
+          token_type: "Bearer",
+        }),
+        { status: 200 },
+      ),
+    );
+    const configProvider = ConfigProvider.fromMap(
+      new Map([
+        ["LINEAR_CLIENT_ID", "test-client"],
+        ["LINEAR_CLIENT_SECRET", "test-secret"],
+        ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
+        [
+          "TOKEN_ENCRYPTION_KEY",
+          Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),
+        ],
+        ["PUBLIC_URL", "http://localhost:3000"],
+        [
+          "NIXPKGS_FLAKE_REF",
+          "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
+        ],
+        ["WORKSPACE_ROOT", "/tmp/mcp-oauth-basic"],
+      ]),
+    );
+    const sqlite = SqliteClientLive(":memory:");
+    const configLayer = Layer.setConfigProvider(configProvider);
+    const token = TokenCrypto.Default.pipe(
+      Layer.provide(Layer.mergeAll(sqlite, configLayer)),
+    );
+    const gateway = GatewayConfig.Default.pipe(Layer.provide(configLayer));
+    const servers = McpServerRepo.Default.pipe(
+      Layer.provide(Layer.mergeAll(sqlite, token)),
+    );
+    const oauth = McpOAuth.Default.pipe(
+      Layer.provide(Layer.mergeAll(sqlite, token, gateway, servers)),
+    );
+    const dependencies = Layer.mergeAll(sqlite, token, gateway, servers, oauth);
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const serverRepo = yield* McpServerRepo;
+            const crypto = yield* TokenCrypto;
+            const { db } = yield* SqliteClient;
+            yield* serverRepo.createMcpServer({
+              organizationId,
+              id: serverId,
+              name: "basic auth",
+              transport: "http",
+              url: "https://mcp.example/server",
+            });
+            const client = yield* crypto.encrypt(
+              JSON.stringify({
+                clientId: "confidential-client",
+                clientSecret: "confidential-secret",
+                tokenEndpointAuthMethod: "client_secret_basic",
+                authorizationEndpoint: "https://issuer.example/authorize",
+                tokenEndpoint: "https://issuer.example/token",
+              }),
+            );
+            const encryptedVerifier = yield* crypto.encrypt(verifier);
+            const now = Date.now();
+            db.query(
+              "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ).run(
+              hash(state),
+              organizationId,
+              serverId,
+              "https://mcp.example/server",
+              `${MCP_OAUTH_ENCRYPTED_PREFIX}${encryptedVerifier}`,
+              "http://localhost:3000/oauth/mcp/callback",
+              `${MCP_OAUTH_ENCRYPTED_PREFIX}${client}`,
+              now + 60_000,
+            );
+            const service = yield* McpOAuth;
+            yield* service.completeMcpAuthorization(
+              new URL(
+                "http://localhost:3000/oauth/mcp/callback?code=auth-code&state=state-basic-auth",
+              ),
+            );
+          }).pipe(Effect.provide(dependencies)),
+        ),
+      );
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const [, init] = fetchMock.mock.calls[0] ?? [];
+    expect(new Headers(init?.headers).get("authorization")).toBe(
+      `Basic ${Buffer.from("confidential-client:confidential-secret").toString("base64")}`,
+    );
+    expect(String(init?.body)).not.toContain("client_secret");
   });
 
   it("materializes an isolated Pi auth database with access-only MCP credentials", async () => {
