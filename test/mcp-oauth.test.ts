@@ -167,7 +167,6 @@ describe("MCP OAuth primitives", () => {
         JSON.stringify({
           access_token: "access-token",
           refresh_token: "refresh-token",
-          expires_in: 3600,
           token_type: "Bearer",
         }),
         { status: 200 },
@@ -220,8 +219,8 @@ describe("MCP OAuth primitives", () => {
             });
             const client = yield* crypto.encrypt(
               JSON.stringify({
-                clientId: "confidential-client",
-                clientSecret: "confidential-secret",
+                clientId: "confidential: client",
+                clientSecret: "confidential% secret",
                 tokenEndpointAuthMethod: "client_secret_basic",
                 authorizationEndpoint: "https://issuer.example/authorize",
                 tokenEndpoint: "https://issuer.example/token",
@@ -247,6 +246,13 @@ describe("MCP OAuth primitives", () => {
                 "http://localhost:3000/oauth/mcp/callback?code=auth-code&state=state-basic-auth",
               ),
             );
+            const credential = yield* service.getCredentialDetails(
+              organizationId,
+              serverId,
+            );
+            expect(Option.getOrThrow(credential).token.expiresAt).toBe(
+              Number.MAX_SAFE_INTEGER,
+            );
           }).pipe(Effect.provide(dependencies)),
         ),
       );
@@ -255,7 +261,7 @@ describe("MCP OAuth primitives", () => {
     }
     const [, init] = fetchMock.mock.calls[0] ?? [];
     expect(new Headers(init?.headers).get("authorization")).toBe(
-      `Basic ${Buffer.from("confidential-client:confidential-secret").toString("base64")}`,
+      `Basic ${Buffer.from("confidential%3A+client:confidential%25+secret").toString("base64")}`,
     );
     expect(String(init?.body)).not.toContain("client_secret");
   });

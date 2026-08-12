@@ -22,6 +22,7 @@ import {
   decodeRows,
   runChanges,
   SqliteClient,
+  transact,
   tryDb,
 } from "./sqlite-client.js";
 
@@ -127,6 +128,13 @@ const normalizeOAuthClient = (value: unknown): McpOAuthClientConfig | null => {
     candidate.scope === undefined || candidate.scope === null
       ? undefined
       : cleanString(candidate.scope, "oauthClient.scope");
+  const tokenEndpointAuthMethod =
+    candidate.tokenEndpointAuthMethod === undefined ||
+    candidate.tokenEndpointAuthMethod === null
+      ? undefined
+      : Schema.decodeUnknownSync(
+          Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+        )(candidate.tokenEndpointAuthMethod);
   if (clientId === undefined && scope === undefined) {
     throw new Error("oauthClient requires a clientId or scope");
   }
@@ -137,6 +145,9 @@ const normalizeOAuthClient = (value: unknown): McpOAuthClientConfig | null => {
     ...(clientId !== undefined ? { clientId } : {}),
     ...(clientSecret !== undefined ? { clientSecret } : {}),
     ...(scope !== undefined ? { scope } : {}),
+    ...(tokenEndpointAuthMethod !== undefined
+      ? { tokenEndpointAuthMethod }
+      : {}),
   };
 };
 
@@ -583,14 +594,28 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
           organizationId: OrganizationId,
           id: McpServerId,
         ): Effect.fn.Return<boolean, DatabaseError> {
-          const result = yield* tryDb(
-            () =>
-              db
-                .query(
-                  "DELETE FROM mcp_server WHERE organization_id=? AND id=?",
-                )
-                .run(organizationId, id),
-            "McpServerRepo.deleteMcpServer",
+          const result = yield* transact(
+            db,
+            Effect.gen(function* () {
+              yield* tryDb(
+                () =>
+                  db
+                    .query(
+                      "DELETE FROM mcp_oauth_credential WHERE organization_id=? AND server_id=?",
+                    )
+                    .run(organizationId, id),
+                "McpServerRepo.deleteMcpServer.credentials",
+              );
+              return yield* tryDb(
+                () =>
+                  db
+                    .query(
+                      "DELETE FROM mcp_server WHERE organization_id=? AND id=?",
+                    )
+                    .run(organizationId, id),
+                "McpServerRepo.deleteMcpServer",
+              );
+            }),
           );
           return (
             (yield* runChanges(result, "McpServerRepo.deleteMcpServer")) === 1

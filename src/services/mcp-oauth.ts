@@ -30,6 +30,7 @@ export const MCP_OAUTH_CALLBACK_PATH = "/oauth/mcp/callback";
 export const MCP_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const PKCE_BYTES = 32;
 const FETCH_TIMEOUT_MS = 5_000;
+const NON_EXPIRING_TOKEN_EXPIRES_AT = Number.MAX_SAFE_INTEGER;
 
 type FetchLike = typeof fetch;
 
@@ -102,7 +103,7 @@ const RegistrationResponse = Schema.Struct({
 const TokenResponse = Schema.Struct({
   access_token: Schema.String,
   refresh_token: Schema.optional(Schema.String),
-  expires_in: Schema.Number.pipe(Schema.nonNegative()),
+  expires_in: Schema.optional(Schema.Number.pipe(Schema.nonNegative())),
   token_type: Schema.optional(Schema.String),
   scope: Schema.optional(Schema.String),
 });
@@ -460,25 +461,44 @@ const registerClient = (
     ),
   );
 
+const formEncode = (value: string): string =>
+  new URLSearchParams({ value }).toString().slice("value=".length);
+
 const tokenEndpointAuth = (
   client: McpOAuthClientMetadata,
   params: URLSearchParams,
-): Record<string, string> => {
-  const method =
-    client.tokenEndpointAuthMethod ??
-    (client.clientSecret === undefined ? "none" : "client_secret_basic");
-  if (method === "client_secret_basic" && client.clientSecret !== undefined) {
-    return {
-      Authorization: `Basic ${Buffer.from(
-        `${client.clientId}:${client.clientSecret}`,
-      ).toString("base64")}`,
-    };
-  }
-  if (method === "client_secret_post" && client.clientSecret !== undefined) {
-    params.set("client_secret", client.clientSecret);
-  }
-  return {};
-};
+): Effect.Effect<Record<string, string>, DatabaseError> =>
+  Effect.gen(function* () {
+    const clientSecret = client.clientSecret;
+    const method =
+      client.tokenEndpointAuthMethod ??
+      (clientSecret === undefined ? "none" : "client_secret_basic");
+    if (method === "client_secret_basic") {
+      if (clientSecret === undefined) {
+        return yield* Effect.fail(
+          new DatabaseError({
+            message: `${method} requires a client secret`,
+          }),
+        );
+      }
+      return {
+        Authorization: `Basic ${Buffer.from(
+          `${formEncode(client.clientId)}:${formEncode(clientSecret)}`,
+        ).toString("base64")}`,
+      };
+    }
+    if (method === "client_secret_post") {
+      if (clientSecret === undefined) {
+        return yield* Effect.fail(
+          new DatabaseError({
+            message: `${method} requires a client secret`,
+          }),
+        );
+      }
+      params.set("client_secret", clientSecret);
+    }
+    return {};
+  });
 
 const redeemCode = (
   client: McpOAuthClientMetadata,
@@ -498,7 +518,7 @@ const redeemCode = (
       code_verifier: verifier,
       resource,
     });
-    const authHeaders = tokenEndpointAuth(client, params);
+    const authHeaders = yield* tokenEndpointAuth(client, params);
     const response = yield* Effect.tryPromise({
       try: () =>
         fetchWithTimeout(fetchImpl, client.tokenEndpoint, {
@@ -529,7 +549,10 @@ const redeemCode = (
       ...(body.refresh_token !== undefined
         ? { refreshToken: body.refresh_token }
         : {}),
-      expiresAt: now + body.expires_in * 1000,
+      expiresAt:
+        body.expires_in === undefined
+          ? NON_EXPIRING_TOKEN_EXPIRES_AT
+          : now + body.expires_in * 1000,
       ...(body.token_type !== undefined ? { tokenType: body.token_type } : {}),
       ...(body.scope !== undefined ? { scope: body.scope } : {}),
     };
@@ -549,7 +572,7 @@ const refreshAccessToken = (
       client_id: client.clientId,
       resource,
     });
-    const authHeaders = tokenEndpointAuth(client, params);
+    const authHeaders = yield* tokenEndpointAuth(client, params);
     const response = yield* Effect.tryPromise({
       try: () =>
         fetchWithTimeout(fetchImpl, client.tokenEndpoint, {
@@ -578,7 +601,10 @@ const refreshAccessToken = (
     return {
       accessToken: body.access_token,
       refreshToken: body.refresh_token ?? refreshToken,
-      expiresAt: now + body.expires_in * 1000,
+      expiresAt:
+        body.expires_in === undefined
+          ? NON_EXPIRING_TOKEN_EXPIRES_AT
+          : now + body.expires_in * 1000,
       ...(body.token_type !== undefined ? { tokenType: body.token_type } : {}),
       ...(body.scope !== undefined ? { scope: body.scope } : {}),
     };

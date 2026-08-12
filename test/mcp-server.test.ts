@@ -140,10 +140,14 @@ describe("MCP server storage and worker config", () => {
           oauthClient: {
             clientId: "client",
             clientSecret: "secret",
+            tokenEndpointAuthMethod: "client_secret_post",
           },
           now: 4,
         });
         expect(oauthServer.oauthClient?.clientId).toBe("client");
+        expect(oauthServer.oauthClient?.tokenEndpointAuthMethod).toBe(
+          "client_secret_post",
+        );
         yield* servers.updateMcpServer(org, serverId("oauth"), {
           oauthClient: null,
         });
@@ -156,7 +160,29 @@ describe("MCP server storage and worker config", () => {
         expect(
           Option.isSome(dynamic) ? dynamic.value.oauthClient : null,
         ).toEqual({ scope: "read:tools" });
+        db.query(
+          "INSERT INTO mcp_oauth_credential (organization_id, server_id, server_url, client_json, access_token, refresh_token, expires_at, token_type, scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ).run(
+          org,
+          serverId("off"),
+          "https://disabled.example.test",
+          "client",
+          "access",
+          null,
+          1,
+          "Bearer",
+          null,
+          1,
+          1,
+        );
         expect(yield* servers.deleteMcpServer(org, serverId("off"))).toBe(true);
+        expect(
+          db
+            .query(
+              "SELECT 1 AS present FROM mcp_oauth_credential WHERE organization_id=? AND server_id=?",
+            )
+            .get(org, serverId("off")),
+        ).toBeNull();
       }),
     ),
   );

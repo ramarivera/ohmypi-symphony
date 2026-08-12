@@ -979,6 +979,7 @@ describe("MCP admin endpoints", () => {
         clientId: "old-client",
         clientSecret: "old-secret",
         scope: "read",
+        tokenEndpointAuthMethod: "client_secret_basic",
       },
       repositoryId: null,
       enabled: true,
@@ -986,6 +987,7 @@ describe("MCP admin endpoints", () => {
       updatedAt: 1,
     });
     let received: Record<string, unknown> | undefined;
+    let disconnected = false;
     const mcpServerRepo = McpServerRepo.make({
       ...deps.mcpServerRepo,
       getMcpServer: () => Effect.succeed(Option.some(server)),
@@ -994,7 +996,17 @@ describe("MCP admin endpoints", () => {
         return Effect.succeed(server);
       },
     });
-    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const handle = createAdminHandle({
+      ...deps,
+      mcpServerRepo,
+      mcpOAuth: {
+        ...deps.mcpOAuth,
+        disconnect: () => {
+          disconnected = true;
+          return Effect.void;
+        },
+      } as AdminDeps["mcpOAuth"],
+    });
     const response = Option.getOrThrow(
       await Effect.runPromise(
         handle(
@@ -1023,6 +1035,7 @@ describe("MCP admin endpoints", () => {
                 repositoryId: null,
                 enabled: true,
                 oauthClientId: "new-client",
+                oauthTokenEndpointAuthMethod: "client_secret_post",
               }),
             },
           ),
@@ -1030,7 +1043,11 @@ describe("MCP admin endpoints", () => {
       ),
     );
     expect(response.status).toBe(200);
-    expect(received?.oauthClient).toEqual({ clientId: "new-client" });
+    expect(received?.oauthClient).toEqual({
+      clientId: "new-client",
+      tokenEndpointAuthMethod: "client_secret_post",
+    });
+    expect(disconnected).toBe(true);
   });
   it("requires enabled to be a boolean and defaults omitted to true", async () => {
     const server = Schema.decodeUnknownSync(McpServerRecord)({
