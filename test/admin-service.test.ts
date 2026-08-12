@@ -141,6 +141,7 @@ const deps: AdminDeps = {
       ),
   },
   reconciler: {
+    trigger: () => Effect.void,
     status: () =>
       Effect.succeed({
         running: false,
@@ -549,6 +550,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       createdInputId?: unknown;
       payload?: unknown;
     } = {};
+    let reconcilerTriggers = 0;
     const newSessionId = "55555555-5555-4555-8555-555555555555";
     const rerunHandle = createAdminHandle({
       ...deps,
@@ -575,6 +577,13 @@ describe("POST /api/admin/runs/:id/rerun", () => {
       linearGateway: {
         createSessionOnIssue: () => Effect.succeed(newSessionId),
       },
+      reconciler: {
+        ...deps.reconciler,
+        trigger: () => {
+          reconcilerTriggers += 1;
+          return Effect.void;
+        },
+      },
     });
     const response = await Effect.runPromise(
       rerunHandle(
@@ -590,6 +599,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(created.sessionId).toBe(newSessionId);
     expect(created.createdRun).toBe(true);
     expect(created.enqueued).toBe(true);
+    expect(reconcilerTriggers).toBe(1);
     const createdInput = created.createdRunInput as {
       organizationId: unknown;
       issueId: unknown;
@@ -607,6 +617,74 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(payload.repositoryId).toBe(repositoryId);
     expect(payload.automationDelegated).toBe(false);
   });
+  it("serializes overlapping reruns for the same issue before creating a session", async () => {
+    let active = false;
+    let createSessionCalls = 0;
+    let releaseFirst = () => {};
+    let signalFirstStarted = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      signalFirstStarted = resolve;
+    });
+    const firstReleased = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const newSessionId = "55555555-5555-4555-8555-555555555555";
+    const rerunHandle = createAdminHandle({
+      ...deps,
+      runRepo: RunRepo.make({
+        ...deps.runRepo,
+        get: () => Effect.succeed(Option.some(terminalRun)),
+        hasActiveForIssue: () => Effect.succeed(active),
+        createIfNoActiveForIssue: () => {
+          if (active) return Effect.succeed("active");
+          active = true;
+          return Effect.succeed("created");
+        },
+      }),
+      runInputRepo: RunInputRepo.make({
+        ...deps.runInputRepo,
+        enqueue: () => Effect.succeed(true),
+      }),
+      linearGateway: {
+        createSessionOnIssue: () => {
+          createSessionCalls += 1;
+          signalFirstStarted();
+          return createSessionCalls === 1
+            ? Effect.promise(() => firstReleased.then(() => newSessionId))
+            : Effect.succeed(newSessionId);
+        },
+      },
+    });
+
+    const firstResponsePromise = Effect.runPromise(
+      rerunHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    await firstStarted;
+    const secondResponsePromise = Effect.runPromise(
+      rerunHandle(
+        request(
+          "/api/admin/runs/22222222-2222-4222-8222-222222222222/rerun",
+          {},
+        ),
+      ),
+    );
+    releaseFirst();
+    const [firstResponse, secondResponse] = await Promise.all([
+      firstResponsePromise,
+      secondResponsePromise,
+    ]);
+    const first = Option.getOrElse(firstResponse, () => null);
+    const second = Option.getOrElse(secondResponse, () => null);
+    expect(first?.status).toBe(200);
+    expect(second?.status).toBe(409);
+    expect(createSessionCalls).toBe(1);
+  });
+
   it("maps Linear rate limits to 429 with retry delay", async () => {
     const rateLimitHandle = createAdminHandle({
       ...deps,
