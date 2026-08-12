@@ -458,6 +458,13 @@ describe("MCP OAuth primitives", () => {
               )
               .get(organizationId, serverId);
             expect(active?.state_hash).toBe(hash(second.state));
+            yield* service.disconnect(organizationId, serverId);
+            const afterDisconnect = db
+              .query<{ count: number }, [string, string]>(
+                "SELECT COUNT(*) AS count FROM mcp_oauth_state WHERE organization_id = ? AND server_id = ? AND consumed_at IS NULL",
+              )
+              .get(organizationId, serverId);
+            expect(afterDisconnect?.count).toBe(0);
           }).pipe(Effect.provide(dependencies)),
         ),
       );

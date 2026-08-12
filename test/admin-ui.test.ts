@@ -169,6 +169,49 @@ describe("renderAdminPage", () => {
     );
   });
 
+  test("keeps prompt template saves disabled until the initial load succeeds", () => {
+    const html = renderAdminPage();
+    expect(html).toMatch(/id="prompt-templates-save" disabled/);
+    expect(html).toMatch(/promptTemplatesLoaded:\s*false/);
+    expect(html).toMatch(
+      /if\s*\(!state\.promptTemplatesLoaded\)\s*\{[\s\S]{0,220}return;/,
+    );
+    expect(html).toMatch(
+      /state\.promptTemplatesLoaded\s*=\s*true[\s\S]{0,120}setPromptTemplatesSaveEnabled\(true\)/,
+    );
+    expect(html).toMatch(
+      /saveButton\.disabled\s*=\s*!enabled\s*\|\|\s*!state\.csrfToken/,
+    );
+    expect(html).toMatch(
+      /state\.csrfToken\s*=\s*typeof data\.csrfToken[\s\S]{0,100}setPromptTemplatesSaveEnabled\(state\.promptTemplatesLoaded\)/,
+    );
+  });
+
+  test("preserves rejected prompt template edits when a save fails", () => {
+    const html = renderAdminPage();
+    expect(html).toMatch(
+      /if\s*\(failures\.length\s*===\s*0\)\s*\{\s*await loadPromptTemplates\(\);\s*\}/,
+    );
+  });
+
+  test("renders live previews for all prompt template editors", () => {
+    const html = renderAdminPage();
+    expect(html).toContain('id="prompt-template-preview-prompted"');
+    expect(html).toContain('id="prompt-template-preview-contract"');
+    expect(html).toMatch(
+      /\["created",\s*"prompted",\s*"contract"\]\.forEach\(function \(kind\)/,
+    );
+    expect(html).toMatch(
+      /prompted:\s*\{\s*userRequest:\s*"Sample follow-up from Linear"/,
+    );
+    expect(html).not.toMatch(
+      /prompted:\s*\{\s*userRequest:\s*"User request:\\nSample follow-up from Linear"/,
+    );
+    expect(html).toMatch(
+      /var preview = templateKind === "created"[\s\S]{0,180}"prompt-template-preview-" \+ templateKind/,
+    );
+  });
+
   test("sends application/json, X-CSRF-Token, and same-origin credentials on every mutation", () => {
     const html = renderAdminPage();
     expect(html).toContain("X-CSRF-Token");

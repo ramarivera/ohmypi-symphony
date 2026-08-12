@@ -125,6 +125,22 @@ describe("Reconciler catch-up", () => {
                 createdAt: "2025-01-01T00:00:00.000Z",
               },
               {
+                id: "prompt-title-only",
+                type: "prompt",
+                body: null,
+                title: "Title only",
+                signal: null,
+                createdAt: "2025-01-01T00:00:00.000Z",
+              },
+              {
+                id: "prompt-empty-title",
+                type: "prompt",
+                body: "Body with empty title",
+                title: "",
+                signal: null,
+                createdAt: "2025-01-01T00:00:00.000Z",
+              },
+              {
                 id: "new-1",
                 type: "unknown",
                 body: "ignored",
@@ -147,12 +163,21 @@ describe("Reconciler catch-up", () => {
         expect(ids).toEqual([
           `${sessionA}:prompted:prompt-1`,
           `${sessionA}:stop:stop-1`,
+          `${sessionA}:prompted:prompt-title-only`,
+          `${sessionA}:prompted:prompt-empty-title`,
         ]);
-        // Catch-up mirrors the webhook's extractPromptBody title prefix.
+        // Catch-up mirrors the webhook's extractPromptBody rules for all
+        // title/body combinations.
         expect(bodies.get(`${sessionA}:prompted:prompt-1`)).toBe(
           "# Follow-up on ENG-1\n\nhello",
         );
         expect(bodies.get(`${sessionA}:stop:stop-1`)).toBe("stop");
+        expect(bodies.get(`${sessionA}:prompted:prompt-title-only`)).toBe(
+          "Title only",
+        );
+        expect(bodies.get(`${sessionA}:prompted:prompt-empty-title`)).toBe(
+          "Body with empty title",
+        );
       }),
   );
   it.effect("rotates bounded batches between catch-up sweeps", () =>

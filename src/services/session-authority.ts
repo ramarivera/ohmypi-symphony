@@ -38,6 +38,10 @@ import {
 } from "./mcp-oauth.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
+import {
+  LINEAR_WORKER_CONTRACT,
+  substitutePromptTemplate,
+} from "./prompt-templates.js";
 import type {
   RpcEvent,
   RpcHostToolCall,
@@ -49,6 +53,7 @@ import { RpcWorker } from "./rpc-worker.js";
 import {
   InstallationRepo,
   McpServerRepo,
+  PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -78,24 +83,48 @@ interface WorkerState {
 
 const CANCEL_GATE_TIMEOUT_MS = 30_000;
 
-const LINEAR_WORKER_CONTRACT = `Linear integration:
-- Use OMP todos for meaningful multi-step work; they are displayed as the Linear agent plan.
-- Use OMP UI requests when human input, selection, confirmation, or authorization is required; they are displayed as Linear elicitations.
-- Tool execution and lifecycle progress are projected automatically as Linear thought and action activities. Do not call Linear directly to report progress.
-- Gateway-owned Linear tools are available: linear_get_issue(issueId) reads any issue visible to this installation; linear_create_comment(body) posts a comment to this run's issue; linear_update_issue(stateId?, delegateId?) updates this run's issue; linear_add_external_url(label, url) appends a URL to this run's agent session.
-- Use linear_get_issue to inspect issue state/details, linear_create_comment for user-facing issue updates, linear_update_issue when changing workflow state or delegation, and linear_add_external_url for durable artifact links.
-- Call linear_add_external_url immediately when you open or update a pull request, using label "Pull request" and the PR URL.
-- Call rromp_report_deviation as soon as you take a shortcut, depart from the original request, change a material assumption, or make a consequential implementation decision. The report becomes a visible Linear issue comment.
-- Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
-- If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
+export { LINEAR_WORKER_CONTRACT };
 
 export const linearWorkerPrompt = (
   kind: "created" | "prompted" | "stop",
   body: string,
+  contract = LINEAR_WORKER_CONTRACT,
 ): string =>
-  kind === "created"
-    ? `${LINEAR_WORKER_CONTRACT}\n\nLinear task:\n${body}`
-    : body;
+  kind === "created" ? `${contract}\n\nLinear task:\n${body}` : body;
+
+const linearWorkerPromptWithTemplate = (
+  repo: PromptTemplateRepo,
+  organizationId: string,
+  kind: "created" | "prompted" | "stop",
+  body: string,
+): Effect.Effect<string, DatabaseError | RowDecodeError> => {
+  if (kind === "prompted") {
+    return repo.get(organizationId, "prompted").pipe(
+      Effect.map((template) =>
+        Option.isSome(template)
+          ? substitutePromptTemplate(template.value.body, {
+              userRequest: body,
+            })
+          : linearWorkerPrompt(kind, body),
+      ),
+    );
+  }
+  return kind !== "created"
+    ? Effect.succeed(linearWorkerPrompt(kind, body))
+    : repo
+        .get(organizationId, "contract")
+        .pipe(
+          Effect.map((template) =>
+            linearWorkerPrompt(
+              kind,
+              body,
+              Option.isSome(template)
+                ? substitutePromptTemplate(template.value.body, {})
+                : LINEAR_WORKER_CONTRACT,
+            ),
+          ),
+        );
+};
 
 export const resolveDeviationExtensionPath = (): string | null => {
   const candidates = [
@@ -284,6 +313,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       InstallationRepo.Default,
       McpServerRepo.Default,
       McpOAuth.Default,
+      PromptTemplateRepo.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
       RunRepo.Default,
@@ -297,6 +327,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
     effect: Effect.gen(function* () {
       const runRepo = yield* RunRepo;
       const runInputRepo = yield* RunInputRepo;
+      const promptTemplateRepo = yield* PromptTemplateRepo;
       const installationRepo = yield* InstallationRepo;
       const runEventRepo = yield* RunEventRepo;
       const workspaceRepo = yield* WorkspaceRepo;
@@ -2085,6 +2116,26 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       Option.isSome(input) ? input.value.payload : null,
                     ),
                   );
+                let retryPrompt: string | undefined;
+                if (Option.isNone(resumed.ompSessionFile)) {
+                  const latestActionable =
+                    yield* runInputRepo.latestActionableInput(sessionId);
+                  if (Option.isNone(latestActionable)) {
+                    return yield* Effect.fail(
+                      new InterruptedRunNoActionableInputError({
+                        sessionId,
+                        message:
+                          "Interrupted run has no actionable input to resume",
+                      }),
+                    );
+                  }
+                  retryPrompt = yield* linearWorkerPromptWithTemplate(
+                    promptTemplateRepo,
+                    resumed.organizationId,
+                    latestActionable.value.kind,
+                    latestActionable.value.body,
+                  );
+                }
                 yield* ensureIssueLifecycle(
                   resumed,
                   retryPayload,
@@ -2108,14 +2159,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   `retry:${resumed.attempt}`,
                   `Retrying the interrupted OhMyPi run (attempt ${resumed.attempt}).`,
                 );
-                if (Option.isSome(run.ompSessionFile)) {
+                if (Option.isSome(resumed.ompSessionFile)) {
                   yield* worker.followUp(
                     "Continue the interrupted Linear task from the saved session state.",
                   );
                 } else {
-                  const latestActionable =
-                    yield* runInputRepo.latestActionableInput(sessionId);
-                  if (Option.isNone(latestActionable)) {
+                  if (retryPrompt === undefined) {
                     return yield* Effect.fail(
                       new InterruptedRunNoActionableInputError({
                         sessionId,
@@ -2124,12 +2173,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       }),
                     );
                   }
-                  const agentInvoked = yield* worker.prompt(
-                    linearWorkerPrompt(
-                      latestActionable.value.kind,
-                      latestActionable.value.body,
-                    ),
-                  );
+                  const agentInvoked = yield* worker.prompt(retryPrompt);
                   if (!agentInvoked) {
                     yield* finishLocalCommand(
                       sessionId,
@@ -2210,6 +2254,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   ? reopenedOption.value
                   : latest;
               }
+              const initialPrompt =
+                input.kind === "created"
+                  ? yield* linearWorkerPromptWithTemplate(
+                      promptTemplateRepo,
+                      latest.organizationId,
+                      input.kind,
+                      input.body,
+                    )
+                  : undefined;
               if (worker === undefined) {
                 if (runUrlForSession !== null) {
                   yield* projector.externalUrls(
@@ -2316,7 +2369,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   );
                 }
                 const agentInvoked = yield* worker.prompt(
-                  linearWorkerPrompt(input.kind, input.body),
+                  initialPrompt ??
+                    (yield* linearWorkerPromptWithTemplate(
+                      promptTemplateRepo,
+                      latest.organizationId,
+                      input.kind,
+                      input.body,
+                    )),
                 );
                 if (!agentInvoked) {
                   yield* finishLocalCommand(sessionId, worker, input.id);
@@ -2341,10 +2400,20 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     next.delete(sessionId);
                     return next;
                   });
-                } else if (yield* worker.isStreaming) {
-                  yield* worker.steer(input.body);
                 } else {
-                  yield* worker.followUp(input.body);
+                  // Render the prompted template at send time: input.body
+                  // stays raw for repo-selection/UI-answer paths.
+                  const rendered = yield* linearWorkerPromptWithTemplate(
+                    promptTemplateRepo,
+                    latest.organizationId,
+                    "prompted",
+                    input.body,
+                  );
+                  if (yield* worker.isStreaming) {
+                    yield* worker.steer(rendered);
+                  } else {
+                    yield* worker.followUp(rendered);
+                  }
                 }
                 yield* runRepo.update(sessionId, { state: "running" });
               }

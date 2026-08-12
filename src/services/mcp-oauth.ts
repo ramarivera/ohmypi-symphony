@@ -995,15 +995,29 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
 
     const disconnect = Effect.fn("McpOAuth.disconnect")(
       (organizationId: OrganizationId, serverId: McpServerId) =>
-        tryDb(
-          () =>
-            db
-              .query(
-                "DELETE FROM mcp_oauth_credential WHERE organization_id = ? AND server_id = ?",
-              )
-              .run(organizationId, serverId),
-          "McpOAuth.disconnect",
-        ).pipe(Effect.asVoid),
+        transact(
+          db,
+          Effect.gen(function* () {
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "DELETE FROM mcp_oauth_credential WHERE organization_id = ? AND server_id = ?",
+                  )
+                  .run(organizationId, serverId),
+              "McpOAuth.disconnect.credential",
+            );
+            yield* tryDb(
+              () =>
+                db
+                  .query(
+                    "DELETE FROM mcp_oauth_state WHERE organization_id = ? AND server_id = ? AND consumed_at IS NULL",
+                  )
+                  .run(organizationId, serverId),
+              "McpOAuth.disconnect.state",
+            );
+          }),
+        ),
     );
 
     const getCredentialDetails = Effect.fn("McpOAuth.getCredentialDetails")(

@@ -57,6 +57,7 @@ import {
 import {
   InstallationRepo,
   McpServerRepo,
+  PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -491,6 +492,118 @@ describe("SessionAuthority behavior invariants", () => {
       ),
     { timeout: 15_000 },
   );
+
+  it.scopedLive("renders the prompted template at prompt time", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const installationRepo = yield* InstallationRepo;
+        const runRepo = yield* RunRepo;
+        const runInputRepo = yield* RunInputRepo;
+        const templateRepo = yield* PromptTemplateRepo;
+        const workspaceRepo = yield* WorkspaceRepo;
+        yield* installationRepo.put(install(testOrganizationId));
+        yield* templateRepo.upsert({
+          organizationId: testOrganizationId,
+          kind: "prompted",
+          body: "Follow-up:\n{{userRequest}}",
+          updatedAt: 0,
+        });
+        const repositoryId = Schema.decodeUnknownSync(WorkspaceId)(
+          "prompt-template-repository",
+        );
+        yield* workspaceRepo.createRepository({
+          organizationId: testOrganizationId,
+          id: repositoryId,
+          url: "https://example.com/repository.git",
+          ref: "main",
+          nixPackages: [],
+        });
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.none(),
+        });
+        yield* runRepo.update(testSessionId, {
+          state: "running",
+          repositoryId: Option.some(repositoryId),
+          workspacePath: Option.some("/tmp/resume-workspace"),
+          ompSessionFile: Option.some("/tmp/resume-workspace/session.jsonl"),
+        });
+
+        yield* runInputRepo.enqueue({
+          id: Schema.decodeUnknownSync(InputId)("stop-input"),
+          sessionId: testSessionId,
+          kind: "stop",
+          body: "stop",
+          payload: {},
+        });
+        yield* authority.processSession(testSessionId);
+
+        yield* runInputRepo.enqueue({
+          id: Schema.decodeUnknownSync(InputId)("resume-input"),
+          sessionId: testSessionId,
+          kind: "prompted",
+          body: "please continue the task",
+          payload: {},
+        });
+        yield* authority.processSession(testSessionId);
+
+        // The raw input body stays literal; the worker receives the
+        // template-rendered prompt.
+        expect(workerPrompts).toEqual(["Follow-up:\nplease continue the task"]);
+      }),
+    ),
+  );
+  it.scopedLive(
+    "renders a prompted template when retrying an orphaned run",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          const templateRepo = yield* PromptTemplateRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* templateRepo.upsert({
+            organizationId: testOrganizationId,
+            kind: "prompted",
+            body: "Retry:\n{{userRequest}}",
+            updatedAt: 0,
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          const inputId =
+            Schema.decodeUnknownSync(InputId)("orphan-retry-input");
+          yield* runInputRepo.enqueue({
+            id: inputId,
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "continue after interruption",
+            payload: {},
+          });
+          yield* runInputRepo.markProcessed(inputId);
+          yield* Effect.promise(() =>
+            mkdir("/tmp/orphan-retry-template", { recursive: true }),
+          );
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/orphan-retry-template"),
+          });
+
+          yield* authority.processSession(testSessionId);
+
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(workerPrompts).toEqual([
+            "Retry:\ncontinue after interruption",
+          ]);
+        }),
+      ),
+  );
   it.effect(
     "materializes configured MCP servers through the real authority layer",
     () =>
@@ -886,6 +999,7 @@ const withAuthority = <A, E>(
     | InstallationRepo
     | McpServerRepo
     | McpOAuth
+    | PromptTemplateRepo
     | WorkspaceRepo
     | NixEnvironment
     | GitHubApp
@@ -938,6 +1052,7 @@ const withAuthority = <A, E>(
         InstallationRepo.Default,
         McpServerRepo.Default,
         McpOAuth.Default,
+        PromptTemplateRepo.Default,
         RunEventRepo.Default,
         RunInputRepo.Default,
         RunRepo.Default,
@@ -1203,6 +1318,9 @@ describe("SessionAuthority infrastructure failures", () => {
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             workspacePath: Option.some("/tmp/host-tool-registration"),
+            ompSessionFile: Option.some(
+              "/tmp/host-tool-registration/session.jsonl",
+            ),
           });
 
           const result = yield* Effect.either(

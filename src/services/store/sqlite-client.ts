@@ -251,6 +251,13 @@ const migrate = (db: Database): void => {
       expires_at INTEGER NOT NULL,
       created_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS prompt_template (
+      organization_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('created', 'prompted', 'contract')),
+      body TEXT NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, kind)
+    );
     CREATE INDEX IF NOT EXISTS admin_session_org ON admin_session(organization_id);
     CREATE INDEX IF NOT EXISTS agent_run_org_issue ON agent_run(organization_id, issue_id);
     CREATE UNIQUE INDEX IF NOT EXISTS repository_default
