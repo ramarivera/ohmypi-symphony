@@ -134,7 +134,10 @@ export const parseRepositorySuggestionCandidate = (
     .replace(/^\/+/u, "")
     .replace(/\/+$/u, "")
     .replace(/\.git$/u, "");
-  if (hostname.length === 0 || !/^[^/]+\/[^/]+$/u.test(repositoryFullName)) {
+  if (
+    hostname.length === 0 ||
+    !/^[^/]+(?:\/[^/]+)+$/u.test(repositoryFullName)
+  ) {
     return null;
   }
   return { hostname, repositoryFullName };

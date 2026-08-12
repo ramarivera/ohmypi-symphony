@@ -1,3 +1,4 @@
+import { TERMINAL_RUN_STATES } from "../domain/models.js";
 import { THEME_CONTROLS } from "./theme";
 
 export type RunDetailLevel = "debug" | "info" | "warn" | "result" | "error";
@@ -52,11 +53,7 @@ const LEVELS: readonly RunDetailLevel[] = [
   "error",
 ];
 
-const TERMINAL_STATES: Record<string, true> = {
-  succeeded: true,
-  failed: true,
-  canceled: true,
-};
+const TERMINAL_STATES: ReadonlySet<string> = new Set(TERMINAL_RUN_STATES);
 
 /** Removes common credentials before a public run page or its JSON is emitted. */
 export function redact(value: string): string {
@@ -173,7 +170,7 @@ export function renderRunDetailBody(
   };
   for (const event of model.events) counts[event.level] += 1;
   const issue = model.issue;
-  const terminal = Object.hasOwn(TERMINAL_STATES, model.run.state);
+  const terminal = TERMINAL_STATES.has(model.run.state);
   const canRerun = terminal && issue !== null && csrfToken !== null;
   const rerunDisabledTitle = canRerun
     ? ""

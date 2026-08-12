@@ -937,7 +937,8 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           });
           const now = yield* Clock.currentTimeMillis;
           const cached = yield* Ref.get(startedStatesCache);
-          const hit = cached.get(input.teamId);
+          const cacheKey = `${run.organizationId}:${input.teamId}`;
+          const hit = cached.get(cacheKey);
           if (
             hit !== undefined &&
             now - hit.fetchedAt < STARTED_STATES_CACHE_TTL_MS
@@ -984,20 +985,20 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           yield* Ref.update(startedStatesCache, (current) => {
             const next = new Map(current);
             if (
-              !next.has(input.teamId) &&
+              !next.has(cacheKey) &&
               next.size >= STARTED_STATES_CACHE_MAX_TEAMS
             ) {
-              let oldestTeamId: string | undefined;
+              let oldestCacheKey: string | undefined;
               let oldestFetchedAt = Number.POSITIVE_INFINITY;
-              for (const [teamId, entry] of next) {
+              for (const [key, entry] of next) {
                 if (entry.fetchedAt < oldestFetchedAt) {
-                  oldestTeamId = teamId;
+                  oldestCacheKey = key;
                   oldestFetchedAt = entry.fetchedAt;
                 }
               }
-              if (oldestTeamId !== undefined) next.delete(oldestTeamId);
+              if (oldestCacheKey !== undefined) next.delete(oldestCacheKey);
             }
-            next.set(input.teamId, { states, fetchedAt });
+            next.set(cacheKey, { states, fetchedAt });
             return next;
           });
           return states;

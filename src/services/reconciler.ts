@@ -158,6 +158,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                   }),
               }),
             );
+          let injected = false;
           for (const activity of activities) {
             if (activity.type !== "prompt") continue;
             const kind = activity.signal === "stop" ? "stop" : "prompted";
@@ -184,6 +185,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                   sessionId: run.sessionId,
                   activityId: activity.id,
                   activity,
+                  automationDelegated: true,
                 },
                 createdAt: Number.isFinite(activityCreatedAt)
                   ? activityCreatedAt
@@ -208,6 +210,7 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                 }),
               );
             if (inserted) {
+              injected = true;
               yield* Effect.logInfo("reconciler.catchup.injected").pipe(
                 Effect.annotateLogs({
                   sessionId: run.sessionId,
@@ -215,6 +218,20 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                 }),
               );
             }
+          }
+          if (run.state === "canceled" && injected) {
+            yield* authority.processSession(run.sessionId).pipe(
+              Effect.matchCauseEffect({
+                onSuccess: Effect.succeed,
+                onFailure: (cause) =>
+                  Effect.logWarning("reconciler.catchup.process_failed").pipe(
+                    Effect.annotateLogs({
+                      sessionId: run.sessionId,
+                      error: Cause.pretty(cause),
+                    }),
+                  ),
+              }),
+            );
           }
         }
       },

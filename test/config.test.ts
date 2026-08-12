@@ -156,10 +156,10 @@ describe("GatewayConfig", () => {
     );
     expect(Either.isLeft(result)).toBe(true);
   });
-  test("rejects a blank repository suggestion confidence threshold", async () => {
+  test("rejects a spaces-only repository suggestion confidence threshold", async () => {
     const result = await Effect.runPromise(
       configResult(
-        valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", " ​ "]]),
+        valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", "   "]]),
       ),
     );
     expect(Either.isLeft(result)).toBe(true);

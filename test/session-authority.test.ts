@@ -10,6 +10,7 @@ import {
   Layer,
   Option,
   Schema,
+  TestClock,
 } from "effect";
 import {
   DatabaseError,
@@ -35,6 +36,7 @@ import { ActivityProjector } from "../src/services/projector.js";
 import {
   type RpcEvent,
   type RpcHostToolCall,
+  type RpcHostToolDefinition,
   type RpcHostToolResult,
   RpcWorker,
   type RpcWorkerHandle,
@@ -574,6 +576,7 @@ const mockProjector = ActivityProjector.make({
 });
 
 const workerPrompts: Array<string> = [];
+let registeredHostTools: ReadonlyArray<RpcHostToolDefinition> = [];
 let hostToolListener:
   | ((
       request: RpcHostToolCall,
@@ -596,7 +599,10 @@ const mockWorker: RpcWorkerHandle = {
     }),
   steer: () => Effect.void,
   followUp: () => Effect.void,
-  setHostTools: () => Effect.void,
+  setHostTools: (tools) =>
+    Effect.sync(() => {
+      registeredHostTools = tools;
+    }),
   onHostToolCall: (listener) =>
     Effect.sync(() => {
       hostToolListener = listener;
@@ -735,6 +741,7 @@ const withAuthority = <A, E>(
       hostToolListener = undefined;
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
+      registeredHostTools = [];
       projectionExpected = 0;
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
@@ -1172,6 +1179,12 @@ describe("SessionAuthority host-tool mutation gate", () => {
           });
 
           yield* authority.processSession(testSessionId);
+          expect(registeredHostTools.map((tool) => tool.name)).toEqual([
+            "linear_get_issue",
+            "linear_create_comment",
+            "linear_update_issue",
+            "linear_add_external_url",
+          ]);
           expect(workerSpawnInputs).toHaveLength(1);
           const listener = hostToolListener;
           expect(listener).toBeDefined();
@@ -1313,7 +1326,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
       ),
   );
 
-  it.scopedLive("cancel waits for an in-flight mutation holding the gate", () =>
+  it.effect("cancel proceeds after a bounded gate wait", () =>
     withAuthority(
       () =>
         Effect.gen(function* () {
@@ -1353,8 +1366,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
           );
           yield* Deferred.await(commentEnteredSignal);
 
-          // A user stop arrives; processSession must not reach
-          // worker.stop until the in-flight mutation releases the gate.
+          // A user stop arrives while the in-flight mutation holds the gate.
           yield* runInputRepo.enqueue({
             id: Schema.decodeUnknownSync(InputId)(
               `${testSessionId}:stop:stop-1`,
@@ -1367,20 +1379,23 @@ describe("SessionAuthority host-tool mutation gate", () => {
           const cancelFiber = yield* Effect.fork(
             authority.processSession(testSessionId),
           );
-          for (let attempt = 0; attempt < 200; attempt += 1) {
+          yield* Effect.yieldNow();
+          yield* TestClock.adjust("30 seconds");
+          for (let attempt = 0; attempt < 20; attempt += 1) {
             if (Option.isSome(yield* Fiber.poll(cancelFiber))) break;
-            yield* Effect.sleep(Duration.millis(10));
+            yield* Effect.yieldNow();
           }
-          expect(Option.isNone(yield* Fiber.poll(cancelFiber))).toBe(true);
-          expect(orderEvents).not.toContain("worker-stopped");
+          expect(Option.isSome(yield* Fiber.poll(cancelFiber))).toBe(true);
+          yield* Fiber.join(cancelFiber);
+          expect(orderEvents).toEqual(["worker-stopped"]);
 
           Deferred.unsafeDone(commentRelease, Effect.void);
           yield* Fiber.await(mutationFiber);
           yield* Fiber.await(cancelFiber);
-          expect(orderEvents).toEqual(["comment-completed", "worker-stopped"]);
+          expect(orderEvents).toEqual(["worker-stopped", "comment-completed"]);
         }),
       { withLinearGateway: true },
-    ),
+    ).pipe(Effect.provide(TestClock.defaultTestClock)),
   );
 });
 

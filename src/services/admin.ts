@@ -35,7 +35,7 @@ import type {
   RepositoryRecord,
   RunEvent,
 } from "../domain/models.js";
-import { normalizeNixPackages } from "../domain/models.js";
+import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
@@ -53,6 +53,28 @@ import { type RepositoryResolution, Workspace } from "./workspace.js";
 const ADMIN_COOKIE = "omp_gateway_admin";
 const CSRF_SALT = "omp-gateway-admin-csrf";
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+// Linear exposes no public session-delete API, so preventing duplicate reruns
+// before creating a session is the only way to avoid orphaned sessions.
+const rerunIssueGates = new Map<string, Effect.Semaphore>();
+
+const rerunIssueGate = (
+  organizationId: OrganizationId,
+  issueId: string,
+): Effect.Semaphore => {
+  const key = `${organizationId}:${issueId}`;
+  const existing = rerunIssueGates.get(key);
+  if (existing !== undefined) return existing;
+  const created = Effect.unsafeMakeSemaphore(1);
+  rerunIssueGates.set(key, created);
+  return created;
+};
+
+const withRerunIssueGate = <A, E, R>(
+  organizationId: OrganizationId,
+  issueId: string,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  rerunIssueGate(organizationId, issueId).withPermits(1)(effect);
 
 const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
@@ -79,6 +101,7 @@ export interface WorkspaceShape {
 
 export interface ReconcilerShape {
   readonly status: () => Effect.Effect<ReconcilerStatus, never>;
+  readonly trigger: () => Effect.Effect<void, never>;
 }
 
 export interface AdminDeps {
@@ -710,114 +733,121 @@ export const createAdminHandle = (deps: AdminDeps) =>
         if (Option.isNone(run.issueId)) {
           return Option.some(text("Run is not linked to an issue", 409));
         }
-        if (
-          run.state !== "succeeded" &&
-          run.state !== "failed" &&
-          run.state !== "canceled"
-        ) {
+        if (!TERMINAL_RUN_STATES.includes(run.state)) {
           return Option.some(text("Run is not terminal", 409));
         }
         const issueId = run.issueId.value;
-        const hasActiveRun = yield* deps.runRepo.hasActiveForIssue({
-          organizationId: run.organizationId,
+        const rerunResponse = yield* withRerunIssueGate(
+          run.organizationId,
           issueId,
-        });
-        if (hasActiveRun) {
-          return Option.some(
-            text("A run for this issue is already active", 409),
-          );
-        }
-        const newSessionId = yield* deps.linearGateway
-          .createSessionOnIssue({
-            organizationId: run.organizationId,
-            issueId,
-          })
-          .pipe(
-            Effect.mapError((error) => {
-              if (error._tag === "@Gateway/LinearRateLimitError") {
-                const retry =
-                  error.retryAfterMs === undefined
-                    ? ""
-                    : ` Retry after ${error.retryAfterMs}ms.`;
-                return new AdminError({
-                  message: `Could not create Linear agent session: ${error.message}.${retry}`,
-                  status: 429,
-                });
-              }
-              return new AdminError({
-                message: `Could not create Linear agent session: ${error.message}`,
-                status: 500,
-              });
-            }),
-          );
-        const newRunSessionId = yield* Schema.decodeUnknown(SessionId)(
-          newSessionId,
-        ).pipe(
-          Effect.catchTags({
-            ParseError: () =>
-              Effect.fail(
-                new AdminError({
-                  message: "Invalid session id from Linear",
-                  status: 500,
-                }),
-              ),
-          }),
-        );
-        const rerunStatus = yield* deps.runRepo.createIfNoActiveForIssue({
-          sessionId: newRunSessionId,
-          organizationId: run.organizationId,
-          issueId: Option.some(issueId),
-          repositoryId: run.repositoryId,
-          teamId: run.teamId,
-          projectId: run.projectId,
-        });
-        if (rerunStatus === "active") {
-          return Option.some(
-            text("A run for this issue is already active", 409),
-          );
-        }
-        const rerunCreatedAt = yield* Clock.currentTimeMillis;
-        const inputId = yield* Schema.decodeUnknown(InputId)(
-          `${newSessionId}:created`,
-        ).pipe(
-          Effect.catchTags({
-            ParseError: () =>
-              Effect.fail(
-                new AdminError({ message: "Invalid input id", status: 500 }),
-              ),
-          }),
-        );
-        const body = `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
-        yield* deps.runInputRepo.enqueue({
-          id: inputId,
-          sessionId: newRunSessionId,
-          kind: "created",
-          body,
-          payload: {
-            type: "AgentSessionEvent",
-            action: "created",
-            organizationId: run.organizationId,
-            ...(Option.isSome(run.repositoryId)
-              ? { repositoryId: run.repositoryId.value }
-              : {}),
-            automationDelegated: false,
-            appUserId: "synthetic",
-            oauthClientId: "synthetic",
-            webhookId: "synthetic",
-            webhookTimestamp: rerunCreatedAt,
-            agentSession: {
-              id: newSessionId,
-              appUserId: "synthetic",
+          Effect.gen(function* () {
+            const hasActiveRun = yield* deps.runRepo.hasActiveForIssue({
               organizationId: run.organizationId,
-              status: "pending",
-              createdAt: rerunCreatedAt,
-              updatedAt: rerunCreatedAt,
               issueId,
-            },
-          },
-          createdAt: rerunCreatedAt,
-        });
-        return Option.some(json({ sessionId: newSessionId }));
+            });
+            if (hasActiveRun) {
+              return Option.some(
+                text("A run for this issue is already active", 409),
+              );
+            }
+            const newSessionId = yield* deps.linearGateway
+              .createSessionOnIssue({
+                organizationId: run.organizationId,
+                issueId,
+              })
+              .pipe(
+                Effect.mapError((error) => {
+                  if (error._tag === "@Gateway/LinearRateLimitError") {
+                    const retry =
+                      error.retryAfterMs === undefined
+                        ? ""
+                        : ` Retry after ${error.retryAfterMs}ms.`;
+                    return new AdminError({
+                      message: `Could not create Linear agent session: ${error.message}.${retry}`,
+                      status: 429,
+                    });
+                  }
+                  return new AdminError({
+                    message: `Could not create Linear agent session: ${error.message}`,
+                    status: 500,
+                  });
+                }),
+              );
+            const newRunSessionId = yield* Schema.decodeUnknown(SessionId)(
+              newSessionId,
+            ).pipe(
+              Effect.catchTags({
+                ParseError: () =>
+                  Effect.fail(
+                    new AdminError({
+                      message: "Invalid session id from Linear",
+                      status: 500,
+                    }),
+                  ),
+              }),
+            );
+            const rerunStatus = yield* deps.runRepo.createIfNoActiveForIssue({
+              sessionId: newRunSessionId,
+              organizationId: run.organizationId,
+              issueId: Option.some(issueId),
+              repositoryId: run.repositoryId,
+              teamId: run.teamId,
+              projectId: run.projectId,
+            });
+            if (rerunStatus === "active") {
+              return Option.some(
+                text("A run for this issue is already active", 409),
+              );
+            }
+            const rerunCreatedAt = yield* Clock.currentTimeMillis;
+            const inputId = yield* Schema.decodeUnknown(InputId)(
+              `${newSessionId}:created`,
+            ).pipe(
+              Effect.catchTags({
+                ParseError: () =>
+                  Effect.fail(
+                    new AdminError({
+                      message: "Invalid input id",
+                      status: 500,
+                    }),
+                  ),
+              }),
+            );
+            const body = `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
+            yield* deps.runInputRepo.enqueue({
+              id: inputId,
+              sessionId: newRunSessionId,
+              kind: "created",
+              body,
+              payload: {
+                type: "AgentSessionEvent",
+                action: "created",
+                organizationId: run.organizationId,
+                ...(Option.isSome(run.repositoryId)
+                  ? { repositoryId: run.repositoryId.value }
+                  : {}),
+                automationDelegated: false,
+                appUserId: "synthetic",
+                oauthClientId: "synthetic",
+                webhookId: "synthetic",
+                webhookTimestamp: rerunCreatedAt,
+                agentSession: {
+                  id: newSessionId,
+                  appUserId: "synthetic",
+                  organizationId: run.organizationId,
+                  status: "pending",
+                  createdAt: rerunCreatedAt,
+                  updatedAt: rerunCreatedAt,
+                  issueId,
+                },
+              },
+              createdAt: rerunCreatedAt,
+            });
+            yield* deps.reconciler.trigger();
+            return Option.some(json({ sessionId: newSessionId }));
+          }),
+        );
+        return rerunResponse;
       }
       if (url.pathname === "/api/admin/bootstrap" && request.method === "GET") {
         const session = yield* requireSession(request);
