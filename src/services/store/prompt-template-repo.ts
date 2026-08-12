@@ -5,7 +5,13 @@ import {
   PromptTemplateKind,
   type PromptTemplate as PromptTemplateRecord,
 } from "../../domain/models.js";
-import { decodeRow, decodeRows, SqliteClient, tryDb } from "./sqlite-client.js";
+import {
+  decodeRow,
+  decodeRows,
+  runChanges,
+  SqliteClient,
+  tryDb,
+} from "./sqlite-client.js";
 
 const PromptTemplateRow = Schema.Struct({
   organization_id: Schema.String,
@@ -115,7 +121,7 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
         organizationId: string,
         kind: PromptTemplateKind,
       ): Effect.fn.Return<boolean, DatabaseError> {
-        const result = yield* tryDb(
+        const changes = yield* tryDb(
           () =>
             db
               .query(
@@ -123,8 +129,12 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
               )
               .run(organizationId, kind),
           "PromptTemplateRepo.remove",
+        ).pipe(
+          Effect.flatMap((result) =>
+            runChanges(result, "PromptTemplateRepo.remove"),
+          ),
         );
-        return result.changes > 0;
+        return changes > 0;
       });
 
       return { get, list, upsert, remove };

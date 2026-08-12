@@ -1239,6 +1239,7 @@ export const ADMIN_SCRIPT = `
     if (mcpList) mcpList.addEventListener("click", handleMcpClick);
     var nixCacheList = el("nix-cache-list");
     if (nixCacheList) nixCacheList.addEventListener("click", handleRepoRowClick);
+    var logoutBtn = el("logout-btn");
 
     var yesBtn = el("confirm-yes");
     var noBtn = el("confirm-no");
