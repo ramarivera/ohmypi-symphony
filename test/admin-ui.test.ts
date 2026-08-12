@@ -297,7 +297,9 @@ describe("renderAdminPage", () => {
   test("does not depend on any external resources (CSP / network hardening)", () => {
     const html = renderAdminPage();
     const lower = html.toLowerCase();
-    expect(lower).not.toMatch(/https?:\/\/(?!mcp\.example\.com)[^"'\s)]+/);
+    expect(lower).not.toMatch(
+      /https?:\/\/(?!mcp\.example\.com)(?!executor\.example\.com)[^"'\s)]+/,
+    );
     expect(lower).not.toMatch(/src=["']https?:/);
     expect(html).not.toMatch(/cdn\./);
     // Same-origin credentials are explicit, never wildcard.
