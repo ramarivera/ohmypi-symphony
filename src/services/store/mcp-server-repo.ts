@@ -10,6 +10,7 @@ import type {
   WorkspaceId,
 } from "../../domain/ids.js";
 import {
+  McpOAuthClientConfig,
   McpServerRecord,
   type McpServerRecord as McpServerRecordType,
   McpServerTransport,
@@ -21,6 +22,7 @@ import {
   decodeRows,
   runChanges,
   SqliteClient,
+  transact,
   tryDb,
 } from "./sqlite-client.js";
 
@@ -34,6 +36,7 @@ const McpServerRow = Schema.Struct({
   url: Schema.NullOr(Schema.String),
   env_json: Schema.String,
   headers_json: Schema.String,
+  oauth_client_json: Schema.NullOr(Schema.String),
   repository_id: Schema.NullOr(Schema.String),
   enabled: Schema.Number,
   created_at: Schema.Number,
@@ -43,7 +46,6 @@ type McpServerRow = Schema.Schema.Type<typeof McpServerRow>;
 
 const SAFE_ID_RE = /^[a-zA-Z0-9_.-]+$/u;
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/u;
-
 type McpInput = {
   readonly organizationId: OrganizationId;
   readonly id: McpServerId;
@@ -54,6 +56,7 @@ type McpInput = {
   readonly url?: string | null;
   readonly env?: Readonly<Record<string, string>>;
   readonly headers?: Readonly<Record<string, string>>;
+  readonly oauthClient?: McpOAuthClientConfig | null;
   readonly repositoryId?: Option.Option<WorkspaceId>;
   readonly enabled?: boolean;
 };
@@ -107,6 +110,47 @@ const normalizeHeaders = (value: unknown): Readonly<Record<string, string>> => {
   return output;
 };
 
+const normalizeOAuthClient = (value: unknown): McpOAuthClientConfig | null => {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("oauthClient must be an object or null");
+  }
+  const candidate = value as Record<string, unknown>;
+  const clientId =
+    candidate.clientId === undefined || candidate.clientId === null
+      ? undefined
+      : cleanString(candidate.clientId, "oauthClient.clientId");
+  const clientSecret =
+    candidate.clientSecret === undefined || candidate.clientSecret === null
+      ? undefined
+      : cleanString(candidate.clientSecret, "oauthClient.clientSecret");
+  const scope =
+    candidate.scope === undefined || candidate.scope === null
+      ? undefined
+      : cleanString(candidate.scope, "oauthClient.scope");
+  const tokenEndpointAuthMethod =
+    candidate.tokenEndpointAuthMethod === undefined ||
+    candidate.tokenEndpointAuthMethod === null
+      ? undefined
+      : Schema.decodeUnknownSync(
+          Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+        )(candidate.tokenEndpointAuthMethod);
+  if (clientId === undefined && scope === undefined) {
+    throw new Error("oauthClient requires a clientId or scope");
+  }
+  if (clientId === undefined && clientSecret !== undefined) {
+    throw new Error("oauthClient.clientSecret requires a clientId");
+  }
+  return {
+    ...(clientId !== undefined ? { clientId } : {}),
+    ...(clientSecret !== undefined ? { clientSecret } : {}),
+    ...(scope !== undefined ? { scope } : {}),
+    ...(tokenEndpointAuthMethod !== undefined
+      ? { tokenEndpointAuthMethod }
+      : {}),
+  };
+};
+
 const validateInput = (
   input: McpInput,
   now: number,
@@ -151,9 +195,10 @@ const validateInput = (
         transport,
         command,
         args: normalizeArgs(input.args ?? []),
-        url,
         env: normalizeEnv(input.env),
         headers: normalizeHeaders(input.headers),
+        oauthClient: normalizeOAuthClient(input.oauthClient),
+        url,
         repositoryId: Option.match(repositoryId, {
           onNone: () => null,
           onSome: (value) => value,
@@ -234,6 +279,19 @@ const rowToRecord = (
         ).pipe(Effect.map((decrypted) => [key, decrypted] as const)),
       ),
     );
+    let oauthClient: McpOAuthClientConfig | null = null;
+    if (row.oauth_client_json !== null) {
+      const encoded = isEncrypted(row.oauth_client_json)
+        ? yield* tokenCrypto.decrypt(
+            row.oauth_client_json.slice(MCP_ENCRYPTED_PREFIX.length),
+          )
+        : row.oauth_client_json;
+      oauthClient = yield* decodeRow(
+        McpOAuthClientConfig,
+        yield* parseJson(encoded, "mcp server oauth client"),
+        "McpServerRecord.oauthClient",
+      );
+    }
     return yield* decodeRow(
       McpServerRecord,
       {
@@ -246,6 +304,7 @@ const rowToRecord = (
         url: row.url,
         env: decryptedEnv,
         headers: decryptedHeaders,
+        oauthClient,
         repositoryId: row.repository_id,
         enabled: row.enabled === 1,
         createdAt: row.created_at,
@@ -268,6 +327,15 @@ const encryptEnv = (
       ),
   ).pipe(Effect.map(Object.fromEntries));
 
+const encryptOAuthClient = (
+  tokenCrypto: TokenCrypto,
+  value: McpOAuthClientConfig | null,
+): Effect.Effect<string | null, TokenCipherError> =>
+  value === null
+    ? Effect.succeed(null)
+    : tokenCrypto
+        .encrypt(JSON.stringify(value))
+        .pipe(Effect.map((encrypted) => `${MCP_ENCRYPTED_PREFIX}${encrypted}`));
 export class McpServerRepo extends Effect.Service<McpServerRepo>()(
   "McpServerRepo",
   {
@@ -328,13 +396,17 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
             tokenCrypto,
             record.headers,
           );
+          const encryptedOAuthClient = yield* encryptOAuthClient(
+            tokenCrypto,
+            record.oauthClient ?? null,
+          );
           yield* tryDb(
             () =>
               db
                 .query(
                   `INSERT INTO mcp_server
-              (organization_id, id, name, transport, command, args_json, url, env_json, headers_json, repository_id, enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              (organization_id, id, name, transport, command, args_json, url, env_json, headers_json, oauth_client_json, repository_id, enabled, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 )
                 .run(
                   record.organizationId,
@@ -346,6 +418,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   Option.getOrNull(record.url),
                   JSON.stringify(encryptedEnv),
                   JSON.stringify(encryptedHeaders),
+                  encryptedOAuthClient,
                   Option.getOrNull(record.repositoryId),
                   record.enabled ? 1 : 0,
                   record.createdAt,
@@ -455,6 +528,10 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
               args: input.args ?? existing.args,
               env: input.env ?? existing.env,
               headers: input.headers ?? existing.headers,
+              oauthClient:
+                input.oauthClient === undefined
+                  ? (existing.oauthClient ?? null)
+                  : input.oauthClient,
               url:
                 input.url === undefined
                   ? Option.getOrNull(existing.url)
@@ -478,13 +555,17 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
               }),
             );
           }
+          const encryptedOAuthClient = yield* encryptOAuthClient(
+            tokenCrypto,
+            next.oauthClient ?? null,
+          );
           const encryptedEnv = yield* encryptEnv(tokenCrypto, next.env);
           const encryptedHeaders = yield* encryptEnv(tokenCrypto, next.headers);
           yield* tryDb(
             () =>
               db
                 .query(
-                  `UPDATE mcp_server SET name=?, transport=?, command=?, args_json=?, url=?, env_json=?, headers_json=?, repository_id=?, enabled=?, updated_at=?
+                  `UPDATE mcp_server SET name=?, transport=?, command=?, args_json=?, url=?, env_json=?, headers_json=?, oauth_client_json=?, repository_id=?, enabled=?, updated_at=?
              WHERE organization_id=? AND id=?`,
                 )
                 .run(
@@ -495,6 +576,7 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
                   Option.getOrNull(next.url),
                   JSON.stringify(encryptedEnv),
                   JSON.stringify(encryptedHeaders),
+                  encryptedOAuthClient,
                   Option.getOrNull(next.repositoryId),
                   next.enabled ? 1 : 0,
                   now,
@@ -512,14 +594,28 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
           organizationId: OrganizationId,
           id: McpServerId,
         ): Effect.fn.Return<boolean, DatabaseError> {
-          const result = yield* tryDb(
-            () =>
-              db
-                .query(
-                  "DELETE FROM mcp_server WHERE organization_id=? AND id=?",
-                )
-                .run(organizationId, id),
-            "McpServerRepo.deleteMcpServer",
+          const result = yield* transact(
+            db,
+            Effect.gen(function* () {
+              yield* tryDb(
+                () =>
+                  db
+                    .query(
+                      "DELETE FROM mcp_oauth_credential WHERE organization_id=? AND server_id=?",
+                    )
+                    .run(organizationId, id),
+                "McpServerRepo.deleteMcpServer.credentials",
+              );
+              return yield* tryDb(
+                () =>
+                  db
+                    .query(
+                      "DELETE FROM mcp_server WHERE organization_id=? AND id=?",
+                    )
+                    .run(organizationId, id),
+                "McpServerRepo.deleteMcpServer",
+              );
+            }),
           );
           return (
             (yield* runChanges(result, "McpServerRepo.deleteMcpServer")) === 1

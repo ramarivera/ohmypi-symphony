@@ -29,6 +29,7 @@ import {
   tokenHash,
 } from "../src/services/admin.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { McpOAuth } from "../src/services/mcp-oauth.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { OAuth } from "../src/services/oauth.js";
 import { Reconciler } from "../src/services/reconciler.js";
@@ -102,6 +103,7 @@ const withApp = <A, E>(
     | NixCacheRepo
     | NixEnvironment
     | OAuth
+    | McpOAuth
     | McpServerRepo
     | RunEventRepo
     | RunInputRepo
@@ -122,6 +124,7 @@ const withApp = <A, E>(
       DeliveryRepo.Default,
       InstallationRepo.Default,
       OAuth.Default,
+      McpOAuth.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
       McpServerRepo.Default,

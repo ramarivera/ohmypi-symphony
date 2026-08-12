@@ -15,6 +15,7 @@ import {
 import {
   DatabaseError,
   type NixEnvironmentError,
+  type OAuthStateError,
   RowDecodeError,
   type TokenCipherError,
   type WorkspaceError,
@@ -45,6 +46,7 @@ import {
   executorUrlForPath,
 } from "./executor.js";
 import { LinearGateway } from "./linear-gateway.js";
+import { McpOAuth, type McpOAuthTokenEndpointAuthMethod } from "./mcp-oauth.js";
 import { NixEnvironment } from "./nix-environment.js";
 import {
   promptTemplateWarnings,
@@ -135,6 +137,7 @@ export interface AdminDeps {
   readonly workspaceRepo: WorkspaceRepo;
   readonly promptTemplateRepo: PromptTemplateRepo;
   readonly mcpServerRepo: McpServerRepo;
+  readonly mcpOAuth: McpOAuth;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
   readonly nixEnvironment: NixEnvironment;
@@ -167,7 +170,7 @@ function adminCookieAttributes(
   config: { publicUrl: URL },
   expiresAt?: number,
 ): string {
-  const base = "HttpOnly; SameSite=Strict; Path=/";
+  const base = "HttpOnly; SameSite=Lax; Path=/";
   const secure = isSecure(config) ? "; Secure" : "";
   const expiry =
     expiresAt === undefined
@@ -349,6 +352,10 @@ interface McpServerPayload {
   readonly url: string | null;
   readonly env: Readonly<Record<string, string>>;
   readonly headers: Readonly<Record<string, string>>;
+  readonly oauthClientId: string | null;
+  readonly oauthClientSecret: string | null;
+  readonly oauthScope: string | null;
+  readonly oauthTokenEndpointAuthMethod: McpOAuthTokenEndpointAuthMethod | null;
   readonly repositoryId: string | null;
   readonly enabled: boolean | undefined;
 }
@@ -429,6 +436,35 @@ function mcpServerPayload(
       headers[key] = value;
     }
   }
+  const oauthClientId = optionalString(body.oauthClientId);
+  const oauthClientSecret = optionalString(body.oauthClientSecret);
+  const oauthScope = optionalString(body.oauthScope);
+  const rawAuthMethod = body.oauthTokenEndpointAuthMethod;
+  const oauthTokenEndpointAuthMethod =
+    rawAuthMethod === undefined ||
+    rawAuthMethod === null ||
+    rawAuthMethod === ""
+      ? null
+      : rawAuthMethod === "none" ||
+          rawAuthMethod === "client_secret_basic" ||
+          rawAuthMethod === "client_secret_post"
+        ? rawAuthMethod
+        : null;
+  if (
+    rawAuthMethod !== undefined &&
+    rawAuthMethod !== null &&
+    rawAuthMethod !== "" &&
+    oauthTokenEndpointAuthMethod === null
+  ) {
+    return Either.left(
+      "oauthTokenEndpointAuthMethod must be none, client_secret_basic, or client_secret_post",
+    );
+  }
+  if (oauthClientSecret !== null && oauthClientId === null) {
+    return Either.left(
+      "oauthClientId is required when oauthClientSecret is set",
+    );
+  }
   if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
     return Either.left("enabled must be a boolean");
   }
@@ -441,12 +477,23 @@ function mcpServerPayload(
     url,
     env,
     headers,
+    oauthClientId,
+    oauthClientSecret,
+    oauthScope,
+    oauthTokenEndpointAuthMethod,
     repositoryId,
     enabled: optionalBoolean(body.enabled),
   });
 }
-
-export function toApiMcpServer(server: McpServerRecord) {
+export function toApiMcpServer(
+  server: McpServerRecord,
+  oauthStatus?: {
+    readonly connected: boolean;
+    readonly serverUrl?: string;
+    readonly expired: boolean;
+    readonly expiresAt: number | null;
+  },
+) {
   const env: Record<string, string> = {};
   for (const name of Object.keys(server.env)) env[name] = "•••";
   const headers: Record<string, string> = {};
@@ -454,6 +501,17 @@ export function toApiMcpServer(server: McpServerRecord) {
     headers[name] = "•••";
   }
   return {
+    oauthClient:
+      server.oauthClient === undefined || server.oauthClient === null
+        ? null
+        : {
+            clientId: server.oauthClient.clientId ?? null,
+            clientSecret:
+              server.oauthClient.clientSecret === undefined ? null : "•••",
+            scope: server.oauthClient.scope ?? null,
+            tokenEndpointAuthMethod:
+              server.oauthClient.tokenEndpointAuthMethod ?? null,
+          },
     id: server.id,
     organizationId: server.organizationId,
     name: server.name,
@@ -465,6 +523,11 @@ export function toApiMcpServer(server: McpServerRecord) {
     headers,
     repositoryId: Option.getOrElse(server.repositoryId, () => null),
     enabled: server.enabled,
+    oauth: oauthStatus ?? {
+      connected: false,
+      expired: false,
+      expiresAt: null,
+    },
     createdAt: server.createdAt,
     updatedAt: server.updatedAt,
   };
@@ -794,6 +857,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
       Option.Option<Response>,
       | AdminError
       | DatabaseError
+      | OAuthStateError
       | NixEnvironmentError
       | RowDecodeError
       | TokenCipherError
@@ -1115,6 +1179,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const mcpServers = yield* deps.mcpServerRepo.listMcpServers(
           session.organizationId,
         );
+        const oauthStatuses = yield* deps.mcpOAuth.listStatuses(
+          session.organizationId,
+        );
         const executorInstance = yield* deps.executorInstanceRepo.get(
           session.organizationId,
         );
@@ -1133,8 +1200,20 @@ export const createAdminHandle = (deps: AdminDeps) =>
               onNone: () => null,
               onSome: toApiExecutorInstance,
             }),
-            mcpServers: mcpServers.map(toApiMcpServer),
             csrfToken: deriveCsrfToken(session.rawToken),
+            mcpServers: mcpServers.map((server) =>
+              toApiMcpServer(
+                server,
+                (() => {
+                  const status = oauthStatuses.get(server.id);
+                  const url = Option.getOrElse(server.url, () => null);
+                  return status !== undefined &&
+                    (status.serverUrl === undefined || status.serverUrl === url)
+                    ? status
+                    : undefined;
+                })(),
+              ),
+            ),
           }),
         );
       }
@@ -1392,11 +1471,28 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "GET"
       ) {
         const session = yield* requireSession(request);
+        const oauthStatuses = yield* deps.mcpOAuth.listStatuses(
+          session.organizationId,
+        );
         const mcpServers = yield* deps.mcpServerRepo.listMcpServers(
           session.organizationId,
         );
         return Option.some(
-          json({ mcpServers: mcpServers.map(toApiMcpServer) }),
+          json({
+            mcpServers: mcpServers.map((server) =>
+              toApiMcpServer(
+                server,
+                (() => {
+                  const status = oauthStatuses.get(server.id);
+                  const url = Option.getOrElse(server.url, () => null);
+                  return status !== undefined &&
+                    (status.serverUrl === undefined || status.serverUrl === url)
+                    ? status
+                    : undefined;
+                })(),
+              ),
+            ),
+          }),
         );
       }
 
@@ -1437,6 +1533,26 @@ export const createAdminHandle = (deps: AdminDeps) =>
               ),
           }),
         );
+        const oauthClient =
+          payload.oauthClientId === null && payload.oauthScope === null
+            ? null
+            : {
+                ...(payload.oauthClientId !== null
+                  ? { clientId: payload.oauthClientId }
+                  : {}),
+                ...(payload.oauthClientSecret !== null
+                  ? { clientSecret: payload.oauthClientSecret }
+                  : {}),
+                ...(payload.oauthScope !== null
+                  ? { scope: payload.oauthScope }
+                  : {}),
+                ...(payload.oauthTokenEndpointAuthMethod !== null
+                  ? {
+                      tokenEndpointAuthMethod:
+                        payload.oauthTokenEndpointAuthMethod,
+                    }
+                  : {}),
+              };
         const server = yield* deps.mcpServerRepo.createMcpServer({
           organizationId: session.organizationId,
           id,
@@ -1447,6 +1563,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           url: payload.url,
           env: payload.env,
           headers: payload.headers,
+          oauthClient,
           repositoryId,
           enabled: payload.enabled ?? true,
           now,
@@ -1454,6 +1571,92 @@ export const createAdminHandle = (deps: AdminDeps) =>
         return Option.some(json({ mcpServer: toApiMcpServer(server) }, 201));
       }
 
+      const mcpOauthConnect =
+        /^\/api\/admin\/mcp-servers\/([^/]+)\/oauth\/connect$/u.exec(
+          url.pathname,
+        );
+      if (mcpOauthConnect !== null && request.method === "POST") {
+        const session = yield* requireMutation(request);
+        const rawId = mcpOauthConnect[1];
+        if (rawId === undefined) return Option.some(text("Not found", 404));
+        const id = yield* Schema.decodeUnknown(McpServerId)(
+          decodeURIComponent(rawId),
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid MCP server id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        const server = yield* deps.mcpServerRepo.getMcpServer(
+          session.organizationId,
+          id,
+        );
+        if (Option.isNone(server)) return Option.some(text("Not found", 404));
+        const oauth = Option.isSome(server)
+          ? server.value.oauthClient
+          : undefined;
+        const result = yield* deps.mcpOAuth
+          .startMcpAuthorization(
+            session.organizationId,
+            id,
+            oauth?.clientId !== undefined
+              ? {
+                  clientId: oauth.clientId,
+                  ...(oauth.clientSecret !== undefined
+                    ? { clientSecret: oauth.clientSecret }
+                    : {}),
+                  ...(oauth.scope !== undefined ? { scope: oauth.scope } : {}),
+                  ...(oauth.tokenEndpointAuthMethod !== undefined
+                    ? {
+                        tokenEndpointAuthMethod: oauth.tokenEndpointAuthMethod,
+                      }
+                    : {}),
+                }
+              : undefined,
+            oauth?.scope,
+            tokenHash(session.rawToken),
+          )
+          .pipe(
+            Effect.catchTag("@Gateway/McpOAuthError", (error) =>
+              Effect.fail(
+                new AdminError({
+                  message: `MCP OAuth setup failed (${error.reason}): ${error.message}`,
+                  status: 400,
+                }),
+              ),
+            ),
+          );
+        return Option.some(json({ authorizationUrl: result.url.toString() }));
+      }
+      const mcpOauthDisconnect =
+        /^\/api\/admin\/mcp-servers\/([^/]+)\/oauth\/disconnect$/u.exec(
+          url.pathname,
+        );
+      if (mcpOauthDisconnect !== null && request.method === "POST") {
+        const session = yield* requireMutation(request);
+        const rawId = mcpOauthDisconnect[1];
+        if (rawId === undefined) return Option.some(text("Not found", 404));
+        const id = yield* Schema.decodeUnknown(McpServerId)(
+          decodeURIComponent(rawId),
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid MCP server id",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        yield* deps.mcpOAuth.disconnect(session.organizationId, id);
+        return Option.some(json({ disconnected: true }));
+      }
       if (url.pathname.startsWith("/api/admin/mcp-servers/")) {
         const rawId = decodeURIComponent(
           url.pathname.slice("/api/admin/mcp-servers/".length),
@@ -1475,9 +1678,24 @@ export const createAdminHandle = (deps: AdminDeps) =>
             session.organizationId,
             id,
           );
-          return Option.isNone(server)
-            ? Option.some(text("Not found", 404))
-            : Option.some(json({ mcpServer: toApiMcpServer(server.value) }));
+          if (Option.isNone(server)) return Option.some(text("Not found", 404));
+          const statuses = yield* deps.mcpOAuth.listStatuses(
+            session.organizationId,
+          );
+          return Option.some(
+            json({
+              mcpServer: toApiMcpServer(
+                server.value,
+                (() => {
+                  const status = statuses.get(id);
+                  const url = Option.getOrElse(server.value.url, () => null);
+                  return status !== undefined && status.serverUrl === url
+                    ? status
+                    : undefined;
+                })(),
+              ),
+            }),
+          );
         }
         if (request.method === "PUT") {
           const session = yield* requireMutation(request);
@@ -1530,6 +1748,63 @@ export const createAdminHandle = (deps: AdminDeps) =>
                 value === "•••" && preserved !== undefined ? preserved : value;
             }
           }
+          const oauthClient =
+            body.oauthClientId === undefined
+              ? (current.value.oauthClient ?? null)
+              : payload.oauthClientId === null && payload.oauthScope === null
+                ? null
+                : {
+                    ...(payload.oauthClientId !== null
+                      ? { clientId: payload.oauthClientId }
+                      : {}),
+                    ...(payload.oauthClientSecret !== null &&
+                    payload.oauthClientSecret !== "•••"
+                      ? { clientSecret: payload.oauthClientSecret }
+                      : current.value.oauthClient?.clientId ===
+                            payload.oauthClientId &&
+                          current.value.oauthClient?.clientSecret !== undefined
+                        ? {
+                            clientSecret:
+                              current.value.oauthClient.clientSecret,
+                          }
+                        : {}),
+                    ...(payload.oauthScope !== null
+                      ? { scope: payload.oauthScope }
+                      : body.oauthScope === undefined &&
+                          current.value.oauthClient?.clientId ===
+                            payload.oauthClientId &&
+                          current.value.oauthClient?.scope !== undefined
+                        ? { scope: current.value.oauthClient.scope }
+                        : {}),
+                    ...(payload.oauthTokenEndpointAuthMethod !== null
+                      ? {
+                          tokenEndpointAuthMethod:
+                            payload.oauthTokenEndpointAuthMethod,
+                        }
+                      : body.oauthTokenEndpointAuthMethod === undefined &&
+                          current.value.oauthClient?.clientId ===
+                            payload.oauthClientId &&
+                          current.value.oauthClient?.tokenEndpointAuthMethod !==
+                            undefined
+                        ? {
+                            tokenEndpointAuthMethod:
+                              current.value.oauthClient.tokenEndpointAuthMethod,
+                          }
+                        : {}),
+                  };
+          const previousOAuthClient = current.value.oauthClient ?? null;
+          const oauthClientChanged =
+            previousOAuthClient?.clientId !== oauthClient?.clientId ||
+            previousOAuthClient?.clientSecret !== oauthClient?.clientSecret ||
+            previousOAuthClient?.scope !== oauthClient?.scope ||
+            previousOAuthClient?.tokenEndpointAuthMethod !==
+              oauthClient?.tokenEndpointAuthMethod;
+          const previousUrl = Option.getOrNull(current.value.url);
+          const oauthCredentialInvalidated =
+            oauthClientChanged || previousUrl !== payload.url;
+          if (oauthCredentialInvalidated) {
+            yield* deps.mcpOAuth.disconnect(session.organizationId, id);
+          }
           const server = yield* deps.mcpServerRepo.updateMcpServer(
             session.organizationId,
             id,
@@ -1541,11 +1816,13 @@ export const createAdminHandle = (deps: AdminDeps) =>
               url: payload.url,
               env,
               headers,
+              oauthClient,
               enabled: payload.enabled,
               repositoryId,
               now,
             },
           );
+
           return Option.some(json({ mcpServer: toApiMcpServer(server) }));
         }
         if (request.method === "DELETE") {
@@ -1830,6 +2107,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     WorkspaceRepo.Default,
     PromptTemplateRepo.Default,
     McpServerRepo.Default,
+    McpOAuth.Default,
     Workspace.Default,
     Reconciler.Default,
     NixEnvironment.Default,
@@ -1844,6 +2122,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const runEventRepo = yield* RunEventRepo;
     const workspaceRepo = yield* WorkspaceRepo;
     const mcpServerRepo = yield* McpServerRepo;
+    const mcpOAuth = yield* McpOAuth;
     const promptTemplateRepo = yield* PromptTemplateRepo;
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
@@ -1864,6 +2143,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
       promptTemplateRepo,
       mcpServerRepo,
       workspace,
+      mcpOAuth,
       reconciler,
       nixEnvironment,
     });

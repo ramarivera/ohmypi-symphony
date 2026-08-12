@@ -160,6 +160,10 @@ export const ADMIN_BODY = `
           <div class="field"><label for="mcp-command">Command</label><input id="mcp-command" name="command" autocomplete="off" placeholder="npx"></div>
           <div class="field"><label for="mcp-url">URL</label><input id="mcp-url" name="url" type="url" autocomplete="off" placeholder="https://mcp.example.com"></div>
           <div class="field"><label for="mcp-args">Arguments (JSON array or comma-separated)</label><input id="mcp-args" name="args" autocomplete="off"></div>
+          <div class="field"><label for="mcp-oauth-client-id">OAuth client ID</label><input id="mcp-oauth-client-id" name="oauthClientId" autocomplete="off"></div>
+          <div class="field"><label for="mcp-oauth-client-secret">OAuth client secret</label><input id="mcp-oauth-client-secret" name="oauthClientSecret" type="password" autocomplete="new-password" placeholder="•••"></div>
+          <div class="field"><label for="mcp-oauth-scope">OAuth scope</label><input id="mcp-oauth-scope" name="oauthScope" autocomplete="off"></div>
+          <div class="field"><label for="mcp-oauth-auth-method">OAuth token auth method</label><select id="mcp-oauth-auth-method" name="oauthTokenEndpointAuthMethod"><option value="">Default</option><option value="none">none</option><option value="client_secret_basic">client_secret_basic</option><option value="client_secret_post">client_secret_post</option></select></div>
           <div class="field"><label for="mcp-env">Environment (KEY=value per line)</label><textarea id="mcp-env" name="env" rows="3" autocomplete="off"></textarea><span class="hint">Secret values are write-only; existing values show as •••.</span></div>
           <div class="field full" id="mcp-headers-field" hidden>
             <label>Headers</label>
@@ -570,7 +574,7 @@ export const ADMIN_SCRIPT = `
     table.className = "repos";
     var head = document.createElement("thead");
     var row = document.createElement("tr");
-    ["Name", "Transport", "Scope", "Environment", "Status", ""].forEach(function (label) {
+    ["Name", "Transport", "Scope", "Environment", "OAuth", "Status", ""].forEach(function (label) {
       var th = document.createElement("th"); th.scope = "col"; th.textContent = label; row.appendChild(th);
     });
     head.appendChild(row); table.appendChild(head);
@@ -581,10 +585,14 @@ export const ADMIN_SCRIPT = `
       var transport = document.createElement("td"); transport.textContent = server.transport || "—"; tr.appendChild(transport);
       var scope = document.createElement("td"); scope.textContent = server.repositoryId || "installation-wide"; tr.appendChild(scope);
       var env = document.createElement("td"); env.textContent = server.env && Object.keys(server.env).length ? Object.keys(server.env).map(function (key) { return key + "=•••"; }).join(", ") : "—"; tr.appendChild(env);
+      var oauth = document.createElement("td"); var oauthState = server.oauth || { connected: false, expired: false }; oauth.textContent = oauthState.connected ? (oauthState.expired ? "expired" : "connected") : "not connected"; tr.appendChild(oauth);
       var enabled = document.createElement("td"); enabled.textContent = server.enabled ? "enabled" : "disabled"; tr.appendChild(enabled);
       var actions = document.createElement("td"); actions.className = "actions";
       var edit = document.createElement("button"); edit.type = "button"; edit.dataset.action = "edit-mcp"; edit.dataset.mcpId = server.id || ""; edit.textContent = "Edit"; actions.appendChild(edit);
       var toggle = document.createElement("button"); toggle.type = "button"; toggle.dataset.action = "toggle-mcp"; toggle.dataset.mcpId = server.id || ""; toggle.textContent = server.enabled ? "Disable" : "Enable"; actions.appendChild(toggle);
+      if ((server.transport === "http" || server.transport === "sse") && server.enabled) {
+        var auth = document.createElement("button"); auth.type = "button"; auth.dataset.action = oauthState.connected ? "disconnect-mcp" : "connect-mcp"; auth.dataset.mcpId = server.id || ""; auth.textContent = oauthState.connected ? "Disconnect" : "Connect"; actions.appendChild(auth);
+      }
       var remove = document.createElement("button"); remove.type = "button"; remove.className = "btn-danger"; remove.dataset.action = "delete-mcp"; remove.dataset.mcpId = server.id || ""; remove.textContent = "Delete"; actions.appendChild(remove);
       tr.appendChild(actions); body.appendChild(tr);
     });
@@ -677,7 +685,7 @@ export const ADMIN_SCRIPT = `
   function openMcpForm(server) {
     state.editingMcp = server || null;
     var form = el("mcp-form"); if (!form) return;
-    var fields = { id: server && server.id || "", name: server && server.name || "", transport: server && server.transport || "stdio", command: server && server.command || "", url: server && server.url || "", args: server && Array.isArray(server.args) ? JSON.stringify(server.args) : "", env: server && server.env ? Object.keys(server.env).map(function (key) { return key + "=" + server.env[key]; }).join("\\n") : "", repositoryId: server && server.repositoryId || "", enabled: !server || server.enabled !== false };
+    var fields = { id: server && server.id || "", name: server && server.name || "", transport: server && server.transport || "stdio", command: server && server.command || "", url: server && server.url || "", args: server && Array.isArray(server.args) ? JSON.stringify(server.args) : "", oauthClientId: server && server.oauthClient ? server.oauthClient.clientId || "" : "", oauthClientSecret: "", oauthScope: server && server.oauthClient ? server.oauthClient.scope || "" : "", oauthTokenEndpointAuthMethod: server && server.oauthClient ? server.oauthClient.tokenEndpointAuthMethod || "" : "", env: server && server.env ? Object.keys(server.env).map(function (key) { return key + "=" + server.env[key]; }).join("\\n") : "", repositoryId: server && server.repositoryId || "", enabled: !server || server.enabled !== false };
     Object.keys(fields).forEach(function (key) { var field = form.elements.namedItem(key); if (!field) return; if (field.type === "checkbox") field.checked = fields[key]; else field.value = fields[key]; });
     setMcpHeaderRows(server && server.headers ? server.headers : {});
     syncMcpHeaderVisibility();
@@ -689,7 +697,7 @@ export const ADMIN_SCRIPT = `
   function serializeMcpForm() {
     var form = el("mcp-form"), fields = form.elements, env = {};
     (fields.namedItem("env").value || "").split("\\n").forEach(function (line) { var index = line.indexOf("="); if (index <= 0) return; env[line.slice(0, index).trim()] = line.slice(index + 1); });
-    return { id: fields.namedItem("id").value.trim(), name: fields.namedItem("name").value.trim(), transport: fields.namedItem("transport").value, command: fields.namedItem("command").value.trim() || null, url: fields.namedItem("url").value.trim() || null, args: parseMcpArgs(fields.namedItem("args").value), env: env, headers: readMcpHeaderRows(), repositoryId: fields.namedItem("repositoryId").value.trim() || null, enabled: !!fields.namedItem("enabled").checked };
+    return { id: fields.namedItem("id").value.trim(), name: fields.namedItem("name").value.trim(), transport: fields.namedItem("transport").value, command: fields.namedItem("command").value.trim() || null, url: fields.namedItem("url").value.trim() || null, args: parseMcpArgs(fields.namedItem("args").value), oauthClientId: fields.namedItem("oauthClientId").value.trim() || null, oauthClientSecret: fields.namedItem("oauthClientSecret").value.trim() || null, oauthScope: fields.namedItem("oauthScope").value.trim() || null, oauthTokenEndpointAuthMethod: fields.namedItem("oauthTokenEndpointAuthMethod").value || null, env: env, headers: readMcpHeaderRows(), repositoryId: fields.namedItem("repositoryId").value.trim() || null, enabled: !!fields.namedItem("enabled").checked };
   }
   async function submitMcpForm(event) {
     event.preventDefault(); var payload = serializeMcpForm();
@@ -698,6 +706,21 @@ export const ADMIN_SCRIPT = `
     try { var update = !!(state.editingMcp && state.editingMcp.id); var result = await fetchJSON(update ? MCP_DETAIL(state.editingMcp.id) : MCP_BASE, { method: update ? "PUT" : "POST", body: payload }); if (result && result.redirecting) return; closeMcpForm(); showToast(update ? "MCP server updated." : "MCP server added.", "ok"); await loadBootstrap({ announce: false }); }
     catch (err) { var box = el("mcp-form-error"); box.textContent = err && err.message ? err.message : "Could not save MCP server."; box.hidden = false; }
     finally { if (button) button.disabled = false; }
+  }
+  async function connectMcpServer(id) {
+    try {
+      var result = await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/connect", { method: "POST", body: {} });
+      var payload = result && result.data;
+      if (payload && payload.authorizationUrl) { window.location.assign(payload.authorizationUrl); return; }
+      announceStatus("mcp-status", "MCP OAuth connection did not return an authorization URL.");
+    } catch (err) { announceStatus("mcp-status", err && err.message ? err.message : "Could not connect MCP OAuth."); showToast("MCP OAuth connection failed.", "danger"); }
+  }
+  async function disconnectMcpServer(id) {
+    try {
+      await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/disconnect", { method: "POST", body: {} });
+      showToast("MCP OAuth disconnected.", "ok");
+      await loadBootstrap({ announce: false });
+    } catch (err) { announceStatus("mcp-status", err && err.message ? err.message : "Could not disconnect MCP OAuth."); showToast("MCP OAuth disconnection failed.", "danger"); }
   }
   async function deleteMcpServer(id) { var result = await fetchJSON(MCP_DETAIL(id), { method: "DELETE", body: {} }); if (result && result.redirecting) return; showToast("MCP server removed.", "ok"); await loadBootstrap({ announce: false }); }
   async function toggleMcpServer(server) { var result = await fetchJSON(MCP_DETAIL(server.id), { method: "PUT", body: Object.assign({}, server, { enabled: !server.enabled }) }); if (result && result.redirecting) return; await loadBootstrap({ announce: false }); }
@@ -708,6 +731,8 @@ export const ADMIN_SCRIPT = `
     var action = button.getAttribute("data-action");
     if (action === "edit-mcp") openMcpForm(server);
     if (action === "toggle-mcp") toggleMcpServer(server);
+    if (action === "connect-mcp") connectMcpServer(id);
+    if (action === "disconnect-mcp") disconnectMcpServer(id);
     if (action === "delete-mcp") openConfirm({ title: "Delete MCP server?", body: "Remove " + (server.name || id) + "?", onConfirm: function () { deleteMcpServer(id); } });
   }
 
@@ -1304,6 +1329,21 @@ export const ADMIN_SCRIPT = `
       renderInstallation(state.installation);
       renderRepositories(state.repositories);
       renderMcpServers(state.mcpServers);
+      // Surface the OAuth callback outcome only after bootstrap rendered.
+      var mcpStatus = el("mcp-status");
+      if (mcpStatus && window.location && window.location.search) {
+        var params = new URLSearchParams(window.location.search);
+        var mcpResult = params.get("mcp");
+        if (mcpResult === "connected") {
+          mcpStatus.textContent = "MCP server connected.";
+        } else if (mcpResult === "error") {
+          mcpStatus.textContent =
+            "MCP connection failed: " + (params.get("message") || "unknown error");
+        }
+        if (mcpResult !== null && window.history && window.history.replaceState) {
+          window.history.replaceState(null, "", window.location.pathname);
+        }
+      }
       renderExecutor(state.executorInstance, state.executorToolkits);
       await loadNixCache();
       var badge = computeAccessibilityBadge(state.installation);

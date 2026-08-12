@@ -4,12 +4,14 @@ import { Effect, Exit, Logger, Option, Redacted, Schema } from "effect";
 import { OAuthStateError } from "../src/domain/errors.js";
 import { AppUserId, OrganizationId, type TeamId } from "../src/domain/ids.js";
 import {
+  mcpOauthCallback,
   oauthCallback,
   oauthStart,
   router,
   webhook,
 } from "../src/http/router.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { McpOAuth } from "../src/services/mcp-oauth.js";
 import { OAuth } from "../src/services/oauth.js";
 import { Reconciler } from "../src/services/reconciler.js";
 import { AdminSessionRepo } from "../src/services/store/repositories.js";
@@ -26,9 +28,13 @@ function route(method: string, path: string) {
 function request(
   method: string,
   path: string,
+  cookie?: string,
 ): HttpServerRequest.HttpServerRequest {
   return HttpServerRequest.fromWeb(
-    new Request(`https://gateway.example${path}`, { method }),
+    new Request(`https://gateway.example${path}`, {
+      method,
+      ...(cookie ? { headers: { Cookie: cookie } } : {}),
+    }),
   );
 }
 
@@ -364,6 +370,69 @@ describe("HTTP router parity", () => {
     expect(Exit.isFailure(result)).toBe(true);
     expect(logs.some((message) => message.startsWith("oauth.failed"))).toBe(
       true,
+    );
+  });
+  it("preserves the configured deployment prefix after MCP OAuth callback", async () => {
+    const config: GatewayConfig = {
+      _tag: "GatewayConfig",
+      githubAppId: undefined,
+      githubAppPrivateKey: undefined,
+      linearClientId: "client",
+      linearClientSecret: Redacted.make("secret"),
+      linearWebhookSecret: Redacted.make("webhook"),
+      tokenEncryptionKey: Redacted.make("key"),
+      publicUrl: new URL("https://gateway.example/base/"),
+      logLevel: "silent",
+      logFile: Option.none(),
+      databasePath: ":memory:",
+      nixBinaryPath: "nix",
+      nixpkgsFlakeRef:
+        "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+      nixRootsDir: "/tmp/nix-roots",
+      nixGcMaxBytes: 1_000_000,
+      workspaceRoot: "/tmp/router-prefix",
+      ompCliPath: "omp",
+      port: 3000,
+      leaseDurationMs: 60_000,
+      reconcilerIntervalMs: 1_000,
+      reconcilerCatchupIntervalMs: 300_000,
+      reconcilerCatchupMinAgeMs: 120_000,
+      webhookReplayWindowMs: 60_000,
+      repositorySuggestionConfidenceThreshold: 0.8,
+    };
+    const mcpOAuth = {
+      _tag: "McpOAuth",
+      completeMcpAuthorization: () => Effect.succeed(undefined),
+    } as unknown as McpOAuth;
+    const adminSessionRepo: AdminSessionRepo = {
+      _tag: "AdminSessionRepo",
+      create: (_input) => Effect.void,
+      get: (_tokenHash, _now) =>
+        Effect.succeed(
+          Option.some({
+            organizationId: "router-org" as OrganizationId,
+            csrfTokenHash: "csrf",
+          }),
+        ),
+      deleteAdminSession: (_tokenHash) => Effect.succeed(false),
+    };
+    const response = await Effect.runPromise(
+      mcpOauthCallback.pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          request(
+            "GET",
+            "/oauth/mcp/callback?code=code&state=state",
+            "omp_gateway_admin=admin-token",
+          ),
+        ),
+        Effect.provideService(GatewayConfig, config),
+        Effect.provideService(AdminSessionRepo, adminSessionRepo),
+        Effect.provideService(McpOAuth, mcpOAuth),
+      ),
+    );
+    expect(HttpServerResponse.toWeb(response).headers.get("location")).toBe(
+      "/base/admin?mcp=connected",
     );
   });
 });

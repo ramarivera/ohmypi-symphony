@@ -1,6 +1,10 @@
 import { Effect, Option, Redacted, Schema } from "effect";
 import { describe, expect, it } from "vitest";
-import { LinearRateLimitError, WorkspaceError } from "../src/domain/errors.js";
+import {
+  DatabaseError,
+  LinearRateLimitError,
+  WorkspaceError,
+} from "../src/domain/errors.js";
 import {
   IssueId,
   OrganizationId,
@@ -119,6 +123,12 @@ const deps: AdminDeps = {
     updateMcpServer: unreachable,
     deleteMcpServer: unreachable,
   } as unknown as AdminDeps["mcpServerRepo"],
+  mcpOAuth: {
+    listStatuses: () => Effect.succeed(new Map()),
+    startMcpAuthorization: unreachable,
+    completeMcpAuthorization: unreachable,
+    disconnect: unreachable,
+  } as unknown as AdminDeps["mcpOAuth"],
   promptTemplateRepo: {
     get: () => Effect.succeed(Option.none()),
     upsert: unreachable,
@@ -980,6 +990,164 @@ describe("MCP admin endpoints", () => {
     );
     expect(response.status).toBe(400);
     expect(called).toBe(false);
+  });
+  it("accepts OAuth scope without a client id for dynamic registration", async () => {
+    let called = false;
+    const mcpServerRepo = {
+      ...deps.mcpServerRepo,
+      createMcpServer: () => {
+        called = true;
+        return Effect.fail(new DatabaseError({ message: "sentinel" }));
+      },
+    } as AdminDeps["mcpServerRepo"];
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const response = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(
+          new Request(new URL("/api/admin/mcp-servers", config.publicUrl), {
+            method: "POST",
+            headers: {
+              Cookie: `omp_gateway_admin=${token}`,
+              Origin: config.publicUrl.toString(),
+              "Content-Type": "application/json",
+              "X-CSRF-Token": deriveCsrfToken(token),
+            },
+            body: JSON.stringify({
+              id: "scope-without-client",
+              name: "scope-without-client",
+              transport: "stdio",
+              args: [],
+              command: "node",
+              oauthScope: "read",
+            }),
+          }),
+        ),
+      ),
+    );
+    expect(response.status).toBe(500);
+    expect(called).toBe(true);
+  });
+  it("drops the previous OAuth secret when replacing the client id", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-oauth-replace",
+      organizationId,
+      name: "oauth replace",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://mcp.example.test",
+      env: {},
+      headers: {},
+      oauthClient: {
+        clientId: "old-client",
+        clientSecret: "old-secret",
+        scope: "read",
+        tokenEndpointAuthMethod: "client_secret_basic",
+      },
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let received: Record<string, unknown> | undefined;
+    let disconnected = false;
+    const mcpServerRepo = McpServerRepo.make({
+      ...deps.mcpServerRepo,
+      getMcpServer: () => Effect.succeed(Option.some(server)),
+      updateMcpServer: (_org, _id, input) => {
+        received = input as Record<string, unknown>;
+        return Effect.succeed(server);
+      },
+    });
+    const handle = createAdminHandle({
+      ...deps,
+      mcpServerRepo,
+      mcpOAuth: {
+        ...deps.mcpOAuth,
+        disconnect: () => {
+          disconnected = true;
+          return Effect.void;
+        },
+      } as AdminDeps["mcpOAuth"],
+    });
+    const response = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(
+          new Request(
+            new URL(
+              "/api/admin/mcp-servers/mcp-oauth-replace",
+              config.publicUrl,
+            ),
+            {
+              method: "PUT",
+              headers: {
+                Cookie: `omp_gateway_admin=${token}`,
+                Origin: config.publicUrl.toString(),
+                "Content-Type": "application/json",
+                "X-CSRF-Token": deriveCsrfToken(token),
+              },
+              body: JSON.stringify({
+                id: "mcp-oauth-replace",
+                name: "oauth replace",
+                transport: "http",
+                command: null,
+                args: [],
+                url: "https://mcp.example.test",
+                env: {},
+                headers: {},
+                repositoryId: null,
+                enabled: true,
+                oauthClientId: "new-client",
+                oauthTokenEndpointAuthMethod: "client_secret_post",
+              }),
+            },
+          ),
+        ),
+      ),
+    );
+    expect(response.status).toBe(200);
+    expect(received?.oauthClient).toEqual({
+      clientId: "new-client",
+      tokenEndpointAuthMethod: "client_secret_post",
+    });
+    expect(disconnected).toBe(true);
+    const scopeOnlyResponse = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(
+          new Request(
+            new URL(
+              "/api/admin/mcp-servers/mcp-oauth-replace",
+              config.publicUrl,
+            ),
+            {
+              method: "PUT",
+              headers: {
+                Cookie: `omp_gateway_admin=${token}`,
+                Origin: config.publicUrl.toString(),
+                "Content-Type": "application/json",
+                "X-CSRF-Token": deriveCsrfToken(token),
+              },
+              body: JSON.stringify({
+                id: "mcp-oauth-replace",
+                name: "oauth replace",
+                transport: "http",
+                command: null,
+                args: [],
+                url: "https://mcp.example.test",
+                env: {},
+                headers: {},
+                repositoryId: null,
+                enabled: true,
+                oauthClientId: null,
+                oauthScope: "read",
+              }),
+            },
+          ),
+        ),
+      ),
+    );
+    expect(scopeOnlyResponse.status).toBe(200);
+    expect(received?.oauthClient).toEqual({ scope: "read" });
   });
   it("requires enabled to be a boolean and defaults omitted to true", async () => {
     const server = Schema.decodeUnknownSync(McpServerRecord)({

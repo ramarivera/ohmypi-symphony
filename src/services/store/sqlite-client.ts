@@ -227,6 +227,7 @@ const migrate = (db: Database): void => {
       url TEXT,
       env_json TEXT NOT NULL,
       headers_json TEXT NOT NULL DEFAULT '{}',
+      oauth_client_json TEXT,
       repository_id TEXT,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL,
@@ -276,6 +277,32 @@ const migrate = (db: Database): void => {
     );
     CREATE INDEX IF NOT EXISTS run_event_session
       ON run_event(session_id, created_at, source_key);
+    CREATE TABLE IF NOT EXISTS mcp_oauth_state (
+      state_hash TEXT PRIMARY KEY,
+      organization_id TEXT NOT NULL,
+      server_id TEXT NOT NULL,
+      server_url TEXT NOT NULL,
+      admin_session_hash TEXT,
+      code_verifier TEXT NOT NULL,
+      redirect_uri TEXT NOT NULL,
+      client_json TEXT NOT NULL,
+      expires_at INTEGER NOT NULL,
+      consumed_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS mcp_oauth_credential (
+      organization_id TEXT NOT NULL,
+      server_id TEXT NOT NULL,
+      server_url TEXT NOT NULL,
+      client_json TEXT NOT NULL,
+      access_token TEXT NOT NULL,
+      refresh_token TEXT,
+      expires_at INTEGER NOT NULL,
+      token_type TEXT,
+      scope TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY (organization_id, server_id)
+    );
   `);
 
   const repositoryColumns = db
@@ -295,6 +322,16 @@ const migrate = (db: Database): void => {
     db.exec(
       "ALTER TABLE mcp_server ADD COLUMN headers_json TEXT NOT NULL DEFAULT '{}'",
     );
+  }
+  if (!mcpServerColumns.includes("oauth_client_json")) {
+    db.exec("ALTER TABLE mcp_server ADD COLUMN oauth_client_json TEXT");
+  }
+  const mcpOAuthStateColumns = db
+    .query<{ name: string }, []>('PRAGMA table_info("mcp_oauth_state")')
+    .all()
+    .map((column) => column.name);
+  if (!mcpOAuthStateColumns.includes("admin_session_hash")) {
+    db.exec("ALTER TABLE mcp_oauth_state ADD COLUMN admin_session_hash TEXT");
   }
 
   db.exec(`

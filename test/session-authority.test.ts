@@ -37,6 +37,7 @@ import {
   type GitHubAppTokenService,
 } from "../src/services/github-app.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
+import { McpOAuth } from "../src/services/mcp-oauth.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
@@ -997,6 +998,7 @@ const withAuthority = <A, E>(
     | RunEventRepo
     | InstallationRepo
     | McpServerRepo
+    | McpOAuth
     | PromptTemplateRepo
     | WorkspaceRepo
     | NixEnvironment
@@ -1049,6 +1051,7 @@ const withAuthority = <A, E>(
         TokenCrypto.Default,
         InstallationRepo.Default,
         McpServerRepo.Default,
+        McpOAuth.Default,
         PromptTemplateRepo.Default,
         RunEventRepo.Default,
         RunInputRepo.Default,

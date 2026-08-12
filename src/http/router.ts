@@ -9,8 +9,10 @@ import {
   Admin,
   createAdminSession,
   setAdminCookie,
+  tokenHash,
 } from "../services/admin.js";
 import { GatewayConfig } from "../services/config.js";
+import { McpOAuth } from "../services/mcp-oauth.js";
 import { OAuth } from "../services/oauth.js";
 import { Reconciler } from "../services/reconciler.js";
 import { AdminSessionRepo } from "../services/store/repositories.js";
@@ -107,6 +109,45 @@ export const oauthCallback = Effect.gen(function* () {
     ),
   );
 });
+export const mcpOauthCallback = Effect.gen(function* () {
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const callback = new URL(request.url, "http://localhost");
+  const config = yield* GatewayConfig;
+  const adminSessionRepo = yield* AdminSessionRepo;
+  const adminUrl = new URL(config.publicUrl.toString());
+  adminUrl.pathname = `${adminUrl.pathname.replace(/\/$/u, "")}/admin`;
+  adminUrl.search = "";
+  const cookie = BunHttpServerRequest.toRequest(request).headers.get("cookie");
+  const rawToken = cookie?.match(/(?:^|;\s*)omp_gateway_admin=([^;]*)/u)?.[1];
+  if (rawToken === undefined) {
+    return yield* Effect.fail(new Error("Unauthorized MCP OAuth callback"));
+  }
+  const adminSessionHash = tokenHash(decodeURIComponent(rawToken));
+  const now = yield* Clock.currentTimeMillis;
+  const session = yield* adminSessionRepo.get(adminSessionHash, now);
+  if (Option.isNone(session)) {
+    return yield* Effect.fail(new Error("Unauthorized MCP OAuth callback"));
+  }
+  return yield* McpOAuth.completeMcpAuthorization(
+    callback,
+    adminSessionHash,
+  ).pipe(
+    Effect.as(
+      HttpServerResponse.redirect(`${adminUrl.pathname}?mcp=connected`, {
+        status: 302,
+        headers: SECURITY_HEADERS,
+      }),
+    ),
+    Effect.catchAll((error) =>
+      Effect.succeed(
+        HttpServerResponse.redirect(
+          `${adminUrl.pathname}?mcp=error&message=${encodeURIComponent(error instanceof Error ? error.message : String(error))}`,
+          { status: 302, headers: SECURITY_HEADERS },
+        ),
+      ),
+    ),
+  );
+});
 
 const admin = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
@@ -121,6 +162,7 @@ export const router = HttpRouter.empty.pipe(
   HttpRouter.all("/webhooks/linear", webhook),
   HttpRouter.get("/oauth/start", oauthStart),
   HttpRouter.get("/oauth/callback", oauthCallback),
+  HttpRouter.get("/oauth/mcp/callback", mcpOauthCallback),
   HttpRouter.get("/", admin),
   HttpRouter.get("/admin", admin),
   HttpRouter.get("/runs/:id", admin),

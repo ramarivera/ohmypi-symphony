@@ -14,6 +14,7 @@ import {
   type RpcTimeoutError,
   type RunLeaseError,
   type TokenCipherError,
+  type TokenRefreshError,
   type WorkspaceError,
 } from "../domain/errors.js";
 import type { SessionId, SourceKey } from "../domain/ids.js";
@@ -30,6 +31,11 @@ import {
   resolveEffectiveMcpServers,
   writeOmpMcpConfig,
 } from "./mcp-config.js";
+import {
+  McpOAuth,
+  materializeMcpAgentDb,
+  removeMcpAgentDb,
+} from "./mcp-oauth.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import {
@@ -291,6 +297,7 @@ type AuthorityError =
   | RpcTimeoutError
   | RunLeaseError
   | TokenCipherError
+  | TokenRefreshError
   | WorkspaceError
   | LinearApiError
   | InstallationRevokedError
@@ -305,6 +312,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       ActivityProjector.Default,
       InstallationRepo.Default,
       McpServerRepo.Default,
+      McpOAuth.Default,
       PromptTemplateRepo.Default,
       RunEventRepo.Default,
       RunInputRepo.Default,
@@ -327,6 +335,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const rpc = yield* RpcWorker;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
+      const mcpOAuth = yield* McpOAuth;
       const linearOption = yield* Effect.serviceOption(LinearGateway);
       const mcpServerRepoOption = yield* Effect.serviceOption(McpServerRepo);
 
@@ -425,7 +434,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Option.match(run.workspacePath, {
           onNone: () => Effect.void,
           onSome: (path) =>
-            workspace.clearGitHubExtraHeader(run.sessionId, path),
+            Effect.zipRight(
+              workspace.clearGitHubExtraHeader(run.sessionId, path),
+              removeMcpAgentDb(path),
+            ),
         });
       const ensureIssueLifecycle = (
         run: AgentRun,
@@ -1640,6 +1652,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         | NixEnvironmentError
         | WorkspaceError
         | TokenCipherError
+        | TokenRefreshError
       > {
         if (!existsSync(cwd)) {
           const error = new RpcSpawnError({
@@ -1738,7 +1751,109 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           allMcpServers,
           Option.isSome(run.repositoryId) ? run.repositoryId.value : null,
         );
-        yield* writeOmpMcpConfig(cwd, effectiveMcpServers, run.sessionId).pipe(
+        const mintedMcp = yield* Effect.forEach(
+          effectiveMcpServers,
+          (server) =>
+            Effect.gen(function* () {
+              if (Option.isNone(server.url) || server.transport === "stdio") {
+                return { server, credential: null };
+              }
+              const token = yield* mcpOAuth.mintCredential(
+                run.organizationId,
+                server.id,
+              );
+              const details = yield* mcpOAuth.getCredentialDetails(
+                run.organizationId,
+                server.id,
+              );
+              return {
+                server,
+                credential: Option.match(token, {
+                  onNone: () => null,
+                  onSome: (value) => {
+                    const detail = Option.getOrUndefined(details);
+                    return {
+                      accessToken: value.accessToken,
+                      expiresAt: value.expiresAt,
+                      ...(value.refreshToken !== undefined
+                        ? { refreshToken: value.refreshToken }
+                        : {}),
+                      ...(detail?.client.tokenEndpoint !== undefined
+                        ? { tokenEndpoint: detail.client.tokenEndpoint }
+                        : {}),
+                      ...(detail?.client.clientId !== undefined
+                        ? { clientId: detail.client.clientId }
+                        : {}),
+                      ...(detail?.client.clientSecret !== undefined
+                        ? { clientSecret: detail.client.clientSecret }
+                        : {}),
+                    };
+                  },
+                }),
+              };
+            }),
+          { concurrency: "unbounded" },
+        ).pipe(
+          Effect.catchAll((error) =>
+            handleFailure(run.sessionId, error).pipe(
+              Effect.zipRight(Effect.fail(error)),
+            ),
+          ),
+        );
+        const credentials = mintedMcp.flatMap((entry) =>
+          entry.credential !== null && Option.isSome(entry.server.url)
+            ? [
+                {
+                  serverUrl: entry.server.url.value,
+                  accessToken: entry.credential.accessToken,
+                  expiresAt: entry.credential.expiresAt,
+                  ...(entry.credential.refreshToken !== undefined
+                    ? { refreshToken: entry.credential.refreshToken }
+                    : {}),
+                  ...(entry.credential.tokenEndpoint !== undefined
+                    ? { tokenEndpoint: entry.credential.tokenEndpoint }
+                    : {}),
+                  ...(entry.credential.clientId !== undefined
+                    ? { clientId: entry.credential.clientId }
+                    : {}),
+                  ...(entry.credential.clientSecret !== undefined
+                    ? { clientSecret: entry.credential.clientSecret }
+                    : {}),
+                },
+              ]
+            : [],
+        );
+        const agentDir = yield* Effect.tryPromise({
+          try: () => materializeMcpAgentDb(cwd, credentials),
+          catch: (error) =>
+            new RpcSpawnError({
+              message: `MCP credential materialization failed: ${String(error)}`,
+            }),
+        }).pipe(
+          Effect.catchTag("@Gateway/RpcSpawnError", (error) =>
+            Effect.logWarning("mcp.credentials.materialization_failed").pipe(
+              Effect.annotateLogs({
+                event: "mcp.credentials.materialization_failed",
+                sessionId: run.sessionId,
+                error: error.message,
+              }),
+              Effect.zipRight(handleFailure(run.sessionId, error)),
+              Effect.zipRight(Effect.fail(error)),
+            ),
+          ),
+        );
+        const configServers = mintedMcp.map((entry) => {
+          if (entry.credential === null) return entry.server;
+          return {
+            ...entry.server,
+            headers: Object.fromEntries(
+              Object.entries(entry.server.headers).filter(
+                ([name]) => name.toLowerCase() !== "authorization",
+              ),
+            ),
+          };
+        });
+        yield* writeOmpMcpConfig(cwd, configServers, run.sessionId).pipe(
           Effect.mapError(
             (error) =>
               new RpcSpawnError({
@@ -1761,7 +1876,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         const worker = yield* rpc.spawn({
           command,
           cwd,
-          env: environment,
+          env: { ...environment, PI_CODING_AGENT_DIR: agentDir },
         });
         const queue = yield* Queue.unbounded<RpcEvent>();
 
