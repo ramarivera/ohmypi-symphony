@@ -1126,8 +1126,16 @@ export const createAdminHandle = (deps: AdminDeps) =>
         request.method === "GET"
       ) {
         const session = yield* requireSession(request);
-        const toolkits = yield* deps
-          .executor!.listToolkits(session.organizationId)
+        if (deps.executor === undefined) {
+          return yield* Effect.fail(
+            new AdminError({
+              message: "Executor integration unavailable",
+              status: 502,
+            }),
+          );
+        }
+        const toolkits = yield* deps.executor
+          .listToolkits(session.organizationId)
           .pipe(Effect.mapError(executorError));
         return Option.some(json({ toolkits }));
       }

@@ -9,7 +9,7 @@ import {
   type OrganizationId as OrganizationIdType,
 } from "../../domain/ids.js";
 import { TokenCrypto } from "../token-crypto.js";
-import { decodeRow, SqliteClient, tryDb } from "./sqlite-client.js";
+import { decodeRow, runChanges, SqliteClient, tryDb } from "./sqlite-client.js";
 
 const ExecutorInstanceRow = Schema.Struct({
   organization_id: Schema.String,
@@ -125,7 +125,7 @@ export class ExecutorInstanceRepo extends Effect.Service<ExecutorInstanceRepo>()
               .run(organizationId),
           "ExecutorInstanceRepo.remove",
         );
-        return result.changes === 1;
+        return (yield* runChanges(result, "ExecutorInstanceRepo.remove")) === 1;
       });
 
       return { get, put, remove };
