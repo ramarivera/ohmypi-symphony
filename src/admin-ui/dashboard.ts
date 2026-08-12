@@ -185,6 +185,24 @@ export const ADMIN_BODY = `
       </div>
     </section>
 
+    <section class="panel" aria-labelledby="prompt-templates-heading">
+      <div class="panel-header">
+        <h2 id="prompt-templates-heading">Worker prompt templates</h2>
+        <span class="hint">Changes apply to new Linear agent sessions.</span>
+      </div>
+      <div class="panel-body">
+        <div id="prompt-templates-status" role="status" aria-live="polite"></div>
+        <div id="prompt-template-editors">
+          <div class="field full"><label for="prompt-template-created">Created input</label><textarea id="prompt-template-created" rows="8" data-prompt-kind="created"></textarea></div>
+          <div class="field full"><label for="prompt-template-prompted">Prompted input</label><textarea id="prompt-template-prompted" rows="4" data-prompt-kind="prompted"></textarea></div>
+          <div class="field full"><label for="prompt-template-contract">Worker contract</label><textarea id="prompt-template-contract" rows="10" data-prompt-kind="contract"></textarea></div>
+        </div>
+        <div class="hint">Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Unknown placeholders remain literal.</div>
+        <div class="field full"><label for="prompt-template-preview">Live preview (sample payload)</label><pre id="prompt-template-preview" aria-live="polite"></pre></div>
+        <div class="form-actions"><button type="button" class="btn btn-primary" id="prompt-templates-save">Save prompt templates</button></div>
+      </div>
+    </section>
+
     <section class="panel" aria-labelledby="preview-heading">
       <div class="panel-header">
         <h2 id="preview-heading">Route preview</h2>
@@ -252,6 +270,7 @@ export const ADMIN_SCRIPT = `
   var MCP_BASE = "/api/admin/mcp-servers";
   var MCP_DETAIL = function (id) { return MCP_BASE + "/" + encodeURIComponent(id); };
   var LOGOUT_URL = "/api/admin/logout";
+  var PROMPT_TEMPLATES_URL = "/api/admin/prompt-templates";
 
   var state = {
     csrfToken: "",
@@ -262,6 +281,7 @@ export const ADMIN_SCRIPT = `
     nixCache: [],
     editing: null,
     pendingDelete: null,
+    promptTemplates: {},
     pendingConfirm: null,
   };
 
@@ -1059,6 +1079,61 @@ export const ADMIN_SCRIPT = `
     }
   }
 
+  var PROMPT_SAMPLE = {
+    userRequest: "User request:\nSample task from Linear",
+    issueContext: "Issue context:\nIssue: Sample issue (SYM-1)",
+    threadComment: "Thread comment:\nPlease investigate this.",
+    previousComments: "Previous comments:\n1. Earlier discussion",
+    guidance: "Guidance:\n1. Keep the change focused.",
+  };
+
+  function substitutePromptPreview(template) {
+    return String(template || "").replace(/{{([A-Za-z][A-Za-z0-9_]*)}}/g, function (token, name) {
+      return Object.prototype.hasOwnProperty.call(PROMPT_SAMPLE, name) ? PROMPT_SAMPLE[name] : token;
+    });
+  }
+
+  function renderPromptPreview() {
+    var source = el("prompt-template-created");
+    var preview = el("prompt-template-preview");
+    if (source && preview) preview.textContent = substitutePromptPreview(source.value);
+  }
+
+  function renderPromptTemplates(templates) {
+    state.promptTemplates = {};
+    (Array.isArray(templates) ? templates : []).forEach(function (template) {
+      state.promptTemplates[template.kind] = template.body;
+      var field = el("prompt-template-" + template.kind);
+      if (field) field.value = template.body;
+    });
+    renderPromptPreview();
+  }
+
+  async function loadPromptTemplates() {
+    var result = await fetchJSON(PROMPT_TEMPLATES_URL, { method: "GET" });
+    if (result && result.redirecting) return;
+    renderPromptTemplates(result.data && result.data.templates);
+  }
+
+  async function savePromptTemplates() {
+    var status = el("prompt-templates-status");
+    try {
+      var kinds = ["created", "prompted", "contract"];
+      for (var i = 0; i < kinds.length; i += 1) {
+        var kind = kinds[i];
+        var field = el("prompt-template-" + kind);
+        await fetchJSON(PROMPT_TEMPLATES_URL, {
+          method: "PUT",
+          body: { kind: kind, body: field ? field.value : "" },
+        });
+      }
+      if (status) status.textContent = "Prompt templates saved.";
+      await loadPromptTemplates();
+    } catch (err) {
+      if (status) status.textContent = err && err.message ? err.message : "Unable to save prompt templates.";
+    }
+  }
+
   // ---- bootstrap loader ----------------------------------------------------
 
   async function loadBootstrap(options) {
@@ -1153,6 +1228,10 @@ export const ADMIN_SCRIPT = `
 
     var previewForm = el("preview-form");
     if (previewForm) previewForm.addEventListener("submit", submitPreview);
+    var promptCreated = el("prompt-template-created");
+    if (promptCreated) promptCreated.addEventListener("input", renderPromptPreview);
+    var promptSave = el("prompt-templates-save");
+    if (promptSave) promptSave.addEventListener("click", savePromptTemplates);
 
     var list = el("repos-list");
     if (list) list.addEventListener("click", handleRepoRowClick);
@@ -1166,7 +1245,10 @@ export const ADMIN_SCRIPT = `
     if (yesBtn) yesBtn.addEventListener("click", function () { closeConfirm(true); });
     if (noBtn) noBtn.addEventListener("click", function () { closeConfirm(false); });
 
-    var logoutBtn = el("logout-btn");
+    loadPromptTemplates().catch(function (err) {
+      var status = el("prompt-templates-status");
+      if (status) status.textContent = err && err.message ? err.message : "Unable to load prompt templates.";
+    });
     if (logoutBtn) logoutBtn.addEventListener("click", logout);
 
     setPreviewIdle();

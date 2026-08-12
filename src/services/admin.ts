@@ -41,11 +41,13 @@ import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
 import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
+import { promptTemplateWarnings } from "./prompt-templates.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
   McpServerRepo,
+  PromptTemplateRepo,
   RunEventRepo,
   RunInputRepo,
   RunRepo,
@@ -119,6 +121,7 @@ export interface AdminDeps {
     readonly createSessionOnIssue: LinearGateway["createSessionOnIssue"];
   };
   readonly workspaceRepo: WorkspaceRepo;
+  readonly promptTemplateRepo?: PromptTemplateRepo;
   readonly mcpServerRepo: McpServerRepo;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
@@ -1026,6 +1029,62 @@ export const createAdminHandle = (deps: AdminDeps) =>
       }
 
       if (
+        url.pathname === "/api/admin/prompt-templates" &&
+        request.method === "GET"
+      ) {
+        const session = yield* requireSession(request);
+        const templates = deps.promptTemplateRepo
+          ? yield* deps.promptTemplateRepo.list(session.organizationId)
+          : [];
+        return Option.some(json({ templates }));
+      }
+      if (
+        url.pathname === "/api/admin/prompt-templates" &&
+        request.method === "PUT"
+      ) {
+        const session = yield* requireMutation(request);
+        if (deps.promptTemplateRepo === undefined) {
+          return Option.some(text("Prompt templates unavailable", 500));
+        }
+        const payload = yield* parseJsonBody(request);
+        const kind = yield* Schema.decodeUnknown(
+          Schema.Literal("created", "prompted", "contract"),
+        )(payload.kind).pipe(
+          Effect.catchTag(
+            "ParseError",
+            () =>
+              new AdminError({
+                message: "Invalid prompt template kind",
+                status: 400,
+              }),
+          ),
+        );
+        if (typeof payload.body !== "string") {
+          return Option.some(
+            text("Prompt template body must be a string", 400),
+          );
+        }
+        const updatedAt = yield* Clock.currentTimeMillis;
+        yield* deps.promptTemplateRepo.upsert({
+          organizationId: session.organizationId,
+          kind,
+          body: payload.body,
+          updatedAt,
+        });
+        return Option.some(
+          json({
+            template: {
+              organizationId: session.organizationId,
+              kind,
+              body: payload.body,
+              updatedAt,
+            },
+            warnings: promptTemplateWarnings(kind, payload.body),
+          }),
+        );
+      }
+
+      if (
         url.pathname === "/api/admin/repositories" &&
         request.method === "GET"
       ) {
@@ -1489,6 +1548,7 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const runEventRepo = yield* RunEventRepo;
     const workspaceRepo = yield* WorkspaceRepo;
     const mcpServerRepo = yield* McpServerRepo;
+    const promptTemplateRepo = yield* Effect.serviceOption(PromptTemplateRepo);
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
     const nixEnvironment = yield* NixEnvironment;
@@ -1503,6 +1563,9 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
       runInputRepo,
       linearGateway,
       workspaceRepo,
+      ...(Option.isSome(promptTemplateRepo)
+        ? { promptTemplateRepo: promptTemplateRepo.value }
+        : {}),
       mcpServerRepo,
       workspace,
       reconciler,
