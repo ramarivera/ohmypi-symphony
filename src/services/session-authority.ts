@@ -1603,10 +1603,25 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               .join(":");
           }
         }
-        const allMcpServers = yield* Option.match(mcpServerRepoOption, {
-          onNone: () => Effect.succeed<ReadonlyArray<McpServerRecord>>([]),
-          onSome: (repo) => repo.listMcpServers(run.organizationId),
-        });
+        const listMcp: Effect.Effect<
+          ReadonlyArray<McpServerRecord>,
+          DatabaseError | RowDecodeError | TokenCipherError
+        > = Option.isNone(mcpServerRepoOption)
+          ? Effect.succeed([])
+          : mcpServerRepoOption.value.listMcpServers(run.organizationId);
+        const allMcpServers = yield* listMcp.pipe(
+          Effect.catchTag("@Gateway/TokenCipherError", (error) =>
+            Effect.logWarning("mcp.config.load_failed").pipe(
+              Effect.annotateLogs({
+                event: "mcp.config.load_failed",
+                sessionId: run.sessionId,
+                error: error.message,
+              }),
+              Effect.zipRight(handleFailure(run.sessionId, error)),
+              Effect.zipRight(Effect.fail(error)),
+            ),
+          ),
+        );
         const effectiveMcpServers = resolveEffectiveMcpServers(
           allMcpServers,
           Option.isSome(run.repositoryId) ? run.repositoryId.value : null,

@@ -56,6 +56,7 @@ import { type RepositoryResolution, Workspace } from "./workspace.js";
 const ADMIN_COOKIE = "omp_gateway_admin";
 const CSRF_SALT = "omp-gateway-admin-csrf";
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const HTTP_TOKEN_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
 
 const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
@@ -376,11 +377,22 @@ function mcpServerPayload(
   const headers: Record<string, string> = {};
   if (headersValue !== undefined && headersValue !== null) {
     if (!record(headersValue)) return Either.left("headers must be an object");
+    const invalidHeaderNames = Object.keys(headersValue).filter(
+      (key) => !HTTP_TOKEN_RE.test(key),
+    );
+    if (invalidHeaderNames.length > 0) {
+      return Either.left(
+        `Invalid MCP header name: ${invalidHeaderNames.join(", ")}`,
+      );
+    }
     for (const [key, value] of Object.entries(headersValue)) {
       if (typeof value !== "string")
         return Either.left(`headers.${key} must be a string`);
       headers[key] = value;
     }
+  }
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    return Either.left("enabled must be a boolean");
   }
   return Either.right({
     id,

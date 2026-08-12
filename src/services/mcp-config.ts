@@ -19,6 +19,23 @@ const isTrackedMcpConfig = async (cwd: string): Promise<boolean> => {
   }
 };
 
+const isGatewayMcpConfig = (value: unknown): boolean => {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    !("mcpServers" in value)
+  ) {
+    return false;
+  }
+  const mcpServers = value.mcpServers;
+  return (
+    typeof mcpServers === "object" &&
+    mcpServers !== null &&
+    !Array.isArray(mcpServers)
+  );
+};
+
 /**
  * Best-effort removal of a generated mcp.json. Repository-tracked files are
  * never removed: only the generated, untracked workspace copy is eligible.
@@ -108,9 +125,27 @@ export const writeOmpMcpConfig = (
       );
       return;
     }
+    const path = join(cwd, "mcp.json");
+    if (yield* Effect.promise(() => Bun.file(path).exists())) {
+      const gatewayShape = yield* Effect.promise(async () => {
+        try {
+          return isGatewayMcpConfig(await Bun.file(path).json());
+        } catch {
+          return false;
+        }
+      });
+      if (!gatewayShape) {
+        yield* Effect.logWarning("mcp.config.foreign_skip").pipe(
+          Effect.annotateLogs({
+            event: "mcp.config.foreign_skip",
+            ...(sessionId === undefined ? {} : { sessionId }),
+          }),
+        );
+        return;
+      }
+    }
     yield* Effect.tryPromise({
       try: async () => {
-        const path = join(cwd, "mcp.json");
         await mkdir(cwd, { recursive: true });
         await writeFile(path, contents, { encoding: "utf8", mode: 0o600 });
         await chmod(path, 0o600);

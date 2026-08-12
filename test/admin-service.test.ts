@@ -796,4 +796,105 @@ describe("MCP admin endpoints", () => {
     expect(response.status).toBe(400);
     expect(called).toBe(false);
   });
+  it("requires enabled to be a boolean and defaults omitted to true", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-enabled",
+      organizationId,
+      name: "enabled",
+      transport: "stdio",
+      command: "node",
+      args: [],
+      url: null,
+      env: {},
+      headers: {},
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let receivedEnabled: boolean | undefined;
+    let receivedArgs: ReadonlyArray<string> | undefined;
+    const mcpServerRepo = {
+      ...deps.mcpServerRepo,
+      createMcpServer: (
+        input: Parameters<AdminDeps["mcpServerRepo"]["createMcpServer"]>[0],
+      ) => {
+        receivedEnabled = input.enabled;
+        receivedArgs = input.args;
+        return Effect.succeed(server);
+      },
+    } as AdminDeps["mcpServerRepo"];
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const runLocal = async (requestValue: Request) =>
+      Option.getOrThrow(await Effect.runPromise(handle(requestValue)));
+    const post = (
+      enabled: unknown,
+      includeEnabled = true,
+      args: ReadonlyArray<string> = [],
+    ) =>
+      runLocal(
+        request("/api/admin/mcp-servers", {
+          id: "mcp-enabled",
+          name: "enabled",
+          transport: "stdio",
+          command: "node",
+          args,
+          ...(includeEnabled ? { enabled } : {}),
+        }),
+      );
+    expect((await post("false")).status).toBe(400);
+    const commaArgs = ["--filter=a,b", '{"query":"x,y"}'];
+    expect((await post(true, true, commaArgs)).status).toBe(201);
+    expect(receivedArgs).toEqual(commaArgs);
+    expect(receivedEnabled).toBe(true);
+    expect((await post(false)).status).toBe(201);
+    expect(receivedEnabled).toBe(false);
+    expect((await post(undefined, false)).status).toBe(201);
+    expect(receivedEnabled).toBe(true);
+  });
+
+  it("rejects invalid MCP header names and accepts RFC token names", async () => {
+    const server = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "mcp-header-validation",
+      organizationId,
+      name: "header-validation",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://mcp.example.test",
+      env: {},
+      headers: {},
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    const mcpServerRepo = {
+      ...deps.mcpServerRepo,
+      createMcpServer: () => Effect.succeed(server),
+    } as AdminDeps["mcpServerRepo"];
+    const handle = createAdminHandle({ ...deps, mcpServerRepo });
+    const runLocal = async (requestValue: Request) =>
+      Option.getOrThrow(await Effect.runPromise(handle(requestValue)));
+    const post = (headers: Record<string, string>) =>
+      runLocal(
+        request("/api/admin/mcp-servers", {
+          id: "mcp-header-validation",
+          name: "header-validation",
+          transport: "http",
+          command: null,
+          args: [],
+          url: "https://mcp.example.test",
+          headers,
+        }),
+      );
+    for (const name of ["Bad:Name", "Bad,Name", "Bad Name"]) {
+      const response = await post({ [name]: "secret" });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain(name);
+    }
+    expect(
+      (await post({ Authorization: "secret", "X-Trace_2": "ok" })).status,
+    ).toBe(201);
+  });
 });

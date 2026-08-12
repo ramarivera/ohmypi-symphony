@@ -532,6 +532,61 @@ describe("SessionAuthority behavior invariants", () => {
       ),
     { timeout: 15_000 },
   );
+  it.effect(
+    "routes MCP decrypt failures through retry handling",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const runRepo = yield* RunRepo;
+          const installationRepo = yield* InstallationRepo;
+          const mcpServerRepo = yield* McpServerRepo;
+          const workspace = yield* Effect.promise(() =>
+            mkdtemp(join("/tmp", "authority-mcp-corrupt-")),
+          );
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* mcpServerRepo.createMcpServer({
+            organizationId: testOrganizationId,
+            id: Schema.decodeUnknownSync(McpServerId)("corrupt-mcp-server"),
+            name: "corrupt",
+            transport: "stdio",
+            command: "node",
+            args: [],
+            env: { TOKEN: "secret" },
+            repositoryId: Option.none(),
+            now: 1,
+          });
+          db.query(
+            "UPDATE mcp_server SET env_json=? WHERE organization_id=? AND id=?",
+          ).run(
+            JSON.stringify({ TOKEN: "mcpenc:v1:not-valid-ciphertext" }),
+            testOrganizationId,
+            "corrupt-mcp-server",
+          );
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some(workspace),
+            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+          });
+          yield* Effect.either(authority.processSession(testSessionId));
+          const updated = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(updated)).toBe(true);
+          if (Option.isSome(updated)) {
+            expect(updated.value.state).toBe("orphaned");
+            expect(updated.value.desiredState).toBe("running");
+            expect(Option.isSome(updated.value.nextAttemptAt)).toBe(true);
+            expect(updated.value.terminalReason).not.toEqual(Option.none());
+          }
+          expect(workerSpawnInputs).toHaveLength(0);
+        }),
+      ),
+    { timeout: 15_000 },
+  );
 
   it.effect(
     "materializes an empty MCP config when no servers exist",

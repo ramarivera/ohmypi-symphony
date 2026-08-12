@@ -159,7 +159,7 @@ export const ADMIN_BODY = `
           <div class="field"><label for="mcp-transport">Transport</label><select id="mcp-transport" name="transport"><option value="stdio">stdio</option><option value="http">http</option><option value="sse">sse</option></select></div>
           <div class="field"><label for="mcp-command">Command</label><input id="mcp-command" name="command" autocomplete="off" placeholder="npx"></div>
           <div class="field"><label for="mcp-url">URL</label><input id="mcp-url" name="url" type="url" autocomplete="off" placeholder="https://mcp.example.com"></div>
-          <div class="field"><label for="mcp-args">Arguments (comma-separated)</label><input id="mcp-args" name="args" autocomplete="off"></div>
+          <div class="field"><label for="mcp-args">Arguments (JSON array or comma-separated)</label><input id="mcp-args" name="args" autocomplete="off"></div>
           <div class="field"><label for="mcp-env">Environment (KEY=value per line)</label><textarea id="mcp-env" name="env" rows="3" autocomplete="off"></textarea><span class="hint">Secret values are write-only; existing values show as •••.</span></div>
           <div class="field full" id="mcp-headers-field" hidden>
             <label>Headers</label>
@@ -576,7 +576,7 @@ export const ADMIN_SCRIPT = `
   function openMcpForm(server) {
     state.editingMcp = server || null;
     var form = el("mcp-form"); if (!form) return;
-    var fields = { id: server && server.id || "", name: server && server.name || "", transport: server && server.transport || "stdio", command: server && server.command || "", url: server && server.url || "", args: server && Array.isArray(server.args) ? server.args.join(", ") : "", env: server && server.env ? Object.keys(server.env).map(function (key) { return key + "=" + server.env[key]; }).join("\\n") : "", repositoryId: server && server.repositoryId || "", enabled: !server || server.enabled !== false };
+    var fields = { id: server && server.id || "", name: server && server.name || "", transport: server && server.transport || "stdio", command: server && server.command || "", url: server && server.url || "", args: server && Array.isArray(server.args) ? JSON.stringify(server.args) : "", env: server && server.env ? Object.keys(server.env).map(function (key) { return key + "=" + server.env[key]; }).join("\\n") : "", repositoryId: server && server.repositoryId || "", enabled: !server || server.enabled !== false };
     Object.keys(fields).forEach(function (key) { var field = form.elements.namedItem(key); if (!field) return; if (field.type === "checkbox") field.checked = fields[key]; else field.value = fields[key]; });
     setMcpHeaderRows(server && server.headers ? server.headers : {});
     syncMcpHeaderVisibility();
@@ -588,7 +588,7 @@ export const ADMIN_SCRIPT = `
   function serializeMcpForm() {
     var form = el("mcp-form"), fields = form.elements, env = {};
     (fields.namedItem("env").value || "").split("\\n").forEach(function (line) { var index = line.indexOf("="); if (index <= 0) return; env[line.slice(0, index).trim()] = line.slice(index + 1); });
-    return { id: fields.namedItem("id").value.trim(), name: fields.namedItem("name").value.trim(), transport: fields.namedItem("transport").value, command: fields.namedItem("command").value.trim() || null, url: fields.namedItem("url").value.trim() || null, args: parseList(fields.namedItem("args").value), env: env, headers: readMcpHeaderRows(), repositoryId: fields.namedItem("repositoryId").value.trim() || null, enabled: !!fields.namedItem("enabled").checked };
+    return { id: fields.namedItem("id").value.trim(), name: fields.namedItem("name").value.trim(), transport: fields.namedItem("transport").value, command: fields.namedItem("command").value.trim() || null, url: fields.namedItem("url").value.trim() || null, args: parseMcpArgs(fields.namedItem("args").value), env: env, headers: readMcpHeaderRows(), repositoryId: fields.namedItem("repositoryId").value.trim() || null, enabled: !!fields.namedItem("enabled").checked };
   }
   async function submitMcpForm(event) {
     event.preventDefault(); var payload = serializeMcpForm();
@@ -766,6 +766,17 @@ export const ADMIN_SCRIPT = `
       .split(",")
       .map(function (entry) { return entry.trim(); })
       .filter(function (entry) { return entry.length > 0; });
+  }
+  function parseMcpArgs(value) {
+    if (typeof value !== "string") return [];
+    var trimmed = value.trim();
+    if (trimmed.charAt(0) === "[") {
+      try {
+        var parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed) && parsed.every(function (entry) { return typeof entry === "string"; })) return parsed;
+      } catch {}
+    }
+    return parseList(value);
   }
 
   function serializeForm(form) {

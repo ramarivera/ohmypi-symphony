@@ -71,7 +71,7 @@ describe("MCP server storage and worker config", () => {
           name: "shared",
           transport: "stdio",
           command: "node",
-          args: ["server.js"],
+          args: ["server.js", "--filter=a,b", '{"query":"x,y"}'],
           env: { TOKEN: "secret" },
           headers: { Authorization: "header-secret" },
           repositoryId: Option.none(),
@@ -84,6 +84,14 @@ describe("MCP server storage and worker config", () => {
           )
           .get(org, serverId("wide"));
         expect(stored?.env_json).toMatch(/"TOKEN":"mcpenc:v1:[A-Za-z0-9_-]+"/u);
+        const storedArgs = db
+          .query<{ readonly args_json: string }, [string, string]>(
+            "SELECT args_json FROM mcp_server WHERE organization_id=? AND id=?",
+          )
+          .get(org, serverId("wide"));
+        expect(storedArgs?.args_json).toBe(
+          JSON.stringify(["server.js", "--filter=a,b", '{"query":"x,y"}']),
+        );
         expect(stored?.env_json).not.toContain("secret");
         const storedHeaders = db
           .query<{ readonly headers_json: string }, [string, string]>(
@@ -470,5 +478,41 @@ describe("MCP server storage and worker config", () => {
     await writeFile(join(untracked, "mcp.json"), "generated");
     await Effect.runPromise(removeMcpConfig(untracked));
     await expect(stat(join(untracked, "mcp.json"))).rejects.toThrow();
+  });
+  it("preserves foreign untracked configs and overwrites gateway configs", async () => {
+    const foreignRoot = await mkdtemp(join("/tmp", "mcp-writer-foreign-"));
+    const foreign = '{"other":"keep"}\n';
+    await writeFile(join(foreignRoot, "mcp.json"), foreign);
+    const logs: Array<{ readonly message: string; readonly event: unknown }> =
+      [];
+    const logger = Logger.make(({ message, annotations }) => {
+      logs.push({
+        message: String(message),
+        event: Option.getOrNull(HashMap.get(annotations, "event")),
+      });
+    });
+    await Effect.runPromise(
+      writeOmpMcpConfig(foreignRoot, [], "foreign-session").pipe(
+        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+      ),
+    );
+    expect(await readFile(join(foreignRoot, "mcp.json"), "utf8")).toBe(foreign);
+    expect(
+      logs.some(
+        (entry) =>
+          entry.message === "mcp.config.foreign_skip" &&
+          entry.event === "mcp.config.foreign_skip",
+      ),
+    ).toBe(true);
+
+    const gatewayRoot = await mkdtemp(join("/tmp", "mcp-writer-gateway-"));
+    await writeFile(
+      join(gatewayRoot, "mcp.json"),
+      '{"mcpServers":{"old":{"type":"stdio"}}}\n',
+    );
+    await Effect.runPromise(writeOmpMcpConfig(gatewayRoot, []));
+    expect(
+      JSON.parse(await readFile(join(gatewayRoot, "mcp.json"), "utf8")),
+    ).toEqual({ mcpServers: {} });
   });
 });
