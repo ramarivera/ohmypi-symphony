@@ -355,15 +355,85 @@ const runGit = (
       }),
   });
 
+const isGatewayGitHubExtraHeader = (value: string): boolean => {
+  const match = /^AUTHORIZATION: basic ([A-Za-z0-9+/]+={0,2})$/u.exec(value);
+  if (match === null) return false;
+  const encoded = match[1];
+  if (encoded === undefined) return false;
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  return (
+    decoded.startsWith("x-access-token:") &&
+    Buffer.from(decoded, "utf8").toString("base64") === encoded
+  );
+};
+
+const runGitOutput = (
+  args: ReadonlyArray<string>,
+  cwd: string | undefined,
+  sessionId: string,
+) =>
+  Effect.tryPromise({
+    try: async () => {
+      const process = Bun.spawn(["git", ...args], {
+        ...(cwd ? { cwd } : {}),
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        process.exited,
+        new Response(process.stdout).text(),
+        new Response(process.stderr).text(),
+      ]);
+      if (exitCode !== 0) {
+        throw new Error(
+          `git ${gitSubcommand(args)} failed: ${redactGitOutput(stderr.trim(), args)}`,
+        );
+      }
+      return stdout;
+    },
+    catch: (cause) =>
+      new WorkspaceError({
+        message:
+          cause instanceof Error
+            ? redactGitOutput(cause.message, args)
+            : "git command failed",
+        sessionId,
+        reason: "git_failed",
+      }),
+  });
+
 const unsetGitHubExtraHeader = (
   target: string,
   sessionId: string,
 ): Effect.Effect<void, never> =>
-  runGit(
-    ["config", "--local", "--unset-all", GITHUB_EXTRA_HEADER_KEY],
-    target,
-    sessionId,
-  ).pipe(Effect.catchAll(() => Effect.void));
+  Effect.gen(function* () {
+    const configuredHeaders = yield* runGitOutput(
+      ["config", "--local", "--get-all", GITHUB_EXTRA_HEADER_KEY],
+      target,
+      sessionId,
+    ).pipe(Effect.catchAll(() => Effect.succeed("")));
+    const headers = configuredHeaders
+      .split(/\r?\n/u)
+      .map((header) => header.trim())
+      .filter((header) => header.length > 0);
+    if (headers.length === 0) return;
+    if (!headers.every(isGatewayGitHubExtraHeader)) {
+      yield* Effect.logDebug(
+        "GitHub extraheader preserved because it contains user-installed values",
+      ).pipe(
+        Effect.annotateLogs({
+          event: "workspace.github_credentials_preserved",
+          sessionId,
+        }),
+      );
+      return;
+    }
+    yield* runGit(
+      ["config", "--local", "--unset-all", GITHUB_EXTRA_HEADER_KEY],
+      target,
+      sessionId,
+    ).pipe(Effect.catchAll(() => Effect.void));
+  });
 
 const lstatOrMissing = (
   path: string,
