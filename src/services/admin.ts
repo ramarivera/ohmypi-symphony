@@ -1150,10 +1150,18 @@ export const createAdminHandle = (deps: AdminDeps) =>
               ),
           }),
         );
-        const result = yield* deps.mcpOAuth.startMcpAuthorization(
-          session.organizationId,
-          id,
-        );
+        const result = yield* deps.mcpOAuth
+          .startMcpAuthorization(session.organizationId, id)
+          .pipe(
+            Effect.catchTag("@Gateway/McpOAuthError", (error) =>
+              Effect.fail(
+                new AdminError({
+                  message: `MCP OAuth setup failed: ${error.message}`,
+                  status: 400,
+                }),
+              ),
+            ),
+          );
         return Option.some(json({ authorizationUrl: result.url.toString() }));
       }
       const mcpOauthDisconnect =

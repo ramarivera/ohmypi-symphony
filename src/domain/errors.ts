@@ -114,6 +114,10 @@ export class OAuthStateError extends Schema.TaggedError<OAuthStateError>()(
   "@Gateway/OAuthStateError",
   message,
 ) {}
+export class McpOAuthError extends Schema.TaggedError<McpOAuthError>()(
+  "@Gateway/McpOAuthError",
+  { ...message, reason: Schema.String },
+) {}
 export class InstallationRevokedError extends Schema.TaggedError<InstallationRevokedError>()(
   "@Gateway/InstallationRevokedError",
   { ...message, organizationId: Schema.String },

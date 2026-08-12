@@ -5,6 +5,7 @@ import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { Clock, Deferred, Effect, Option, Ref, Schema } from "effect";
 import {
   DatabaseError,
+  McpOAuthError,
   OAuthStateError,
   type TokenCipherError,
   TokenRefreshError,
@@ -218,7 +219,7 @@ const decodeStoredJson = <A, I, R>(
 const discoverMcpOAuthMetadataEffect = (
   serverUrl: string,
   fetchImpl: FetchLike,
-): Effect.Effect<McpOAuthMetadata, DatabaseError> =>
+): Effect.Effect<McpOAuthMetadata, DatabaseError | McpOAuthError> =>
   Effect.gen(function* () {
     const base = new URL(serverUrl);
     const protectedResource = new URL(
@@ -257,7 +258,12 @@ const discoverMcpOAuthMetadataEffect = (
           "MCP OAuth issuer must be HTTPS and must not contain credentials",
         );
     } catch (error) {
-      return yield* Effect.fail(new DatabaseError({ message: String(error) }));
+      return yield* Effect.fail(
+        new McpOAuthError({
+          message: String(error),
+          reason: "endpoint_validation",
+        }),
+      );
     }
     const metadataUrl = new URL(
       discoveryUrl(authServerUrl, "oauth-authorization-server").pathname,
@@ -288,7 +294,12 @@ const discoverMcpOAuthMetadataEffect = (
       );
       tokenEndpoint = validateEndpoint(metadata.token_endpoint, authServerUrl);
     } catch (error) {
-      return yield* Effect.fail(new DatabaseError({ message: String(error) }));
+      return yield* Effect.fail(
+        new McpOAuthError({
+          message: String(error),
+          reason: "endpoint_validation",
+        }),
+      );
     }
     return {
       authorizationEndpoint,

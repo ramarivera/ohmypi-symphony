@@ -1150,6 +1150,21 @@ export const ADMIN_SCRIPT = `
   // ---- wire-up -------------------------------------------------------------
 
   function init() {
+    // Surface the OAuth callback outcome (mcp=connected / mcp=error).
+    var mcpStatus = el("mcp-status");
+    if (mcpStatus && window.location && window.location.search) {
+      var params = new URLSearchParams(window.location.search);
+      var mcpResult = params.get("mcp");
+      if (mcpResult === "connected") {
+        mcpStatus.textContent = "MCP server connected.";
+      } else if (mcpResult === "error") {
+        mcpStatus.textContent =
+          "MCP connection failed: " + (params.get("message") || "unknown error");
+      }
+      if (mcpResult !== null && window.history && window.history.replaceState) {
+        window.history.replaceState(null, "", window.location.pathname);
+      }
+    }
     var newBtn = el("new-repo-btn");
     if (newBtn) newBtn.addEventListener("click", function () { openForm(null); });
     var newMcpBtn = el("new-mcp-btn");
