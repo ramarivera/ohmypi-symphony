@@ -1802,6 +1802,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
           const previousUrl = Option.getOrNull(current.value.url);
           const oauthCredentialInvalidated =
             oauthClientChanged || previousUrl !== payload.url;
+          if (oauthCredentialInvalidated) {
+            yield* deps.mcpOAuth.disconnect(session.organizationId, id);
+          }
           const server = yield* deps.mcpServerRepo.updateMcpServer(
             session.organizationId,
             id,
@@ -1819,9 +1822,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
               now,
             },
           );
-          if (oauthCredentialInvalidated) {
-            yield* deps.mcpOAuth.disconnect(session.organizationId, id);
-          }
+
           return Option.some(json({ mcpServer: toApiMcpServer(server) }));
         }
         if (request.method === "DELETE") {
