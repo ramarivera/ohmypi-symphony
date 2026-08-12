@@ -2001,6 +2001,26 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       Option.isSome(input) ? input.value.payload : null,
                     ),
                   );
+                let retryPrompt: string | undefined;
+                if (Option.isNone(resumed.ompSessionFile)) {
+                  const latestActionable =
+                    yield* runInputRepo.latestActionableInput(sessionId);
+                  if (Option.isNone(latestActionable)) {
+                    return yield* Effect.fail(
+                      new InterruptedRunNoActionableInputError({
+                        sessionId,
+                        message:
+                          "Interrupted run has no actionable input to resume",
+                      }),
+                    );
+                  }
+                  retryPrompt = yield* linearWorkerPromptWithTemplate(
+                    promptTemplateRepo,
+                    resumed.organizationId,
+                    latestActionable.value.kind,
+                    latestActionable.value.body,
+                  );
+                }
                 yield* ensureIssueLifecycle(
                   resumed,
                   retryPayload,
@@ -2024,14 +2044,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   `retry:${resumed.attempt}`,
                   `Retrying the interrupted OhMyPi run (attempt ${resumed.attempt}).`,
                 );
-                if (Option.isSome(run.ompSessionFile)) {
+                if (Option.isSome(resumed.ompSessionFile)) {
                   yield* worker.followUp(
                     "Continue the interrupted Linear task from the saved session state.",
                   );
                 } else {
-                  const latestActionable =
-                    yield* runInputRepo.latestActionableInput(sessionId);
-                  if (Option.isNone(latestActionable)) {
+                  if (retryPrompt === undefined) {
                     return yield* Effect.fail(
                       new InterruptedRunNoActionableInputError({
                         sessionId,
@@ -2040,14 +2058,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       }),
                     );
                   }
-                  const agentInvoked = yield* worker.prompt(
-                    yield* linearWorkerPromptWithTemplate(
-                      promptTemplateRepo,
-                      resumed.organizationId,
-                      latestActionable.value.kind,
-                      latestActionable.value.body,
-                    ),
-                  );
+                  const agentInvoked = yield* worker.prompt(retryPrompt);
                   if (!agentInvoked) {
                     yield* finishLocalCommand(
                       sessionId,

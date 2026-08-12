@@ -174,6 +174,12 @@ describe("renderAdminPage", () => {
     expect(html).toMatch(
       /state\.promptTemplatesLoaded\s*=\s*true[\s\S]{0,120}setPromptTemplatesSaveEnabled\(true\)/,
     );
+    expect(html).toMatch(
+      /saveButton\.disabled\s*=\s*!enabled\s*\|\|\s*!state\.csrfToken/,
+    );
+    expect(html).toMatch(
+      /state\.csrfToken\s*=\s*typeof data\.csrfToken[\s\S]{0,100}setPromptTemplatesSaveEnabled\(state\.promptTemplatesLoaded\)/,
+    );
   });
 
   test("renders live previews for all prompt template editors", () => {
@@ -182,6 +188,12 @@ describe("renderAdminPage", () => {
     expect(html).toContain('id="prompt-template-preview-contract"');
     expect(html).toMatch(
       /\["created",\s*"prompted",\s*"contract"\]\.forEach\(function \(kind\)/,
+    );
+    expect(html).toMatch(
+      /prompted:\s*\{\s*userRequest:\s*"Sample follow-up from Linear"/,
+    );
+    expect(html).not.toMatch(
+      /prompted:\s*\{\s*userRequest:\s*"User request:\\nSample follow-up from Linear"/,
     );
     expect(html).toMatch(
       /var preview = templateKind === "created"[\s\S]{0,180}"prompt-template-preview-" \+ templateKind/,

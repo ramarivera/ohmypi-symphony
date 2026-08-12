@@ -1091,7 +1091,7 @@ export const ADMIN_SCRIPT = `
       guidance: "Guidance:\n1. Keep the change focused.",
     },
     prompted: {
-      userRequest: "User request:\nSample follow-up from Linear",
+      userRequest: "Sample follow-up from Linear",
     },
     contract: {},
   };
@@ -1138,7 +1138,7 @@ export const ADMIN_SCRIPT = `
   }
   function setPromptTemplatesSaveEnabled(enabled) {
     var saveButton = el("prompt-templates-save");
-    if (saveButton) saveButton.disabled = !enabled;
+    if (saveButton) saveButton.disabled = !enabled || !state.csrfToken;
   }
 
   async function loadPromptTemplates() {
@@ -1152,6 +1152,10 @@ export const ADMIN_SCRIPT = `
 
   async function savePromptTemplates() {
     var status = el("prompt-templates-status");
+    if (!state.csrfToken) {
+      if (status) status.textContent = "Prompt templates are not ready yet.";
+      return;
+    }
     if (!state.promptTemplatesLoaded) {
       if (status) status.textContent = "Prompt templates are not loaded yet.";
       return;
@@ -1210,6 +1214,7 @@ export const ADMIN_SCRIPT = `
       if (result && result.redirecting) return;
       var data = result.data || {};
       state.csrfToken = typeof data.csrfToken === "string" ? data.csrfToken : "";
+      setPromptTemplatesSaveEnabled(state.promptTemplatesLoaded);
       state.installation = data.installation || null;
       state.repositories = Array.isArray(data.repositories) ? data.repositories : [];
       state.mcpServers = Array.isArray(data.mcpServers) ? data.mcpServers : [];
