@@ -21,6 +21,13 @@ const sdkState = vi.hoisted(() => {
 
   const state: {
     readonly activities: ActivityInput[];
+    readonly activityPages: Array<{
+      readonly nodes: ReadonlyArray<Record<string, unknown>>;
+      readonly pageInfo: {
+        readonly hasNextPage: boolean;
+        readonly endCursor: string | null;
+      };
+    }>;
     readonly comments: CommentInput[];
     readonly updates: UpdateInput[];
     readonly pending: Pending[];
@@ -28,13 +35,27 @@ const sdkState = vi.hoisted(() => {
       readonly count: number;
       readonly resolve: () => void;
     }>;
+    readonly createdSessionInputs: Array<{ readonly issueId: string }>;
+    readonly startedStates: Map<
+      string,
+      ReadonlyArray<{
+        readonly id: string;
+        readonly name: string;
+        readonly position: number;
+      }>
+    >;
+    teamCalls: number;
     activityHandler: (input: ActivityInput) => Promise<unknown>;
   } = {
     activities: [],
+    activityPages: [],
     comments: [],
     updates: [],
     pending: [],
     waiters: [],
+    createdSessionInputs: [],
+    startedStates: new Map(),
+    teamCalls: 0,
     activityHandler: async () => ({
       success: true,
       agentActivityId: "activity-id",
@@ -50,7 +71,39 @@ const sdkState = vi.hoisted(() => {
       }
       return state.activityHandler(input);
     }
-
+    agentSession(_id: string): Promise<unknown> {
+      return Promise.resolve({
+        activities: (variables?: { readonly after?: string }) => {
+          const previousPageIndex =
+            variables?.after === undefined
+              ? -1
+              : state.activityPages.findIndex(
+                  (page) => page.pageInfo.endCursor === variables.after,
+                );
+          const pageIndex =
+            variables?.after === undefined
+              ? 0
+              : previousPageIndex < 0
+                ? -1
+                : previousPageIndex + 1;
+          return Promise.resolve(
+            state.activityPages[pageIndex] ?? {
+              nodes: [],
+              pageInfo: { hasNextPage: false, endCursor: null },
+            },
+          );
+        },
+      });
+    }
+    team(teamId: string): Promise<unknown> {
+      state.teamCalls += 1;
+      return Promise.resolve({
+        states: () =>
+          Promise.resolve({
+            nodes: state.startedStates.get(teamId) ?? [],
+          }),
+      });
+    }
     createComment(input: CommentInput): Promise<unknown> {
       state.comments.push(input);
       return Promise.resolve({
@@ -65,6 +118,14 @@ const sdkState = vi.hoisted(() => {
       state.updates.push(input);
       return Promise.resolve({ success: true });
     }
+
+    agentSessionCreateOnIssue(input: { issueId: string }): Promise<unknown> {
+      state.createdSessionInputs.push(input);
+      return Promise.resolve({
+        success: true,
+        agentSessionId: "new-session-id",
+      });
+    }
   }
 
   return {
@@ -74,8 +135,12 @@ const sdkState = vi.hoisted(() => {
       state.activities.length = 0;
       state.comments.length = 0;
       state.updates.length = 0;
+      state.activityPages.length = 0;
       state.pending.length = 0;
       state.waiters.length = 0;
+      state.createdSessionInputs.length = 0;
+      state.startedStates.clear();
+      state.teamCalls = 0;
       state.activityHandler = async () => ({
         success: true,
         agentActivityId: "activity-id",
@@ -96,7 +161,17 @@ vi.mock("@linear/sdk", async () => {
 });
 
 import { it as effectIt } from "@effect/vitest";
-import { Effect, Exit, Fiber, Layer, Option, Redacted, Schema } from "effect";
+import {
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  Layer,
+  Option,
+  Redacted,
+  Schema,
+  TestClock,
+} from "effect";
 import { beforeEach, describe, expect, it } from "vitest";
 import { LinearRateLimitError } from "../src/domain/errors.js";
 import {
@@ -165,9 +240,13 @@ const gatewayDependencies = Layer.mergeAll(
     RunRepo.make({
       get: () => Effect.succeed(Option.some(run)),
       create: unusedRepoMethod,
+      createIfNoActiveForIssue: unusedRepoMethod,
       update: unusedRepoMethod,
       reopen: unusedRepoMethod,
+      hasActiveForIssue: unusedRepoMethod,
+      listNonTerminalByIssue: unusedRepoMethod,
       listRunnable: unusedRepoMethod,
+      listCatchupCandidates: unusedRepoMethod,
       listCancellationPending: unusedRepoMethod,
       claimLease: unusedRepoMethod,
       renewLease: unusedRepoMethod,
@@ -207,6 +286,9 @@ const gatewayDependencies = Layer.mergeAll(
       ompCliPath: "omp",
       port: 3000,
       leaseDurationMs: 60_000,
+      reconcilerCatchupIntervalMs: 300_000,
+      reconcilerCatchupMinAgeMs: 120_000,
+      repositorySuggestionConfidenceThreshold: 0.8,
       reconcilerIntervalMs: 1_000,
       webhookReplayWindowMs: 60_000,
     }),
@@ -216,6 +298,53 @@ const gatewayDependencies = Layer.mergeAll(
 const gatewayLayer = LinearGateway.DefaultWithoutDependencies.pipe(
   Layer.provide(gatewayDependencies),
 );
+const cacheTests = () => {
+  effectIt.effect("expires started-state cache entries after one hour", () =>
+    Effect.gen(function* () {
+      sdkState.state.startedStates.set("team-ttl", [
+        { id: "state-1", name: "Started", position: 1 },
+      ]);
+      const clock = yield* TestClock.testClock();
+      const gateway = yield* LinearGateway;
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-ttl",
+      });
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-ttl",
+      });
+      expect(sdkState.state.teamCalls).toBe(1);
+      yield* clock.adjust(Duration.hours(1));
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-ttl",
+      });
+      expect(sdkState.state.teamCalls).toBe(2);
+    }).pipe(Effect.provide(gatewayLayer)),
+  );
+
+  effectIt.effect("bounds started-state cache to one hundred teams", () =>
+    Effect.gen(function* () {
+      const gateway = yield* LinearGateway;
+      for (let index = 0; index < 101; index += 1) {
+        const teamId = `team-${index}`;
+        sdkState.state.startedStates.set(teamId, []);
+        yield* gateway.teamStartedStates({
+          sessionId: String(sessionId),
+          teamId,
+        });
+      }
+      expect(sdkState.state.teamCalls).toBe(101);
+      yield* gateway.teamStartedStates({
+        sessionId: String(sessionId),
+        teamId: "team-0",
+      });
+      expect(sdkState.state.teamCalls).toBe(102);
+    }).pipe(Effect.provide(gatewayLayer)),
+  );
+};
+cacheTests();
 
 const getGateway = () =>
   Effect.runPromise(
@@ -239,6 +368,91 @@ const activityBody = (content: unknown): string | undefined => {
 beforeEach(() => sdkState.reset());
 
 describe("LinearGateway parity", () => {
+  it("paginates activities and preserves unknown content typenames", async () => {
+    sdkState.state.activityPages.push(
+      {
+        nodes: [
+          {
+            id: "activity-1",
+            content: {
+              __typename: "AgentActivityPromptContent",
+              body: "hello",
+            },
+            signal: "stop",
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ],
+        pageInfo: { hasNextPage: true, endCursor: "cursor-1" },
+      },
+      {
+        nodes: [
+          {
+            id: "activity-2",
+            content: {
+              __typename: "AgentActivityFutureContent",
+              body: "future",
+            },
+            signal: "continue",
+            createdAt: "2025-01-01T00:01:00.000Z",
+          },
+        ],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    );
+    const gateway = await getGateway();
+    const activities = await Effect.runPromise(
+      gateway
+        .listSessionActivities({ sessionId })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    expect(activities).toEqual([
+      {
+        id: "activity-1",
+        type: "prompt",
+        body: "hello",
+        title: null,
+        signal: "stop",
+        createdAt: "2025-01-01T00:00:00.000Z",
+      },
+      {
+        id: "activity-2",
+        type: "unknown",
+        body: "future",
+        title: null,
+        signal: "continue",
+        createdAt: "2025-01-01T00:01:00.000Z",
+      },
+    ]);
+  });
+  it("caps activity pagination at ten pages", async () => {
+    sdkState.state.activityPages.push(
+      ...Array.from({ length: 11 }, (_, index) => ({
+        nodes: [
+          {
+            id: `activity-${index}`,
+            content: {
+              __typename: "AgentActivityPromptContent",
+              body: `body-${index}`,
+            },
+            signal: null,
+            createdAt: "2025-01-01T00:00:00.000Z",
+          },
+        ],
+        pageInfo: {
+          hasNextPage: true,
+          endCursor: `cursor-${index}`,
+        },
+      })),
+    );
+    const gateway = await getGateway();
+    const activities = await Effect.runPromise(
+      gateway
+        .listSessionActivities({ sessionId })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    expect(activities).toHaveLength(10);
+    expect(activities.at(-1)?.id).toBe("activity-9");
+  });
   it("forwards persisted activity content and signal metadata verbatim", async () => {
     const gateway = await getGateway();
     const content = {
@@ -461,5 +675,24 @@ describe("LinearGateway parity", () => {
       if (exit.cause._tag === "Fail")
         expect(exit.cause.error).toBeInstanceOf(LinearRateLimitError);
     }
+  });
+});
+
+describe("LinearGateway.createSessionOnIssue", () => {
+  it("creates an agent session on an issue and returns the new session id", async () => {
+    sdkState.reset();
+    const gateway = await getGateway();
+    const newSessionId = await Effect.runPromise(
+      gateway
+        .createSessionOnIssue({
+          organizationId: String(organizationId),
+          issueId: String(issueId),
+        })
+        .pipe(Effect.provide(gatewayLayer)),
+    );
+    expect(newSessionId).toBe("new-session-id");
+    expect(sdkState.state.createdSessionInputs).toEqual([
+      { issueId: String(issueId) },
+    ]);
   });
 });

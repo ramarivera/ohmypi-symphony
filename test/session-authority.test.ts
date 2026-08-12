@@ -3,8 +3,10 @@ import {
   ConfigProvider,
   Context,
   Deferred,
+  Duration,
   Effect,
   Either,
+  Fiber,
   Layer,
   Option,
   Schema,
@@ -12,22 +14,28 @@ import {
 import {
   DatabaseError,
   InterruptedRunNoActionableInputError,
+  LinearApiError,
   NixEnvironmentError,
 } from "../src/domain/errors.js";
 import {
   AppUserId,
   InputId,
+  IssueId,
   OrganizationId,
   SessionId,
   SourceKey,
+  TeamId,
   WorkspaceId,
 } from "../src/domain/ids.js";
 import { type Installation, NixPackageName } from "../src/domain/models.js";
 import { GatewayConfig } from "../src/services/config.js";
+import { LinearGateway } from "../src/services/linear-gateway.js";
 import { NixEnvironment } from "../src/services/nix-environment.js";
 import { ActivityProjector } from "../src/services/projector.js";
 import {
   type RpcEvent,
+  type RpcHostToolCall,
+  type RpcHostToolResult,
   RpcWorker,
   type RpcWorkerHandle,
 } from "../src/services/rpc-worker.js";
@@ -512,6 +520,14 @@ const projectorTerminals: Array<{
   readonly kind: string;
   readonly text: string;
 }> = [];
+const toolExternalUrlCalls: Array<{
+  readonly sessionId: string;
+  readonly urls: ReadonlyArray<{
+    readonly label: string;
+    readonly url: string;
+  }>;
+}> = [];
+let linearIssueLookupFails = false;
 let elicitationWaiter: Deferred.Deferred<void, never> | undefined;
 
 const signalProjection = (): void => {
@@ -558,12 +574,21 @@ const mockProjector = ActivityProjector.make({
 });
 
 const workerPrompts: Array<string> = [];
+let hostToolListener:
+  | ((
+      request: RpcHostToolCall,
+    ) => Effect.Effect<RpcHostToolResult, never, never>)
+  | undefined;
+const orderEvents: Array<string> = [];
 const mockWorker: RpcWorkerHandle = {
   sessionId: Effect.succeed(Option.none()),
   sessionFile: Effect.succeed(Option.none()),
   isStreaming: Effect.succeed(false),
   start: () => Effect.void,
-  stop: () => Effect.void,
+  stop: () =>
+    Effect.sync(() => {
+      orderEvents.push("worker-stopped");
+    }),
   prompt: (message) =>
     Effect.sync(() => {
       workerPrompts.push(message);
@@ -571,6 +596,15 @@ const mockWorker: RpcWorkerHandle = {
     }),
   steer: () => Effect.void,
   followUp: () => Effect.void,
+  setHostTools: () => Effect.void,
+  onHostToolCall: (listener) =>
+    Effect.sync(() => {
+      hostToolListener = listener;
+      return () =>
+        Effect.sync(() => {
+          if (hostToolListener === listener) hostToolListener = undefined;
+        });
+    }),
   abort: () => Effect.void,
   getState: () => Effect.succeed({}),
   respondToUi: () => Effect.void,
@@ -614,6 +648,68 @@ const mockNixEnvironment = NixEnvironment.make({
   prune: () => Effect.succeed(false),
 });
 
+const toolCommentCalls: Array<{
+  readonly sessionId: string;
+  readonly body: string;
+}> = [];
+let commentEnteredSignal: Deferred.Deferred<void> | undefined;
+let commentRelease: Deferred.Deferred<void> | undefined;
+const mockToolsGateway = LinearGateway.make({
+  createActivity: () => Effect.die(new Error("unused in authority tests")),
+  updateSession: () => Effect.die(new Error("unused in authority tests")),
+  createIssueComment: (input) =>
+    Effect.gen(function* () {
+      if (commentEnteredSignal !== undefined) {
+        Deferred.unsafeDone(commentEnteredSignal, Effect.void);
+      }
+      if (commentRelease !== undefined) {
+        yield* Deferred.await(commentRelease);
+      }
+      toolCommentCalls.push(input);
+      orderEvents.push("comment-completed");
+      return `comment-${toolCommentCalls.length}`;
+    }),
+  refreshInstallation: () => Effect.die(new Error("unused in authority tests")),
+  listSessionActivities: () =>
+    Effect.die(new Error("unused in authority tests")),
+  getIssue: () =>
+    linearIssueLookupFails
+      ? Effect.fail(
+          new LinearApiError({
+            message: "issue lookup unavailable",
+            operation: "getIssue",
+          }),
+        )
+      : Effect.succeed({
+          id: "issue-1",
+          identifier: "AUTH-1",
+          title: "Authority issue",
+          description: null,
+          stateId: "state-started",
+          stateName: "In Progress",
+          stateType: "started",
+          delegateId: "authority-app-user",
+          url: null,
+          teamId: null,
+          labels: [],
+        }),
+  updateIssue: () => Effect.void,
+  addSessionExternalUrls: (input: {
+    readonly sessionId: string;
+    readonly urls: ReadonlyArray<{
+      readonly label: string;
+      readonly url: string;
+    }>;
+  }) =>
+    Effect.sync(() => {
+      toolExternalUrlCalls.push(input);
+    }),
+  teamStartedStates: () => Effect.succeed([]),
+  repositorySuggestions: () => Effect.succeed([]),
+  createSessionOnIssue: () =>
+    Effect.die(new Error("unused in authority tests")),
+});
+
 const withAuthority = <A, E>(
   effect: (
     db: SqliteClientShape["db"],
@@ -628,11 +724,15 @@ const withAuthority = <A, E>(
     | WorkspaceRepo
     | NixEnvironment
   >,
+  options?: { readonly withLinearGateway?: boolean },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
+      linearIssueLookupFails = false;
+      toolExternalUrlCalls.length = 0;
       terminalFailure = undefined;
       workerEventListener = undefined;
+      hostToolListener = undefined;
       projectionWaiter = undefined;
       elicitationWaiter = undefined;
       projectionExpected = 0;
@@ -644,6 +744,10 @@ const withAuthority = <A, E>(
       nixPathEntries = [];
       nixPrepareError = undefined;
       projectorTerminals.length = 0;
+      toolCommentCalls.length = 0;
+      orderEvents.length = 0;
+      commentEnteredSignal = undefined;
+      commentRelease = undefined;
       const sqliteContext = yield* Layer.build(SqliteClientLive(":memory:"));
       const sqlite = Context.get(sqliteContext, SqliteClient);
       const dependencies = Layer.mergeAll(
@@ -657,6 +761,9 @@ const withAuthority = <A, E>(
         Layer.succeed(ActivityProjector, mockProjector),
         Layer.succeed(RpcWorker, mockRpcWorker),
         Layer.succeed(NixEnvironment, mockNixEnvironment),
+        ...(options?.withLinearGateway === true
+          ? [Layer.succeed(LinearGateway, mockToolsGateway)]
+          : []),
       ).pipe(
         Layer.provide(
           Layer.mergeAll(
@@ -675,6 +782,7 @@ const withAuthority = <A, E>(
   );
 
 const testSessionId = Schema.decodeUnknownSync(SessionId)("authority-session");
+const testIssueId = Schema.decodeUnknownSync(IssueId)("authority-issue");
 const testOrganizationId = Schema.decodeUnknownSync(OrganizationId)(
   "authority-organization",
 );
@@ -688,6 +796,127 @@ const install = (organizationId: OrganizationId): Installation => ({
   revokedAt: Option.none(),
   accessibleTeamIds: Option.none(),
   canAccessAllPublicTeams: Option.none(),
+});
+
+describe("SessionAuthority team-access gate", () => {
+  it.scopedLive(
+    "proceeds when the installation team-access snapshot is unknown (null)",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const teamId = Schema.decodeUnknownSync(TeamId)("authority-team");
+          // install() leaves accessibleTeamIds/canAccessAllPublicTeams unset
+          // (Option.none) — an unknown snapshot must not cancel teamed runs;
+          // Linear enforces access server-side.
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+            teamId: Option.some(teamId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/team-access-unknown"),
+            ompSessionFile: Option.some(
+              "/tmp/team-access-unknown/session.jsonl",
+            ),
+          });
+
+          yield* authority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(1);
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.terminalReason).not.toEqual(
+              Option.some("Linear team access was removed"),
+            );
+          }
+        }),
+      ),
+  );
+
+  it.scopedLive("cancels when a known snapshot excludes the run's team", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const installationRepo = yield* InstallationRepo;
+        const runRepo = yield* RunRepo;
+        const teamId = Schema.decodeUnknownSync(TeamId)("authority-team");
+        yield* installationRepo.put({
+          ...install(testOrganizationId),
+          accessibleTeamIds: Option.some([]),
+          canAccessAllPublicTeams: Option.some(false),
+        });
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.some(testIssueId),
+          teamId: Option.some(teamId),
+        });
+        yield* runRepo.update(testSessionId, {
+          state: "orphaned",
+          workspacePath: Option.some("/tmp/team-access-known"),
+          ompSessionFile: Option.some("/tmp/team-access-known/session.jsonl"),
+        });
+
+        yield* authority.processSession(testSessionId);
+        expect(workerSpawnInputs).toHaveLength(0);
+        const run = yield* runRepo.get(testSessionId);
+        expect(Option.isSome(run)).toBe(true);
+        if (Option.isSome(run)) {
+          expect(run.value.state).toBe("canceled");
+          expect(run.value.terminalReason).toEqual(
+            Option.some("Linear team access was removed"),
+          );
+        }
+      }),
+    ),
+  );
+  it.scopedLive(
+    "cancels when only the public-team access snapshot is known and false",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const teamId = Schema.decodeUnknownSync(TeamId)("authority-team");
+          yield* installationRepo.put({
+            ...install(testOrganizationId),
+            accessibleTeamIds: Option.none(),
+            canAccessAllPublicTeams: Option.some(false),
+          });
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+            teamId: Option.some(teamId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/team-access-partial"),
+            ompSessionFile: Option.some(
+              "/tmp/team-access-partial/session.jsonl",
+            ),
+          });
+
+          yield* authority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(0);
+          const run = yield* runRepo.get(testSessionId);
+          expect(Option.isSome(run)).toBe(true);
+          if (Option.isSome(run)) {
+            expect(run.value.state).toBe("canceled");
+            expect(run.value.terminalReason).toEqual(
+              Option.some("Linear team access was removed"),
+            );
+          }
+        }),
+      ),
+  );
 });
 
 describe("SessionAuthority infrastructure failures", () => {
@@ -866,6 +1095,295 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 });
+describe("SessionAuthority deferred stop handling", () => {
+  it.scopedLive(
+    "skips a deferred stop after repeated lookup failures instead of canceling",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const installationRepo = yield* InstallationRepo;
+            const runRepo = yield* RunRepo;
+            const runInputRepo = yield* RunInputRepo;
+            linearIssueLookupFails = true;
+            yield* installationRepo.put(install(testOrganizationId));
+            yield* runRepo.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.some(testIssueId),
+            });
+            yield* runRepo.update(testSessionId, {
+              state: "orphaned",
+              workspacePath: Option.some("/tmp/deferred-stop"),
+              ompSessionFile: Option.some("/tmp/deferred-stop/session.jsonl"),
+            });
+            const inputId = Schema.decodeUnknownSync(InputId)(
+              "deferred-stop-input",
+            );
+            yield* runInputRepo.enqueue({
+              id: inputId,
+              sessionId: testSessionId,
+              kind: "stop",
+              body: "Linear issue status changed",
+              payload: {
+                type: "AppUserNotification",
+                action: "issueStatusChanged",
+                notification: { issueId: "issue-1" },
+              },
+            });
+
+            for (let attempt = 0; attempt < 10; attempt += 1) {
+              yield* authority.processSession(testSessionId);
+            }
+
+            const pending = yield* runInputRepo.pending(testSessionId);
+            expect(pending).toHaveLength(0);
+            const run = yield* runRepo.get(testSessionId);
+            expect(Option.isSome(run)).toBe(true);
+            if (Option.isSome(run)) {
+              expect(run.value.state).not.toBe("canceled");
+              expect(run.value.desiredState).toBe("running");
+            }
+          }),
+        { withLinearGateway: true },
+      ),
+  );
+});
+describe("SessionAuthority host-tool mutation gate", () => {
+  it.scopedLive("refuses mutating host tools once the run is canceled", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/mutation-gate"),
+            ompSessionFile: Option.some("/tmp/mutation-gate/session.jsonl"),
+          });
+
+          yield* authority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(1);
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
+
+          const allowed = yield* listener({
+            id: "call-allowed",
+            toolCallId: "tool-1",
+            toolName: "linear_create_comment",
+            arguments: { body: "first" },
+          });
+          expect(allowed.isError).not.toBe(true);
+          expect(toolCommentCalls).toHaveLength(1);
+
+          // Stop dominance: desired_state flips to canceled, then the
+          // in-gate re-read must refuse further mutations.
+          yield* runInputRepo.applyStop(testSessionId);
+          const refused = yield* listener({
+            id: "call-refused",
+            toolCallId: "tool-2",
+            toolName: "linear_create_comment",
+            arguments: { body: "second" },
+          });
+          expect(refused.isError).toBe(true);
+          expect(toolCommentCalls).toHaveLength(1);
+
+          // Read tools still work after cancellation.
+          const read = yield* listener({
+            id: "call-read",
+            toolCallId: "tool-3",
+            toolName: "linear_get_issue",
+            arguments: { issueId: "issue-1" },
+          });
+          expect(read.isError).not.toBe(true);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
+  it.scopedLive("normalizes external URLs before sending", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/external-url"),
+            ompSessionFile: Option.some("/tmp/external-url/session.jsonl"),
+          });
+          yield* authority.processSession(testSessionId);
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
+
+          const result = yield* listener({
+            id: "call-url",
+            toolCallId: "tool-url",
+            toolName: "linear_add_external_url",
+            arguments: {
+              label: "Pull request",
+              url: "  https://github.com/acme/project/pull/42  ",
+            },
+          });
+          expect(result.isError).not.toBe(true);
+          expect(toolExternalUrlCalls).toEqual([
+            {
+              sessionId: testSessionId,
+              urls: [
+                {
+                  label: "Pull request",
+                  url: "https://github.com/acme/project/pull/42",
+                },
+              ],
+            },
+          ]);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
+
+  it.scopedLive(
+    "reports a pull request from the saved assistant draft at agent end",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const installationRepo = yield* InstallationRepo;
+            const runRepo = yield* RunRepo;
+            yield* installationRepo.put(install(testOrganizationId));
+            yield* runRepo.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.some(testIssueId),
+            });
+            yield* runRepo.update(testSessionId, {
+              state: "orphaned",
+              workspacePath: Option.some("/tmp/pr-draft"),
+              ompSessionFile: Option.some("/tmp/pr-draft/session.jsonl"),
+            });
+            yield* authority.processSession(testSessionId);
+            expect(workerEventListener).toBeDefined();
+            if (workerEventListener === undefined) return;
+
+            const projected = yield* Deferred.make<void>();
+            projectionWaiter = projected;
+            projectionExpected = 2;
+            workerEventListener({
+              type: "message_end",
+              message: {
+                role: "assistant",
+                content:
+                  "Opened https://github.com/acme/project/pull/42 for review.",
+              },
+            });
+            workerEventListener({ type: "agent_end" });
+            yield* Deferred.await(projected);
+
+            expect(toolExternalUrlCalls).toEqual([
+              {
+                sessionId: testSessionId,
+                urls: [
+                  {
+                    label: "Pull request",
+                    url: "https://github.com/acme/project/pull/42",
+                  },
+                ],
+              },
+            ]);
+          }),
+        { withLinearGateway: true },
+      ),
+  );
+
+  it.scopedLive("cancel waits for an in-flight mutation holding the gate", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const installationRepo = yield* InstallationRepo;
+          const runRepo = yield* RunRepo;
+          const runInputRepo = yield* RunInputRepo;
+          yield* installationRepo.put(install(testOrganizationId));
+          yield* runRepo.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+          });
+          yield* runRepo.update(testSessionId, {
+            state: "orphaned",
+            workspacePath: Option.some("/tmp/mutation-gate-order"),
+            ompSessionFile: Option.some(
+              "/tmp/mutation-gate-order/session.jsonl",
+            ),
+          });
+          yield* authority.processSession(testSessionId);
+          const listener = hostToolListener;
+          expect(listener).toBeDefined();
+          if (listener === undefined) return;
+
+          // Block the mutation inside the gateway's Linear call while it
+          // holds the session gate.
+          commentEnteredSignal = yield* Deferred.make<void>();
+          commentRelease = yield* Deferred.make<void>();
+          const mutationFiber = yield* Effect.fork(
+            listener({
+              id: "call-blocked",
+              toolCallId: "tool-blocked",
+              toolName: "linear_create_comment",
+              arguments: { body: "in-flight" },
+            }),
+          );
+          yield* Deferred.await(commentEnteredSignal);
+
+          // A user stop arrives; processSession must not reach
+          // worker.stop until the in-flight mutation releases the gate.
+          yield* runInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)(
+              `${testSessionId}:stop:stop-1`,
+            ),
+            sessionId: testSessionId,
+            kind: "stop",
+            body: "Stop requested",
+            payload: {},
+          });
+          const cancelFiber = yield* Effect.fork(
+            authority.processSession(testSessionId),
+          );
+          for (let attempt = 0; attempt < 200; attempt += 1) {
+            if (Option.isSome(yield* Fiber.poll(cancelFiber))) break;
+            yield* Effect.sleep(Duration.millis(10));
+          }
+          expect(Option.isNone(yield* Fiber.poll(cancelFiber))).toBe(true);
+          expect(orderEvents).not.toContain("worker-stopped");
+
+          Deferred.unsafeDone(commentRelease, Effect.void);
+          yield* Fiber.await(mutationFiber);
+          yield* Fiber.await(cancelFiber);
+          expect(orderEvents).toEqual(["comment-completed", "worker-stopped"]);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
+});
+
 describe("SessionAuthority Nix environment preparation", () => {
   it.scopedLive(
     "prepares repository dependencies before the first worker and its orphan retry",

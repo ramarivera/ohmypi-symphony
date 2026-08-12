@@ -156,6 +156,39 @@ describe("GatewayConfig", () => {
     );
     expect(Either.isLeft(result)).toBe(true);
   });
+  test("rejects a blank repository suggestion confidence threshold", async () => {
+    const result = await Effect.runPromise(
+      configResult(
+        valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", " ​ "]]),
+      ),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+  });
+  test("rejects empty and whitespace-only confidence thresholds", async () => {
+    for (const blank of ["", "   "]) {
+      const result = await Effect.runPromise(
+        configResult(
+          valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", blank]]),
+        ),
+      );
+      expect(Either.isLeft(result), JSON.stringify(blank)).toBe(true);
+    }
+  });
+
+  test("rejects malformed positive-integer settings instead of truncating", async () => {
+    for (const malformed of ["5m", "1e3", "1.5", "-3", ""]) {
+      for (const name of [
+        "RECONCILER_CATCHUP_INTERVAL_MS",
+        "RECONCILER_CATCHUP_MIN_AGE_MS",
+        "LEASE_DURATION_MS",
+      ]) {
+        const result = await Effect.runPromise(
+          configResult(valuesWith([[name, malformed]])),
+        );
+        expect(Either.isLeft(result), `${name}=${malformed}`).toBe(true);
+      }
+    }
+  });
 
   test("wraps all secret values in Redacted", async () => {
     const config = await Effect.runPromise(
@@ -260,8 +293,12 @@ describe("GatewayConfig", () => {
     ({ field, value }) =>
       Effect.gen(function* () {
         const result = yield* configResult(valuesWith([[field, value]]));
-        const parsed = Number.parseInt(value, 10);
-        const valid = Number.isSafeInteger(parsed) && parsed > 0;
+        // Strict digit-only contract: "1.5" and other truncatable forms
+        // are rejected, not silently parsed.
+        const valid =
+          /^\d+$/u.test(value) &&
+          Number.isSafeInteger(Number(value)) &&
+          Number(value) > 0;
         expect(Either.isRight(result)).toBe(valid);
       }),
     { fastCheck: { numRuns: 20 } },

@@ -51,6 +51,9 @@ const resetMock = () => {
 
 let runCounter = 0;
 
+const unused = (..._args: ReadonlyArray<unknown>) =>
+  Effect.die(new Error("not used in projector tests"));
+
 const mockLinear = LinearGateway.make({
   createActivity: (input) =>
     Effect.gen(function* () {
@@ -74,6 +77,13 @@ const mockLinear = LinearGateway.make({
       }
       return `activity-${mockState.activities.length}`;
     }),
+  listSessionActivities: unused,
+  getIssue: unused,
+  updateIssue: unused,
+  addSessionExternalUrls: unused,
+  teamStartedStates: unused,
+  repositorySuggestions: unused,
+  createSessionOnIssue: unused,
   updateSession: (input) =>
     Effect.gen(function* () {
       mockState.updates.push(input);

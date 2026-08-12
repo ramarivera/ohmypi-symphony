@@ -118,10 +118,13 @@ ${ADMIN_SCRIPT}`,
  * Render a public, redacted run-observability page. The document uses the
  * shared theme bootstrap and styles so it retains the operator's appearance.
  */
-export function renderRunDetailPage(model: RunDetailModel): string {
+export function renderRunDetailPage(
+  model: RunDetailModel,
+  csrfToken: string | null = null,
+): string {
   return renderDocument({
     title: `OhMyPi run ${model.run.sessionId}`,
-    body: renderRunDetailBody(model),
+    body: renderRunDetailBody(model, csrfToken),
     script: `${THEME_SCRIPT}
 ${RUN_DETAIL_SCRIPT}`,
     extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,

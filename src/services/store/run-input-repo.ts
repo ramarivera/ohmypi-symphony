@@ -2,7 +2,11 @@ import { Clock, Effect, Option, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type { InputId } from "../../domain/ids.js";
 import { SessionId, SourceKey } from "../../domain/ids.js";
-import { InputKind, RunInput } from "../../domain/models.js";
+import {
+  InputKind,
+  isDeferredNotificationStopPayload,
+  RunInput,
+} from "../../domain/models.js";
 import { RunEventRepo } from "./run-event-repo.js";
 import {
   decodeRow,
@@ -97,6 +101,31 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           return Option.some(yield* decodeRow(RunRowState, row, "AgentRun"));
         });
 
+      const isDeferredNotificationStop = (input: {
+        readonly kind: InputKind;
+        readonly payload: unknown;
+      }): boolean =>
+        input.kind === "stop" &&
+        isDeferredNotificationStopPayload(input.payload);
+
+      const applyStop = Effect.fn("RunInputRepo.applyStop")(function* (
+        sessionId: SessionId,
+        at?: number,
+      ): Effect.fn.Return<void, DatabaseError> {
+        const createdAt = at ?? (yield* Clock.currentTimeMillis);
+        yield* tryDb(
+          () =>
+            db
+              .query(`
+                UPDATE agent_run SET desired_state='canceled',
+                  state=CASE WHEN state IN ('queued','waiting') THEN 'stopping' ELSE state END, updated_at=?
+                WHERE session_id=?
+              `)
+              .run(createdAt, sessionId),
+          "RunInputRepo.applyStop",
+        );
+      });
+
       const enqueue = Effect.fn("RunInputRepo.enqueue")(function* (input: {
         readonly id: InputId;
         readonly sessionId: SessionId;
@@ -170,18 +199,8 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
             );
           }
 
-          if (input.kind === "stop") {
-            yield* tryDb(
-              () =>
-                db
-                  .query(`
-                    UPDATE agent_run SET desired_state='canceled',
-                      state=CASE WHEN state IN ('queued','waiting') THEN 'stopping' ELSE state END, updated_at=?
-                    WHERE session_id=?
-                  `)
-                  .run(createdAt, input.sessionId),
-              "RunInputRepo.enqueue.stop",
-            );
+          if (input.kind === "stop" && !isDeferredNotificationStop(input)) {
+            yield* applyStop(input.sessionId, createdAt);
           }
 
           return inserted;
@@ -212,18 +231,23 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
 
       const latestActionableInput = Effect.fn(
         "RunInputRepo.latestActionableInput",
-      )(function* (
-        sessionId: SessionId,
-      ): Effect.fn.Return<
-        Option.Option<{ readonly body: string; readonly kind: InputKind }>,
+      )(function* (sessionId: SessionId): Effect.fn.Return<
+        Option.Option<{
+          readonly body: string;
+          readonly kind: InputKind;
+          readonly payload: unknown;
+        }>,
         DatabaseError
       > {
         yield* Effect.annotateCurrentSpan("sessionId", sessionId);
         const row = yield* tryDb(
           () =>
             db
-              .query<{ body: string; kind: InputKind }, [string]>(`
-                SELECT body, kind FROM run_input
+              .query<
+                { body: string; kind: InputKind; payload_json: string },
+                [string]
+              >(`
+                SELECT body, kind, payload_json FROM run_input
                 WHERE session_id=? AND kind!='stop'
                 ORDER BY created_at DESC, id DESC
                 LIMIT 1
@@ -232,7 +256,14 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
           "RunInputRepo.latestActionableInput",
         );
         if (row === null) return Option.none();
-        return Option.some({ body: row.body, kind: row.kind });
+        const payload = yield* Effect.try({
+          try: () => JSON.parse(row.payload_json) as unknown,
+          catch: () =>
+            new DatabaseError({
+              message: "Invalid JSON in run_input.payload_json",
+            }),
+        });
+        return Option.some({ body: row.body, kind: row.kind, payload });
       });
 
       const listSessionsWithPendingInputs = Effect.fn(
@@ -276,6 +307,7 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
 
       return {
         enqueue,
+        applyStop,
         pending,
         latestActionableInput,
         listSessionsWithPendingInputs,

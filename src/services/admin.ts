@@ -19,8 +19,14 @@ import {
   type TokenCipherError,
   type WorkspaceError,
 } from "../domain/errors.js";
-import type { OrganizationId } from "../domain/ids.js";
-import { ProjectId, SessionId, TeamId, WorkspaceId } from "../domain/ids.js";
+import {
+  InputId,
+  type OrganizationId,
+  ProjectId,
+  SessionId,
+  TeamId,
+  WorkspaceId,
+} from "../domain/ids.js";
 import type {
   AgentRun,
   Installation,
@@ -31,12 +37,14 @@ import type {
 } from "../domain/models.js";
 import { normalizeNixPackages } from "../domain/models.js";
 import { GatewayConfig, type GatewayConfigShape } from "./config.js";
+import { LinearGateway } from "./linear-gateway.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { Reconciler, type ReconcilerStatus } from "./reconciler.js";
 import {
   AdminSessionRepo,
   InstallationRepo,
   RunEventRepo,
+  RunInputRepo,
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
@@ -79,6 +87,10 @@ export interface AdminDeps {
   readonly installationRepo: InstallationRepo;
   readonly runRepo: RunRepo;
   readonly runEventRepo: RunEventRepo;
+  readonly runInputRepo: RunInputRepo;
+  readonly linearGateway: {
+    readonly createSessionOnIssue: LinearGateway["createSessionOnIssue"];
+  };
   readonly workspaceRepo: WorkspaceRepo;
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
@@ -100,7 +112,7 @@ class AdminError extends Schema.TaggedError<AdminError>()(
   "@Gateway/AdminError",
   {
     message: Schema.String,
-    status: Schema.Literal(400, 401, 403, 404, 409, 500),
+    status: Schema.Literal(400, 401, 403, 404, 409, 429, 500),
   },
 ) {}
 
@@ -630,6 +642,28 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const run = runOption.value;
         const events = yield* deps.runEventRepo.list(sessionId);
         const model = runDetailModel(run, events);
+
+        const rawToken = findCookieValue(request, ADMIN_COOKIE);
+        const adminSession =
+          rawToken === null
+            ? Option.none()
+            : yield* deps.adminSessionRepo.get(tokenHash(rawToken), now).pipe(
+                Effect.catchAll((error) =>
+                  Effect.logWarning("admin.session_lookup_failed").pipe(
+                    Effect.annotateLogs({
+                      sessionId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    }),
+                    Effect.as(Option.none()),
+                  ),
+                ),
+              );
+        const csrfToken = Option.match(adminSession, {
+          onNone: () => null,
+          onSome: () => deriveCsrfToken(rawToken ?? ""),
+        });
+
         const acceptsJson =
           request.headers.get("accept")?.includes("application/json") ?? false;
         const detail = {
@@ -642,10 +676,149 @@ export const createAdminHandle = (deps: AdminDeps) =>
         return Option.some(
           isJsonPath || acceptsJson
             ? json(detail)
-            : html(renderRunDetailPage(model)),
+            : html(renderRunDetailPage(model, csrfToken)),
         );
       }
 
+      const rerunMatch = /^\/api\/admin\/runs\/([^/]+)\/rerun$/u.exec(
+        url.pathname,
+      );
+      if (rerunMatch !== null && request.method === "POST") {
+        const rawSessionId = decodeURIComponent(rerunMatch[1] ?? "");
+        const sessionId = yield* Schema.decodeUnknown(SessionId)(
+          rawSessionId,
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({ message: "Invalid run id", status: 400 }),
+              ),
+          }),
+        );
+        const adminSession = yield* requireMutation(request);
+        const runOption = yield* deps.runRepo.get(sessionId);
+        if (Option.isNone(runOption)) {
+          return Option.some(text("Not found", 404));
+        }
+        const run = runOption.value;
+        // Scope to the authenticated admin's organization: a valid admin
+        // session for org A must not drive runs (or spend tokens) of org B.
+        // 404 rather than 403 so cross-org run ids are not confirmable.
+        if (run.organizationId !== adminSession.organizationId) {
+          return Option.some(text("Not found", 404));
+        }
+        if (Option.isNone(run.issueId)) {
+          return Option.some(text("Run is not linked to an issue", 409));
+        }
+        if (
+          run.state !== "succeeded" &&
+          run.state !== "failed" &&
+          run.state !== "canceled"
+        ) {
+          return Option.some(text("Run is not terminal", 409));
+        }
+        const issueId = run.issueId.value;
+        const hasActiveRun = yield* deps.runRepo.hasActiveForIssue({
+          organizationId: run.organizationId,
+          issueId,
+        });
+        if (hasActiveRun) {
+          return Option.some(
+            text("A run for this issue is already active", 409),
+          );
+        }
+        const newSessionId = yield* deps.linearGateway
+          .createSessionOnIssue({
+            organizationId: run.organizationId,
+            issueId,
+          })
+          .pipe(
+            Effect.mapError((error) => {
+              if (error._tag === "@Gateway/LinearRateLimitError") {
+                const retry =
+                  error.retryAfterMs === undefined
+                    ? ""
+                    : ` Retry after ${error.retryAfterMs}ms.`;
+                return new AdminError({
+                  message: `Could not create Linear agent session: ${error.message}.${retry}`,
+                  status: 429,
+                });
+              }
+              return new AdminError({
+                message: `Could not create Linear agent session: ${error.message}`,
+                status: 500,
+              });
+            }),
+          );
+        const newRunSessionId = yield* Schema.decodeUnknown(SessionId)(
+          newSessionId,
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid session id from Linear",
+                  status: 500,
+                }),
+              ),
+          }),
+        );
+        const rerunStatus = yield* deps.runRepo.createIfNoActiveForIssue({
+          sessionId: newRunSessionId,
+          organizationId: run.organizationId,
+          issueId: Option.some(issueId),
+          repositoryId: run.repositoryId,
+          teamId: run.teamId,
+          projectId: run.projectId,
+        });
+        if (rerunStatus === "active") {
+          return Option.some(
+            text("A run for this issue is already active", 409),
+          );
+        }
+        const rerunCreatedAt = yield* Clock.currentTimeMillis;
+        const inputId = yield* Schema.decodeUnknown(InputId)(
+          `${newSessionId}:created`,
+        ).pipe(
+          Effect.catchTags({
+            ParseError: () =>
+              Effect.fail(
+                new AdminError({ message: "Invalid input id", status: 500 }),
+              ),
+          }),
+        );
+        const body = `User request:\nWork on the issue below.\n\nIssue context:\nIssue: ${issueId}`;
+        yield* deps.runInputRepo.enqueue({
+          id: inputId,
+          sessionId: newRunSessionId,
+          kind: "created",
+          body,
+          payload: {
+            type: "AgentSessionEvent",
+            action: "created",
+            organizationId: run.organizationId,
+            ...(Option.isSome(run.repositoryId)
+              ? { repositoryId: run.repositoryId.value }
+              : {}),
+            automationDelegated: false,
+            appUserId: "synthetic",
+            oauthClientId: "synthetic",
+            webhookId: "synthetic",
+            webhookTimestamp: rerunCreatedAt,
+            agentSession: {
+              id: newSessionId,
+              appUserId: "synthetic",
+              organizationId: run.organizationId,
+              status: "pending",
+              createdAt: rerunCreatedAt,
+              updatedAt: rerunCreatedAt,
+              issueId,
+            },
+          },
+          createdAt: rerunCreatedAt,
+        });
+        return Option.some(json({ sessionId: newSessionId }));
+      }
       if (url.pathname === "/api/admin/bootstrap" && request.method === "GET") {
         const session = yield* requireSession(request);
         const installation = yield* deps.installationRepo.get(
@@ -950,6 +1123,8 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     InstallationRepo.Default,
     RunRepo.Default,
     RunEventRepo.Default,
+    RunInputRepo.Default,
+    LinearGateway.Default,
     WorkspaceRepo.Default,
     Workspace.Default,
     Reconciler.Default,
@@ -965,12 +1140,16 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     const workspace = yield* Workspace;
     const reconciler = yield* Reconciler;
     const nixEnvironment = yield* NixEnvironment;
+    const runInputRepo = yield* RunInputRepo;
+    const linearGateway = yield* LinearGateway;
     const handle = createAdminHandle({
       config,
       adminSessionRepo,
       installationRepo,
       runRepo,
       runEventRepo,
+      runInputRepo,
+      linearGateway,
       workspaceRepo,
       workspace,
       reconciler,

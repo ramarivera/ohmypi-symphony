@@ -52,6 +52,7 @@ describe("HTTP router parity", () => {
     const reconciler: Reconciler = {
       _tag: "Reconciler",
       tick: () => Effect.succeed(undefined),
+      catchup: () => Effect.void,
       trigger: () => Effect.void,
       awaitTrigger: () => Effect.never,
       status: () =>
@@ -87,6 +88,7 @@ describe("HTTP router parity", () => {
     const reconciler: Reconciler = {
       _tag: "Reconciler",
       tick: () => Effect.void,
+      catchup: () => Effect.void,
       trigger: () =>
         Effect.sync(() => {
           triggerCalls += 1;
@@ -127,6 +129,7 @@ describe("HTTP router parity", () => {
       const reconciler: Reconciler = {
         _tag: "Reconciler",
         tick: () => Effect.void,
+        catchup: () => Effect.void,
         trigger: () =>
           Effect.sync(() => {
             triggerCalls += 1;
@@ -253,7 +256,10 @@ describe("HTTP router parity", () => {
       port: 3000,
       leaseDurationMs: 60_000,
       reconcilerIntervalMs: 1_000,
+      reconcilerCatchupIntervalMs: 300_000,
+      reconcilerCatchupMinAgeMs: 120_000,
       webhookReplayWindowMs: 60_000,
+      repositorySuggestionConfidenceThreshold: 0.8,
     };
     const adminSessionRepo: AdminSessionRepo = {
       _tag: "AdminSessionRepo",
@@ -336,7 +342,10 @@ describe("HTTP router parity", () => {
           port: 3000,
           leaseDurationMs: 60_000,
           reconcilerIntervalMs: 1_000,
+          reconcilerCatchupIntervalMs: 300_000,
+          reconcilerCatchupMinAgeMs: 120_000,
           webhookReplayWindowMs: 60_000,
+          repositorySuggestionConfidenceThreshold: 0.8,
         }),
         Effect.provideService(AdminSessionRepo, {
           _tag: "AdminSessionRepo",

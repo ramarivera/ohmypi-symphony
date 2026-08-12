@@ -43,6 +43,21 @@ while (true) {
 }
 `;
 
+const ignoresStdinCloseFixture = String.raw`
+const marker = Bun.env.STOP_MARKER;
+process.stdout.write(JSON.stringify({
+  type: "ready",
+  protocolVersion: 1,
+  supportedProtocolVersions: [1],
+}) + "\n");
+process.on("SIGTERM", async () => {
+  if (marker) await Bun.write(marker, "signal");
+  await Bun.sleep(100);
+  if (marker) await Bun.write(marker, "exited");
+  process.exit(0);
+});
+await Bun.sleep(60_000);
+`;
 describe("RpcWorker", () => {
   const Live = RpcWorker.Default;
 
@@ -179,6 +194,23 @@ describe("RpcWorker", () => {
       yield* worker.abort();
       yield* worker.stop();
       yield* worker.stop();
+    }).pipe(Effect.provide(Live)),
+  );
+  it.effect("escalates when stdin close does not stop the process", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const marker = `/tmp/omp-rpc-stop-${Date.now()}-${Math.random()}`;
+      const worker = yield* rpc.spawn({
+        command: ["bun", "-e", ignoresStdinCloseFixture],
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH, STOP_MARKER: marker },
+      });
+      yield* worker.start();
+      yield* worker.stop();
+      const markerValue = yield* Effect.tryPromise(() =>
+        Bun.file(marker).text(),
+      );
+      expect(markerValue).toBe("exited");
     }).pipe(Effect.provide(Live)),
   );
 

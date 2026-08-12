@@ -21,8 +21,13 @@ import type {
   AgentSessionActivity as AgentSessionActivityType,
   AgentSessionEvent as AgentSessionEventType,
   AgentSessionIssue as AgentSessionIssueType,
+  AppUserNotification as AppUserNotificationType,
 } from "../domain/models.js";
-import { AgentSessionEvent } from "../domain/models.js";
+import {
+  AgentSessionEvent,
+  APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION,
+  AppUserNotification,
+} from "../domain/models.js";
 import { GatewayConfig } from "./config.js";
 import {
   isNumber,
@@ -76,6 +81,16 @@ export const verifySignature = (
 
 export const payloadHash = (rawBody: Uint8Array): string =>
   createHash("sha256").update(rawBody).digest("hex");
+
+// Linear reports the OAuth client id in two forms: the console client_id
+// (hex, used by the OAuth flow) in AgentSessionEvent payloads, and the
+// dashed-UUID form of the same client in PermissionChange payloads. Compare
+// normalized forms; the client id is an identifier, not a secret.
+const normalizeClientId = (value: string): string =>
+  value.replaceAll("-", "").toLowerCase();
+
+const clientIdMatches = (received: string, configured: string): boolean =>
+  normalizeClientId(received) === normalizeClientId(configured);
 
 const buildFallbackDeliveryId = (
   parsed: Record<string, unknown>,
@@ -218,6 +233,17 @@ const resolveTeamAndProject = (
   const projectId = issue?.projectId ?? fallback.projectId ?? null;
   return { teamId, projectId };
 };
+const automationDelegatedPayload = (
+  event: AgentSessionEventType,
+  rawAgentSession: unknown,
+): AgentSessionEventType & { readonly automationDelegated: boolean } => {
+  const raw = isRecord(rawAgentSession) ? rawAgentSession : {};
+  const creator = raw.creator;
+  const creatorPresent =
+    (isString(raw.creatorId) && raw.creatorId.length > 0) ||
+    (isRecord(creator) && isString(creator.id) && creator.id.length > 0);
+  return { ...event, automationDelegated: !creatorPresent };
+};
 
 const validateAgentSessionIdentity = (
   event: AgentSessionEventType,
@@ -229,10 +255,10 @@ const validateAgentSessionIdentity = (
   never
 > =>
   Effect.gen(function* () {
-    if (event.oauthClientId !== config.linearClientId) {
+    if (!clientIdMatches(event.oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
-          message: "OAuth client identity mismatch",
+          message: `OAuth client identity mismatch (received ${event.oauthClientId})`,
         }),
       );
     }
@@ -330,6 +356,7 @@ const handleAgentSessionEvent = (
     );
     const teamIdOption = yield* decodeOptionalBrand(teamId, TeamId);
     const projectIdOption = yield* decodeOptionalBrand(projectId, ProjectId);
+    const persistedPayload = automationDelegatedPayload(event, rawAgentSession);
 
     yield* runRepo.create({
       sessionId,
@@ -359,7 +386,7 @@ const handleAgentSessionEvent = (
         sessionId,
         kind: "created",
         body,
-        payload: event,
+        payload: persistedPayload,
         createdAt: timestamp,
       });
       return;
@@ -404,7 +431,7 @@ const handleAgentSessionEvent = (
         sessionId,
         kind,
         body,
-        payload: event,
+        payload: persistedPayload,
         createdAt: timestamp,
       });
       return;
@@ -432,7 +459,7 @@ const handleAgentSessionEvent = (
         sessionId,
         kind: "stop",
         body,
-        payload: event,
+        payload: persistedPayload,
         createdAt: timestamp,
       });
       return;
@@ -462,10 +489,10 @@ const validateOAuthAppPayload = (
         }),
       );
     }
-    if (oauthClientId !== config.linearClientId) {
+    if (!clientIdMatches(oauthClientId, config.linearClientId)) {
       return yield* Effect.fail(
         new WebhookIdentityError({
-          message: "OAuth client identity mismatch",
+          message: `OAuth client identity mismatch (received ${oauthClientId})`,
         }),
       );
     }
@@ -534,10 +561,18 @@ const validatePermissionChangePayload = (
       );
     }
 
-    if (oauthClientId !== config.linearClientId) {
-      return yield* Effect.fail(
-        new WebhookIdentityError({
-          message: "OAuth client identity mismatch",
+    // Live evidence (2026-08-11): PermissionChange payloads report the OAuth
+    // client's internal UUID, NOT the console client_id carried by
+    // AgentSessionEvent/AppUserNotification payloads — the two identifiers
+    // share no hex, so a direct comparison can never match. The HMAC
+    // signature is the auth boundary; the organization + appUserId checks
+    // below pin the tenant and app. Log the observed form for visibility.
+    if (!clientIdMatches(oauthClientId, config.linearClientId)) {
+      yield* Effect.logInfo("webhook.permissionChange.client_id_form").pipe(
+        Effect.annotateLogs({
+          event: "webhook.permissionChange.client_id_form",
+          oauthClientId,
+          organizationId,
         }),
       );
     }
@@ -622,6 +657,186 @@ const handlePermissionChange = (
       removedTeamIds,
       canAccessAllPublicTeams,
       timestamp,
+    );
+  });
+
+const APP_USER_NOTIFICATION_STOP_ACTIONS: Record<string, true> = {
+  issueUnassignedFromYou: true,
+  [APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION]: true,
+};
+
+const validateAppUserNotification = (
+  parsed: Record<string, unknown>,
+  config: { readonly linearClientId: string },
+  installationRepo: InstallationRepo,
+): Effect.Effect<
+  {
+    readonly payload: AppUserNotificationType;
+    readonly organizationId: OrganizationId;
+    readonly appUserId: AppUserId;
+    readonly issueId: Option.Option<IssueId>;
+  },
+  | WebhookPayloadError
+  | WebhookIdentityError
+  | DatabaseError
+  | RowDecodeError
+  | TokenCipherError
+> =>
+  Effect.gen(function* () {
+    const payload = yield* Schema.decodeUnknown(AppUserNotification)(
+      parsed,
+    ).pipe(
+      Effect.catchTag(
+        "ParseError",
+        (error) =>
+          new WebhookPayloadError({
+            message: "AppUserNotification payload is invalid",
+            status: 400,
+            cause: String(error),
+          }),
+      ),
+    );
+    if (!clientIdMatches(payload.oauthClientId, config.linearClientId)) {
+      return yield* Effect.fail(
+        new WebhookIdentityError({
+          message: `OAuth client identity mismatch (received ${payload.oauthClientId})`,
+        }),
+      );
+    }
+
+    const organizationId = yield* Schema.decodeUnknown(OrganizationId)(
+      payload.organizationId,
+    ).pipe(
+      Effect.catchTag(
+        "ParseError",
+        () =>
+          new WebhookIdentityError({
+            message: "Organization identity is not a valid identifier",
+          }),
+      ),
+    );
+    const appUserId = yield* Schema.decodeUnknown(AppUserId)(
+      payload.appUserId,
+    ).pipe(
+      Effect.catchTag(
+        "ParseError",
+        () =>
+          new WebhookPayloadError({
+            message: `Invalid app user id ${payload.appUserId}`,
+            status: 400,
+          }),
+      ),
+    );
+    const installation = yield* installationRepo.get(organizationId);
+    if (Option.isNone(installation)) {
+      return yield* Effect.fail(
+        new WebhookIdentityError({
+          message: "No installation for organization",
+        }),
+      );
+    }
+    if (Option.isSome(installation.value.revokedAt)) {
+      return yield* Effect.fail(
+        new WebhookIdentityError({ message: "Installation is revoked" }),
+      );
+    }
+    if (installation.value.appUserId !== appUserId) {
+      return yield* Effect.fail(
+        new WebhookIdentityError({ message: "Installation app user mismatch" }),
+      );
+    }
+
+    const rawIssueId = Option.getOrElse(
+      payload.notification.issueId,
+      () => null,
+    );
+    let issueId = Option.none<IssueId>();
+    if (rawIssueId !== null) {
+      issueId = Option.some(
+        yield* Schema.decodeUnknown(IssueId)(rawIssueId).pipe(
+          Effect.catchTag(
+            "ParseError",
+            () =>
+              new WebhookPayloadError({
+                message: `Invalid issue id ${rawIssueId}`,
+                status: 400,
+              }),
+          ),
+        ),
+      );
+    }
+    if (APP_USER_NOTIFICATION_STOP_ACTIONS[payload.action] === true) {
+      if (Option.isNone(issueId) || Option.isNone(payload.notification.issue)) {
+        return yield* Effect.fail(
+          new WebhookPayloadError({
+            message: "AppUserNotification action is missing issue details",
+            status: 400,
+          }),
+        );
+      }
+      if (payload.notification.issue.value.id !== rawIssueId) {
+        return yield* Effect.fail(
+          new WebhookIdentityError({
+            message: "Notification issue identity mismatch",
+          }),
+        );
+      }
+    }
+    return { payload, organizationId, appUserId, issueId };
+  });
+
+const handleAppUserNotification = (
+  payload: AppUserNotificationType,
+  organizationId: OrganizationId,
+  issueId: Option.Option<IssueId>,
+  runRepo: RunRepo,
+  runInputRepo: RunInputRepo,
+  timestamp: number,
+): Effect.Effect<
+  void,
+  WebhookPayloadError | DatabaseError | RowDecodeError,
+  never
+> =>
+  Effect.gen(function* () {
+    if (APP_USER_NOTIFICATION_STOP_ACTIONS[payload.action] !== true) {
+      yield* Effect.logDebug("webhook.appUserNotification.ignored").pipe(
+        Effect.annotateLogs({
+          event: "webhook.appUserNotification.ignored",
+          action: payload.action,
+        }),
+      );
+      return;
+    }
+    if (Option.isNone(issueId)) return;
+    const persistedPayload =
+      Schema.encodeUnknownSync(AppUserNotification)(payload);
+    const runs = yield* runRepo.listNonTerminalByIssue({
+      organizationId,
+      issueId: issueId.value,
+    });
+    const stopId = payload.notification.id || payload.webhookId;
+    yield* Effect.forEach(runs, (run) =>
+      Schema.decodeUnknown(InputId)(`${run.sessionId}:stop:${stopId}`).pipe(
+        Effect.catchTag(
+          "ParseError",
+          () =>
+            new WebhookPayloadError({
+              message: "Invalid AppUserNotification stop input id",
+              status: 400,
+            }),
+        ),
+        Effect.flatMap((id) =>
+          runInputRepo.enqueue({
+            id,
+            sessionId: run.sessionId,
+            kind: "stop",
+            body: `Stopped by Linear notification ${payload.action}.`,
+            payload: persistedPayload,
+            createdAt: timestamp,
+          }),
+        ),
+        Effect.asVoid,
+      ),
     );
   });
 
@@ -916,6 +1131,26 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                   action,
                   orgId,
                   installationRepo,
+                  timestamp,
+                );
+                break;
+              }
+              case "AppUserNotification": {
+                const {
+                  payload,
+                  organizationId: orgId,
+                  issueId,
+                } = yield* validateAppUserNotification(
+                  parsed,
+                  config,
+                  installationRepo,
+                );
+                yield* handleAppUserNotification(
+                  payload,
+                  orgId,
+                  issueId,
+                  runRepo,
+                  runInputRepo,
                   timestamp,
                 );
                 break;

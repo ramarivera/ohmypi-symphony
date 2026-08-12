@@ -62,7 +62,10 @@ const testConfig: GatewayConfigShape = {
   port: 3000,
   leaseDurationMs: 60_000,
   reconcilerIntervalMs: 1_000,
+  reconcilerCatchupIntervalMs: 300_000,
+  reconcilerCatchupMinAgeMs: 120_000,
   webhookReplayWindowMs: 60_000,
+  repositorySuggestionConfidenceThreshold: 0.8,
   logLevel: "info",
   logFile: Option.none(),
 };
