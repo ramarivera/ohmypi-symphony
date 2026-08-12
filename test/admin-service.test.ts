@@ -119,6 +119,14 @@ const deps: AdminDeps = {
     updateMcpServer: unreachable,
     deleteMcpServer: unreachable,
   } as unknown as AdminDeps["mcpServerRepo"],
+  executorInstanceRepo: {
+    get: () => Effect.succeed(Option.none()),
+    put: unreachable,
+    remove: unreachable,
+  } as unknown as AdminDeps["executorInstanceRepo"],
+  executor: {
+    listToolkits: unreachable,
+  } as unknown as AdminDeps["executor"],
   runInputRepo: RunInputRepo.make({
     enqueue: unreachable,
     applyStop: unreachable,
@@ -1018,5 +1026,167 @@ describe("MCP admin endpoints", () => {
     expect(
       (await post({ Authorization: "secret", "X-Trace_2": "ok" })).status,
     ).toBe(201);
+  });
+});
+
+describe("Executor admin endpoints", () => {
+  const mutation = (path: string, method: string, body: unknown) =>
+    new Request(new URL(path, config.publicUrl), {
+      method,
+      headers: {
+        Cookie: `omp_gateway_admin=${token}`,
+        Origin: config.publicUrl.toString(),
+        "Content-Type": "application/json",
+        "X-CSRF-Token": deriveCsrfToken(token),
+      },
+      body: JSON.stringify(body),
+    });
+
+  it("rejects endpoint credentials, queries, and fragments before persistence", async () => {
+    let puts = 0;
+    const executorInstanceRepo = {
+      get: () => Effect.succeed(Option.none()),
+      put: () => {
+        puts += 1;
+        return Effect.never;
+      },
+      remove: unreachable,
+    } as unknown as AdminDeps["executorInstanceRepo"];
+    const handle = createAdminHandle({ ...deps, executorInstanceRepo });
+    for (const endpoint of [
+      "https://user:pass@executor.example",
+      "https://executor.example?tenant=one",
+      "https://executor.example/#fragment",
+    ]) {
+      const response = Option.getOrThrow(
+        await Effect.runPromise(
+          handle(
+            mutation("/api/admin/executor-instance", "PUT", {
+              endpoint,
+              token: "secret",
+            }),
+          ),
+        ),
+      );
+      expect(response.status).toBe(400);
+    }
+    expect(puts).toBe(0);
+  });
+
+  it("rotates credentials and URLs for attached Executor MCP rows", async () => {
+    const attached = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "executor-toolkit",
+      organizationId,
+      name: "executor:toolkit:Toolkit",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://old.example/mcp/toolkits/toolkit",
+      env: {},
+      headers: { Authorization: "Bearer old-token" },
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let persisted = {
+      organizationId,
+      endpoint: "https://old.example",
+      token: "old-token",
+      updatedAt: 1,
+    };
+    let updateInput: Record<string, unknown> | undefined;
+    const executorInstanceRepo = {
+      get: () => Effect.succeed(Option.some(persisted)),
+      put: (input: typeof persisted) => {
+        persisted = input;
+        return Effect.succeed(persisted);
+      },
+      remove: () => Effect.succeed(true),
+    } as unknown as AdminDeps["executorInstanceRepo"];
+    const mcpServerRepo = McpServerRepo.make({
+      listMcpServers: () => Effect.succeed([attached]),
+      createMcpServer: unreachable,
+      getMcpServer: () => Effect.succeed(Option.some(attached)),
+      updateMcpServer: (_org, _id, input) => {
+        updateInput = input as Record<string, unknown>;
+        return Effect.succeed(attached);
+      },
+      deleteMcpServer: unreachable,
+    });
+    const handle = createAdminHandle({
+      ...deps,
+      executorInstanceRepo,
+      mcpServerRepo,
+    });
+    const response = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(
+          mutation("/api/admin/executor-instance", "PUT", {
+            endpoint: "https://new.example/base",
+            token: "new-token",
+          }),
+        ),
+      ),
+    );
+    expect(response.status).toBe(200);
+    expect(updateInput).toMatchObject({
+      url: "https://new.example/base/mcp/toolkits/toolkit",
+      headers: { Authorization: "Bearer new-token" },
+    });
+  });
+
+  it("disables attached rows when Executor credentials are removed", async () => {
+    const attached = Schema.decodeUnknownSync(McpServerRecord)({
+      id: "executor-toolkit",
+      organizationId,
+      name: "executor:toolkit:Toolkit",
+      transport: "http",
+      command: null,
+      args: [],
+      url: "https://old.example/mcp/toolkits/toolkit",
+      env: {},
+      headers: { Authorization: "Bearer old-token" },
+      repositoryId: null,
+      enabled: true,
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    let enabled: boolean | undefined;
+    const mcpServerRepo = McpServerRepo.make({
+      listMcpServers: () => Effect.succeed([attached]),
+      createMcpServer: unreachable,
+      getMcpServer: () => Effect.succeed(Option.some(attached)),
+      updateMcpServer: (_org, _id, input) => {
+        enabled = input.enabled;
+        return Effect.succeed(attached);
+      },
+      deleteMcpServer: unreachable,
+    });
+    const executorInstanceRepo = {
+      get: () =>
+        Effect.succeed(
+          Option.some({
+            organizationId,
+            endpoint: "https://old.example",
+            token: "old-token",
+            updatedAt: 1,
+          }),
+        ),
+      put: unreachable,
+      remove: () => Effect.succeed(true),
+    } as unknown as AdminDeps["executorInstanceRepo"];
+    const handle = createAdminHandle({
+      ...deps,
+      executorInstanceRepo,
+      mcpServerRepo,
+    });
+    const response = Option.getOrThrow(
+      await Effect.runPromise(
+        handle(mutation("/api/admin/executor-instance", "DELETE", {})),
+      ),
+    );
+    expect(response.status).toBe(204);
+    expect(enabled).toBe(false);
   });
 });

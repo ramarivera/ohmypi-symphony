@@ -174,6 +174,22 @@ export const ADMIN_BODY = `
         </form>
       </div>
     </section>
+    <section class="panel" aria-labelledby="executor-heading">
+      <div class="panel-header">
+        <h2 id="executor-heading">Executor source</h2>
+        <button id="executor-list-btn" type="button" class="btn">List Executor toolkits</button>
+      </div>
+      <div class="panel-body">
+        <form id="executor-form" class="repo-form" novalidate>
+          <div class="field"><label for="executor-endpoint">Executor endpoint</label><input id="executor-endpoint" name="endpoint" type="url" required placeholder="https://executor.example.com"></div>
+          <div class="field"><label for="executor-token">Bearer token</label><input id="executor-token" name="token" type="password" autocomplete="new-password" placeholder="•••"></div>
+          <div id="executor-form-error" class="error" role="alert" hidden></div>
+          <div class="form-actions"><button type="submit" class="btn btn-primary">Save Executor</button><button id="executor-delete-btn" type="button" class="btn btn-danger">Remove</button></div>
+        </form>
+        <div id="executor-status" role="status" aria-live="polite"></div>
+        <div id="executor-toolkit-list"></div>
+      </div>
+    </section>
 
     <section class="panel" aria-labelledby="nix-cache-heading">
       <div class="panel-header">
@@ -252,11 +268,16 @@ export const ADMIN_SCRIPT = `
   var MCP_BASE = "/api/admin/mcp-servers";
   var MCP_DETAIL = function (id) { return MCP_BASE + "/" + encodeURIComponent(id); };
   var LOGOUT_URL = "/api/admin/logout";
+  var EXECUTOR_BASE = "/api/admin/executor-instance";
+  var EXECUTOR_TOOLKITS = "/api/admin/executor/toolkits";
+  var EXECUTOR_ATTACH = "/api/admin/executor/attach";
 
   var state = {
     csrfToken: "",
     installation: null,
     repositories: [],
+    executorInstance: null,
+    executorToolkits: [],
     mcpServers: [],
     editingMcp: null,
     nixCache: [],
@@ -545,6 +566,63 @@ export const ADMIN_SCRIPT = `
       tr.appendChild(actions); body.appendChild(tr);
     });
     table.appendChild(body); list.appendChild(table); setAriaBusy("mcp-list", false);
+  }
+  function renderExecutor(instance, toolkits) {
+    var endpoint = el("executor-endpoint"); var token = el("executor-token");
+    if (endpoint) endpoint.value = instance && instance.endpoint ? instance.endpoint : "";
+    if (token) token.value = "";
+    var list = el("executor-toolkit-list"); var status = el("executor-status");
+    if (!list || !status) return;
+    list.textContent = ""; status.textContent = instance ? "Executor configured." : "Configure an Executor endpoint and token.";
+    (Array.isArray(toolkits) ? toolkits : []).forEach(function (toolkit) {
+      var row = document.createElement("div"); row.className = "install-row";
+      var label = document.createElement("div"); label.className = "label"; label.textContent = toolkit.name || toolkit.slug || "Toolkit";
+      var value = document.createElement("div"); value.className = "value"; value.textContent = toolkit.slug || "—";
+      var button = document.createElement("button"); button.type = "button"; button.className = "btn"; button.textContent = "Attach as MCP"; button.dataset.executorSlug = toolkit.slug || "";
+      row.appendChild(label); row.appendChild(value); row.appendChild(button); list.appendChild(row);
+    });
+  }
+  async function listExecutorToolkits() {
+    var status = el("executor-status"); if (status) status.textContent = "Loading toolkits…";
+    try {
+      var result = await fetchJSON(EXECUTOR_TOOLKITS, { method: "GET" });
+      if (result && result.redirecting) return;
+      state.executorToolkits = result.data && Array.isArray(result.data.toolkits) ? result.data.toolkits : [];
+      renderExecutor(state.executorInstance, state.executorToolkits);
+    }
+    catch (err) { if (status) status.textContent = err && err.message ? err.message : "Could not list Executor toolkits."; }
+  }
+  async function saveExecutor(event) {
+    event.preventDefault(); var form = el("executor-form"); var error = el("executor-form-error");
+    if (!form) return;
+    if (error) { error.textContent = ""; error.hidden = true; }
+    try {
+      var result = await fetchJSON(EXECUTOR_BASE, { method: "PUT", body: { endpoint: form.elements.namedItem("endpoint").value.trim(), token: form.elements.namedItem("token").value } });
+      if (result && result.redirecting) return;
+      if (error) { error.textContent = ""; error.hidden = true; }
+      showToast("Executor saved.", "ok"); await loadBootstrap({ announce: false });
+    }
+    catch (err) { if (error) { error.textContent = err && err.message ? err.message : "Could not save Executor."; error.hidden = false; } }
+  }
+  async function deleteExecutor() {
+    try {
+      var result = await fetchJSON(EXECUTOR_BASE, { method: "DELETE", body: {} });
+      if (result && result.redirecting) return;
+      showToast("Executor removed.", "ok"); await loadBootstrap({ announce: false });
+    }
+    catch (err) { showToast(err && err.message ? err.message : "Could not remove Executor.", "error"); }
+  }
+  async function attachExecutorToolkit(slug) {
+    try {
+      var result = await fetchJSON(EXECUTOR_ATTACH, { method: "POST", body: { slug: slug } });
+      if (result && result.redirecting) return;
+      showToast("Toolkit attached as MCP.", "ok"); await loadBootstrap({ announce: false, preserveExecutorToolkits: true });
+    }
+    catch (err) { showToast(err && err.message ? err.message : "Could not attach toolkit.", "error"); }
+  }
+  function handleExecutorClick(event) {
+    var target = event.target; if (!(target instanceof HTMLElement)) return;
+    var button = target.closest("button[data-executor-slug]"); if (button) attachExecutorToolkit(button.dataset.executorSlug || "");
   }
   function addMcpHeaderRow(key, value) {
     var editor = el("mcp-headers-editor"); if (!editor) return;
@@ -1064,6 +1142,7 @@ export const ADMIN_SCRIPT = `
   async function loadBootstrap(options) {
     options = options || {};
     var announce = options.announce !== false;
+    var preserveExecutorToolkits = options.preserveExecutorToolkits === true;
     if (announce) {
       setStatus("loading", "loading…");
       announceStatus("repos-status", "Loading repositories…");
@@ -1086,9 +1165,12 @@ export const ADMIN_SCRIPT = `
       state.installation = data.installation || null;
       state.repositories = Array.isArray(data.repositories) ? data.repositories : [];
       state.mcpServers = Array.isArray(data.mcpServers) ? data.mcpServers : [];
+      state.executorInstance = data.executorInstance || null;
+      if (!preserveExecutorToolkits) state.executorToolkits = [];
       renderInstallation(state.installation);
       renderRepositories(state.repositories);
       renderMcpServers(state.mcpServers);
+      renderExecutor(state.executorInstance, state.executorToolkits);
       await loadNixCache();
       var badge = computeAccessibilityBadge(state.installation);
       setStatus(badge.state, badge.label);
@@ -1113,6 +1195,7 @@ export const ADMIN_SCRIPT = `
       setStatus("warn", "load error");
     }
   }
+
 
   // ---- logout --------------------------------------------------------------
 
@@ -1139,6 +1222,20 @@ export const ADMIN_SCRIPT = `
     if (addHeader) addHeader.addEventListener("click", function () { addMcpHeaderRow("", ""); });
     var transport = el("mcp-transport");
     if (transport) transport.addEventListener("change", syncMcpHeaderVisibility);
+    var executorForm = el("executor-form");
+    if (executorForm) executorForm.addEventListener("submit", saveExecutor);
+    var executorList = el("executor-list-btn");
+    if (executorList) executorList.addEventListener("click", listExecutorToolkits);
+    var executorDelete = el("executor-delete-btn");
+    if (executorDelete) executorDelete.addEventListener("click", function () {
+      openConfirm({
+        title: "Remove Executor credentials?",
+        body: "This removes the saved Executor endpoint and bearer token.",
+        onConfirm: deleteExecutor,
+      });
+    });
+    var executorToolkitList = el("executor-toolkit-list");
+    if (executorToolkitList) executorToolkitList.addEventListener("click", handleExecutorClick);
 
     var cancelBtn = el("form-cancel-btn");
     if (cancelBtn) cancelBtn.addEventListener("click", closeForm);
