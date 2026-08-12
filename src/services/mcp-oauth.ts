@@ -1,12 +1,13 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { Clock, Deferred, Effect, Option, Ref, Schema } from "effect";
 import {
   DatabaseError,
   OAuthStateError,
   type TokenCipherError,
+  TokenRefreshError,
 } from "../domain/errors.js";
 import type { McpServerId, OrganizationId } from "../domain/ids.js";
 import { GatewayConfig } from "./config.js";
@@ -128,8 +129,32 @@ export const createPkceVerifier = (): string =>
 
 export const createPkceChallenge = (verifier: string): string => hash(verifier);
 
-const callbackUri = (publicUrl: URL): string =>
-  new URL(MCP_OAUTH_CALLBACK_PATH, publicUrl).toString();
+const callbackUri = (publicUrl: URL): string => {
+  const base = publicUrl.toString().endsWith("/")
+    ? publicUrl.toString()
+    : `${publicUrl.toString()}/`;
+  const value = new URL(base);
+  value.pathname = `${value.pathname.replace(/\/$/u, "")}${MCP_OAUTH_CALLBACK_PATH}`;
+  return value.toString();
+};
+
+const discoveryUrl = (base: URL, suffix: string): URL => {
+  const value = new URL(base.toString());
+  const path = value.pathname === "/" ? "" : value.pathname.replace(/\/$/u, "");
+  value.pathname = `/.well-known/${suffix}${path}`;
+  return value;
+};
+
+const validateEndpoint = (endpoint: string, base: URL): string => {
+  const value = new URL(endpoint);
+  if (value.protocol !== "https:")
+    throw new Error("MCP OAuth endpoint must use HTTPS");
+  if (value.username || value.password)
+    throw new Error("MCP OAuth endpoint must not contain credentials");
+  if (value.origin !== base.origin)
+    throw new Error("MCP OAuth endpoint has an untrusted origin");
+  return value.toString();
+};
 
 const fetchWithTimeout = async (
   fetchImpl: FetchLike,
@@ -197,7 +222,7 @@ const discoverMcpOAuthMetadataEffect = (
   Effect.gen(function* () {
     const base = new URL(serverUrl);
     const protectedResource = new URL(
-      "/.well-known/oauth-protected-resource",
+      discoveryUrl(base, "oauth-protected-resource").pathname,
       base,
     );
     const resourceResponse = yield* Effect.tryPromise({
@@ -220,9 +245,22 @@ const discoverMcpOAuthMetadataEffect = (
       resource.authorization_servers?.[0] ??
       resource.authorization_server ??
       base.origin;
-    const authServerUrl = new URL(issuer);
+    let authServerUrl: URL;
+    try {
+      authServerUrl = new URL(issuer);
+      if (
+        authServerUrl.protocol !== "https:" ||
+        authServerUrl.username ||
+        authServerUrl.password
+      )
+        throw new Error(
+          "MCP OAuth issuer must be HTTPS and must not contain credentials",
+        );
+    } catch (error) {
+      return yield* Effect.fail(new DatabaseError({ message: String(error) }));
+    }
     const metadataUrl = new URL(
-      "/.well-known/oauth-authorization-server",
+      discoveryUrl(authServerUrl, "oauth-authorization-server").pathname,
       authServerUrl,
     );
     const authResponse = yield* Effect.tryPromise({
@@ -241,11 +279,27 @@ const discoverMcpOAuthMetadataEffect = (
       authResponse,
       "MCP OAuth authorization-server discovery",
     );
+    let authorizationEndpoint: string;
+    let tokenEndpoint: string;
+    try {
+      authorizationEndpoint = validateEndpoint(
+        metadata.authorization_endpoint,
+        authServerUrl,
+      );
+      tokenEndpoint = validateEndpoint(metadata.token_endpoint, authServerUrl);
+    } catch (error) {
+      return yield* Effect.fail(new DatabaseError({ message: String(error) }));
+    }
     return {
-      authorizationEndpoint: metadata.authorization_endpoint,
-      tokenEndpoint: metadata.token_endpoint,
+      authorizationEndpoint,
+      tokenEndpoint,
       ...(metadata.registration_endpoint !== undefined
-        ? { registrationEndpoint: metadata.registration_endpoint }
+        ? {
+            registrationEndpoint: validateEndpoint(
+              metadata.registration_endpoint,
+              authServerUrl,
+            ),
+          }
         : {}),
     };
   });
@@ -262,6 +316,7 @@ export const buildMcpAuthorizeUrl = (input: {
   readonly state: string;
   readonly codeVerifier: string;
   readonly scope?: string;
+  readonly resource?: string;
 }): URL => {
   const url = new URL(input.client.authorizationEndpoint);
   url.searchParams.set("response_type", "code");
@@ -274,6 +329,7 @@ export const buildMcpAuthorizeUrl = (input: {
   );
   url.searchParams.set("code_challenge_method", "S256");
   if (input.scope) url.searchParams.set("scope", input.scope);
+  if (input.resource) url.searchParams.set("resource", input.resource);
   return url;
 };
 
@@ -340,6 +396,7 @@ const redeemCode = (
   verifier: string,
   fetchImpl: FetchLike,
   now: number,
+  resource: string,
 ): Effect.Effect<McpOAuthToken, DatabaseError> =>
   Effect.gen(function* () {
     const params = new URLSearchParams({
@@ -348,6 +405,7 @@ const redeemCode = (
       redirect_uri: redirectUri,
       client_id: client.clientId,
       code_verifier: verifier,
+      resource,
     });
     if (client.clientSecret) params.set("client_secret", client.clientSecret);
     const response = yield* Effect.tryPromise({
@@ -390,12 +448,14 @@ const refreshAccessToken = (
   refreshToken: string,
   fetchImpl: FetchLike,
   now: number,
+  resource: string,
 ): Effect.Effect<McpOAuthToken, DatabaseError> =>
   Effect.gen(function* () {
     const params = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: refreshToken,
       client_id: client.clientId,
+      resource,
     });
     if (client.clientSecret) params.set("client_secret", client.clientSecret);
     const response = yield* Effect.tryPromise({
@@ -513,6 +573,15 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           () =>
             db
               .query(
+                "DELETE FROM mcp_oauth_state WHERE consumed_at IS NOT NULL OR expires_at < ?",
+              )
+              .run(now),
+          "McpOAuth.startMcpAuthorization.prune",
+        );
+        yield* tryDb(
+          () =>
+            db
+              .query(
                 "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
               )
               .run(
@@ -537,6 +606,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
             ...(preRegisteredClient?.scope
               ? { scope: preRegisteredClient.scope }
               : {}),
+            resource: serverUrl,
           }),
         };
       },
@@ -576,20 +646,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         "McpOAuth.completeMcpAuthorization.client",
       );
       const verifier = yield* decryptValue(tokenCrypto, row.code_verifier);
-      const token = yield* redeemCode(
-        client,
-        code,
-        row.redirect_uri,
-        verifier,
-        fetch,
-        now,
-      );
-      const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
-      const refreshToken = token.refreshToken
-        ? yield* tokenCrypto.encrypt(token.refreshToken)
-        : null;
-
-      const result = yield* transact(
+      yield* transact(
         db,
         Effect.gen(function* () {
           const consumed = yield* tryDb(
@@ -606,13 +663,40 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
               consumed,
               "McpOAuth.completeMcpAuthorization.consume",
             )) !== 1
-          ) {
+          )
             return yield* Effect.fail(
               new OAuthStateError({
                 message: "Invalid or expired MCP OAuth state",
               }),
             );
-          }
+          yield* tryDb(
+            () =>
+              db
+                .query(
+                  "DELETE FROM mcp_oauth_state WHERE consumed_at IS NOT NULL OR expires_at < ?",
+                )
+                .run(now),
+            "McpOAuth.completeMcpAuthorization.prune",
+          );
+        }),
+      );
+      const token = yield* redeemCode(
+        client,
+        code,
+        row.redirect_uri,
+        verifier,
+        fetch,
+        now,
+        row.server_url,
+      );
+      const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
+      const refreshToken = token.refreshToken
+        ? yield* tokenCrypto.encrypt(token.refreshToken)
+        : null;
+
+      const result = yield* transact(
+        db,
+        Effect.gen(function* () {
           yield* tryDb(
             () =>
               db
@@ -657,54 +741,22 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         ).pipe(Effect.asVoid),
     );
 
-    const getCredential = Effect.fn("McpOAuth.getCredential")(function* (
-      organizationId: OrganizationId,
-      serverId: McpServerId,
-    ) {
-      const row = yield* tryDb(
-        () =>
-          db
-            .query<CredentialRow, [string, string]>(
-              "SELECT server_url, client_json, access_token, refresh_token, expires_at, token_type, scope FROM mcp_oauth_credential WHERE organization_id = ? AND server_id = ?",
-            )
-            .get(organizationId, serverId),
-        "McpOAuth.getCredential",
-      );
-      if (row === null) return Option.none<McpOAuthToken>();
-      const decoded = yield* decodeRow(
-        CredentialRow,
-        row,
-        "McpOAuthCredential",
-      );
-      const accessToken = yield* decryptValue(
-        tokenCrypto,
-        decoded.access_token,
-      );
-      const refreshToken = decoded.refresh_token
-        ? yield* decryptValue(tokenCrypto, decoded.refresh_token).pipe(
-            Effect.map(Option.some),
-          )
-        : Option.none<string>();
-      return Option.some({
-        accessToken,
-        expiresAt: decoded.expires_at,
-        ...(Option.isSome(refreshToken)
-          ? { refreshToken: refreshToken.value }
-          : {}),
-        ...(decoded.token_type ? { tokenType: decoded.token_type } : {}),
-        ...(decoded.scope ? { scope: decoded.scope } : {}),
-      });
-    });
-
     const getCredentialDetails = Effect.fn("McpOAuth.getCredentialDetails")(
       function* (organizationId: OrganizationId, serverId: McpServerId) {
+        const server = yield* mcpServerRepo.getMcpServer(
+          organizationId,
+          serverId,
+        );
+        if (Option.isNone(server) || Option.isNone(server.value.url))
+          return Option.none<McpOAuthCredential>();
+        const serverUrl = server.value.url.value;
         const row = yield* tryDb(
           () =>
             db
-              .query<CredentialRow, [string, string]>(
-                "SELECT server_url, client_json, access_token, refresh_token, expires_at, token_type, scope FROM mcp_oauth_credential WHERE organization_id = ? AND server_id = ?",
+              .query<CredentialRow, [string, string, string]>(
+                "SELECT server_url, client_json, access_token, refresh_token, expires_at, token_type, scope FROM mcp_oauth_credential WHERE organization_id = ? AND server_id = ? AND server_url = ?",
               )
-              .get(organizationId, serverId),
+              .get(organizationId, serverId, serverUrl),
           "McpOAuth.getCredentialDetails",
         );
         if (row === null) return Option.none<McpOAuthCredential>();
@@ -735,6 +787,14 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         return Option.some({ serverUrl: decoded.server_url, client, token });
       },
     );
+
+    const getCredential = Effect.fn("McpOAuth.getCredential")(function* (
+      organizationId: OrganizationId,
+      serverId: McpServerId,
+    ) {
+      const details = yield* getCredentialDetails(organizationId, serverId);
+      return Option.map(details, (value) => value.token);
+    });
 
     const persistRefreshedToken = (
       organizationId: OrganizationId,
@@ -796,12 +856,14 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         current.token.refreshToken!,
         fetch,
         now,
+        current.serverUrl,
       ).pipe(
         Effect.tap((token) =>
           persistRefreshedToken(organizationId, serverId, token, now),
         ),
         Effect.tap((token) => Deferred.succeed(mine, token)),
         Effect.tapError((error) => Deferred.fail(mine, error)),
+        Effect.onExit((exit) => Deferred.done(mine, exit)),
         Effect.ensuring(
           Ref.update(refreshFlights, (flights) => {
             const next = new Map(flights);
@@ -821,11 +883,16 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       if (Option.isNone(details)) return Option.none<McpOAuthToken>();
       const now = yield* Clock.currentTimeMillis;
       const current = details.value;
-      if (
-        current.token.expiresAt > now + 60_000 ||
-        current.token.refreshToken === undefined
-      ) {
+      if (current.token.expiresAt > now + 60_000)
         return Option.some(current.token);
+      if (current.token.refreshToken === undefined) {
+        return yield* Effect.fail(
+          new TokenRefreshError({
+            organizationId,
+            message:
+              "MCP OAuth access token expired and no refresh token is available",
+          }),
+        );
       }
       const token = yield* refreshTokens(
         organizationId,
@@ -884,8 +951,9 @@ export const materializeMcpAgentDb = async (
 ): Promise<string> => {
   const agentDir = join(workspace, ".omp-gateway");
   const path = join(agentDir, "agent.db");
-  await mkdir(agentDir, { recursive: true });
+  await mkdir(agentDir, { recursive: true, mode: 0o700 });
   await chmod(agentDir, 0o700);
+  await rm(path, { force: true });
   let db: Database | undefined;
   try {
     db = new Database(path);
@@ -958,6 +1026,15 @@ export const materializeMcpAgentDb = async (
     db?.close();
   }
 };
+
+export const removeMcpAgentDb = (
+  workspace: string,
+): Effect.Effect<void, never, never> =>
+  Effect.promise(async () => {
+    try {
+      await unlink(join(workspace, ".omp-gateway", "agent.db"));
+    } catch {}
+  });
 
 export const mcpProviderForServerUrl = (serverUrl: string): string =>
   `${MCP_OAUTH_PROVIDER_PREFIX}${serverUrl}`;

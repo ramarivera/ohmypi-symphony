@@ -603,14 +603,19 @@ export const ADMIN_SCRIPT = `
     finally { if (button) button.disabled = false; }
   }
   async function connectMcpServer(id) {
-    var result = await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/connect", { method: "POST", body: {} });
-    if (result && result.authorizationUrl) { window.location.assign(result.authorizationUrl); return; }
-    await loadBootstrap({ announce: false });
+    try {
+      var result = await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/connect", { method: "POST", body: {} });
+      var payload = result && result.data;
+      if (payload && payload.authorizationUrl) { window.location.assign(payload.authorizationUrl); return; }
+      announceStatus("mcp-status", "MCP OAuth connection did not return an authorization URL.");
+    } catch (err) { announceStatus("mcp-status", err && err.message ? err.message : "Could not connect MCP OAuth."); showToast("MCP OAuth connection failed.", "danger"); }
   }
   async function disconnectMcpServer(id) {
-    await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/disconnect", { method: "POST", body: {} });
-    showToast("MCP OAuth disconnected.", "ok");
-    await loadBootstrap({ announce: false });
+    try {
+      await fetchJSON(MCP_BASE + "/" + encodeURIComponent(id) + "/oauth/disconnect", { method: "POST", body: {} });
+      showToast("MCP OAuth disconnected.", "ok");
+      await loadBootstrap({ announce: false });
+    } catch (err) { announceStatus("mcp-status", err && err.message ? err.message : "Could not disconnect MCP OAuth."); showToast("MCP OAuth disconnection failed.", "danger"); }
   }
   async function deleteMcpServer(id) { var result = await fetchJSON(MCP_DETAIL(id), { method: "DELETE", body: {} }); if (result && result.redirecting) return; showToast("MCP server removed.", "ok"); await loadBootstrap({ announce: false }); }
   async function toggleMcpServer(server) { var result = await fetchJSON(MCP_DETAIL(server.id), { method: "PUT", body: Object.assign({}, server, { enabled: !server.enabled }) }); if (result && result.redirecting) return; await loadBootstrap({ announce: false }); }

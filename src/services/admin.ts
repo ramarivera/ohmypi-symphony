@@ -1202,9 +1202,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
             id,
           );
           if (Option.isNone(server)) return Option.some(text("Not found", 404));
-          const statuses = deps.mcpOAuth
-            ? yield* deps.mcpOAuth.listStatuses(session.organizationId)
-            : new Map();
+          const statuses = yield* deps.mcpOAuth.listStatuses(
+            session.organizationId,
+          );
           return Option.some(
             json({
               mcpServer: toApiMcpServer(server.value, statuses.get(id)),

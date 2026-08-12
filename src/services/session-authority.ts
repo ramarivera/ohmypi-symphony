@@ -14,6 +14,7 @@ import {
   type RpcTimeoutError,
   type RunLeaseError,
   type TokenCipherError,
+  type TokenRefreshError,
   type WorkspaceError,
 } from "../domain/errors.js";
 import type { SessionId, SourceKey } from "../domain/ids.js";
@@ -30,7 +31,11 @@ import {
   resolveEffectiveMcpServers,
   writeOmpMcpConfig,
 } from "./mcp-config.js";
-import { McpOAuth, materializeMcpAgentDb } from "./mcp-oauth.js";
+import {
+  McpOAuth,
+  materializeMcpAgentDb,
+  removeMcpAgentDb,
+} from "./mcp-oauth.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { ActivityProjector } from "./projector.js";
 import type {
@@ -263,6 +268,7 @@ type AuthorityError =
   | RpcTimeoutError
   | RunLeaseError
   | TokenCipherError
+  | TokenRefreshError
   | WorkspaceError
   | LinearApiError
   | InstallationRevokedError
@@ -396,7 +402,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Option.match(run.workspacePath, {
           onNone: () => Effect.void,
           onSome: (path) =>
-            workspace.clearGitHubExtraHeader(run.sessionId, path),
+            Effect.zipRight(
+              workspace.clearGitHubExtraHeader(run.sessionId, path),
+              removeMcpAgentDb(path),
+            ),
         });
       const ensureIssueLifecycle = (
         run: AgentRun,
@@ -1611,6 +1620,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         | NixEnvironmentError
         | WorkspaceError
         | TokenCipherError
+        | TokenRefreshError
       > {
         if (!existsSync(cwd)) {
           const error = new RpcSpawnError({

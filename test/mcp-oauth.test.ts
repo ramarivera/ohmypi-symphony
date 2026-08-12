@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { rm } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import {
   buildMcpAuthorizeUrl,
@@ -22,9 +23,11 @@ describe("MCP OAuth primitives", () => {
       state: "state-value",
       codeVerifier: verifier,
       scope: "read",
+      resource: "https://mcp.example/server",
     });
 
     expect(url.searchParams.get("client_id")).toBe("client-1");
+    expect(url.searchParams.get("resource")).toBe("https://mcp.example/server");
     expect(url.searchParams.get("state")).toBe("state-value");
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");
     expect(url.searchParams.get("code_challenge")).toBe(
@@ -61,7 +64,7 @@ describe("MCP OAuth primitives", () => {
       registrationEndpoint: "https://issuer.example/register",
     });
     expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
-      "https://mcp.example/.well-known/oauth-protected-resource",
+      "https://mcp.example/.well-known/oauth-protected-resource/server",
       "https://issuer.example/.well-known/oauth-authorization-server",
     ]);
   });
@@ -73,6 +76,13 @@ describe("MCP OAuth primitives", () => {
         serverUrl: "https://mcp.example/server",
         accessToken: "access-token",
         expiresAt: 1_700_000_000_000,
+      },
+    ]);
+    await materializeMcpAgentDb(workspace, [
+      {
+        serverUrl: "https://mcp.example/server",
+        accessToken: "access-token-2",
+        expiresAt: 1_700_000_000_001,
       },
     ]);
     const db = new Database(`${agentDir}/agent.db`);
@@ -99,11 +109,12 @@ describe("MCP OAuth primitives", () => {
       provider: mcpProviderForServerUrl("https://mcp.example/server"),
       credential_type: "oauth",
       data: JSON.stringify({
-        access: "access-token",
-        expires: 1_700_000_000_000,
+        access: "access-token-2",
+        expires: 1_700_000_000_001,
       }),
     });
     expect(JSON.parse(row?.data ?? "{}")).not.toHaveProperty("type");
     db.close();
+    await rm(workspace, { recursive: true, force: true });
   });
 });

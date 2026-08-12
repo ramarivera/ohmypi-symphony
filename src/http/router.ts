@@ -110,13 +110,29 @@ export const oauthCallback = Effect.gen(function* () {
 });
 export const mcpOauthCallback = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
-  yield* McpOAuth.completeMcpAuthorization(
-    new URL(request.url, "http://localhost"),
+  const callback = new URL(request.url, "http://localhost");
+  const adminUrl = new URL(callback.toString());
+  adminUrl.pathname = adminUrl.pathname.replace(
+    /\/oauth\/mcp\/callback$/u,
+    "/admin",
   );
-  return HttpServerResponse.redirect("/admin?mcp=connected", {
-    status: 302,
-    headers: SECURITY_HEADERS,
-  });
+  adminUrl.search = "";
+  return yield* McpOAuth.completeMcpAuthorization(callback).pipe(
+    Effect.as(
+      HttpServerResponse.redirect(`${adminUrl.pathname}?mcp=connected`, {
+        status: 302,
+        headers: SECURITY_HEADERS,
+      }),
+    ),
+    Effect.catchAll((error) =>
+      Effect.succeed(
+        HttpServerResponse.redirect(
+          `${adminUrl.pathname}?mcp=error&message=${encodeURIComponent(error instanceof Error ? error.message : String(error))}`,
+          { status: 302, headers: SECURITY_HEADERS },
+        ),
+      ),
+    ),
+  );
 });
 
 const admin = Effect.gen(function* () {
