@@ -665,7 +665,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     expect(created.createdRun).toBe(true);
     expect(created.enqueued).toBe(true);
     expect(created.createdInputBody).toBe(
-      "Work on the issue below.\nIssue: 44444444-4444-4444-8444-444444444444",
+      "User request:\nWork on the issue below.\nIssue context:\nIssue: 44444444-4444-4444-8444-444444444444",
     );
     expect(reconcilerTriggers).toBe(1);
     const createdInput = created.createdRunInput as {

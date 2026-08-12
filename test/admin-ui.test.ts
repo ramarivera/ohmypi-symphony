@@ -182,6 +182,13 @@ describe("renderAdminPage", () => {
     );
   });
 
+  test("preserves rejected prompt template edits when a save fails", () => {
+    const html = renderAdminPage();
+    expect(html).toMatch(
+      /if\s*\(failures\.length\s*===\s*0\)\s*\{\s*await loadPromptTemplates\(\);\s*\}/,
+    );
+  });
+
   test("renders live previews for all prompt template editors", () => {
     const html = renderAdminPage();
     expect(html).toContain('id="prompt-template-preview-prompted"');

@@ -1187,7 +1187,9 @@ export const ADMIN_SCRIPT = `
         ? messages.join(" | ")
         : "Prompt templates saved.";
     }
-    await loadPromptTemplates();
+    if (failures.length === 0) {
+      await loadPromptTemplates();
+    }
   }
 
   // ---- bootstrap loader ----------------------------------------------------

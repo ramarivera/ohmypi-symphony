@@ -917,8 +917,8 @@ export const createAdminHandle = (deps: AdminDeps) =>
             // the synthetic context.
             const body = Option.isSome(rerunTemplate)
               ? substitutePromptTemplate(rerunTemplate.value.body, {
-                  userRequest: "Work on the issue below.",
-                  issueContext: `Issue: ${issueId}`,
+                  userRequest: "User request:\nWork on the issue below.",
+                  issueContext: `Issue context:\nIssue: ${issueId}`,
                   threadComment: "",
                   previousComments: "",
                   guidance: "",
