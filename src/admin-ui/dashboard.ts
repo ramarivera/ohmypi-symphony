@@ -198,8 +198,10 @@ export const ADMIN_BODY = `
           <div class="field full"><label for="prompt-template-contract">Worker contract</label><textarea id="prompt-template-contract" rows="10" data-prompt-kind="contract"></textarea></div>
         </div>
         <div class="hint">Leave a template blank to restore the built-in default. Created placeholders: <code>{{userRequest}}</code> <code>{{issueContext}}</code> <code>{{threadComment}}</code> <code>{{previousComments}}</code> <code>{{guidance}}</code>. Prompted placeholder: <code>{{userRequest}}</code>. Unknown placeholders remain literal. Edits apply to new inputs — including follow-ups in already-running sessions.</div>
-        <div class="field full"><label for="prompt-template-preview">Live preview (sample payload)</label><pre id="prompt-template-preview" aria-live="polite"></pre></div>
-        <div class="form-actions"><button type="button" class="btn btn-primary" id="prompt-templates-save">Save prompt templates</button></div>
+        <div class="field full"><label for="prompt-template-preview">Created preview (sample payload)</label><pre id="prompt-template-preview" aria-live="polite"></pre></div>
+        <div class="field full"><label for="prompt-template-preview-prompted">Prompted preview (sample payload)</label><pre id="prompt-template-preview-prompted" aria-live="polite"></pre></div>
+        <div class="field full"><label for="prompt-template-preview-contract">Contract preview</label><pre id="prompt-template-preview-contract" aria-live="polite"></pre></div>
+        <div class="form-actions"><button type="button" class="btn btn-primary" id="prompt-templates-save" disabled>Save prompt templates</button></div>
       </div>
     </section>
 
@@ -280,8 +282,9 @@ export const ADMIN_SCRIPT = `
     editingMcp: null,
     nixCache: [],
     editing: null,
-    pendingDelete: null,
     promptTemplates: {},
+    promptTemplatesLoaded: false,
+    pendingDelete: null,
     pendingConfirm: null,
   };
 
@@ -1103,10 +1106,15 @@ export const ADMIN_SCRIPT = `
     });
   }
 
-  function renderPromptPreview() {
-    var source = el("prompt-template-created");
-    var preview = el("prompt-template-preview");
-    if (source && preview) preview.textContent = substitutePromptPreview(source.value);
+  function renderPromptPreview(kind) {
+    var kinds = kind ? [kind] : ["created", "prompted", "contract"];
+    kinds.forEach(function (templateKind) {
+      var source = el("prompt-template-" + templateKind);
+      var preview = templateKind === "created"
+        ? el("prompt-template-preview")
+        : el("prompt-template-preview-" + templateKind);
+      if (source && preview) preview.textContent = substitutePromptPreview(source.value);
+    });
   }
 
   function renderPromptTemplates(templates) {
@@ -1122,15 +1130,26 @@ export const ADMIN_SCRIPT = `
     });
     renderPromptPreview();
   }
+  function setPromptTemplatesSaveEnabled(enabled) {
+    var saveButton = el("prompt-templates-save");
+    if (saveButton) saveButton.disabled = !enabled;
+  }
 
   async function loadPromptTemplates() {
+    setPromptTemplatesSaveEnabled(false);
     var result = await fetchJSON(PROMPT_TEMPLATES_URL, { method: "GET" });
     if (result && result.redirecting) return;
     renderPromptTemplates(result.data && result.data.templates);
+    state.promptTemplatesLoaded = true;
+    setPromptTemplatesSaveEnabled(true);
   }
 
   async function savePromptTemplates() {
     var status = el("prompt-templates-status");
+    if (!state.promptTemplatesLoaded) {
+      if (status) status.textContent = "Prompt templates are not loaded yet.";
+      return;
+    }
     var kinds = ["created", "prompted", "contract"];
     var failures = [];
     var warnings = [];
@@ -1255,8 +1274,12 @@ export const ADMIN_SCRIPT = `
 
     var previewForm = el("preview-form");
     if (previewForm) previewForm.addEventListener("submit", submitPreview);
-    var promptCreated = el("prompt-template-created");
-    if (promptCreated) promptCreated.addEventListener("input", renderPromptPreview);
+    ["created", "prompted", "contract"].forEach(function (kind) {
+      var promptField = el("prompt-template-" + kind);
+      if (promptField) promptField.addEventListener("input", function () {
+        renderPromptPreview(kind);
+      });
+    });
     var promptSave = el("prompt-templates-save");
     if (promptSave) promptSave.addEventListener("click", savePromptTemplates);
 
@@ -1273,7 +1296,9 @@ export const ADMIN_SCRIPT = `
     if (yesBtn) yesBtn.addEventListener("click", function () { closeConfirm(true); });
     if (noBtn) noBtn.addEventListener("click", function () { closeConfirm(false); });
 
+    setPromptTemplatesSaveEnabled(false);
     loadPromptTemplates().catch(function (err) {
+      setPromptTemplatesSaveEnabled(false);
       var status = el("prompt-templates-status");
       if (status) status.textContent = err && err.message ? err.message : "Unable to load prompt templates.";
     });

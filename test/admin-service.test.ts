@@ -211,6 +211,31 @@ describe("service Admin request validation", () => {
     }
   });
 
+  it("measures prompt template size in UTF-8 bytes", async () => {
+    const body = "😀".repeat(8_192);
+    expect(body.length).toBe(16_384);
+    expect(new TextEncoder().encode(body).byteLength).toBe(32_768);
+    const response = await run(
+      new Request(
+        new URL("/api/admin/prompt-templates", config.publicUrl),
+        {
+          method: "PUT",
+          headers: {
+            Cookie: `omp_gateway_admin=${token}`,
+            Origin: config.publicUrl.toString(),
+            "X-CSRF-Token": deriveCsrfToken(token),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ kind: "created", body }),
+        },
+      ),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe(
+      "Prompt template body exceeds the 16 KiB limit",
+    );
+  });
+
   it("normalizes valid packages and rejects invalid Nix package names", async () => {
     const valid = {
       id: "repo-nix",

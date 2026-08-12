@@ -1091,7 +1091,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           );
         }
         const body = payload.body.trim().length === 0 ? "" : payload.body;
-        if (body.length > 16_384) {
+        if (new TextEncoder().encode(body).byteLength > 16_384) {
           return Option.some(
             text("Prompt template body exceeds the 16 KiB limit", 400),
           );

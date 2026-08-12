@@ -173,13 +173,14 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
             const id = Schema.decodeUnknownSync(InputId)(
               `${run.sessionId}:${kind}:${activity.id}`,
             );
-            // Mirror the webhook's extractPromptBody: title-prefixed when the
-            // activity carries a title, so a catch-up-first injection reads
-            // identically to a webhook-delivered prompt.
+            // Mirror webhook.extractPromptBody exactly: prefix only when both
+            // title and body are non-empty, then fall back to either value.
+            const title = activity.title ?? "";
+            const activityBody = activity.body ?? "";
             const rawBody =
-              activity.title !== null && activity.body !== null
-                ? `# ${activity.title}\n\n${activity.body}`
-                : (activity.body ?? activity.title ?? "");
+              title && activityBody
+                ? `# ${title}\n\n${activityBody}`
+                : activityBody || title;
             const configured =
               kind === "prompted" && Option.isSome(promptTemplateRepoOption)
                 ? yield* promptTemplateRepoOption.value
