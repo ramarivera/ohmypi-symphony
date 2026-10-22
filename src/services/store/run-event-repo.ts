@@ -2,6 +2,7 @@ import { Clock, Effect, Schema } from "effect";
 import { type DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type { SessionId, SourceKey } from "../../domain/ids.js";
 import { RunEvent } from "../../domain/models.js";
+import { isRecord as record } from "../../util/guards.js";
 import { decodeRow, decodeRows, SqliteClient, tryDb } from "./sqlite-client.js";
 
 const RunEventRow = Schema.Struct({
@@ -39,10 +40,6 @@ export const runEventLevelFromKind = (
       return "info";
   }
 };
-
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
 
 function text(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
@@ -138,6 +135,22 @@ const rowToRunEvent = (
     );
   });
 
+export interface RunEventCursor {
+  readonly createdAt: number;
+  readonly sourceKey: string;
+}
+
+export interface RunEventPageOptions {
+  readonly limit?: number;
+  readonly cursor?: RunEventCursor;
+}
+
+// Route hook: pass query limit/cursor to list; derive the next cursor from the last event.
+export const runEventCursor = (event: RunEvent): RunEventCursor => ({
+  createdAt: event.createdAt,
+  sourceKey: event.sourceKey,
+});
+
 export class RunEventRepo extends Effect.Service<RunEventRepo>()(
   "RunEventRepo",
   {
@@ -211,18 +224,35 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
 
       const list = Effect.fn("RunEventRepo.list")(function* (
         sessionId: SessionId,
+        options: RunEventPageOptions = {},
       ): Effect.fn.Return<
         ReadonlyArray<RunEvent>,
         DatabaseError | RowDecodeError
       > {
         yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+        const limit = Number.isFinite(options.limit)
+          ? Math.max(1, Math.min(1000, Math.floor(options.limit ?? 100)))
+          : 100;
+        const cursor = options.cursor;
         const rows = yield* tryDb(
           () =>
-            db
-              .query<RunEventRow, [string]>(
-                "SELECT * FROM run_event WHERE session_id=? ORDER BY created_at, source_key",
-              )
-              .all(sessionId),
+            cursor === undefined
+              ? db
+                  .query<RunEventRow, [string, number]>(
+                    "SELECT * FROM run_event WHERE session_id=? ORDER BY created_at, source_key LIMIT ?",
+                  )
+                  .all(sessionId, limit)
+              : db
+                  .query<RunEventRow, [string, number, number, string, number]>(
+                    "SELECT * FROM run_event WHERE session_id=? AND (created_at>? OR (created_at=? AND source_key>?)) ORDER BY created_at, source_key LIMIT ?",
+                  )
+                  .all(
+                    sessionId,
+                    cursor.createdAt,
+                    cursor.createdAt,
+                    cursor.sourceKey,
+                    limit,
+                  ),
           "RunEventRepo.list",
         );
         const decoded = yield* decodeRows(RunEventRow, rows, "RunEvent");

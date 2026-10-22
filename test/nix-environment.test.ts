@@ -8,12 +8,16 @@ import {
   NixPackageName,
   type RepositoryRecord,
 } from "../src/domain/models.js";
-
 import {
   makeNixEnvironment,
   type NixEnvironmentDependencies,
   nixCacheKey,
+  protectedNixCacheKeys,
 } from "../src/services/nix-environment.js";
+import {
+  SqliteClient,
+  SqliteClientLive,
+} from "../src/services/store/sqlite-client.js";
 
 const closureSizeOutput = JSON.stringify({
   "/nix/store/abc-tool": { closureSize: 123 },
@@ -275,5 +279,201 @@ describe("NixEnvironment", () => {
     expect(Either.isLeft(result)).toBe(true);
     if (Either.isLeft(result))
       expect(result.left._tag).toBe("@Gateway/NixEnvironmentError");
+  });
+  it("evicts LRU out-links until the measured store meets its budget and preserves active keys", async () => {
+    const state = fixture();
+    const activeKey = nixCacheKey(state.dependencies.nixpkgsFlakeRef, ["git"]);
+    let size = 300;
+    const service = await Effect.runPromise(
+      makeNixEnvironment({
+        ...state.dependencies,
+        protectedCacheKeys: () => Effect.succeed(new Set([activeKey])),
+        run: async (argv) => {
+          if (argv.includes("--all"))
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify({ "/nix/store/all": { narSize: size } }),
+              stderr: "",
+            };
+          if (argv[1] === "store") {
+            state.commands.push([...argv]);
+            size -= 100;
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return state.dependencies.run(argv);
+        },
+      }),
+    );
+    const active = await Effect.runPromise(
+      service.prepare(repository(["git"])),
+    );
+    const oldest = await Effect.runPromise(
+      service.prepare(repository(["nodejs"])),
+    );
+    const newest = await Effect.runPromise(
+      service.prepare(repository(["python3"])),
+    );
+    const result = await Effect.runPromise(service.enforceBudget(100));
+    expect(result).toEqual({ removed: 2, sizeBytes: 100, withinBudget: true });
+    expect(state.removals).toEqual([
+      `/roots/${oldest.cacheKey}`,
+      `/roots/${newest.cacheKey}`,
+    ]);
+    expect(state.entries.has(active.cacheKey)).toBe(true);
+    expect(state.commands.filter((argv) => argv[1] === "store")).toEqual([
+      ["nix", "store", "gc", "--max-freed", "1234"],
+      ["nix", "store", "gc", "--max-freed", "1234"],
+    ]);
+  });
+
+  it("does not evict below budget and reports budgets held by active roots", async () => {
+    const state = fixture();
+    let size = 50;
+    const service = await Effect.runPromise(
+      makeNixEnvironment({
+        ...state.dependencies,
+        protectedCacheKeys: () => Effect.succeed(new Set(state.entries.keys())),
+        run: async (argv) =>
+          argv.includes("--all")
+            ? {
+                exitCode: 0,
+                stdout: JSON.stringify([{ narSize: size }]),
+                stderr: "",
+              }
+            : state.dependencies.run(argv),
+      }),
+    );
+    await Effect.runPromise(service.prepare(repository(["git"])));
+    expect(await Effect.runPromise(service.enforceBudget(100))).toEqual({
+      removed: 0,
+      sizeBytes: 50,
+      withinBudget: true,
+    });
+    size = 200;
+    expect(await Effect.runPromise(service.enforceBudget(100))).toEqual({
+      removed: 0,
+      sizeBytes: 200,
+      withinBudget: false,
+    });
+    expect(state.removals).toEqual([]);
+  });
+
+  it("fails closed on invalid store measurements", async () => {
+    const state = fixture();
+    const service = await Effect.runPromise(
+      makeNixEnvironment({
+        ...state.dependencies,
+        run: async (argv) =>
+          argv.includes("--all")
+            ? {
+                exitCode: 0,
+                stdout: JSON.stringify({ path: { narSize: -1 } }),
+                stderr: "",
+              }
+            : state.dependencies.run(argv),
+      }),
+    );
+    await Effect.runPromise(service.prepare(repository(["git"])));
+    const result = await Effect.runPromise(
+      Effect.either(service.enforceBudget(100)),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+    expect(state.removals).toEqual([]);
+  });
+  it.scopedLive(
+    "protects persisted active references, live terminal leases and unknown configuration history",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const state = fixture();
+        const service = yield* makeNixEnvironment(state.dependencies);
+        const git = yield* service.prepare(repository(["git"]));
+        const node = yield* service.prepare(repository(["nodejs"]));
+        const entries = [...state.entries.values()];
+        db.query(`INSERT INTO repository (organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, nix_packages_json, created_at, updated_at)
+      VALUES ('organization', 'workspace', 'https://example.test/repo', 'main', '[]', '[]', '[]', '["git"]', 1, 1)`).run();
+        db.query(`INSERT INTO agent_run (session_id, organization_id, repository_id, state, created_at, updated_at)
+      VALUES ('active', 'organization', 'workspace', 'running', 2, 2)`).run();
+        expect(yield* protectedNixCacheKeys(db, entries)).toEqual(
+          new Set([git.cacheKey]),
+        );
+        db.query("UPDATE agent_run SET state='succeeded'").run();
+        expect(yield* protectedNixCacheKeys(db, entries)).toEqual(new Set());
+        db.query("UPDATE agent_run SET lease_expires_at=?").run(
+          Date.now() + 60000,
+        );
+        expect(yield* protectedNixCacheKeys(db, entries)).toEqual(
+          new Set([git.cacheKey]),
+        );
+        db.query("UPDATE repository SET updated_at=3").run();
+        expect(yield* protectedNixCacheKeys(db, entries)).toEqual(
+          new Set([git.cacheKey, node.cacheKey]),
+        );
+        db.query("DELETE FROM repository").run();
+        expect(yield* protectedNixCacheKeys(db, entries)).toEqual(
+          new Set([git.cacheKey, node.cacheKey]),
+        );
+      }).pipe(Effect.provide(SqliteClientLive(":memory:"))),
+  );
+
+  it("refuses explicit pruning of active roots", async () => {
+    const state = fixture();
+    const key = nixCacheKey(state.dependencies.nixpkgsFlakeRef, ["git"]);
+    const service = await Effect.runPromise(
+      makeNixEnvironment({
+        ...state.dependencies,
+        protectedCacheKeys: () => Effect.succeed(new Set([key])),
+      }),
+    );
+    const result = await Effect.runPromise(Effect.either(service.prune(key)));
+    expect(Either.isLeft(result)).toBe(true);
+    expect(state.removals).toEqual([]);
+    expect(state.commands).toEqual([]);
+  });
+  it("retries failed GC even after the last out-link and metadata were removed", async () => {
+    const state = fixture();
+    let gcCalls = 0;
+    let size = 300;
+    const service = await Effect.runPromise(
+      makeNixEnvironment({
+        ...state.dependencies,
+        run: async (argv) => {
+          if (argv.includes("--all"))
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify([{ narSize: size }]),
+              stderr: "",
+            };
+          if (argv[1] === "store") {
+            gcCalls++;
+            if (gcCalls === 1)
+              return {
+                exitCode: 1,
+                stdout: "",
+                stderr: "GC temporarily unavailable",
+              };
+            size = 50;
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return state.dependencies.run(argv);
+        },
+      }),
+    );
+    const prepared = await Effect.runPromise(
+      service.prepare(repository(["git"])),
+    );
+    expect(
+      Either.isLeft(
+        await Effect.runPromise(Effect.either(service.enforceBudget(100))),
+      ),
+    ).toBe(true);
+    expect(state.entries.size).toBe(0);
+    expect(await Effect.runPromise(service.enforceBudget(100))).toEqual({
+      removed: 0,
+      sizeBytes: 50,
+      withinBudget: true,
+    });
+    expect(state.removals).toEqual([`/roots/${prepared.cacheKey}`]);
+    expect(gcCalls).toBe(2);
   });
 });

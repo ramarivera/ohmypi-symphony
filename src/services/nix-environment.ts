@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdir, realpath, rm } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { Deferred, Effect, Option } from "effect";
 import {
   type DatabaseError,
@@ -12,8 +12,10 @@ import type {
   NixPackageName,
   RepositoryRecord,
 } from "../domain/models.js";
+import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
 import { NixCacheRepo } from "./store/repositories.js";
+import { SqliteClient, tryDb } from "./store/sqlite-client.js";
 
 const CACHE_KEY = /^[a-f0-9]{64}$/;
 const NIX_PACKAGE = /^[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*$/;
@@ -54,6 +56,10 @@ export interface NixEnvironmentDependencies {
   readonly nixRootsDir: string;
   readonly nixGcMaxBytes: number;
   readonly repo: NixRepo;
+  readonly protectedCacheKeys?: () => Effect.Effect<
+    ReadonlySet<string>,
+    DatabaseError | RowDecodeError
+  >;
   readonly run: (argv: ReadonlyArray<string>) => Promise<NixProcessResult>;
   readonly filesystem?: NixEnvironmentFileSystem;
   readonly now?: () => number;
@@ -86,14 +92,6 @@ const failure = (
       ? {}
       : { cause: cause instanceof Error ? cause.message : String(cause) }),
   });
-
-const isWithin = (root: string, candidate: string): boolean => {
-  const rel = relative(root, candidate);
-  return (
-    rel === "" ||
-    (!rel.startsWith(`..${sep}`) && rel !== ".." && !rel.startsWith(sep))
-  );
-};
 
 export const nixCacheKey = (
   nixpkgsFlakeRef: string,
@@ -200,6 +198,7 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
       >
     >();
     const inflightMutex = yield* Effect.makeSemaphore(1);
+    const cacheMutex = yield* Effect.makeSemaphore(1);
 
     const rootFor = Effect.fn("NixEnvironment.rootFor")(function* (
       cacheKey: string,
@@ -396,7 +395,9 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
           Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
               const completed = yield* Effect.exit(
-                restore(prepareFresh(cacheKey, packages)),
+                restore(
+                  cacheMutex.withPermits(1)(prepareFresh(cacheKey, packages)),
+                ),
               );
               yield* Deferred.done(claim.deferred, completed);
               yield* inflightMutex.withPermits(1)(
@@ -415,20 +416,7 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
       return yield* input.repo.list();
     });
 
-    const prune = Effect.fn("NixEnvironment.prune")(function* (
-      cacheKey: string,
-    ) {
-      const root = yield* rootFor(cacheKey);
-      yield* Effect.tryPromise({
-        try: () => filesystem.remove(root),
-        catch: (cause) =>
-          failure(
-            "metadata_failed",
-            "Nix cache root could not be removed",
-            cause,
-          ),
-      });
-      const removed = yield* input.repo.remove(cacheKey);
+    const collectGarbage = Effect.gen(function* () {
       const gc = yield* Effect.tryPromise({
         try: () =>
           input.run([
@@ -449,10 +437,194 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
         return yield* Effect.fail(
           failure("gc_failed", "Nix garbage collection failed"),
         );
+    });
+
+    const pruneUnlocked = Effect.fn("NixEnvironment.prune")(function* (
+      cacheKey: string,
+    ) {
+      const protectedKeys =
+        input.protectedCacheKeys === undefined
+          ? new Set<string>()
+          : yield* input.protectedCacheKeys();
+      if (protectedKeys.has(cacheKey) || inflight.has(cacheKey)) {
+        return yield* Effect.fail(
+          failure(
+            "gc_failed",
+            "Cannot prune a Nix environment referenced by an active run or build",
+          ),
+        );
+      }
+      const root = yield* rootFor(cacheKey);
+      yield* Effect.tryPromise({
+        try: () => filesystem.remove(root),
+        catch: (cause) =>
+          failure(
+            "metadata_failed",
+            "Nix cache root could not be removed",
+            cause,
+          ),
+      });
+      const removed = yield* input.repo.remove(cacheKey);
+      yield* collectGarbage;
       return removed;
     });
 
-    return { prepare, list, prune };
+    const storeSize = Effect.gen(function* () {
+      const result = yield* Effect.tryPromise({
+        try: () =>
+          input.run([input.nixBinaryPath, "path-info", "--all", "--json"]),
+        catch: (cause) =>
+          failure(
+            "gc_failed",
+            "Nix store size query could not be started",
+            cause,
+          ),
+      });
+      if (result.exitCode !== 0)
+        return yield* Effect.fail(
+          failure("gc_failed", "Nix store size query failed"),
+        );
+      return yield* Effect.try({
+        try: () => {
+          const parsed: unknown = JSON.parse(result.stdout);
+          if (typeof parsed !== "object" || parsed === null)
+            throw new Error("Invalid Nix store metadata");
+          let total = 0;
+          // narSize counts each registered path once, unlike overlapping closure sizes.
+          for (const value of Object.values(parsed)) {
+            if (typeof value !== "object" || value === null)
+              throw new Error("Invalid Nix store path metadata");
+            const size: unknown = Reflect.get(value, "narSize");
+            if (
+              typeof size !== "number" ||
+              !Number.isSafeInteger(size) ||
+              size < 0
+            )
+              throw new Error("Invalid Nix store path size");
+            total += size;
+            if (!Number.isSafeInteger(total))
+              throw new Error("Nix store size exceeds safe limits");
+          }
+          return total;
+        },
+        catch: (cause) =>
+          failure("gc_failed", "Nix store size metadata is invalid", cause),
+      });
+    });
+
+    const enforceBudget = (maxBytes: number) =>
+      cacheMutex.withPermits(1)(
+        Effect.gen(function* () {
+          if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+            return yield* Effect.fail(
+              failure(
+                "gc_failed",
+                "Nix store budget must be a positive integer",
+              ),
+            );
+          const entries = [...(yield* input.repo.list())].sort(
+            (a, b) =>
+              a.updatedAt - b.updatedAt || a.cacheKey.localeCompare(b.cacheKey),
+          );
+          let sizeBytes = yield* storeSize;
+          let removed = 0;
+          for (const entry of entries) {
+            if (sizeBytes <= maxBytes) break;
+            const protectedKeys =
+              input.protectedCacheKeys === undefined
+                ? new Set<string>()
+                : yield* input.protectedCacheKeys();
+            if (
+              protectedKeys.has(entry.cacheKey) ||
+              inflight.has(entry.cacheKey)
+            )
+              continue;
+            // prune removes only the validated managed out-link, then runs bounded GC.
+            yield* pruneUnlocked(entry.cacheKey);
+            removed++;
+            sizeBytes = yield* storeSize;
+          }
+          // Retry collection of already-unrooted garbage, including a previous
+          // prune whose GC failed after its metadata was removed.
+          if (entries.length === 0 && sizeBytes > maxBytes) {
+            yield* collectGarbage;
+            sizeBytes = yield* storeSize;
+          }
+          const result = {
+            removed,
+            sizeBytes,
+            withinBudget: sizeBytes <= maxBytes,
+          };
+          yield* (
+            result.withinBudget
+              ? Effect.logInfo("Nix store budget checked")
+              : Effect.logWarning(
+                  "Nix store remains above budget; referenced roots were preserved",
+                )
+          ).pipe(
+            Effect.annotateLogs({ event: "nix.budget", maxBytes, ...result }),
+          );
+          return result;
+        }),
+      );
+
+    const prune = (cacheKey: string) =>
+      cacheMutex.withPermits(1)(pruneUnlocked(cacheKey));
+    return { prepare, list, prune, enforceBudget };
+  });
+
+export const protectedNixCacheKeys = (
+  db: import("bun:sqlite").Database,
+  entries: ReadonlyArray<NixCacheEntry>,
+) =>
+  Effect.gen(function* () {
+    const active = yield* tryDb(
+      () =>
+        db
+          .query<
+            {
+              nix_packages_json: string | null;
+              repository_updated_at: number | null;
+              run_created_at: number;
+            },
+            []
+          >(`SELECT p.nix_packages_json, p.updated_at AS repository_updated_at, r.created_at AS run_created_at
+          FROM agent_run r LEFT JOIN repository p ON p.id=r.repository_id AND p.organization_id=r.organization_id
+          WHERE r.state NOT IN ('succeeded','failed','canceled') OR r.lease_expires_at>strftime('%s','now')*1000`)
+          .all(),
+      "NixEnvironment.activeReferences",
+    );
+    const protectedKeys = new Set<string>();
+    for (const run of active) {
+      // Older workers may use a previous repository configuration. If its
+      // history is unknown, retain all roots instead of guessing at safety.
+      if (
+        run.nix_packages_json === null ||
+        run.repository_updated_at === null ||
+        run.repository_updated_at > run.run_created_at
+      ) {
+        for (const entry of entries) protectedKeys.add(entry.cacheKey);
+        continue;
+      }
+      let packages: unknown;
+      try {
+        packages = JSON.parse(run.nix_packages_json);
+      } catch {
+        packages = null;
+      }
+      if (
+        !Array.isArray(packages) ||
+        !packages.every((item): item is string => typeof item === "string")
+      ) {
+        for (const entry of entries) protectedKeys.add(entry.cacheKey);
+        continue;
+      }
+      for (const entry of entries) {
+        if (entry.cacheKey === nixCacheKey(entry.nixpkgsFlakeRef, packages))
+          protectedKeys.add(entry.cacheKey);
+      }
+    }
+    return protectedKeys;
   });
 
 export class NixEnvironment extends Effect.Service<NixEnvironment>()(
@@ -463,12 +635,18 @@ export class NixEnvironment extends Effect.Service<NixEnvironment>()(
     effect: Effect.gen(function* () {
       const config = yield* GatewayConfig;
       const repo = yield* NixCacheRepo;
+      const { db } = yield* SqliteClient;
+      const protectedCacheKeys = () =>
+        Effect.flatMap(repo.list(), (entries) =>
+          protectedNixCacheKeys(db, entries),
+        );
       return yield* makeNixEnvironment({
         nixBinaryPath: config.nixBinaryPath,
         nixpkgsFlakeRef: config.nixpkgsFlakeRef,
         nixRootsDir: config.nixRootsDir,
         nixGcMaxBytes: config.nixGcMaxBytes,
         repo,
+        protectedCacheKeys,
         run: nativeRunner,
       });
     }),

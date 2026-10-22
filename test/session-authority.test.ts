@@ -917,6 +917,8 @@ let nixPathEntries: ReadonlyArray<string> = [];
 let nixPrepareError: NixEnvironmentError | undefined;
 const nixPreparedRepositories: Array<string> = [];
 const mockNixEnvironment = NixEnvironment.make({
+  enforceBudget: () =>
+    Effect.succeed({ removed: 0, sizeBytes: 0, withinBudget: true }),
   prepare: (repository) => {
     nixPreparedRepositories.push(repository.id);
     if (nixPrepareError !== undefined) return Effect.fail(nixPrepareError);

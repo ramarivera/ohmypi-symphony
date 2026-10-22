@@ -1,11 +1,9 @@
 import { redact } from "../admin-ui/run-detail.js";
 import type { ActivityType } from "../domain/models.js";
 
-export const isRecord = (value: unknown): value is Record<string, unknown> =>
-  typeof value === "object" && value !== null && !Array.isArray(value);
+import { isRecord, isString } from "../util/guards.js";
 
-export const isString = (value: unknown): value is string =>
-  typeof value === "string";
+export { isRecord, isString } from "../util/guards.js";
 
 export const isNumber = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value);

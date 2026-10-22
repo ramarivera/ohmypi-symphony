@@ -188,6 +188,8 @@ const deps: AdminDeps = {
       }),
   },
   nixEnvironment: NixEnvironment.make({
+    enforceBudget: () =>
+      Effect.succeed({ removed: 0, sizeBytes: 0, withinBudget: true }),
     prepare: unreachable,
     list: () => Effect.succeed([]),
     prune: () => Effect.succeed(false),
@@ -362,6 +364,8 @@ describe("service Admin request validation", () => {
     const cacheHandle = createAdminHandle({
       ...deps,
       nixEnvironment: NixEnvironment.make({
+        enforceBudget: () =>
+          Effect.succeed({ removed: 0, sizeBytes: 0, withinBudget: true }),
         prepare: unreachable,
         list: () =>
           Effect.succeed([
