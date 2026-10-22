@@ -1340,3 +1340,71 @@ describe("pure invariants", () => {
     { timeout: 15_000, fastCheck: { numRuns: 20 } },
   );
 });
+
+describe("Lease-fenced run writes", () => {
+  it.scopedLive(
+    "rejects completion and metadata writes from a replaced lease owner",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* RunRepo;
+          const sid = makeSessionId("lease-fence");
+          const now = yield* Clock.currentTimeMillis;
+          yield* repo.create({
+            sessionId: sid,
+            organizationId: makeOrganizationId("org"),
+            issueId: Option.none(),
+          });
+          yield* repo.claimLease(sid, "old-owner", 10, now - 100);
+          expect(yield* repo.claimLease(sid, "new-owner", 60_000, now)).toBe(
+            true,
+          );
+          for (const patch of [
+            { state: "succeeded" as const },
+            { ompSessionId: Option.some("stale-session") },
+          ]) {
+            const result = yield* repo
+              .update(sid, { ...patch, leaseOwner: "old-owner" })
+              .pipe(Effect.either);
+            expect(Either.isLeft(result)).toBe(true);
+          }
+          const run = Option.getOrThrow(yield* repo.get(sid));
+          expect(run.state).toBe("queued");
+          expect(run.ompSessionId).toEqual(Option.none());
+          expect(yield* RunEventRepo.list(sid)).toEqual([]);
+          yield* repo.update(sid, {
+            leaseOwner: "new-owner",
+            state: "succeeded",
+          });
+          expect(Option.getOrThrow(yield* repo.get(sid)).state).toBe(
+            "succeeded",
+          );
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "rejects writes after expiry even before another owner claims",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const sid = makeSessionId("expired-write");
+          yield* RunRepo.create({
+            sessionId: sid,
+            organizationId: makeOrganizationId("org"),
+            issueId: Option.none(),
+          });
+          const now = yield* Clock.currentTimeMillis;
+          yield* RunRepo.claimLease(sid, "expired-owner", 10, now - 100);
+          expect(
+            Either.isLeft(
+              yield* RunRepo.update(sid, {
+                leaseOwner: "expired-owner",
+                state: "succeeded",
+              }).pipe(Effect.either),
+            ),
+          ).toBe(true);
+        }),
+      ),
+  );
+});
