@@ -292,8 +292,10 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
             onFailure: (cause) =>
               Effect.gen(function* () {
                 const message = Cause.pretty(cause);
+                const completedAt = yield* Clock.currentTimeMillis;
                 yield* Ref.update(statusRef, (s) => ({
                   ...s,
+                  lastCompletedAt: Option.some(completedAt),
                   lastError: Option.some(message),
                 }));
                 yield* Effect.logWarning("reconciler.tick.error").pipe(

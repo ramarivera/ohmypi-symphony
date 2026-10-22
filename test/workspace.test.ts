@@ -2,6 +2,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   symlink,
@@ -28,6 +29,7 @@ import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 import {
   isWithin,
   makeWorkspace,
+  runGitOutput,
   safeSessionKey,
   Workspace,
 } from "../src/services/workspace.js";
@@ -1167,3 +1169,90 @@ it.scopedLive(
       ).toBe(header);
     }),
 );
+
+describe("Workspace recovery regressions", () => {
+  it.scopedLive("retries cleanly when fetch fails after cloning", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: undefined,
+      });
+      const repository = repositoryRecord({
+        id: "atomic-clone",
+        url: fixture.url,
+        ref: "missing-ref",
+      });
+      const result = yield* workspace
+        .materialize("atomic-session", repository)
+        .pipe(Effect.either);
+      expect(Either.isLeft(result)).toBe(true);
+      if (Either.isLeft(result)) expect(result.left.reason).toBe("git_failed");
+      expect(
+        yield* fixtureIo("list workspace root", () =>
+          readdir(fixture.workspaceRoot),
+        ),
+      ).toEqual([]);
+      const target = yield* workspace.materialize("atomic-session", {
+        ...repository,
+        ref: "HEAD",
+      });
+      expect(
+        yield* fixtureIo("read clone", () =>
+          readFile(join(target, "README.txt"), "utf8"),
+        ),
+      ).toBe("fixture\n");
+      expect(
+        yield* fixtureIo("read marker", () =>
+          readFile(join(target, MARKER_FILE), "utf8"),
+        ),
+      ).toContain("atomic-clone");
+    }),
+  );
+
+  it.scopedLive("replaces an old partial clone without a marker", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const target = join(
+        fixture.workspaceRoot,
+        safeSessionKey("partial-session"),
+      );
+      yield* fixtureIo("create partial clone", async () => {
+        await mkdir(target, { recursive: true });
+        await writeFile(join(target, "partial.txt"), "incomplete");
+      });
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: undefined,
+      });
+      expect(
+        yield* workspace.materialize(
+          "partial-session",
+          repositoryRecord({ id: "partial", url: fixture.url, ref: "HEAD" }),
+        ),
+      ).toBe(target);
+      expect(
+        yield* fixtureIo("read recovered clone", () => readdir(target)),
+      ).not.toContain("partial.txt");
+    }),
+  );
+
+  it.scopedLive(
+    "bounds a hanging git subprocess and kills its process group",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const result = yield* runGitOutput(
+          ["-c", "alias.hang=!sleep 60", "hang"],
+          fixture.root,
+          "git-timeout",
+          30,
+        ).pipe(Effect.either);
+        expect(Either.isLeft(result)).toBe(true);
+        if (Either.isLeft(result))
+          expect(result.left.message).toContain("timed out after 30ms");
+      }),
+  );
+});

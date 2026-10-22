@@ -969,6 +969,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
         request: Request,
       ): Effect.fn.Return<Response, never> {
         let deliveryId: DeliveryId | undefined;
+        let claimedDelivery = false;
 
         const process: Effect.Effect<Response, WebhookProcessingError, never> =
           Effect.gen(function* () {
@@ -1125,7 +1126,8 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
             const rawDeliveryId =
               request.headers.get(LINEAR_DELIVERY_HEADER) ??
               buildFallbackDeliveryId(parsed, timestamp);
-            deliveryId = yield* decodeDeliveryId(rawDeliveryId);
+            const decodedDeliveryId = yield* decodeDeliveryId(rawDeliveryId);
+            deliveryId = decodedDeliveryId;
 
             // Normalize webhookTimestamp on the decoded payload so the schema
             // sees a number even when the header was the source.
@@ -1148,13 +1150,24 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
               }),
             );
 
-            const claim = yield* deliveryRepo.claim({
-              id: deliveryId,
-              organizationId,
-              payloadHash: hash,
-              payload: parsed,
-              receivedAt,
-            });
+            // Keep the durable claim and its cleanup ownership hand-off atomic
+            // with respect to request-fiber interruption.
+            const claim = yield* deliveryRepo
+              .claim({
+                id: decodedDeliveryId,
+                organizationId,
+                payloadHash: hash,
+                payload: parsed,
+                receivedAt,
+              })
+              .pipe(
+                Effect.tap((result) =>
+                  Effect.sync(() => {
+                    claimedDelivery = result === "claimed";
+                  }),
+                ),
+                Effect.uninterruptible,
+              );
             if (claim === "duplicate") {
               yield* Effect.logInfo("webhook.deduplicated").pipe(
                 Effect.annotateLogs({
@@ -1313,6 +1326,16 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
           });
 
         return yield* process.pipe(
+          Effect.onError(() =>
+            claimedDelivery
+              ? markDelivery(
+                  deliveryRepo,
+                  deliveryId,
+                  "failed",
+                  "Webhook processing interrupted or failed",
+                )
+              : Effect.void,
+          ),
           Effect.catchTags({
             "@Gateway/WebhookPayloadError": (error) =>
               Effect.gen(function* () {

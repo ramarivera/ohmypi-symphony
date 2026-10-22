@@ -634,3 +634,60 @@ describe("NixEnvironment", () => {
     },
   );
 });
+
+describe("Nix liveness regressions", () => {
+  it.live(
+    "bounds a hung build, aborts it, and lets a subsequent call retry",
+    () =>
+      Effect.gen(function* () {
+        const state = fixture();
+        let aborted = false;
+        let hang = true;
+        const service = yield* makeNixEnvironment({
+          ...state.dependencies,
+          timeoutMs: 30,
+          run: (argv, signal) =>
+            hang
+              ? new Promise((_resolve) => {
+                  signal?.addEventListener("abort", () => {
+                    aborted = true;
+                  });
+                })
+              : state.dependencies.run(argv),
+        });
+        const result = yield* service
+          .prepare(repository(["git"]))
+          .pipe(Effect.either);
+        expect(Either.isLeft(result)).toBe(true);
+        if (Either.isLeft(result))
+          expect(result.left.message).toContain("timed out after 30ms");
+        expect(aborted).toBe(true);
+        hang = false;
+        expect(
+          (yield* service.prepare(repository(["git"]))).pathEntries,
+        ).toEqual(["/nix/store/abc-tool/bin"]);
+      }),
+  );
+
+  it.live("includes the bounded stderr tail in a build failure", () =>
+    Effect.gen(function* () {
+      const state = fixture();
+      const service = yield* makeNixEnvironment({
+        ...state.dependencies,
+        run: async () => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: `${"x".repeat(8000)}specific build failure`,
+        }),
+      });
+      const result = yield* service
+        .prepare(repository(["git"]))
+        .pipe(Effect.either);
+      expect(Either.isLeft(result)).toBe(true);
+      if (Either.isLeft(result)) {
+        expect(result.left.message).toContain("specific build failure");
+        expect(result.left.message.length).toBeLessThan(4200);
+      }
+    }),
+  );
+});

@@ -2,7 +2,17 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Clock, Duration, Effect, Fiber, Option, Queue, Ref } from "effect";
+import {
+  Cause,
+  Clock,
+  Duration,
+  Effect,
+  Fiber,
+  Option,
+  Queue,
+  Ref,
+  Schedule,
+} from "effect";
 import {
   type DatabaseError,
   type InstallationRevokedError,
@@ -84,11 +94,21 @@ interface InputContext {
 interface WorkerState {
   readonly worker: RpcWorkerHandle;
   readonly queue: Queue.Queue<RpcEvent>;
-  readonly consumer: Fiber.Fiber<never, AuthorityError>;
+  readonly consumer: Fiber.Fiber<
+    void,
+    DatabaseError | RowDecodeError | RpcProtocolError | RpcTimeoutError
+  >;
   readonly unsubscribe: () => Effect.Effect<void, never, never>;
 }
 
 const CANCEL_GATE_TIMEOUT_MS = 30_000;
+
+const failureMessage = <E>(cause: Cause.Cause<E>): string => {
+  const failure = Cause.failureOption(cause);
+  return Option.isSome(failure) && failure.value instanceof Error
+    ? failure.value.message
+    : Cause.pretty(cause);
+};
 
 export { LINEAR_WORKER_CONTRACT };
 
@@ -331,7 +351,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       RpcWorker.Default,
       NixEnvironment.Default,
     ],
-    effect: Effect.gen(function* () {
+    scoped: Effect.gen(function* () {
+      const scope = yield* Effect.scope;
       const runRepo = yield* RunRepo;
       const runInputRepo = yield* RunInputRepo;
       const promptTemplateRepo = yield* PromptTemplateRepo;
@@ -412,6 +433,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           Effect.asVoid,
         );
 
+      const updateRun = (
+        sessionId: SessionId,
+        patch: Parameters<typeof runRepo.update>[1],
+      ) => runRepo.update(sessionId, { ...patch, leaseOwner: owner });
+      const leasedSessions = yield* Ref.make<ReadonlySet<SessionId>>(new Set());
+      const workerSlots = yield* Ref.make<ReadonlySet<SessionId>>(new Set());
+      const processingSessions = yield* Ref.make<ReadonlySet<SessionId>>(
+        new Set(),
+      );
       const leaseDurationMs = config.leaseDurationMs;
       const maxAttempts = 5;
 
@@ -427,6 +457,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const githubAppOption = yield* Effect.serviceOption(GitHubApp);
       const workspace = yield* makeWorkspace({
         workspaceRoot: config.workspaceRoot,
+        gitTimeoutMs: config.gitTimeoutMs ?? 120_000,
         repo: workspaceRepo,
         githubApp:
           config.githubAppId !== undefined &&
@@ -806,6 +837,16 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Effect.gen(function* () {
           const workers = yield* Ref.get(workersRef);
           if (!workers.has(sessionId)) {
+            yield* Ref.update(workerSlots, (slots) => {
+              const next = new Set(slots);
+              next.delete(sessionId);
+              return next;
+            });
+            yield* Ref.update(leasedSessions, (sessions) => {
+              const next = new Set(sessions);
+              next.delete(sessionId);
+              return next;
+            });
             yield* bestEffort(
               "release lease after authority cleanup",
               runRepo.releaseLease(sessionId, owner),
@@ -917,7 +958,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         worker: RpcWorkerHandle,
       ): Effect.fn.Return<
         void,
-        DatabaseError | RowDecodeError | RpcProtocolError
+        DatabaseError | RowDecodeError | RpcProtocolError | RpcTimeoutError
       > {
         const state = yield* worker.getState();
         const fromStateSessionId = isString(state.sessionId)
@@ -934,7 +975,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         const ompSessionFile = Option.isSome(fromStateSessionFile)
           ? fromStateSessionFile
           : workerSessionFile;
-        yield* runRepo.update(sessionId, { ompSessionId, ompSessionFile });
+        yield* updateRun(sessionId, { ompSessionId, ompSessionFile });
         if (Array.isArray(state.todoPhases)) {
           const items = planItems(state.todoPhases);
           if (items.length > 0) {
@@ -967,10 +1008,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         sourceId: string,
       ): Effect.fn.Return<
         void,
-        DatabaseError | RowDecodeError | RpcProtocolError
+        DatabaseError | RowDecodeError | RpcProtocolError | RpcTimeoutError
       > {
         yield* captureWorkerState(sessionId, worker);
-        yield* runRepo.update(sessionId, {
+        yield* updateRun(sessionId, {
           state: "waiting",
           nextAttemptAt: Option.none(),
         });
@@ -980,6 +1021,21 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           "The OhMyPi command completed without starting an agent turn.",
         );
       });
+
+      const dropWorker = (sessionId: SessionId) =>
+        Effect.gen(function* () {
+          const state = yield* Ref.modify(workersRef, (workers) => {
+            const existing = workers.get(sessionId);
+            const next = new Map(workers);
+            next.delete(sessionId);
+            return [existing, next] as const;
+          });
+          if (state !== undefined) {
+            yield* state.unsubscribe();
+            yield* state.worker.stop();
+            yield* Queue.shutdown(state.queue);
+          }
+        });
 
       const cancel = Effect.fn("SessionAuthority.cancel")(function* (
         run: AgentRun,
@@ -991,18 +1047,24 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         yield* withCancelMutationGate(
           run.sessionId,
           Effect.gen(function* () {
+            if (!["succeeded", "failed", "canceled"].includes(run.state)) {
+              const claimed = yield* runRepo.claimLease(
+                run.sessionId,
+                owner,
+                leaseDurationMs,
+              );
+              if (!claimed) return;
+              yield* Ref.update(leasedSessions, (sessions) =>
+                new Set(sessions).add(run.sessionId),
+              );
+            }
             if (Option.isSome(run.workspacePath)) {
               yield* removeMcpConfig(run.workspacePath.value);
             }
             const state = yield* getWorker(run.sessionId);
             if (Option.isSome(state)) {
               yield* abortForCleanup(run.sessionId, state.value.worker);
-              yield* state.value.worker.stop();
-              yield* Ref.update(workersRef, (workers) => {
-                const next = new Map(workers);
-                next.delete(run.sessionId);
-                return next;
-              });
+              yield* dropWorker(run.sessionId);
             }
             yield* Ref.update(pendingUiRef, (pending) => {
               const next = new Map(pending);
@@ -1015,7 +1077,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               run.state !== "failed" &&
               run.state !== "canceled"
             ) {
-              yield* runRepo.update(run.sessionId, {
+              yield* updateRun(run.sessionId, {
                 state: "canceled",
                 terminalReason: Option.some("Stopped by Linear user"),
               });
@@ -1043,19 +1105,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const handleFailure = Effect.fn("SessionAuthority.handleFailure")(
         function* (
           sessionId: SessionId,
-          error: AuthorityError,
+          error: { readonly message: string },
+          incrementAttempt = false,
         ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
           const message = error.message;
-          const worker = yield* getWorker(sessionId);
-          if (Option.isSome(worker)) {
-            yield* abortForCleanup(sessionId, worker.value.worker);
-            yield* worker.value.worker.stop();
-            yield* Ref.update(workersRef, (workers) => {
-              const next = new Map(workers);
-              next.delete(sessionId);
-              return next;
-            });
-          }
+          yield* dropWorker(sessionId);
 
           yield* Effect.logWarning("authority.failure").pipe(
             Effect.annotateLogs({
@@ -1069,12 +1123,23 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           if (
             Option.isNone(current) ||
             current.value.state === "succeeded" ||
+            current.value.state === "failed" ||
             current.value.state === "canceled"
           ) {
             return;
           }
 
-          const run = current.value;
+          if (
+            Option.getOrNull(current.value.leaseOwner) !== owner ||
+            Option.getOrElse(current.value.leaseExpiresAt, () => 0) <
+              (yield* Clock.currentTimeMillis)
+          )
+            return;
+          if (incrementAttempt && current.value.attempt < maxAttempts)
+            yield* updateRun(sessionId, { incrementAttempt: true });
+          const refreshed = yield* runRepo.get(sessionId);
+          if (Option.isNone(refreshed)) return;
+          const run = refreshed.value;
           if (run.desiredState === "canceled") {
             yield* cancel(run);
             return;
@@ -1090,7 +1155,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               message,
             );
             yield* clearWorkspaceCredentials(run);
-            yield* runRepo.update(run.sessionId, {
+            yield* updateRun(run.sessionId, {
               state: "failed",
               terminalReason: Option.some(`${message} [${correlationId}]`),
               nextAttemptAt: Option.none(),
@@ -1124,7 +1189,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           );
           const now = yield* Clock.currentTimeMillis;
           const nextAttemptAt = now + delay + jitter;
-          yield* runRepo.update(run.sessionId, {
+          yield* updateRun(run.sessionId, {
             state: "orphaned",
             terminalReason: Option.some(message),
             nextAttemptAt: Option.some(nextAttemptAt),
@@ -1146,7 +1211,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         event: RpcEvent,
       ): Effect.fn.Return<
         void,
-        DatabaseError | RowDecodeError | RpcProtocolError
+        DatabaseError | RowDecodeError | RpcProtocolError | RpcTimeoutError
       > {
         const current = yield* runRepo.get(sessionId);
         if (
@@ -1157,6 +1222,32 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           return;
         }
         const run = current.value;
+        if (
+          Option.getOrNull(run.leaseOwner) !== owner ||
+          Option.getOrElse(run.leaseExpiresAt, () => 0) <
+            (yield* Clock.currentTimeMillis)
+        ) {
+          yield* dropWorker(sessionId);
+          yield* releaseIfNoWorker(sessionId);
+          return;
+        }
+        const existingSequence = (yield* Ref.get(eventSequenceRef)).get(
+          sessionId,
+        );
+        if (existingSequence === undefined) {
+          const events = yield* runEventRepo.list(sessionId);
+          const prefix = `rpc:${sessionId}:`;
+          const maxSequence = events.reduce((max, item) => {
+            if (!item.sourceKey.startsWith(prefix)) return max;
+            const value = Number(
+              item.sourceKey.slice(prefix.length).split(":")[0],
+            );
+            return Number.isSafeInteger(value) ? Math.max(max, value) : max;
+          }, 0);
+          yield* Ref.update(eventSequenceRef, (m) =>
+            new Map(m).set(sessionId, maxSequence),
+          );
+        }
         const sequence = yield* Ref.modify(eventSequenceRef, (m) => {
           const next = new Map(m);
           const value = (next.get(sessionId) ?? 0) + 1;
@@ -1217,7 +1308,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               [title, message].filter(Boolean).join("\n\n"),
               options.length > 0 ? options : undefined,
             );
-            yield* runRepo.update(sessionId, { state: "waiting" });
+            yield* updateRun(sessionId, { state: "waiting" });
             return;
           }
         }
@@ -1235,7 +1326,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           }
           return;
         }
-        if (event.type === "error") {
+        if (event.type === "error" || event.type === "worker_exited") {
           return yield* Effect.fail(
             new RpcProtocolError({
               method: "worker",
@@ -1302,7 +1393,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               attempt: run.attempt,
             }),
           );
-          yield* runRepo.update(sessionId, {
+          yield* updateRun(sessionId, {
             state: "succeeded",
             nextAttemptAt: Option.none(),
           });
@@ -1313,14 +1404,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 if (Option.isSome(run.workspacePath)) {
                   yield* removeMcpConfig(run.workspacePath.value);
                 }
-                if (Option.isSome(worker)) {
-                  yield* worker.value.worker.stop();
-                }
-                yield* Ref.update(workersRef, (workers) => {
-                  const next = new Map(workers);
-                  next.delete(sessionId);
-                  return next;
-                });
+                yield* dropWorker(sessionId);
                 yield* Ref.update(reportedPullRequestUrlsRef, (reported) => {
                   const next = new Map(reported);
                   next.delete(sessionId);
@@ -1352,7 +1436,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       )(function* (
         run: AgentRun,
         worker: RpcWorkerHandle,
-      ): Effect.fn.Return<void, RpcProtocolError> {
+      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
         if (
           typeof worker.onHostToolCall !== "function" ||
           typeof worker.setHostTools !== "function"
@@ -1665,7 +1749,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           const error = new RpcSpawnError({
             message: `Persisted workspace does not exist: ${cwd}`,
           });
-          yield* handleFailure(run.sessionId, error);
           return yield* Effect.fail(error);
         }
         const command: string[] = [config.ompCliPath];
@@ -1721,7 +1804,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                         errorTag: error._tag,
                         reason: error.reason,
                       }),
-                      Effect.zipRight(handleFailure(run.sessionId, error)),
                       Effect.zipRight(Effect.fail(error)),
                     ),
                 ),
@@ -1753,7 +1835,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 sessionId: run.sessionId,
                 error: error.message,
               }),
-              Effect.zipRight(handleFailure(run.sessionId, error)),
               Effect.zipRight(Effect.fail(error)),
             ),
           ),
@@ -1790,12 +1871,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               };
             }),
           { concurrency: "unbounded" },
-        ).pipe(
-          Effect.catchAll((error) =>
-            handleFailure(run.sessionId, error).pipe(
-              Effect.zipRight(Effect.fail(error)),
-            ),
-          ),
         );
         const credentials = mintedMcp.flatMap((entry) =>
           entry.credential !== null && Option.isSome(entry.server.url)
@@ -1837,7 +1912,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 sessionId: run.sessionId,
                 error: error.message,
               }),
-              Effect.zipRight(handleFailure(run.sessionId, error)),
               Effect.zipRight(Effect.fail(error)),
             ),
           ),
@@ -1867,16 +1941,19 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 sessionId: run.sessionId,
                 error: error.message,
               }),
-              Effect.zipRight(handleFailure(run.sessionId, error)),
               Effect.zipRight(Effect.fail(error)),
             ),
           ),
         );
 
+        // Preparation may outlive a lease. Fence again before creating a process.
+        yield* updateRun(run.sessionId, {});
         const worker = yield* rpc.spawn({
           command,
           cwd,
           env: { ...environment, PI_CODING_AGENT_DIR: agentDir },
+          sessionId: run.sessionId,
+          requestTimeoutMs: config.rpcRequestTimeoutMs ?? 30_000,
         });
         const queue = yield* Queue.unbounded<RpcEvent>();
 
@@ -1884,20 +1961,21 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           Queue.unsafeOffer(queue, event);
         });
 
-        const consumer = yield* Effect.fork(
+        const consumer = yield* Effect.forkIn(
           Effect.forever(
             Queue.take(queue).pipe(
               Effect.flatMap((event) => handleEvent(run.sessionId, event)),
-              Effect.catchTags({
-                "@Gateway/DatabaseError": (error) =>
-                  handleFailure(run.sessionId, error),
-                "@Gateway/RowDecodeError": (error) =>
-                  handleFailure(run.sessionId, error),
-                "@Gateway/RpcProtocolError": (error) =>
-                  handleFailure(run.sessionId, error),
-              }),
+            ),
+          ).pipe(
+            Effect.catchAllCause((cause) =>
+              Cause.isInterruptedOnly(cause)
+                ? Effect.failCause(cause)
+                : handleFailure(run.sessionId, {
+                    message: failureMessage(cause),
+                  }).pipe(Effect.ensuring(releaseIfNoWorker(run.sessionId))),
             ),
           ),
+          scope,
         );
 
         yield* Ref.update(workersRef, (workers) => {
@@ -1929,7 +2007,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             }),
           ),
         );
-        yield* runRepo.update(run.sessionId, { state: "running" });
+        yield* updateRun(run.sessionId, { state: "running" });
         yield* captureWorkerState(run.sessionId, worker);
 
         const ompSessionId = yield* worker.sessionId;
@@ -1954,8 +2032,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           sessionId: SessionId,
         ): Effect.fn.Return<void, AuthorityError> {
           yield* Effect.annotateCurrentSpan("sessionId", sessionId);
+          const entered = yield* Ref.modify(processingSessions, (sessions) => {
+            if (sessions.has(sessionId)) return [false, sessions] as const;
+            return [true, new Set(sessions).add(sessionId)] as const;
+          });
+          if (!entered) return;
+          let initialAttempt = 0;
           return yield* Effect.gen(function* () {
             const initial = yield* runRepo.get(sessionId);
+            if (Option.isSome(initial)) initialAttempt = initial.value.attempt;
             const inputs = yield* runInputRepo.pending(sessionId);
             if (
               Option.isSome(initial) &&
@@ -1988,11 +2073,30 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 }),
               );
             }
+            if (
+              Option.isSome(initial) &&
+              Option.isSome(initial.value.nextAttemptAt) &&
+              initial.value.nextAttemptAt.value >
+                (yield* Clock.currentTimeMillis)
+            )
+              return;
             const workerState = yield* getWorker(sessionId);
+            if (Option.isNone(workerState)) {
+              const reserved = yield* Ref.modify(workerSlots, (slots) => {
+                if (slots.has(sessionId)) return [true, slots] as const;
+                if (slots.size >= (config.maxConcurrentWorkers ?? 4))
+                  return [false, slots] as const;
+                return [true, new Set(slots).add(sessionId)] as const;
+              });
+              if (!reserved) return;
+            }
             const leased = Option.isSome(workerState)
               ? yield* runRepo.renewLease(sessionId, owner, leaseDurationMs)
               : yield* runRepo.claimLease(sessionId, owner, leaseDurationMs);
             if (!leased) return;
+            yield* Ref.update(leasedSessions, (sessions) =>
+              new Set(sessions).add(sessionId),
+            );
             const runOption = yield* runRepo.get(sessionId);
             if (Option.isNone(runOption)) return;
             const run = runOption.value;
@@ -2018,7 +2122,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               if (Option.isSome(run.workspacePath)) {
                 yield* removeMcpConfig(run.workspacePath.value);
               }
-              yield* runRepo.update(sessionId, {
+              yield* updateRun(sessionId, {
                 state: "failed",
                 terminalReason: Option.some(
                   "Linear installation is unavailable",
@@ -2076,7 +2180,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               if (Option.isSome(run.workspacePath)) {
                 yield* removeMcpConfig(run.workspacePath.value);
               }
-              yield* runRepo.update(sessionId, {
+              yield* updateRun(sessionId, {
                 state: "canceled",
                 terminalReason: Option.some("Linear team access was removed"),
               });
@@ -2095,17 +2199,35 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               Option.map(workerState, (state) => state.worker),
               () => undefined,
             );
+            if (worker === undefined && run.attempt >= maxAttempts) {
+              return yield* Effect.fail(
+                new RpcProtocolError({
+                  method: "recovery",
+                  message: "Run exhausted its worker attempts",
+                }),
+              );
+            }
             if (inputs.length === 0) {
               if (
                 worker === undefined &&
-                run.state === "orphaned" &&
-                Option.isSome(run.workspacePath)
+                ["orphaned", "starting", "running", "waiting"].includes(
+                  run.state,
+                )
               ) {
-                yield* runRepo.update(sessionId, {
+                yield* updateRun(sessionId, {
                   state: "starting",
                   incrementAttempt: true,
                   nextAttemptAt: Option.none(),
                 });
+                if (Option.isNone(run.workspacePath)) {
+                  return yield* Effect.fail(
+                    new InterruptedRunNoActionableInputError({
+                      sessionId,
+                      message:
+                        "Interrupted run has no workspace or pending input to resume",
+                    }),
+                  );
+                }
                 const resumedOption = yield* runRepo.get(sessionId);
                 if (Option.isNone(resumedOption)) return;
                 const resumed = resumedOption.value;
@@ -2286,7 +2408,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   // workspace were resolved by an earlier attempt, and
                   // startWorker reattaches the persisted OMP session via
                   // --session when one was captured.
-                  yield* runRepo.update(sessionId, {
+                  yield* updateRun(sessionId, {
                     state: "starting",
                     incrementAttempt: true,
                     nextAttemptAt: Option.none(),
@@ -2333,7 +2455,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                         ? augmented.options
                         : undefined,
                     );
-                    yield* runRepo.update(sessionId, { state: "waiting" });
+                    yield* updateRun(sessionId, { state: "waiting" });
                     return;
                   }
                   if (resolution.kind === "ambiguous") {
@@ -2343,18 +2465,18 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       "Select the repository for this issue.",
                       resolution.repositories.map((r) => r.id),
                     );
-                    yield* runRepo.update(sessionId, { state: "waiting" });
+                    yield* updateRun(sessionId, { state: "waiting" });
                     return;
                   }
+                  yield* updateRun(sessionId, { incrementAttempt: true });
                   const workspacePath = yield* workspace.materialize(
                     sessionId,
                     resolution.repository,
                   );
-                  yield* runRepo.update(sessionId, {
+                  yield* updateRun(sessionId, {
                     state: "starting",
                     repositoryId: Option.some(resolution.repository.id),
                     workspacePath: Option.some(workspacePath),
-                    incrementAttempt: true,
                   });
                   const updatedOption = yield* runRepo.get(sessionId);
                   if (Option.isNone(updatedOption)) return;
@@ -2415,11 +2537,32 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     yield* worker.followUp(rendered);
                   }
                 }
-                yield* runRepo.update(sessionId, { state: "running" });
+                yield* updateRun(sessionId, { state: "running" });
               }
               yield* runInputRepo.markProcessed(input.id);
             }
           }).pipe(
+            Effect.catchAllCause((cause) =>
+              Cause.isInterruptedOnly(cause)
+                ? Effect.failCause(cause)
+                : Effect.gen(function* () {
+                    const current = yield* runRepo.get(sessionId);
+                    yield* handleFailure(
+                      sessionId,
+                      { message: failureMessage(cause) },
+                      Option.isSome(current) &&
+                        current.value.attempt === initialAttempt,
+                    );
+                    return yield* Effect.failCause(cause);
+                  }),
+            ),
+            Effect.ensuring(
+              Ref.update(processingSessions, (sessions) => {
+                const next = new Set(sessions);
+                next.delete(sessionId);
+                return next;
+              }),
+            ),
             // NOTE: stop-deferral counts survive across processSession
             // invocations so the deferral bound can trip. Terminal paths
             // clear them alongside their mutation gate cleanup.
@@ -2432,40 +2575,28 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         function* (): Effect.fn.Return<void, AuthorityError> {
           yield* projector.flushPending();
           const now = yield* Clock.currentTimeMillis;
-          const workers = yield* Ref.get(workersRef);
-          for (const [sessionId, workerState] of workers) {
-            const run = yield* runRepo.get(sessionId);
-            if (Option.isNone(run) || run.value.desiredState === "canceled") {
-              continue;
-            }
-            const renewed = yield* runRepo.renewLease(
-              sessionId,
-              owner,
-              leaseDurationMs,
-            );
-            if (!renewed) {
-              yield* abortForCleanup(sessionId, workerState.worker);
-              yield* workerState.worker.stop();
-              yield* Ref.update(workersRef, (m) => {
-                const next = new Map(m);
-                next.delete(sessionId);
-                return next;
-              });
-            }
-          }
           const cancellationPending = yield* runRepo.listCancellationPending();
-          for (const run of cancellationPending) {
-            yield* cancel(run);
-          }
           const runnable = yield* runRepo.listRunnable(now);
           const sessionsWithInputs =
             yield* runInputRepo.listSessionsWithPendingInputs();
           const sessionIds = new Set<SessionId>([
+            ...cancellationPending.map((run) => run.sessionId),
             ...sessionsWithInputs,
             ...runnable.map((r) => r.sessionId),
           ]);
           for (const sessionId of sessionIds) {
-            yield* processSession(sessionId);
+            yield* processSession(sessionId).pipe(
+              Effect.catchAllCause((cause) =>
+                Cause.isInterruptedOnly(cause)
+                  ? Effect.failCause(cause)
+                  : Effect.logWarning("authority.session_failed").pipe(
+                      Effect.annotateLogs({
+                        sessionId,
+                        error: Cause.pretty(cause),
+                      }),
+                    ),
+              ),
+            );
           }
           yield* projector.flushPending();
         },
@@ -2474,12 +2605,18 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const shutdown = Effect.fn("SessionAuthority.shutdown")(
         function* (): Effect.fn.Return<void, AuthorityError> {
           const workers = yield* Ref.get(workersRef);
-          for (const [, workerState] of workers) {
+          for (const [sessionId, workerState] of workers) {
             yield* Fiber.interrupt(workerState.consumer);
-            yield* workerState.unsubscribe();
-            yield* workerState.worker.stop();
+            yield* dropWorker(sessionId);
           }
-          yield* Ref.set(workersRef, new Map());
+          for (const sessionId of yield* Ref.get(leasedSessions)) {
+            yield* bestEffort(
+              "release lease during shutdown",
+              runRepo.releaseLease(sessionId, owner),
+            );
+          }
+          yield* Ref.set(leasedSessions, new Set());
+          yield* Ref.set(workerSlots, new Set());
           yield* Ref.set(eventSequenceRef, new Map());
           yield* Ref.set(pendingUiRef, new Map());
           yield* Ref.set(reportedPullRequestUrlsRef, new Map());
@@ -2489,6 +2626,43 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           // or workspace context, so terminal-path cleanup owns deletion.
           yield* projector.flushPending();
         },
+      );
+
+      const renewLeases = Effect.gen(function* () {
+        for (const sessionId of yield* Ref.get(leasedSessions)) {
+          yield* runRepo.renewLease(sessionId, owner, leaseDurationMs).pipe(
+            Effect.flatMap((renewed) =>
+              renewed
+                ? Effect.void
+                : Effect.forkIn(
+                    dropWorker(sessionId).pipe(
+                      Effect.ensuring(releaseIfNoWorker(sessionId)),
+                    ),
+                    scope,
+                  ).pipe(Effect.asVoid),
+            ),
+            Effect.catchAllCause((cause) =>
+              Effect.logWarning("authority.lease_renewal_failed").pipe(
+                Effect.annotateLogs({ sessionId, error: Cause.pretty(cause) }),
+              ),
+            ),
+          );
+        }
+      });
+      yield* Effect.addFinalizer(() =>
+        shutdown().pipe(
+          Effect.catchAllCause((cause) =>
+            Effect.logError("authority.shutdown_failed").pipe(
+              Effect.annotateLogs({ error: Cause.pretty(cause) }),
+            ),
+          ),
+        ),
+      );
+      yield* Effect.forkScoped(
+        Effect.repeat(
+          renewLeases,
+          Schedule.spaced(Math.max(1, Math.floor(leaseDurationMs / 3))),
+        ),
       );
 
       const activeWorkerCount = Effect.fn("SessionAuthority.activeWorkerCount")(

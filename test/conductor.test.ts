@@ -1,8 +1,10 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Layer, Option } from "effect";
-import { GatewayServicesLive } from "../src/conductor.js";
+import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
+import { GatewayServicesLive, recoverGateway } from "../src/conductor.js";
+import { DeliveryId, OrganizationId, SessionId } from "../src/domain/ids.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { Reconciler } from "../src/services/reconciler.js";
+import { DeliveryRepo, RunRepo } from "../src/services/store/repositories.js";
 
 const configProvider = ConfigProvider.fromMap(
   new Map([
@@ -33,6 +35,37 @@ describe("Conductor", () => {
         expect(config.databasePath).toBe(":memory:");
         expect(config.port).toBe(3000);
         expect((yield* reconciler.status()).lastError).toEqual(Option.none());
+      }).pipe(Effect.provide(Live)),
+  );
+});
+
+describe("Gateway startup recovery", () => {
+  it.scopedLive(
+    "recovers interrupted runs and makes pending deliveries reclaimable",
+    () =>
+      Effect.gen(function* () {
+        const sid = Schema.decodeUnknownSync(SessionId)("startup-run");
+        const org = Schema.decodeUnknownSync(OrganizationId)("startup-org");
+        yield* RunRepo.create({
+          sessionId: sid,
+          organizationId: org,
+          issueId: Option.none(),
+        });
+        yield* RunRepo.update(sid, { state: "starting" });
+        yield* RunRepo.claimLease(sid, "dead-process", 60_000);
+        const delivery = {
+          id: Schema.decodeUnknownSync(DeliveryId)("startup-delivery"),
+          organizationId: org,
+          payloadHash: "hash",
+          payload: { type: "AgentSessionEvent" },
+        };
+        expect(yield* DeliveryRepo.claim(delivery)).toBe("claimed");
+        expect(yield* DeliveryRepo.claim(delivery)).toBe("duplicate");
+        yield* recoverGateway;
+        const run = Option.getOrThrow(yield* RunRepo.get(sid));
+        expect(run.state).toBe("orphaned");
+        expect(run.leaseOwner).toEqual(Option.none());
+        expect(yield* DeliveryRepo.claim(delivery)).toBe("claimed");
       }).pipe(Effect.provide(Live)),
   );
 });

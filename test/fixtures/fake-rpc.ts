@@ -37,6 +37,17 @@ while (true) {
         typeof input.id === "string" &&
         typeof input.type === "string"
       ) {
+        if (input.type === Bun.env.FAKE_RPC_HANG_COMMAND) continue;
+        if (input.type === "prompt" && "message" in input) {
+          if (input.message === "crash with inherited stdout") {
+            Bun.spawn(["sh", "-c", "sleep 60"], {
+              stdout: "inherit",
+              stderr: "inherit",
+            });
+            process.exit(17);
+          }
+          if (input.message === "crash after ready") process.exit(17);
+        }
         if (input.type === "get_state") {
           send({
             type: "response",

@@ -1,5 +1,14 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Option, Schema } from "effect";
+import {
+  Deferred,
+  Effect,
+  Either,
+  Fiber,
+  HashMap,
+  Logger,
+  Option,
+  Schema,
+} from "effect";
 import { RpcWorker } from "../src/services/rpc-worker.js";
 import { testPaths } from "./fixtures/paths.js";
 
@@ -289,5 +298,139 @@ describe("RpcWorker", () => {
         }).pipe(Effect.ensuring(worker.stop()));
       }).pipe(Effect.provide(Live)),
     { fastCheck: { numRuns: 20 }, timeout: 120_000 },
+  );
+});
+
+describe("RPC liveness regressions", () => {
+  it.live("times out an unacknowledged command", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: [process.execPath, "run", fixture],
+        cwd: process.cwd(),
+        env: { FAKE_RPC_HANG_COMMAND: "get_state" },
+        requestTimeoutMs: 30,
+      });
+      yield* worker.start();
+      const result = yield* worker.getState().pipe(Effect.either);
+      expect(Either.isLeft(result)).toBe(true);
+      if (Either.isLeft(result)) {
+        expect(result.left).toMatchObject({
+          _tag: "@Gateway/RpcTimeoutError",
+          method: "get_state",
+        });
+      }
+      yield* worker.stop();
+    }).pipe(Effect.provide(RpcWorker.Default)),
+  );
+
+  it.live.each([
+    "crash after ready",
+    "crash with inherited stdout",
+    "close stdout",
+  ])("emits a failure event when the worker does %s", (message) =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command:
+          message === "close stdout"
+            ? [
+                "sh",
+                "-c",
+                `printf '%s\\n' '{"type":"ready","supportedProtocolVersions":[1]}'; read request; exec 1>&-; sleep 60`,
+              ]
+            : [process.execPath, "run", fixture],
+        cwd: process.cwd(),
+      });
+      const failed = yield* Deferred.make<void>();
+      yield* worker.onEvent((event) => {
+        if (event.type === "worker_exited")
+          Deferred.unsafeDone(failed, Effect.void);
+      });
+      yield* worker.start();
+      const prompt = yield* Effect.fork(
+        worker.prompt(message).pipe(Effect.ignore),
+      );
+      yield* Deferred.await(failed).pipe(Effect.timeout("2 seconds"));
+      yield* Fiber.join(prompt);
+      const state = yield* worker.getState().pipe(Effect.either);
+      expect(Either.isLeft(state)).toBe(true);
+      yield* worker.stop();
+    }).pipe(Effect.provide(RpcWorker.Default)),
+  );
+});
+
+describe("Worker process tree cleanup", () => {
+  it.live("stops a tool child along with its OMP parent", () =>
+    Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: [
+          "sh",
+          "-c",
+          `trap 'wait; exit 0' TERM; printf '%s\\n' '{"type":"ready","supportedProtocolVersions":[1]}'; sleep 60 & child=$!; printf '{"type":"child_spawned","pid":%s}\\n' "$child"; while read request; do :; done; wait`,
+        ],
+        cwd: process.cwd(),
+      });
+      const child = yield* Deferred.make<number>();
+      yield* worker.onEvent((event) => {
+        if (event.type === "child_spawned" && typeof event.pid === "number")
+          Deferred.unsafeDone(child, Effect.succeed(event.pid));
+      });
+      yield* worker.start();
+      const childPid = yield* Deferred.await(child).pipe(
+        Effect.timeout("1 second"),
+      );
+      yield* worker.stop();
+      const alive = yield* Effect.try(() => process.kill(childPid, 0)).pipe(
+        Effect.either,
+      );
+      expect(Either.isLeft(alive)).toBe(true);
+    }).pipe(Effect.provide(RpcWorker.Default)),
+  );
+
+  it.live("logs the gateway session on worker failure", () => {
+    const sessionIds: unknown[] = [];
+    const logger = Logger.make((options) => {
+      if (String(options.message).includes("worker.failed"))
+        sessionIds.push(
+          Option.getOrNull(HashMap.get(options.annotations, "sessionId")),
+        );
+    });
+    return Effect.gen(function* () {
+      const rpc = yield* RpcWorker;
+      const worker = yield* rpc.spawn({
+        command: [process.execPath, "run", fixture],
+        cwd: process.cwd(),
+        sessionId: "gateway-session",
+      });
+      const failed = yield* Deferred.make<void>();
+      yield* worker.onEvent((event) => {
+        if (event.type === "worker_exited")
+          Deferred.unsafeDone(failed, Effect.void);
+      });
+      yield* worker.start();
+      yield* worker.prompt("crash after ready").pipe(Effect.ignore);
+      yield* Deferred.await(failed).pipe(Effect.timeout("1 second"));
+      expect(sessionIds).toEqual(["gateway-session"]);
+    }).pipe(
+      Effect.provide(RpcWorker.Default),
+      Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+    );
+  });
+});
+
+describe("Worker fiber ownership", () => {
+  it.live("keeps worker IO alive after the caller's startup fiber exits", () =>
+    Effect.gen(function* () {
+      const worker = yield* RpcWorker.spawn({
+        command: [process.execPath, "run", fixture],
+        cwd: process.cwd(),
+      });
+      const startup = yield* Effect.fork(worker.start());
+      yield* Fiber.join(startup);
+      expect(yield* worker.getState()).toMatchObject({ sessionId: "omp-test" });
+      yield* worker.stop();
+    }).pipe(Effect.provide(RpcWorker.Default)),
   );
 });

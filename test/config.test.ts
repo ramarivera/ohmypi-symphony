@@ -407,3 +407,43 @@ describe("GatewayConfig", () => {
     { fastCheck: { numRuns: 20 } },
   );
 });
+
+describe("Recovery bounds configuration", () => {
+  it.effect("loads safe worker and operation bounds by default", () =>
+    Effect.gen(function* () {
+      const result = yield* configResult(valuesWith([]));
+      expect(Either.isRight(result)).toBe(true);
+      if (Either.isRight(result))
+        expect(result.right).toMatchObject({
+          rpcRequestTimeoutMs: 30_000,
+          gitTimeoutMs: 120_000,
+          nixTimeoutMs: 600_000,
+          maxConcurrentWorkers: 4,
+        });
+    }),
+  );
+
+  it.effect.each([
+    "RPC_REQUEST_TIMEOUT_MS",
+    "GIT_TIMEOUT_MS",
+    "NIX_TIMEOUT_MS",
+    "MAX_CONCURRENT_WORKERS",
+  ] as const)("requires a positive integer for %s", (name) =>
+    Effect.gen(function* () {
+      expect(
+        Either.isLeft(yield* configResult(valuesWith([[name, "0"]]))),
+      ).toBe(true);
+      const result = yield* configResult(valuesWith([[name, "7"]]));
+      expect(Either.isRight(result)).toBe(true);
+      if (Either.isRight(result)) {
+        const key = {
+          RPC_REQUEST_TIMEOUT_MS: "rpcRequestTimeoutMs",
+          GIT_TIMEOUT_MS: "gitTimeoutMs",
+          NIX_TIMEOUT_MS: "nixTimeoutMs",
+          MAX_CONCURRENT_WORKERS: "maxConcurrentWorkers",
+        }[name];
+        expect(Reflect.get(result.right, key)).toBe(7);
+      }
+    }),
+  );
+});

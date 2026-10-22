@@ -1,11 +1,13 @@
 import type { Subprocess } from "bun";
-import { Config, Deferred, Effect, Fiber, Option, Ref } from "effect";
+import { Config, Deferred, Effect, Fiber, Option, Ref, Scope } from "effect";
 import {
   RpcProtocolError,
   RpcSpawnError,
   RpcTimeoutError,
 } from "../domain/errors.js";
 import { workerEnvironment, workerIdentityCommand } from "./worker-security.js";
+
+import { detachedProcessGroup, signalProcessTree } from "./process.js";
 
 export interface RpcEvent {
   readonly type: string;
@@ -48,23 +50,27 @@ export interface RpcWorkerHandle {
   ) => Effect.Effect<boolean, RpcProtocolError | RpcTimeoutError, never>;
   readonly steer: (
     message: string,
-  ) => Effect.Effect<void, RpcProtocolError, never>;
+  ) => Effect.Effect<void, RpcProtocolError | RpcTimeoutError, never>;
   readonly followUp: (
     message: string,
-  ) => Effect.Effect<void, RpcProtocolError, never>;
+  ) => Effect.Effect<void, RpcProtocolError | RpcTimeoutError, never>;
   readonly setHostTools: (
     tools: ReadonlyArray<RpcHostToolDefinition>,
-  ) => Effect.Effect<void, RpcProtocolError, never>;
+  ) => Effect.Effect<void, RpcProtocolError | RpcTimeoutError, never>;
   /** Registers the sole host-tool handler, replacing any previous handler. */
   readonly onHostToolCall: (
     handler: (
       request: RpcHostToolCall,
     ) => Effect.Effect<RpcHostToolResult, never, never>,
   ) => Effect.Effect<() => Effect.Effect<void, never, never>, never, never>;
-  readonly abort: () => Effect.Effect<void, RpcProtocolError, never>;
+  readonly abort: () => Effect.Effect<
+    void,
+    RpcProtocolError | RpcTimeoutError,
+    never
+  >;
   readonly getState: () => Effect.Effect<
     Record<string, unknown>,
-    RpcProtocolError,
+    RpcProtocolError | RpcTimeoutError,
     never
   >;
   readonly respondToUi: (
@@ -128,7 +134,8 @@ function configWithDefault(
 export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
   accessors: true,
   dependencies: [],
-  effect: Effect.gen(function* () {
+  scoped: Effect.gen(function* () {
+    const scope = yield* Effect.scope;
     const spawn = Effect.fn("RpcWorker.spawn")(function* (input: {
       readonly command: ReadonlyArray<string>;
       readonly cwd: string;
@@ -136,6 +143,8 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       /** Values explicitly created by the caller for this run. Never pass process.env here. */
       readonly injectedEnv?: Record<string, string>;
       readonly startTimeoutMs?: number;
+      readonly requestTimeoutMs?: number;
+      readonly sessionId?: string;
     }): Effect.fn.Return<RpcWorkerHandle, RpcSpawnError> {
       if (input.command.length === 0) {
         return yield* Effect.fail(
@@ -153,6 +162,8 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       });
       const cwd = input.cwd;
       const startTimeoutMs = input.startTimeoutMs ?? 30_000;
+      const requestTimeoutMs = input.requestTimeoutMs ?? 30_000;
+      const stoppingRef = yield* Ref.make(false);
       const env = {
         ...workerEnvironment(
           input.env ?? {
@@ -199,6 +210,9 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const promptRequestIdsRef = yield* Ref.make<Set<string>>(new Set());
       const ready = yield* Deferred.make<void, RpcSpawnError>();
       const stdoutFiberRef = yield* Ref.make<
+        Option.Option<Fiber.Fiber<void, never>>
+      >(Option.none());
+      const exitFiberRef = yield* Ref.make<
         Option.Option<Fiber.Fiber<void, never>>
       >(Option.none());
       const stderrFiberRef = yield* Ref.make<
@@ -254,11 +268,10 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const fail = (error: unknown): Effect.Effect<void, never, never> =>
         Effect.gen(function* () {
           const base = error instanceof Error ? error.message : String(error);
-          const process = yield* Ref.get(processRef);
-          yield* Ref.set(processRef, Option.none());
+          const process = yield* Ref.getAndSet(processRef, Option.none());
           yield* Ref.set(isStreamingRef, false);
 
-          if (Option.isSome(process)) {
+          if (Option.isSome(process) && !(yield* Ref.get(stoppingRef))) {
             const readyDone = yield* Deferred.isDone(ready);
             if (!readyDone) {
               yield* Deferred.fail(
@@ -271,7 +284,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
 
             yield* bestEffort(
               "kill failed worker process",
-              Effect.try(() => process.value.kill()),
+              Effect.try(() => signalProcessTree(process.value, "SIGKILL")),
             );
 
             const stderr = (yield* Ref.get(stderrTailRef)).trim();
@@ -281,16 +294,17 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               Effect.annotateLogs({
                 event: "worker.failed",
                 workerPid: process.value.pid,
+                sessionId:
+                  input.sessionId ??
+                  Option.getOrNull(yield* Ref.get(sessionIdRef)),
                 error: normalized,
               }),
             );
 
             yield* rejectPending(
-              new RpcProtocolError({
-                method: "worker",
-                message: normalized,
-              }),
+              new RpcProtocolError({ method: "worker", message: normalized }),
             );
+            yield* emit({ type: "worker_exited", message: normalized });
           } else {
             yield* rejectPending(
               new RpcProtocolError({
@@ -788,7 +802,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         result: Effect.Effect<RpcHostToolResult, never, never>,
       ): Effect.Effect<void, never, never> =>
         Effect.gen(function* () {
-          const resultFiber = yield* Effect.fork(
+          const resultFiber = yield* Effect.forkIn(
             bestEffort(
               "write host-tool result",
               result.pipe(
@@ -802,12 +816,13 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
                 ),
               ),
             ),
+            scope,
           );
           yield* Ref.update(hostToolResultFibersRef, (fibers) => {
             fibers.add(resultFiber);
             return fibers;
           });
-          yield* Effect.fork(
+          yield* Effect.forkIn(
             bestEffort(
               "track host-tool result fiber",
               Fiber.join(resultFiber).pipe(
@@ -819,13 +834,17 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
                 ),
               ),
             ),
+            scope,
           );
         });
 
       const send = Effect.fn("RpcWorker.send")(function* (
         type: string,
         body: Record<string, unknown> = {},
-      ): Effect.fn.Return<Record<string, unknown>, RpcProtocolError> {
+      ): Effect.fn.Return<
+        Record<string, unknown>,
+        RpcProtocolError | RpcTimeoutError
+      > {
         yield* getProcess;
         const sequence = yield* Ref.modify(requestSeqRef, (n) => [
           n + 1,
@@ -844,17 +863,23 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
 
         const frame = { id, type, ...body };
 
-        const sent = yield* writeFrame(frame).pipe(Effect.either);
-
-        if (sent._tag === "Left") {
-          yield* Ref.update(pendingRef, (map) => {
-            map.delete(id);
-            return map;
-          });
-          return yield* Effect.fail(sent.left);
-        }
-
-        return yield* Deferred.await(deferred);
+        return yield* writeFrame(frame).pipe(
+          Effect.zipRight(Deferred.await(deferred)),
+          Effect.timeoutFail({
+            duration: requestTimeoutMs,
+            onTimeout: () =>
+              new RpcTimeoutError({
+                method: type,
+                message: `RPC ${type} timed out after ${requestTimeoutMs}ms`,
+              }),
+          }),
+          Effect.ensuring(
+            Ref.update(pendingRef, (map) => {
+              map.delete(id);
+              return map;
+            }),
+          ),
+        );
       });
 
       const start = Effect.fn("RpcWorker.start")(function* (): Effect.fn.Return<
@@ -884,6 +909,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             Bun.spawn(command, {
               cwd,
               env,
+              detached: detachedProcessGroup,
               stdin: "pipe",
               stdout: "pipe",
               stderr: "pipe",
@@ -896,8 +922,8 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
 
         yield* Ref.set(processRef, Option.some(process));
 
-        const stdoutFiber = yield* Effect.fork(readOutput(process));
-        const stderrFiber = yield* Effect.fork(readStderr(process));
+        const stdoutFiber = yield* Effect.forkIn(readOutput(process), scope);
+        const stderrFiber = yield* Effect.forkIn(readStderr(process), scope);
 
         yield* Ref.set(stdoutFiberRef, Option.some(stdoutFiber));
         yield* Ref.set(stderrFiberRef, Option.some(stderrFiber));
@@ -933,6 +959,15 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           return yield* Effect.fail(result.left);
         }
 
+        const exitFiber = yield* Effect.forkIn(
+          Effect.promise(() => process.exited).pipe(
+            Effect.flatMap((code) =>
+              fail(new Error(`OhMyPi exited with code ${code}`)),
+            ),
+          ),
+          scope,
+        );
+        yield* Ref.set(exitFiberRef, Option.some(exitFiber));
         const supportsV2 = yield* Ref.get(supportsV2Ref);
         if (supportsV2) {
           const negotiated = yield* send("negotiate_protocol", {
@@ -958,6 +993,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         void,
         never
       > {
+        yield* Ref.set(stoppingRef, true);
         const hostToolResultFibers = yield* Ref.get(hostToolResultFibersRef);
         for (const fiber of hostToolResultFibers) {
           yield* Fiber.interruptFork(fiber);
@@ -974,7 +1010,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             onFailure: () =>
               bestEffort(
                 "force-kill after stdin close failure",
-                Effect.try(() => process.value.kill()),
+                Effect.try(() => signalProcessTree(process.value)),
               ),
           }),
         );
@@ -989,7 +1025,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         if (!exitedGracefully) {
           yield* bestEffort(
             "force-kill worker after graceful stop timeout",
-            Effect.try(() => process.value.kill()),
+            Effect.try(() => signalProcessTree(process.value)),
           );
           yield* Effect.promise(() =>
             Promise.race([
@@ -1000,7 +1036,15 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             ]),
           );
         }
+        yield* bestEffort(
+          "kill remaining worker children",
+          Effect.try(() => signalProcessTree(process.value, "SIGKILL")),
+        );
         yield* Ref.set(processRef, Option.none());
+        const exitFiber = yield* Ref.get(exitFiberRef);
+        if (Option.isSome(exitFiber))
+          yield* Fiber.interruptFork(exitFiber.value);
+        yield* Ref.set(exitFiberRef, Option.none());
         const stdoutFiber = yield* Ref.get(stdoutFiberRef);
         const stderrFiber = yield* Ref.get(stderrFiberRef);
         if (Option.isSome(stdoutFiber)) {
@@ -1037,18 +1081,18 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
 
       const steer = Effect.fn("RpcWorker.steer")(function* (
         message: string,
-      ): Effect.fn.Return<void, RpcProtocolError> {
+      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
         yield* send("steer", { message });
       });
 
       const followUp = Effect.fn("RpcWorker.followUp")(function* (
         message: string,
-      ): Effect.fn.Return<void, RpcProtocolError> {
+      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
         yield* send("follow_up", { message });
       });
       const setHostTools = Effect.fn("RpcWorker.setHostTools")(function* (
         tools: ReadonlyArray<RpcHostToolDefinition>,
-      ): Effect.fn.Return<void, RpcProtocolError> {
+      ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
         yield* send("set_host_tools", { tools: [...tools] });
       });
 
@@ -1068,7 +1112,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
 
       const abort = Effect.fn("RpcWorker.abort")(function* (): Effect.fn.Return<
         void,
-        RpcProtocolError
+        RpcProtocolError | RpcTimeoutError
       > {
         yield* send("abort");
       });
@@ -1076,7 +1120,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const getState = Effect.fn("RpcWorker.getState")(
         function* (): Effect.fn.Return<
           Record<string, unknown>,
-          RpcProtocolError
+          RpcProtocolError | RpcTimeoutError
         > {
           const response = yield* send("get_state");
           const state = record(response.data) ? response.data : {};
@@ -1125,6 +1169,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const sessionFile = Ref.get(sessionFileRef);
       const isStreaming = Ref.get(isStreamingRef);
 
+      yield* Scope.addFinalizerExit(scope, () => stop());
       const handle: RpcWorkerHandle = {
         sessionId,
         sessionFile,

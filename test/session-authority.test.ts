@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import {
+  Clock,
   ConfigProvider,
   Context,
   Deferred,
@@ -11,6 +12,7 @@ import {
   Layer,
   Option,
   Schema,
+  TestClock,
 } from "effect";
 import {
   DatabaseError,
@@ -751,7 +753,11 @@ describe("SessionAuthority behavior invariants", () => {
     { timeout: 15_000 },
   );
 });
-const testConfigProvider = (githubEnabled = false) => {
+let authorityTestRoot = "";
+const testConfigProvider = (
+  githubEnabled = false,
+  valuesOverride: ReadonlyArray<readonly [string, string]> = [],
+) => {
   const values: Array<readonly [string, string]> = [
     ["LINEAR_CLIENT_ID", "test-client"],
     ["LINEAR_CLIENT_SECRET", "test-secret"],
@@ -762,10 +768,7 @@ const testConfigProvider = (githubEnabled = false) => {
       "NIXPKGS_FLAKE_REF",
       "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
     ],
-    [
-      "WORKSPACE_ROOT",
-      "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/authority-tests",
-    ],
+    ["WORKSPACE_ROOT", authorityTestRoot],
   ];
   if (githubEnabled) {
     values.push(
@@ -773,7 +776,7 @@ const testConfigProvider = (githubEnabled = false) => {
       ["GITHUB_APP_PRIVATE_KEY", "test-private-key"],
     );
   }
-  return ConfigProvider.fromMap(new Map(values));
+  return ConfigProvider.fromMap(new Map([...values, ...valuesOverride]));
 };
 let workerEventListener: ((event: RpcEvent) => void) | undefined;
 let projectionWaiter: Deferred.Deferred<void, never> | undefined;
@@ -915,6 +918,9 @@ const workerSpawnInputs: Array<{
 }> = [];
 let nixPathEntries: ReadonlyArray<string> = [];
 let nixPrepareError: NixEnvironmentError | undefined;
+let nixPrepareBlock:
+  | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> }
+  | undefined;
 const nixPreparedRepositories: Array<string> = [];
 const mockNixEnvironment = NixEnvironment.make({
   enforceBudget: () =>
@@ -922,11 +928,17 @@ const mockNixEnvironment = NixEnvironment.make({
   prepare: (repository) => {
     nixPreparedRepositories.push(repository.id);
     if (nixPrepareError !== undefined) return Effect.fail(nixPrepareError);
-    return Effect.succeed({
-      cacheKey: "test-cache",
-      storePaths: [],
-      pathEntries: nixPathEntries,
-      reused: false,
+    return Effect.gen(function* () {
+      if (nixPrepareBlock !== undefined) {
+        yield* Deferred.succeed(nixPrepareBlock.entered, undefined);
+        yield* Deferred.await(nixPrepareBlock.release);
+      }
+      return {
+        cacheKey: "test-cache",
+        storePaths: [],
+        pathEntries: nixPathEntries,
+        reused: false,
+      };
     });
   },
   list: () => Effect.succeed([]),
@@ -1016,12 +1028,15 @@ const withAuthority = <A, E>(
     | RpcWorker
   >,
   options?: {
+    readonly afterShutdown?: (db: SqliteClientShape["db"]) => void;
+    readonly config?: ReadonlyArray<readonly [string, string]>;
     readonly withLinearGateway?: boolean;
     readonly githubApp?: GitHubAppTokenService;
   },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
+      authorityTestRoot = testPath("temporary");
       linearIssueLookupFails = false;
       toolExternalUrlCalls.length = 0;
       terminalFailure = undefined;
@@ -1040,6 +1055,7 @@ const withAuthority = <A, E>(
       nixPreparedRepositories.length = 0;
       nixPathEntries = [];
       nixPrepareError = undefined;
+      nixPrepareBlock = undefined;
       projectorTerminals.length = 0;
       toolCommentCalls.length = 0;
       orderEvents.length = 0;
@@ -1077,7 +1093,10 @@ const withAuthority = <A, E>(
           Layer.mergeAll(
             Layer.succeed(SqliteClient, sqlite),
             Layer.setConfigProvider(
-              testConfigProvider(options?.githubApp !== undefined),
+              testConfigProvider(
+                options?.githubApp !== undefined,
+                options?.config,
+              ),
             ),
           ),
         ),
@@ -1085,9 +1104,11 @@ const withAuthority = <A, E>(
       const authority = SessionAuthority.DefaultWithoutDependencies.pipe(
         Layer.provide(dependencies),
       );
-      return yield* effect(sqlite.db).pipe(
+      const result = yield* effect(sqlite.db).pipe(
         Effect.provide(Layer.mergeAll(dependencies, authority)),
       );
+      yield* Effect.sync(() => options?.afterShutdown?.(sqlite.db));
+      return result;
     }),
   );
 
@@ -1367,9 +1388,7 @@ describe("SessionAuthority infrastructure failures", () => {
           });
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some(
-              "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/authority-tests",
-            ),
+            workspacePath: Option.some(authorityTestRoot),
           });
 
           const result = yield* Effect.either(
@@ -1502,7 +1521,7 @@ describe("SessionAuthority infrastructure failures", () => {
           }
           const run = yield* runRepo.get(testSessionId);
           expect(Option.isSome(run)).toBe(true);
-          if (Option.isSome(run)) expect(run.value.state).toBe("running");
+          if (Option.isSome(run)) expect(run.value.state).toBe("orphaned");
           expect(yield* runInputRepo.pending(testSessionId)).toHaveLength(1);
         }),
       ),
@@ -2038,6 +2057,385 @@ describe("SessionAuthority Nix environment preparation", () => {
               Option.some("Nix preparation failed"),
             );
           }
+        }),
+      ),
+  );
+});
+
+const seedInterrupted = (
+  sid: SessionId,
+  state: "starting" | "running" | "waiting" | "orphaned" = "orphaned",
+) =>
+  Effect.gen(function* () {
+    yield* InstallationRepo.put(install(testOrganizationId));
+    yield* RunRepo.create({
+      sessionId: sid,
+      organizationId: testOrganizationId,
+      issueId: Option.none(),
+    });
+    yield* RunRepo.update(sid, {
+      state,
+      workspacePath: Option.some(authorityTestRoot),
+      ompSessionFile: Option.some(join(authorityTestRoot, "session.jsonl")),
+    });
+  });
+
+describe("Recovery and concurrency regressions", () => {
+  it.effect.each(["starting", "running", "waiting", "orphaned"] as const)(
+    "exhausts retries for an interrupted %s run without actionable input",
+    (state) =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          yield* seedInterrupted(testSessionId, state);
+          yield* RunRepo.update(testSessionId, {
+            ompSessionFile: Option.none(),
+          });
+          for (let attempt = 1; attempt <= 5; attempt++) {
+            yield* authority.processRunnable();
+            const run = yield* RunRepo.get(testSessionId);
+            if (Option.isNone(run)) throw new Error("run missing");
+            expect(run.value.attempt).toBe(attempt);
+            expect(run.value.state).toBe(attempt === 5 ? "failed" : "orphaned");
+            if (attempt < 5) {
+              const next = Option.getOrThrow(run.value.nextAttemptAt);
+              expect(next).toBeGreaterThan(yield* Clock.currentTimeMillis);
+              yield* authority.processRunnable();
+              expect(yield* RunRepo.get(testSessionId)).toEqual(run);
+              yield* TestClock.setTime(next + 1);
+            }
+          }
+          expect(
+            Option.getOrThrow(yield* RunRepo.get(testSessionId)).leaseOwner,
+          ).toEqual(Option.none());
+        }),
+      ),
+  );
+
+  it.effect(
+    "recovers a starting run that has neither workspace nor pending input",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          yield* seedInterrupted(testSessionId, "starting");
+          yield* RunRepo.update(testSessionId, {
+            workspacePath: Option.none(),
+          });
+          yield* authority.processRunnable();
+          const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+          expect(run.state).toBe("orphaned");
+          expect(run.attempt).toBe(1);
+          expect(Option.getOrNull(run.terminalReason)).toContain(
+            "no workspace",
+          );
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "isolates materialization errors and continues to newer sessions",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const bad = Schema.decodeUnknownSync(SessionId)("a-broken-clone");
+          const good = Schema.decodeUnknownSync(SessionId)("z-newer-session");
+          const repoId =
+            Schema.decodeUnknownSync(WorkspaceId)("broken-local-repo");
+          yield* InstallationRepo.put(install(testOrganizationId));
+          yield* WorkspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repoId,
+            url: join(authorityTestRoot, "missing-repository"),
+            ref: "main",
+            isDefault: true,
+          });
+          yield* RunRepo.create({
+            sessionId: bad,
+            organizationId: testOrganizationId,
+            issueId: Option.none(),
+          });
+          yield* RunInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("clone-input"),
+            sessionId: bad,
+            kind: "created",
+            body: "work",
+            payload: { organizationId: testOrganizationId },
+          });
+          yield* seedInterrupted(good);
+          yield* authority.processRunnable();
+          const failed = Option.getOrThrow(yield* RunRepo.get(bad));
+          expect(failed.state).toBe("orphaned");
+          expect(failed.attempt).toBe(1);
+          expect(Option.getOrNull(failed.terminalReason)).toContain(
+            "git clone failed",
+          );
+          expect(Option.getOrThrow(yield* RunRepo.get(good)).state).toBe(
+            "running",
+          );
+          expect(yield* authority.activeWorkerCount()).toBe(1);
+        }),
+      ),
+  );
+
+  it.effect("seeds event sequence from persisted events after restart", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        yield* seedInterrupted(testSessionId);
+        yield* RunEventRepo.upsert({
+          sessionId: testSessionId,
+          sourceKey: Schema.decodeUnknownSync(SourceKey)(
+            `rpc:${testSessionId}:40:progress`,
+          ),
+          kind: "progress",
+          level: "info",
+          payload: { type: "progress", message: "old" },
+        });
+        for (const sequence of [41, 42]) {
+          yield* authority.processSession(testSessionId);
+          const observed = yield* Deferred.make<void>();
+          projectionWaiter = observed;
+          projectionExpected = sequence - 40;
+          if (workerEventListener === undefined)
+            throw new Error("listener missing");
+          workerEventListener({ type: "progress", message: `new-${sequence}` });
+          yield* Deferred.await(observed);
+          expect(projectorEvents.at(-1)?.sequence).toBe(sequence);
+          yield* authority.shutdown();
+          yield* RunRepo.update(testSessionId, {
+            state: "orphaned",
+            ompSessionFile: Option.some(
+              join(authorityTestRoot, "session.jsonl"),
+            ),
+          });
+        }
+        const events = (yield* RunEventRepo.list(testSessionId)).filter(
+          (event) => event.kind === "progress",
+        );
+        expect(events).toHaveLength(3);
+        expect(
+          events.find((event) => event.sourceKey.endsWith(":40:progress"))
+            ?.payload,
+        ).toEqual({ type: "progress", message: "old" });
+      }),
+    ),
+  );
+
+  it.effect("drops a crashed worker and retries it with backoff", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        yield* seedInterrupted(testSessionId);
+        yield* authority.processSession(testSessionId);
+        if (workerEventListener === undefined)
+          throw new Error("listener missing");
+        workerEventListener({
+          type: "worker_exited",
+          message: "worker exited with code 17",
+        });
+        yield* Effect.repeat(Effect.yieldNow(), {
+          until: () => orderEvents.includes("worker-stopped"),
+        });
+        yield* Effect.repeat(Effect.yieldNow(), {
+          until: () => workerEventListener === undefined,
+        });
+        // Wait for the event consumer's failure transaction, without a real clock.
+        yield* Effect.repeat(RunRepo.get(testSessionId), {
+          until: (run) => Option.isSome(run) && run.value.state === "orphaned",
+        });
+        expect(yield* authority.activeWorkerCount()).toBe(0);
+        const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+        expect(run.attempt).toBe(1);
+        expect(Option.getOrNull(run.terminalReason)).toContain("code 17");
+        expect(Option.isSome(run.nextAttemptAt)).toBe(true);
+      }),
+    ),
+  );
+
+  it.effect(
+    "caps concurrent workers and admits a waiting session when capacity is released",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const next = Schema.decodeUnknownSync(SessionId)("second-worker");
+            yield* seedInterrupted(testSessionId);
+            yield* seedInterrupted(next);
+            yield* Effect.all(
+              [
+                authority.processSession(testSessionId),
+                authority.processSession(next),
+              ],
+              { concurrency: "unbounded" },
+            );
+            expect(workerSpawnInputs).toHaveLength(1);
+            expect(yield* authority.activeWorkerCount()).toBe(1);
+            yield* authority.shutdown();
+            yield* authority.processSession(next);
+            expect(workerSpawnInputs).toHaveLength(2);
+          }),
+        { config: [["MAX_CONCURRENT_WORKERS", "1"]] },
+      ),
+  );
+
+  it.effect(
+    "renews healthy workers while another session is blocked preparing Nix",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            yield* seedInterrupted(testSessionId);
+            yield* authority.processSession(testSessionId);
+            const blocked =
+              Schema.decodeUnknownSync(SessionId)("slow-preparation");
+            const repoId = Schema.decodeUnknownSync(WorkspaceId)("slow-nix");
+            yield* seedInterrupted(blocked);
+            yield* WorkspaceRepo.createRepository({
+              organizationId: testOrganizationId,
+              id: repoId,
+              url: "https://example.invalid/unused",
+              ref: "main",
+            });
+            yield* RunRepo.update(blocked, {
+              repositoryId: Option.some(repoId),
+            });
+            const entered = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            nixPrepareBlock = { entered, release };
+            const preparation = yield* Effect.fork(
+              authority.processSession(blocked),
+            );
+            yield* Deferred.await(entered);
+            for (let step = 0; step < 12; step++) yield* TestClock.adjust(100);
+            const now = yield* Clock.currentTimeMillis;
+            const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+            expect(Option.getOrThrow(run.leaseExpiresAt)).toBeGreaterThan(now);
+            expect(yield* authority.activeWorkerCount()).toBe(1);
+            yield* Deferred.succeed(release, undefined);
+            yield* Fiber.join(preparation);
+            expect(yield* authority.activeWorkerCount()).toBe(2);
+          }),
+        { config: [["LEASE_DURATION_MS", "600"]] },
+      ),
+  );
+
+  it.effect("layer finalization shuts down workers and releases leases", () =>
+    Effect.gen(function* () {
+      yield* withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            yield* seedInterrupted(testSessionId);
+            yield* authority.processSession(testSessionId);
+            expect(orderEvents).not.toContain("worker-stopped");
+          }),
+        {
+          afterShutdown: (db) => {
+            const row = db
+              .query("SELECT lease_owner FROM agent_run WHERE session_id=?")
+              .get(testSessionId);
+            expect(row).toEqual({ lease_owner: null });
+          },
+        },
+      );
+      expect(orderEvents).toContain("worker-stopped");
+      expect(workerEventListener).toBeUndefined();
+    }),
+  );
+});
+
+describe("Authority lease loss", () => {
+  it.effect(
+    "refuses a late success event after another process takes over",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          yield* seedInterrupted(testSessionId);
+          yield* authority.processSession(testSessionId);
+          const now = yield* Clock.currentTimeMillis;
+          db.query(
+            "UPDATE agent_run SET lease_owner='replacement', lease_expires_at=? WHERE session_id=?",
+          ).run(now + 60_000, testSessionId);
+          if (workerEventListener === undefined)
+            throw new Error("listener missing");
+          workerEventListener({ type: "agent_end" });
+          yield* Effect.repeat(Effect.yieldNow(), {
+            until: () => orderEvents.includes("worker-stopped"),
+          });
+          expect(
+            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+          ).toBe("running");
+          expect(
+            Option.getOrThrow(yield* RunRepo.get(testSessionId)).leaseOwner,
+          ).toEqual(Option.some("replacement"));
+          expect(yield* authority.activeWorkerCount()).toBe(0);
+          expect(
+            (yield* RunEventRepo.list(testSessionId)).some((event) =>
+              Option.getOrElse(event.text, () => "").includes("succeeded"),
+            ),
+          ).toBe(false);
+        }),
+      ),
+  );
+});
+
+describe("Recovery admission fencing", () => {
+  it.effect("doesn't spawn from a preparation whose lease was replaced", () =>
+    withAuthority((db) =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        yield* seedInterrupted(testSessionId);
+        const repoId =
+          Schema.decodeUnknownSync(WorkspaceId)("preparation-fence");
+        yield* WorkspaceRepo.createRepository({
+          organizationId: testOrganizationId,
+          id: repoId,
+          url: "https://example.invalid/unused",
+          ref: "main",
+        });
+        yield* RunRepo.update(testSessionId, {
+          repositoryId: Option.some(repoId),
+        });
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        nixPrepareBlock = { entered, release };
+        const preparing = yield* Effect.fork(
+          authority.processSession(testSessionId).pipe(Effect.either),
+        );
+        yield* Deferred.await(entered);
+        db.query(
+          "UPDATE agent_run SET lease_owner='replacement' WHERE session_id=?",
+        ).run(testSessionId);
+        yield* Deferred.succeed(release, undefined);
+        expect(Either.isLeft(yield* Fiber.join(preparing))).toBe(true);
+        expect(workerSpawnInputs).toEqual([]);
+        expect(
+          Option.getOrThrow(yield* RunRepo.get(testSessionId)).leaseOwner,
+        ).toEqual(Option.some("replacement"));
+      }),
+    ),
+  );
+
+  it.effect(
+    "fails an interrupted final attempt without starting a sixth worker",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          yield* seedInterrupted(testSessionId);
+          db.query("UPDATE agent_run SET attempt=5 WHERE session_id=?").run(
+            testSessionId,
+          );
+          yield* authority.processRunnable();
+          const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+          expect(run.state).toBe("failed");
+          expect(run.attempt).toBe(5);
+          expect(workerSpawnInputs).toEqual([]);
         }),
       ),
   );

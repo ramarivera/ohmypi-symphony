@@ -4,7 +4,9 @@ import { it } from "@effect/vitest";
 import {
   Clock,
   ConfigProvider,
+  Deferred,
   Effect,
+  Fiber,
   Layer,
   Logger,
   Option,
@@ -12,7 +14,7 @@ import {
   Schema,
 } from "effect";
 import pino from "pino";
-import { describe, expect } from "vitest";
+import { describe, expect, vi } from "vitest";
 import {
   AppUserId,
   IssueId,
@@ -1473,6 +1475,46 @@ describe("webhook admission security", () => {
             }),
           );
           expect(response.status).toBe(413);
+        }),
+      ),
+  );
+});
+
+describe("Interrupted webhook delivery recovery", () => {
+  it.scopedLive(
+    "reclaims a delivery when its processing fiber was interrupted",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const installationRepo = yield* InstallationRepo;
+          const pipeline = yield* WebhookPipeline;
+          const entered = yield* Deferred.make<void>();
+          const spy = vi
+            .spyOn(installationRepo, "get")
+            .mockImplementation(() =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.zipRight(Effect.never),
+              ),
+            );
+          const now = yield* Clock.currentTimeMillis;
+          const payload = createdPayload(now);
+          const fiber = yield* Effect.fork(
+            pipeline.handle(
+              signedRequest(payload, { delivery: "interrupted-webhook" }),
+            ),
+          );
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(fiber);
+          spy.mockRestore();
+          const response = yield* pipeline.handle(
+            signedRequest(payload, { delivery: "interrupted-webhook" }),
+          );
+          expect(response.status).toBe(200);
+          expect(yield* Effect.promise(() => response.text())).toBe("OK");
+          expect(
+            Option.isSome(yield* RunRepo.get(sessionId("session-1"))),
+          ).toBe(true);
         }),
       ),
   );
