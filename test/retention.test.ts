@@ -87,7 +87,7 @@ describe("retention", () => {
           ).run(id, id);
         }
         db.query(
-          "INSERT INTO webhook_delivery VALUES ('old', 'org', 1, 'hash', '{}', 'processed', NULL), ('pending', 'org', 1, 'hash', '{}', 'pending', NULL), ('new', 'org', 950, 'hash', '{}', 'processed', NULL)",
+          "INSERT INTO webhook_delivery VALUES ('old', 'org', 1, 'hash', '{}', 'processed', NULL), ('pending', 'org', 1, 'hash', '{}', 'pending', NULL), ('failed', 'org', 1, 'hash', '{}', 'failed', 'error'), ('new', 'org', 950, 'hash', '{}', 'processed', NULL)",
         ).run();
         db.query(
           "INSERT INTO oauth_state VALUES ('old', 1, 1, NULL), ('new', 1, 950, NULL)",
@@ -111,7 +111,7 @@ describe("retention", () => {
           events: 1,
           projections: 2,
           inputs: 1,
-          deliveries: 1,
+          deliveries: 2,
           auth: 3,
         });
         expect(existsSync(expired)).toBe(false);
@@ -148,6 +148,17 @@ describe("retention", () => {
             )
             .get(),
         ).toEqual({ payload_json: "{}" });
+        expect(
+          db
+            .query(
+              "SELECT payload_json, payload_hash, status FROM webhook_delivery WHERE delivery_id='failed'",
+            )
+            .get(),
+        ).toEqual({
+          payload_json: "null",
+          payload_hash: "hash",
+          status: "failed",
+        });
         expect((yield* service.sweep(now)).workspaces).toBe(0);
       }).pipe(withDatabase),
   );

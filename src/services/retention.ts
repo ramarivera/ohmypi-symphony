@@ -166,7 +166,7 @@ export const makeRetention = (input: {
           // Preserve delivery identities for deduplication. Drop their large raw payloads.
           const deliveries = db
             .query(
-              "UPDATE webhook_delivery SET payload_json='null' WHERE status='processed' AND received_at<? AND payload_json<>'null'",
+              "UPDATE webhook_delivery SET payload_json='null' WHERE status IN ('processed','failed') AND received_at<? AND payload_json<>'null'",
             )
             .run(
               now - Math.max(policy.deliveryTtlMs, input.webhookReplayWindowMs),
