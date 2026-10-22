@@ -432,7 +432,8 @@ const registerClient = (
   scope?: string,
 ): Effect.Effect<McpOAuthClientMetadata, DatabaseError | McpOAuthError> =>
   Effect.gen(function* () {
-    if (!metadata.registrationEndpoint) {
+    const registrationEndpoint = metadata.registrationEndpoint;
+    if (!registrationEndpoint) {
       return yield* Effect.fail(
         new DatabaseError({
           message: "MCP OAuth server requires a pre-registered client",
@@ -441,7 +442,7 @@ const registerClient = (
     }
     const response = yield* Effect.tryPromise({
       try: () =>
-        fetchWithTimeout(fetchImpl, metadata.registrationEndpoint!, {
+        fetchWithTimeout(fetchImpl, registrationEndpoint, {
           method: "POST",
           headers: {
             "content-type": "application/json",
@@ -1125,6 +1126,12 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       McpOAuthToken,
       DatabaseError | TokenCipherError | TokenRefreshError
     > {
+      const refreshToken = current.token.refreshToken;
+      if (refreshToken === undefined) {
+        return yield* Effect.fail(
+          new DatabaseError({ message: "MCP OAuth refresh token is missing" }),
+        );
+      }
       const key = `${organizationId}:${serverId}`;
       const mine = yield* Deferred.make<
         McpOAuthToken,
@@ -1148,7 +1155,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       if (Option.isSome(claim)) return yield* Deferred.await(claim.value);
       const refreshed = yield* refreshAccessToken(
         current.client,
-        current.token.refreshToken!,
+        refreshToken,
         fetch,
         now,
         current.serverUrl,
@@ -1310,13 +1317,14 @@ export const materializeMcpAgentDb = async (
   await rm(path, { force: true });
   let db: Database | undefined;
   try {
-    db = new Database(path);
+    const database = new Database(path);
+    db = database;
     await Effect.runPromise(
       tryDb(() => {
-        db!.exec(
+        database.exec(
           `CREATE TABLE IF NOT EXISTS auth_credentials (id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, credential_type TEXT NOT NULL, data TEXT NOT NULL, disabled_cause TEXT DEFAULT NULL, identity_key TEXT DEFAULT NULL, created_at INTEGER NOT NULL DEFAULT (unixepoch()), updated_at INTEGER NOT NULL DEFAULT (unixepoch())); CREATE INDEX IF NOT EXISTS idx_auth_provider ON auth_credentials(provider); CREATE INDEX IF NOT EXISTS idx_auth_provider_identity ON auth_credentials(provider, identity_key) WHERE identity_key IS NOT NULL;`,
         );
-        const insert = db!.query(
+        const insert = database.query(
           "INSERT INTO auth_credentials (provider, credential_type, data, identity_key) VALUES (?, 'oauth', ?, NULL)",
         );
         for (const credential of credentials) {
