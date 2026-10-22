@@ -14,6 +14,14 @@ export interface LogFileConfig {
   readonly limit: number;
 }
 export interface GatewayConfigShape {
+  readonly allowedOrganizationIds?: ReadonlySet<string> | undefined;
+  readonly gatewayAdminOrganizationIds?: ReadonlySet<string> | undefined;
+  readonly githubAppAllowedOwners?:
+    | Readonly<Record<string, ReadonlyArray<string>>>
+    | undefined;
+  readonly mcpOAuthAllowLoopbackHttp?: boolean | undefined;
+  readonly tokenEncryptionKeyId?: number | undefined;
+  readonly tokenEncryptionPreviousKeys?: Redacted.Redacted<string> | undefined;
   readonly linearClientId: string;
   readonly linearClientSecret: Redacted.Redacted<string>;
   readonly linearWebhookSecret: Redacted.Redacted<string>;
@@ -177,6 +185,10 @@ const logFile = Config.all({
 const GatewayConfigValues = Config.all({
   logLevel,
   logFile,
+  mcpOAuthAllowLoopbackHttp: Config.boolean(
+    "MCP_OAUTH_ALLOW_LOOPBACK_HTTP",
+  ).pipe(Config.withDefault(false)),
+  tokenEncryptionKeyId: positiveInteger("TOKEN_ENCRYPTION_KEY_ID", 1),
   databasePath: Config.string("DATABASE_PATH").pipe(
     Config.withDefault("./data/gateway.sqlite"),
     Config.map((value) => (value === ":memory:" ? value : resolve(value))),
@@ -282,6 +294,75 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
     accessors: true,
     effect: Effect.gen(function* () {
       const values = yield* Config.unwrap(GatewayConfigValues);
+      const allowedIds = yield* optionalValue(
+        "LINEAR_ALLOWED_ORGANIZATION_IDS",
+      );
+      const production = yield* Config.string("NODE_ENV").pipe(
+        Config.withDefault("development"),
+      );
+      if (production === "production" && allowedIds === undefined) {
+        return yield* Effect.fail(
+          ConfigError.InvalidData(
+            ["LINEAR_ALLOWED_ORGANIZATION_IDS"],
+            "Production requires an explicit organization allowlist",
+          ),
+        );
+      }
+      const parseIds = (raw: string | undefined) =>
+        raw === undefined
+          ? undefined
+          : new Set(
+              raw
+                .split(",")
+                .map((id) => id.trim())
+                .filter(Boolean),
+            );
+      const allowedOrganizationIds = parseIds(allowedIds);
+      const gatewayAdminOrganizationIds = parseIds(
+        yield* optionalValue("GATEWAY_ADMIN_ORGANIZATION_IDS"),
+      );
+      const ownersJson = yield* optionalValue("GITHUB_APP_ALLOWED_OWNERS_JSON");
+      const githubAppAllowedOwners = yield* Effect.try({
+        try: () => {
+          if (ownersJson === undefined) return undefined;
+          const value: unknown = JSON.parse(ownersJson);
+          if (
+            typeof value !== "object" ||
+            value === null ||
+            Array.isArray(value)
+          )
+            throw new Error("Expected org to GitHub owner array map");
+          const result: Record<string, ReadonlyArray<string>> = {};
+          for (const [org, owners] of Object.entries(value)) {
+            if (
+              !Array.isArray(owners) ||
+              !owners.every(
+                (owner): owner is string =>
+                  typeof owner === "string" &&
+                  /^[A-Za-z0-9][A-Za-z0-9-]*$/u.test(owner),
+              )
+            )
+              throw new Error("Invalid GitHub owner binding");
+            result[org] = owners.map((owner) => owner.toLowerCase());
+          }
+          return result;
+        },
+        catch: () =>
+          ConfigError.InvalidData(
+            ["GITHUB_APP_ALLOWED_OWNERS_JSON"],
+            "Invalid organization to GitHub owners map",
+          ),
+      });
+      if (values.tokenEncryptionKeyId > 255)
+        return yield* Effect.fail(
+          ConfigError.InvalidData(
+            ["TOKEN_ENCRYPTION_KEY_ID"],
+            "Key id must fit one byte",
+          ),
+        );
+      const previousKeys = yield* optionalValue(
+        "TOKEN_ENCRYPTION_PREVIOUS_KEYS_JSON",
+      );
       const linearClientId = yield* requiredValue("LINEAR_CLIENT_ID");
       const linearClientSecret = yield* requiredValue("LINEAR_CLIENT_SECRET");
       const linearWebhookSecret = yield* requiredValue("LINEAR_WEBHOOK_SECRET");
@@ -326,6 +407,11 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
       }
       return {
         ...values,
+        allowedOrganizationIds,
+        gatewayAdminOrganizationIds,
+        githubAppAllowedOwners,
+        tokenEncryptionPreviousKeys:
+          previousKeys === undefined ? undefined : Redacted.make(previousKeys),
         linearClientId,
         githubAppId,
         githubAppPrivateKey:
@@ -337,6 +423,13 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
         tokenEncryptionKey: Redacted.make(tokenEncryptionKey),
         publicUrl,
       };
-    }),
+    }).pipe(Effect.map((value): GatewayConfigShape => value)),
   },
 ) {}
+
+export const organizationAllowed = (
+  config: GatewayConfigShape,
+  organizationId: string,
+): boolean =>
+  config.allowedOrganizationIds === undefined ||
+  config.allowedOrganizationIds.has(organizationId);

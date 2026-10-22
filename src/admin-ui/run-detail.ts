@@ -55,14 +55,24 @@ const LEVELS: readonly RunDetailLevel[] = [
 
 const TERMINAL_STATES: ReadonlySet<string> = new Set(TERMINAL_RUN_STATES);
 
-/** Removes common credentials before a public run page or its JSON is emitted. */
+/** Defense in depth for authenticated transcripts and their JSON. */
 export function redact(value: string): string {
   return value
+    .replace(
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/gu,
+      "[redacted private key]",
+    )
+    .replace(/\b(?:gh[psour]_|github_pat_)[A-Za-z0-9_]+/gu, "redacted")
+    .replace(
+      /\bAuthorization\s*:\s*Basic\s+[A-Za-z0-9+/=]+/giu,
+      "Authorization: Basic redacted",
+    )
     .replace(
       /\bAuthorization\s*:\s*Bearer\s+[^\s,;"'}\]]+/giu,
       "Authorization: Bearer redacted",
     )
-    .replace(/\bBearer\s+[A-Za-z0-9._~+\-/=]+/gu, "Bearer redacted")
+    .replace(/\bBasic\s+[A-Za-z0-9+/=]+/giu, "Basic redacted")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\-/=]+/giu, "Bearer redacted")
     .replace(
       /((?:["'](?:access[_-]?token|token|api[_-]?key|key|secret|signature|password)["']|(?:access[_-]?token|token|api[_-]?key|key|secret|signature|password))\s*[:=]\s*["']?)[^,"'\s}\]]+/giu,
       "$1redacted",

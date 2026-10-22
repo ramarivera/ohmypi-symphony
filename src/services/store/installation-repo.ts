@@ -10,6 +10,7 @@ import {
   Installation as InstallationSchema,
 } from "../../domain/models.js";
 import { TokenCrypto } from "../token-crypto.js";
+import { tokenContext } from "../token-migration.js";
 import {
   decodeRow,
   runChanges,
@@ -67,8 +68,24 @@ const rowToInstallation = (
   Effect.gen(function* () {
     const [accessToken, refreshToken] = yield* Effect.all(
       [
-        tokenCrypto.decrypt(row.access_token),
-        tokenCrypto.decrypt(row.refresh_token),
+        tokenCrypto.decrypt(
+          row.access_token,
+          tokenContext(
+            "installation",
+            row.organization_id,
+            row.organization_id,
+            "access_token",
+          ),
+        ),
+        tokenCrypto.decrypt(
+          row.refresh_token,
+          tokenContext(
+            "installation",
+            row.organization_id,
+            row.organization_id,
+            "refresh_token",
+          ),
+        ),
       ],
       { concurrency: 2 },
     );
@@ -122,8 +139,24 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
         );
         const [accessToken, refreshToken] = yield* Effect.all(
           [
-            tokenCrypto.encrypt(record.accessToken),
-            tokenCrypto.encrypt(record.refreshToken),
+            tokenCrypto.encrypt(
+              record.accessToken,
+              tokenContext(
+                "installation",
+                record.organizationId,
+                record.organizationId,
+                "access_token",
+              ),
+            ),
+            tokenCrypto.encrypt(
+              record.refreshToken,
+              tokenContext(
+                "installation",
+                record.organizationId,
+                record.organizationId,
+                "refresh_token",
+              ),
+            ),
           ],
           { concurrency: 2 },
         );
@@ -208,6 +241,9 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
           db.query(
             "UPDATE installation SET revoked_at = ? WHERE organization_id = ?",
           ).run(at, organizationId);
+          db.query("DELETE FROM admin_session WHERE organization_id = ?").run(
+            organizationId,
+          );
           db.query(
             "UPDATE agent_run SET desired_state='canceled', updated_at=? WHERE organization_id=? AND state NOT IN ('succeeded','failed','canceled')",
           ).run(at, organizationId);

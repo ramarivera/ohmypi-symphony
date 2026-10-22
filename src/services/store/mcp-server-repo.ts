@@ -17,6 +17,7 @@ import {
   type McpServerTransport as McpServerTransportType,
 } from "../../domain/models.js";
 import { TokenCrypto } from "../token-crypto.js";
+import { tokenContext } from "../token-migration.js";
 import {
   decodeRow,
   decodeRows,
@@ -266,7 +267,15 @@ const rowToRecord = (
     const decryptedEnv = Object.fromEntries(
       yield* Effect.forEach(Object.entries(validEnv), ([key, value]) =>
         (isEncrypted(value)
-          ? tokenCrypto.decrypt(value.slice(MCP_ENCRYPTED_PREFIX.length))
+          ? tokenCrypto.decrypt(
+              value.slice(MCP_ENCRYPTED_PREFIX.length),
+              tokenContext(
+                "mcp_server",
+                row.organization_id,
+                row.id,
+                `env_json:${key}`,
+              ),
+            )
           : Effect.succeed(value)
         ).pipe(Effect.map((decrypted) => [key, decrypted] as const)),
       ),
@@ -274,7 +283,15 @@ const rowToRecord = (
     const decryptedHeaders = Object.fromEntries(
       yield* Effect.forEach(Object.entries(validHeaders), ([key, value]) =>
         (isEncrypted(value)
-          ? tokenCrypto.decrypt(value.slice(MCP_ENCRYPTED_PREFIX.length))
+          ? tokenCrypto.decrypt(
+              value.slice(MCP_ENCRYPTED_PREFIX.length),
+              tokenContext(
+                "mcp_server",
+                row.organization_id,
+                row.id,
+                `headers_json:${key}`,
+              ),
+            )
           : Effect.succeed(value)
         ).pipe(Effect.map((decrypted) => [key, decrypted] as const)),
       ),
@@ -284,6 +301,12 @@ const rowToRecord = (
       const encoded = isEncrypted(row.oauth_client_json)
         ? yield* tokenCrypto.decrypt(
             row.oauth_client_json.slice(MCP_ENCRYPTED_PREFIX.length),
+            tokenContext(
+              "mcp_server",
+              row.organization_id,
+              row.id,
+              "oauth_client_json",
+            ),
           )
         : row.oauth_client_json;
       oauthClient = yield* decodeRow(
@@ -316,10 +339,11 @@ const rowToRecord = (
 const encryptEnv = (
   tokenCrypto: TokenCrypto,
   env: Readonly<Record<string, string>>,
+  context: (key: string) => string,
 ): Effect.Effect<Record<string, string>, TokenCipherError> =>
   Effect.forEach(Object.entries(env), ([key, value]) =>
     tokenCrypto
-      .encrypt(value)
+      .encrypt(value, context(key))
       .pipe(
         Effect.map(
           (encrypted) => [key, `${MCP_ENCRYPTED_PREFIX}${encrypted}`] as const,
@@ -330,11 +354,12 @@ const encryptEnv = (
 const encryptOAuthClient = (
   tokenCrypto: TokenCrypto,
   value: McpOAuthClientConfig | null,
+  context: string,
 ): Effect.Effect<string | null, TokenCipherError> =>
   value === null
     ? Effect.succeed(null)
     : tokenCrypto
-        .encrypt(JSON.stringify(value))
+        .encrypt(JSON.stringify(value), context)
         .pipe(Effect.map((encrypted) => `${MCP_ENCRYPTED_PREFIX}${encrypted}`));
 export class McpServerRepo extends Effect.Service<McpServerRepo>()(
   "McpServerRepo",
@@ -391,14 +416,37 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
               }),
             );
           }
-          const encryptedEnv = yield* encryptEnv(tokenCrypto, record.env);
+          const encryptedEnv = yield* encryptEnv(
+            tokenCrypto,
+            record.env,
+            (key) =>
+              tokenContext(
+                "mcp_server",
+                record.organizationId,
+                record.id,
+                `env_json:${key}`,
+              ),
+          );
           const encryptedHeaders = yield* encryptEnv(
             tokenCrypto,
             record.headers,
+            (key) =>
+              tokenContext(
+                "mcp_server",
+                record.organizationId,
+                record.id,
+                `headers_json:${key}`,
+              ),
           );
           const encryptedOAuthClient = yield* encryptOAuthClient(
             tokenCrypto,
             record.oauthClient ?? null,
+            tokenContext(
+              "mcp_server",
+              record.organizationId,
+              record.id,
+              "oauth_client_json",
+            ),
           );
           yield* tryDb(
             () =>
@@ -558,9 +606,22 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
           const encryptedOAuthClient = yield* encryptOAuthClient(
             tokenCrypto,
             next.oauthClient ?? null,
+            tokenContext("mcp_server", organizationId, id, "oauth_client_json"),
           );
-          const encryptedEnv = yield* encryptEnv(tokenCrypto, next.env);
-          const encryptedHeaders = yield* encryptEnv(tokenCrypto, next.headers);
+          const encryptedEnv = yield* encryptEnv(tokenCrypto, next.env, (key) =>
+            tokenContext("mcp_server", organizationId, id, `env_json:${key}`),
+          );
+          const encryptedHeaders = yield* encryptEnv(
+            tokenCrypto,
+            next.headers,
+            (key) =>
+              tokenContext(
+                "mcp_server",
+                organizationId,
+                id,
+                `headers_json:${key}`,
+              ),
+          );
           yield* tryDb(
             () =>
               db

@@ -5,6 +5,7 @@ import {
   RpcSpawnError,
   RpcTimeoutError,
 } from "../domain/errors.js";
+import { workerEnvironment, workerIdentityCommand } from "./worker-security.js";
 
 export interface RpcEvent {
   readonly type: string;
@@ -110,23 +111,6 @@ function frameId(frame: Record<string, unknown>): string | number | null {
   return null;
 }
 
-function sanitizedEnvironment(
-  input: Record<string, string | undefined>,
-): Record<string, string> {
-  const output: Record<string, string> = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (value === undefined) continue;
-    if (
-      key.startsWith("LINEAR_") ||
-      key === "TOKEN_ENCRYPTION_KEY" ||
-      key === "DATABASE_URL"
-    )
-      continue;
-    output[key] = value;
-  }
-  return output;
-}
-
 const MAX_CHUNK_SIZE = 67_108_864;
 const MAX_PROMPT_REQUEST_IDS = 256;
 const GRACEFUL_STOP_TIMEOUT_MS = 2_000;
@@ -149,6 +133,8 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       readonly command: ReadonlyArray<string>;
       readonly cwd: string;
       readonly env?: Record<string, string | undefined>;
+      /** Values explicitly created by the caller for this run. Never pass process.env here. */
+      readonly injectedEnv?: Record<string, string>;
       readonly startTimeoutMs?: number;
     }): Effect.fn.Return<RpcWorkerHandle, RpcSpawnError> {
       if (input.command.length === 0) {
@@ -156,17 +142,28 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
           new RpcSpawnError({ message: "RPC command cannot be empty" }),
         );
       }
-      const command = [...input.command, "--mode", "rpc"];
+      const workerUid = yield* configWithDefault("WORKER_UID", "");
+      const command = yield* Effect.try({
+        try: () =>
+          workerIdentityCommand([...input.command, "--mode", "rpc"], workerUid),
+        catch: () =>
+          new RpcSpawnError({
+            message: "Invalid worker identity configuration",
+          }),
+      });
       const cwd = input.cwd;
       const startTimeoutMs = input.startTimeoutMs ?? 30_000;
-      const env = sanitizedEnvironment(
-        input.env ?? {
-          PATH: yield* configWithDefault("PATH", ""),
-          HOME: yield* configWithDefault("HOME", ""),
-          TMPDIR: yield* configWithDefault("TMPDIR", "/tmp"),
-          XDG_CONFIG_HOME: yield* configWithDefault("XDG_CONFIG_HOME", ""),
-        },
-      );
+      const env = {
+        ...workerEnvironment(
+          input.env ?? {
+            PATH: yield* configWithDefault("PATH", ""),
+            HOME: yield* configWithDefault("HOME", ""),
+            TMPDIR: yield* configWithDefault("TMPDIR", "/tmp"),
+            XDG_CONFIG_HOME: yield* configWithDefault("XDG_CONFIG_HOME", ""),
+          },
+        ),
+        ...input.injectedEnv,
+      };
       const processRef = yield* Ref.make<
         Option.Option<Subprocess<"pipe", "pipe", "pipe">>
       >(Option.none());

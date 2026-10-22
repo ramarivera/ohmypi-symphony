@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { mkdir } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Context, Effect, Exit, Layer, ParseResult, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
@@ -388,7 +388,7 @@ export const SqliteClientLive = (
       Effect.gen(function* () {
         if (path !== ":memory:") {
           yield* Effect.tryPromise({
-            try: () => mkdir(dirname(path), { recursive: true }),
+            try: () => mkdir(dirname(path), { recursive: true, mode: 0o700 }),
             catch: (error) =>
               new DatabaseError({
                 message: `mkdir failed: ${
@@ -402,6 +402,14 @@ export const SqliteClientLive = (
           () => new Database(path, { create: true, strict: true }),
           "open",
         );
+        if (path !== ":memory:")
+          yield* Effect.tryPromise({
+            try: () => chmod(path, 0o600),
+            catch: () =>
+              new DatabaseError({
+                message: "Could not secure database permissions",
+              }),
+          });
         yield* tryDb(
           () =>
             db.exec(

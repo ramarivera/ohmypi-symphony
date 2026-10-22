@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import {
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  realpath,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Option } from "effect";
 import {
@@ -146,16 +154,16 @@ export const parseRepositorySuggestionCandidate = (
   return { hostname, repositoryFullName };
 };
 
-const isHttpsGitHubRepositoryUrl = (repositoryUrl: string): boolean => {
-  try {
-    const parsed = new URL(repositoryUrl);
-    return (
-      parsed.protocol === "https:" &&
-      parsed.hostname.toLowerCase() === "github.com"
-    );
-  } catch {
+export const isHttpsGitHubRepositoryUrl = (repositoryUrl: string): boolean => {
+  if (repositoryUrl.startsWith("-") || repositoryUrl.includes("\\"))
     return false;
-  }
+  // Match the raw string too: URL canonicalization must not hide traversal,
+  // credentials, encoded path separators, explicit ports, queries or fragments.
+  return (
+    /^https:\/\/github\.com\/[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9_.-]+(?:\.git)?$/u.test(
+      repositoryUrl,
+    ) && ![".", "..", ".git"].includes(repositoryUrl.split("/").at(-1) ?? "")
+  );
 };
 
 const mintGitHubExtraHeader = (
@@ -327,17 +335,28 @@ const runGit = (
   args: ReadonlyArray<string>,
   cwd: string | undefined,
   sessionId: string,
+  extraHeader?: string,
 ) =>
   Effect.tryPromise({
     try: async () => {
-      const process = Bun.spawn(["git", ...args], {
+      const child = Bun.spawn(["git", ...args], {
+        env: {
+          ...process.env,
+          ...(extraHeader === undefined
+            ? {}
+            : {
+                GIT_CONFIG_COUNT: "1",
+                GIT_CONFIG_KEY_0: GITHUB_EXTRA_HEADER_KEY,
+                GIT_CONFIG_VALUE_0: extraHeader,
+              }),
+        },
         ...(cwd ? { cwd } : {}),
         stdout: "pipe",
         stderr: "pipe",
       });
       const [exitCode, stderr] = await Promise.all([
-        process.exited,
-        new Response(process.stderr).text(),
+        child.exited,
+        new Response(child.stderr).text(),
       ]);
       if (exitCode !== 0) {
         throw new Error(
@@ -355,6 +374,54 @@ const runGit = (
         reason: "git_failed",
       }),
   });
+
+const persistGitHubExtraHeader = (
+  target: string,
+  sessionId: string,
+  header: string,
+): Effect.Effect<void, WorkspaceError> =>
+  unsetGitHubExtraHeader(target, sessionId).pipe(
+    Effect.zipRight(
+      Effect.tryPromise({
+        try: async () => {
+          if (!isGatewayGitHubExtraHeader(header))
+            throw new Error("Invalid gateway credential");
+          const gitDir = await open(
+            join(target, ".git"),
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          );
+          try {
+            const configPath =
+              process.platform === "linux"
+                ? `/proc/self/fd/${gitDir.fd}/config`
+                : join(target, ".git", "config");
+            const config = await open(
+              configPath,
+              constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW,
+            );
+            try {
+              if (!(await config.stat()).isFile())
+                throw new Error("Git config must be a regular file");
+              await config.chmod(0o600);
+              await config.writeFile(
+                `\n[http "https://github.com/"]\n\textraheader = ${header}\n`,
+              );
+            } finally {
+              await config.close();
+            }
+          } finally {
+            await gitDir.close();
+          }
+        },
+        catch: () =>
+          new WorkspaceError({
+            message: "Could not persist GitHub credential",
+            sessionId,
+            reason: "git_failed",
+          }),
+      }),
+    ),
+  );
 
 const isGatewayGitHubExtraHeader = (value: string): boolean => {
   const match = /^AUTHORIZATION: basic ([A-Za-z0-9+/]+={0,2})$/u.exec(value);
@@ -376,6 +443,7 @@ const runGitOutput = (
   Effect.tryPromise({
     try: async () => {
       const process = Bun.spawn(["git", ...args], {
+        env: { ...globalThis.process.env },
         ...(cwd ? { cwd } : {}),
         stdout: "pipe",
         stderr: "pipe",
@@ -409,7 +477,7 @@ const unsetGitHubExtraHeader = (
 ): Effect.Effect<void, never> =>
   Effect.gen(function* () {
     const configuredHeaders = yield* runGitOutput(
-      ["config", "--local", "--get-all", GITHUB_EXTRA_HEADER_KEY],
+      ["config", "--local", "--get-all", "--", GITHUB_EXTRA_HEADER_KEY],
       target,
       sessionId,
     ).pipe(Effect.catchAll(() => Effect.succeed("")));
@@ -430,7 +498,7 @@ const unsetGitHubExtraHeader = (
       return;
     }
     yield* runGit(
-      ["config", "--local", "--unset-all", GITHUB_EXTRA_HEADER_KEY],
+      ["config", "--local", "--unset-all", "--", GITHUB_EXTRA_HEADER_KEY],
       target,
       sessionId,
     ).pipe(Effect.catchAll(() => Effect.void));
@@ -650,11 +718,7 @@ export const makeWorkspace = (input: {
         yield* unsetGitHubExtraHeader(target, sessionId);
         return;
       }
-      yield* runGit(
-        ["config", "--local", GITHUB_EXTRA_HEADER_KEY, githubExtraHeader],
-        target,
-        sessionId,
-      );
+      yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
     });
 
     const clearGitHubExtraHeader = (
@@ -671,6 +735,19 @@ export const makeWorkspace = (input: {
         "workspace.repository_id": repository.id,
       });
 
+      if (
+        !isHttpsGitHubRepositoryUrl(repository.url) ||
+        repository.ref.startsWith("-") ||
+        /[\r\n\0]/u.test(repository.ref)
+      ) {
+        return yield* Effect.fail(
+          new WorkspaceError({
+            message: "Repository must be an HTTPS GitHub URL with a valid ref",
+            sessionId,
+            reason: "git_failed",
+          }),
+        );
+      }
       const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
       const target = join(canonicalRoot, safeSessionKey(sessionId));
 
@@ -750,36 +827,27 @@ export const makeWorkspace = (input: {
       }
 
       const cloneArgs = [
-        ...(githubExtraHeader === undefined
-          ? []
-          : [
-              "-c",
-              `http.https://github.com/.extraheader=${githubExtraHeader}`,
-            ]),
         "clone",
         "--no-checkout",
         "--filter=blob:none",
+        "--",
         repository.url,
         target,
       ];
-      yield* runGit(cloneArgs, undefined, sessionId);
+      yield* runGit(cloneArgs, undefined, sessionId, githubExtraHeader);
       if (githubExtraHeader !== undefined) {
-        yield* runGit(
-          ["config", "--local", GITHUB_EXTRA_HEADER_KEY, githubExtraHeader],
-          target,
-          sessionId,
-        );
+        yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
       }
       // If anything after persisting the header fails, drop it so the next
       // attempt doesn't inherit a stale/expired credential.
       yield* Effect.gen(function* () {
         yield* runGit(
-          ["fetch", "--depth=1", "origin", repository.ref],
+          ["fetch", "--depth=1", "--", "origin", repository.ref],
           target,
           sessionId,
         );
         yield* runGit(
-          ["checkout", "--detach", "--force", "FETCH_HEAD"],
+          ["checkout", "--detach", "--force", "FETCH_HEAD", "--"],
           target,
           sessionId,
         );

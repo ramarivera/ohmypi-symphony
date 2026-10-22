@@ -10,7 +10,7 @@ import {
   Installation,
   type Installation as InstallationType,
 } from "../domain/models.js";
-import { GatewayConfig } from "./config.js";
+import { GatewayConfig, organizationAllowed } from "./config.js";
 import {
   buildInstallationRecord,
   discoverAppInstallation,
@@ -213,6 +213,12 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
         const { organizationId, appUserId } = yield* discoverInstallation(
           token.accessToken,
         );
+
+        if (!organizationAllowed(config, organizationId)) {
+          return yield* Effect.fail(
+            new OAuthStateError({ message: "Organization is not allowed" }),
+          );
+        }
 
         const installation = yield* buildInstallation(
           token,

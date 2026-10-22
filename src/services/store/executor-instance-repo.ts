@@ -9,6 +9,7 @@ import {
   type OrganizationId as OrganizationIdType,
 } from "../../domain/ids.js";
 import { TokenCrypto } from "../token-crypto.js";
+import { tokenContext } from "../token-migration.js";
 import { decodeRow, runChanges, SqliteClient, tryDb } from "./sqlite-client.js";
 
 const ExecutorInstanceRow = Schema.Struct({
@@ -39,7 +40,15 @@ const rowToInstance = (
       "ExecutorInstance.organizationId",
     );
     const token = row.token.startsWith(PREFIX)
-      ? yield* crypto.decrypt(row.token.slice(PREFIX.length))
+      ? yield* crypto.decrypt(
+          row.token.slice(PREFIX.length),
+          tokenContext(
+            "executor_instance",
+            row.organization_id,
+            row.organization_id,
+            "token",
+          ),
+        )
       : row.token;
     return {
       organizationId,
@@ -92,7 +101,15 @@ export class ExecutorInstanceRepo extends Effect.Service<ExecutorInstanceRepo>()
         DatabaseError | RowDecodeError | TokenCipherError
       > {
         const updatedAt = input.updatedAt ?? (yield* Clock.currentTimeMillis);
-        const encrypted = yield* crypto.encrypt(input.token);
+        const encrypted = yield* crypto.encrypt(
+          input.token,
+          tokenContext(
+            "executor_instance",
+            input.organizationId,
+            input.organizationId,
+            "token",
+          ),
+        );
         yield* tryDb(
           () =>
             db

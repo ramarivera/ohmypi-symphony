@@ -28,7 +28,8 @@ import {
   APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION,
   AppUserNotification,
 } from "../domain/models.js";
-import { GatewayConfig } from "./config.js";
+import { BodyTooLargeError, readBoundedBody } from "./bounded-body.js";
+import { GatewayConfig, organizationAllowed } from "./config.js";
 import {
   isNumber,
   isRecord,
@@ -990,15 +991,23 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
               return new Response("Method not allowed", { status: 405 });
             }
 
+            if (
+              Number(request.headers.get("content-length")) >
+              MAX_WEBHOOK_BODY_BYTES
+            )
+              return new Response("Payload too large", { status: 413 });
             const rawBody = yield* Effect.tryPromise({
-              try: () => request.arrayBuffer(),
+              try: () => readBoundedBody(request, MAX_WEBHOOK_BODY_BYTES),
               catch: (error) =>
                 new WebhookPayloadError({
-                  message: "Unable to read body",
-                  status: 400,
+                  message:
+                    error instanceof BodyTooLargeError
+                      ? "Payload too large"
+                      : "Unable to read body",
+                  status: error instanceof BodyTooLargeError ? 413 : 400,
                   cause: String(error),
                 }),
-            }).pipe(Effect.map((buffer) => new Uint8Array(buffer)));
+            });
 
             const signature = request.headers.get(LINEAR_SIGNATURE_HEADER);
             if (signature === null) {
@@ -1106,6 +1115,11 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                 { status: 400 },
               );
             }
+
+            if (!organizationAllowed(config, organizationId))
+              return new Response("Organization is not allowed", {
+                status: 403,
+              });
 
             const hash = payloadHash(rawBody);
             const rawDeliveryId =
@@ -1366,3 +1380,5 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
     }),
   },
 ) {}
+
+export const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
