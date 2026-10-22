@@ -57,6 +57,7 @@ describe("GitHubApp", () => {
       );
     };
     const service = makeGitHubApp({
+      allowedOwners: { "org-test": ["octo-org"] },
       appId: "12345",
       privateKey: privateKeyPem,
       fetch: fetchMock,
@@ -108,6 +109,7 @@ describe("GitHubApp", () => {
       );
     };
     const service = makeGitHubApp({
+      allowedOwners: { "org-test": ["octo-org"] },
       appId: "12345",
       privateKey: privateKeyPem,
       fetch: fetchMock,
@@ -161,6 +163,7 @@ describe("GitHubApp", () => {
       });
     };
     const service = makeGitHubApp({
+      allowedOwners: { "org-test": ["octo-org"] },
       appId: "12345",
       privateKey: privateKeyPem,
       fetch: fetchMock,
@@ -185,6 +188,7 @@ describe("GitHubApp", () => {
     const result = await Effect.runPromise(
       Effect.either(
         makeGitHubApp({
+          allowedOwners: { "org-test": ["octo-org"] },
           appId: undefined,
           privateKey: undefined,
         }).getInstallationToken("owner", "repo", "org-test"),
@@ -203,6 +207,7 @@ describe("GitHubApp", () => {
         status: 404,
       });
     const service = makeGitHubApp({
+      allowedOwners: { "org-test": ["octo-org"] },
       appId: "12345",
       privateKey: privateKeyPem,
       fetch: fetchMock,
@@ -221,6 +226,7 @@ describe("GitHubApp", () => {
   it("releases single-flight waiters when the winner is interrupted", async () => {
     const started = Deferred.unsafeMake<void>(FiberId.none);
     const service = makeGitHubApp({
+      allowedOwners: { "org-test": ["octo-org"] },
       appId: "12345",
       privateKey: privateKeyPem,
       fetch: async () => {

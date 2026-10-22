@@ -189,6 +189,10 @@ describe("HTTP router parity", () => {
     };
     const response = await Effect.runPromise(
       oauthStart.pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          request("GET", "/oauth/start"),
+        ),
         Effect.provideService(OAuth, oauth),
         Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
       ),

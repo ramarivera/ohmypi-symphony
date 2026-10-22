@@ -20,7 +20,7 @@ import type {
   TeamId,
   WorkspaceId,
 } from "../src/domain/ids.js";
-import { httpApp } from "../src/http/router.js";
+import { httpApp, router } from "../src/http/router.js";
 import {
   Admin,
   createAdminSession,
@@ -229,7 +229,7 @@ describe("admin control plane", () => {
         const a = yield* repo.createRepository({
           organizationId: organizationId("org-a"),
           id: workspaceId("repo"),
-          url: "https://example.com/a.git",
+          url: "https://github.com/test/a.git",
           ref: "main",
           teamIds: [],
           projectIds: [],
@@ -239,7 +239,7 @@ describe("admin control plane", () => {
         const b = yield* repo.createRepository({
           organizationId: organizationId("org-b"),
           id: workspaceId("repo"),
-          url: "https://example.com/b.git",
+          url: "https://github.com/test/b.git",
           ref: "main",
           teamIds: [],
           projectIds: [],
@@ -252,12 +252,12 @@ describe("admin control plane", () => {
           (yield* repo.listRepositories(organizationId("org-a"))).map(
             (r) => r.url,
           ),
-        ).toEqual(["https://example.com/a.git"]);
+        ).toEqual(["https://github.com/test/a.git"]);
         expect(
           (yield* repo.listRepositories(organizationId("org-b"))).map(
             (r) => r.url,
           ),
-        ).toEqual(["https://example.com/b.git"]);
+        ).toEqual(["https://github.com/test/b.git"]);
       }),
     ),
   );
@@ -270,7 +270,7 @@ describe("admin control plane", () => {
         const first = yield* repo.createRepository({
           organizationId: organization,
           id: workspaceId("first"),
-          url: "https://example.com/first.git",
+          url: "https://github.com/test/first.git",
           ref: "main",
           teamIds: [],
           projectIds: [],
@@ -281,7 +281,7 @@ describe("admin control plane", () => {
         const second = yield* repo.createRepository({
           organizationId: organization,
           id: workspaceId("second"),
-          url: "https://example.com/second.git",
+          url: "https://github.com/test/second.git",
           ref: "main",
           teamIds: [],
           projectIds: [],
@@ -314,7 +314,7 @@ describe("admin control plane", () => {
         yield* repo.createRepository({
           organizationId: organization,
           id,
-          url: "https://example.com/repo.git",
+          url: "https://github.com/test/repo.git",
           ref: "main",
           teamIds: [teamId("team")],
           projectIds: [],
@@ -371,7 +371,7 @@ describe("admin control plane", () => {
             repo.createRepository({
               organizationId: organization,
               id: workspaceId(id),
-              url: `https://example.com/${id}.git`,
+              url: `https://github.com/test/${id}.git`,
               ref: "main",
               teamIds: options.teamIds ?? [],
               projectIds: options.projectIds ?? [],
@@ -492,7 +492,9 @@ describe("admin control plane", () => {
           expect((yield* fetchApp(adminRequest("/"))).status).toBe(200);
           const dashboard = yield* fetchApp(adminRequest("/admin"));
           expect(dashboard.status).toBe(302);
-          expect(dashboard.headers.get("location")).toBe("/");
+          expect(dashboard.headers.get("location")).toContain(
+            "/oauth/start?returnTo=",
+          );
         }),
       ),
   );
@@ -554,7 +556,7 @@ describe("admin control plane", () => {
                 method: "POST",
                 body: {
                   id: "x",
-                  url: "https://example.com/x.git",
+                  url: "https://github.com/test/x.git",
                   ref: "main",
                 },
               }),
@@ -571,7 +573,7 @@ describe("admin control plane", () => {
                 csrf,
                 body: {
                   id: "x",
-                  url: "https://example.com/x.git",
+                  url: "https://github.com/test/x.git",
                   ref: "main",
                 },
               }),
@@ -585,7 +587,7 @@ describe("admin control plane", () => {
                 origin: PUBLIC_URL,
                 body: {
                   id: "x",
-                  url: "https://example.com/x.git",
+                  url: "https://github.com/test/x.git",
                   ref: "main",
                 },
               }),
@@ -600,7 +602,7 @@ describe("admin control plane", () => {
               origin: PUBLIC_URL,
               body: {
                 id: "api-repo",
-                url: "https://example.com/api.git",
+                url: "https://github.com/test/api.git",
                 ref: "main",
                 teamIds: ["team-a"],
               },
@@ -632,7 +634,7 @@ describe("admin control plane", () => {
               origin: PUBLIC_URL,
               body: {
                 id: "api-repo",
-                url: "https://example.com/api.git",
+                url: "https://github.com/test/api.git",
                 ref: "develop",
                 labels: ["frontend"],
               },
@@ -667,7 +669,7 @@ describe("admin control plane", () => {
   );
 
   it.scopedLive(
-    "redacts public run details and preserves their JSON representation",
+    "authenticates run details, scopes them to their org, and redacts HTML and JSON",
     () =>
       withApp(
         Effect.gen(function* () {
@@ -708,8 +710,29 @@ describe("admin control plane", () => {
             now,
           });
           const path = `/runs/${encodeURIComponent(id)}`;
+          const { token } = yield* createSession("org-runs", Date.now());
+          const { token: otherToken } = yield* createSession(
+            "org-other",
+            Date.now(),
+          );
+          const unauthenticated = yield* fetchApp(adminRequest(path));
+          expect(unauthenticated.status).toBe(302);
+          expect(unauthenticated.headers.get("location")).toContain(
+            "returnTo=",
+          );
+          expect((yield* fetchApp(adminRequest(`${path}.json`))).status).toBe(
+            401,
+          );
+          expect(
+            (yield* fetchApp(adminRequest(path, { token: otherToken }))).status,
+          ).toBe(404);
+          expect(
+            (yield* fetchApp(
+              adminRequest(`${path}.json`, { token: otherToken }),
+            )).status,
+          ).toBe(404);
 
-          const html = yield* fetchApp(adminRequest(path));
+          const html = yield* fetchApp(adminRequest(path, { token }));
           expect(html.status).toBe(200);
           expect(html.headers.get("content-type")).toContain("text/html");
           const page = yield* Effect.promise(() => html.text());
@@ -726,7 +749,10 @@ describe("admin control plane", () => {
 
           const json = yield* fetchApp(
             new Request(new URL(path, PUBLIC_URL).toString(), {
-              headers: { Accept: "application/json" },
+              headers: {
+                Accept: "application/json",
+                Cookie: `omp_gateway_admin=${token}`,
+              },
             }),
           );
           expect(json.status).toBe(200);
@@ -761,7 +787,9 @@ describe("admin control plane", () => {
           });
           expect(JSON.stringify(detail)).not.toContain("query-secret");
 
-          const suffix = yield* fetchApp(adminRequest(`${path}.json`));
+          const suffix = yield* fetchApp(
+            adminRequest(`${path}.json`, { token }),
+          );
           expect(suffix.status).toBe(200);
           expect(suffix.headers.get("content-type")).toContain(
             "application/json",
@@ -826,7 +854,7 @@ describe("admin control plane", () => {
           repo.createRepository({
             organizationId: organization,
             id: workspaceId(id),
-            url: `https://example.com/${id}.git`,
+            url: `https://github.com/test/${id}.git`,
             ref: "main",
             teamIds: options.teamIds ?? [],
             projectIds: [],
@@ -916,7 +944,7 @@ describe("admin session and routing invariants", () => {
             yield* repo.createRepository({
               organizationId: organizationId(owner),
               id: workspaceId("private-repository"),
-              url: "https://example.com/private.git",
+              url: "https://github.com/test/private.git",
               ref: "main",
               labels: [label],
               isDefault: true,
@@ -935,5 +963,71 @@ describe("admin session and routing invariants", () => {
         ),
       ),
     { timeout: 15_000, fastCheck: { numRuns: 20 } },
+  );
+});
+
+describe("route authentication inventory", () => {
+  it.scopedLive(
+    "requires login for every registered route outside the explicit protocol exemptions",
+    () =>
+      withApp(
+        Effect.gen(function* () {
+          const publicRoutes = new Set([
+            "GET /",
+            "GET /health",
+            "GET /oauth/start",
+            "GET /oauth/callback",
+            "POST /webhooks/linear",
+          ]);
+          const encountered = new Set<string>();
+          for (const route of router.routes) {
+            const methods =
+              route.method === "*"
+                ? ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+                : [route.method];
+            const path = route.path
+              .replace(":id.json", "example.json")
+              .replace(":id", "example")
+              .replace("*", "example");
+            for (const method of methods) {
+              const key = `${method} ${path}`;
+              if (publicRoutes.has(key)) {
+                encountered.add(key);
+                continue;
+              }
+              const response = yield* fetchApp(adminRequest(path, { method }));
+              expect([401, 302], key).toContain(response.status);
+              if (response.status === 302)
+                expect(response.headers.get("location"), key).toContain(
+                  "/oauth/start?returnTo=",
+                );
+            }
+          }
+          expect([...encountered].sort()).toEqual([...publicRoutes].sort());
+        }),
+      ),
+  );
+  it.scopedLive(
+    "deletes all admin sessions when their installation is revoked",
+    () =>
+      withApp(
+        Effect.gen(function* () {
+          const { token } = yield* createSession("org-revoked", Date.now());
+          expect(
+            (yield* fetchApp(adminRequest("/admin", { token }))).status,
+          ).toBe(200);
+          yield* InstallationRepo.revoke(
+            organizationId("org-revoked"),
+            Date.now(),
+          );
+          expect(
+            (yield* fetchApp(adminRequest("/api/admin/bootstrap", { token })))
+              .status,
+          ).toBe(401);
+          expect(yield* AdminSessionRepo.get(tokenHash(token))).toEqual(
+            Option.none(),
+          );
+        }),
+      ),
   );
 });

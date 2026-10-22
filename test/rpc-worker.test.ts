@@ -206,7 +206,8 @@ describe("RpcWorker", () => {
       const worker = yield* rpc.spawn({
         command: ["bun", "-e", ignoresStdinCloseFixture],
         cwd: process.cwd(),
-        env: { PATH: process.env.PATH, STOP_MARKER: marker },
+        env: { PATH: process.env.PATH },
+        injectedEnv: { STOP_MARKER: marker },
       });
       yield* worker.start();
       yield* worker.stop();

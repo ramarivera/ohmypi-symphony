@@ -47,6 +47,10 @@ const withRepo = <A, E>(
         Layer.setConfigProvider(
           ConfigProvider.fromMap(
             new Map([
+              ["LINEAR_CLIENT_ID", "test"],
+              ["LINEAR_CLIENT_SECRET", "test"],
+              ["LINEAR_WEBHOOK_SECRET", "test"],
+              ["PUBLIC_URL", "http://localhost:3000"],
               [
                 "TOKEN_ENCRYPTION_KEY",
                 Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64"),

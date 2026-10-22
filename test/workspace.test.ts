@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { it } from "@effect/vitest";
 import { ConfigProvider, Effect, Either, Layer, Schema } from "effect";
 import * as fc from "effect/FastCheck";
-import { describe, expect } from "vitest";
+import { describe, expect, vi } from "vitest";
 import { WorkspaceError } from "../src/domain/errors.js";
 import {
   OrganizationId,
@@ -120,6 +120,8 @@ const readGitConfigAll = (key: string, cwd: string) =>
 interface GitFixture {
   readonly root: string;
   readonly source: string;
+  readonly url: string;
+  readonly previousGitConfigGlobal: string | undefined;
   readonly workspaceRoot: string;
 }
 
@@ -142,12 +144,34 @@ const gitFixture = Effect.acquireRelease(
     yield* runGit(["add", "README.txt"], source);
     yield* runGit(["commit", "-m", "fixture"], source);
 
-    return { root, source, workspaceRoot: join(root, "workspaces") };
+    const previousGitConfigGlobal = process.env.GIT_CONFIG_GLOBAL;
+    const url = `https://github.com/fixture/repo-${crypto.randomUUID()}.git`;
+    const gitConfig = join(root, "gitconfig");
+    yield* fixtureIo("git transport config", () =>
+      writeFile(
+        gitConfig,
+        `[url "${source}"]\n\tinsteadOf = ${url}\n[url "${root}/missing"]\n\tinsteadOf = https://github.com/octo-org/repository-that-does-not-exist.git\n`,
+      ),
+    );
+    process.env.GIT_CONFIG_GLOBAL = gitConfig;
+    return {
+      root,
+      source,
+      url,
+      previousGitConfigGlobal,
+      workspaceRoot: join(root, "workspaces"),
+    };
   }),
   (fixture) =>
-    fixtureIo("fixture cleanup", () =>
-      rm(fixture.root, { recursive: true, force: true }),
-    ).pipe(
+    fixtureIo("fixture cleanup", async () => {
+      for (const [name, value] of [
+        ["GIT_CONFIG_GLOBAL", fixture.previousGitConfigGlobal],
+      ] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      await rm(fixture.root, { recursive: true, force: true });
+    }).pipe(
       Effect.catchTag("@Gateway/WorkspaceError", (error) => Effect.die(error)),
     ),
 );
@@ -250,7 +274,7 @@ const createRepository = (
   repo.createRepository({
     organizationId: organizationId("org"),
     id: workspaceId(id),
-    url: fixture.source,
+    url: fixture.url,
     ref: overrides.ref ?? "main",
     labels: overrides.labels ?? [],
     projectIds: (overrides.projectIds ?? []).map(projectId),
@@ -428,7 +452,7 @@ describe("Workspace", () => {
               ),
             ).toEqual({
               repositoryId: "one",
-              url: fixture.source,
+              url: fixture.url,
               ref: "main",
             });
             expect(
@@ -728,47 +752,52 @@ describe("Workspace", () => {
     }),
   );
 
-  it.scopedLive("does not mint credentials for SSH-style GitHub URLs", () =>
-    Effect.gen(function* () {
-      const fixture = yield* gitFixture;
-      const id = sessionId("github-ssh-reuse");
-      const record = repositoryRecord({
-        id: "github-ssh-reuse",
-        url: "git@github.com:octo-org/private-repo.git",
-      });
-      yield* fixtureIo("workspace root creation", () =>
-        mkdir(fixture.workspaceRoot, { recursive: true }),
-      );
-      const target = join(fixture.workspaceRoot, safeSessionKey(id));
-      yield* fixtureIo("workspace target creation", () => mkdir(target));
-      yield* runGit(["init"], target);
-      yield* fixtureIo("workspace marker creation", () =>
-        writeFile(
-          join(target, MARKER_FILE),
-          JSON.stringify({
-            repositoryId: record.id,
-            url: record.url,
-            ref: record.ref,
-          }),
-        ),
-      );
-      let tokenCalls = 0;
-      const workspace = yield* makeWorkspace({
-        workspaceRoot: fixture.workspaceRoot,
-        repo: { listRepositories: () => Effect.succeed([]) },
-        githubApp: {
-          getInstallationToken: () => {
-            tokenCalls += 1;
-            return Effect.succeed("unexpected-token");
+  it.scopedLive(
+    "rejects SSH-style GitHub URLs before minting credentials",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const id = sessionId("github-ssh-reuse");
+        const record = repositoryRecord({
+          id: "github-ssh-reuse",
+          url: "git@github.com:octo-org/private-repo.git",
+        });
+        yield* fixtureIo("workspace root creation", () =>
+          mkdir(fixture.workspaceRoot, { recursive: true }),
+        );
+        const target = join(fixture.workspaceRoot, safeSessionKey(id));
+        yield* fixtureIo("workspace target creation", () => mkdir(target));
+        yield* runGit(["init"], target);
+        yield* fixtureIo("workspace marker creation", () =>
+          writeFile(
+            join(target, MARKER_FILE),
+            JSON.stringify({
+              repositoryId: record.id,
+              url: record.url,
+              ref: record.ref,
+            }),
+          ),
+        );
+        let tokenCalls = 0;
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getInstallationToken: () => {
+              tokenCalls += 1;
+              return Effect.succeed("unexpected-token");
+            },
           },
-        },
-      });
-      yield* workspace.materialize(id, record);
-      expect(tokenCalls).toBe(0);
-      expect(
-        yield* readGitConfig("http.https://github.com/.extraheader", target),
-      ).toBeUndefined();
-    }),
+        });
+        const rejected = yield* Effect.either(
+          workspace.materialize(id, record),
+        );
+        expect(Either.isLeft(rejected)).toBe(true);
+        expect(tokenCalls).toBe(0);
+        expect(
+          yield* readGitConfig("http.https://github.com/.extraheader", target),
+        ).toBeUndefined();
+      }),
   );
 
   it.scopedLive(
@@ -1086,3 +1115,40 @@ describe("Workspace properties", () => {
     },
   );
 });
+
+it.scopedLive(
+  "keeps GitHub credentials off every Git argv while cloning and checking out a real fixture",
+  () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const spy = yield* Effect.acquireRelease(
+        Effect.sync(() => vi.spyOn(Bun, "spawn")),
+        (value) => Effect.sync(() => value.mockRestore()),
+      );
+      const token = "ghs_argv_secret";
+      const header = buildGitHubExtraHeader(token);
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: { getInstallationToken: () => Effect.succeed(token) },
+      });
+      const target = yield* workspace.materialize(
+        "secret-argv-test",
+        repositoryRecord({ id: "secret-argv-test", url: fixture.url }),
+      );
+      const calls = spy.mock.calls;
+      const commands = calls
+        .map(([command]) => command)
+        .filter((command): command is string[] => Array.isArray(command));
+      expect(JSON.stringify(commands)).not.toContain(token);
+      expect(JSON.stringify(commands)).not.toContain(header);
+      const clone = calls.find(
+        ([command]) => Array.isArray(command) && command.includes("clone"),
+      );
+      expect(clone?.[0]).toContain("--");
+      expect(clone?.[1]?.env?.GIT_CONFIG_VALUE_0).toBe(header);
+      expect(
+        yield* readGitConfig("http.https://github.com/.extraheader", target),
+      ).toBe(header);
+    }),
+);

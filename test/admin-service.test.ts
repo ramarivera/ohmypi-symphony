@@ -52,6 +52,7 @@ const repositoryId = Schema.decodeUnknownSync(WorkspaceId)("repo-main");
 const teamId = Schema.decodeUnknownSync(TeamId)("team-main");
 const projectId = Schema.decodeUnknownSync(ProjectId)("project-main");
 const config: GatewayConfigShape = {
+  gatewayAdminOrganizationIds: new Set([organizationId]),
   githubAppId: undefined,
   githubAppPrivateKey: undefined,
   linearClientId: "client",
@@ -225,7 +226,7 @@ describe("service Admin request validation", () => {
       const response = await run(
         request("/api/admin/repositories", {
           id: `repo-${field}`,
-          url: "https://example.com/repo.git",
+          url: "https://github.com/test/repo.git",
           ref: "main",
           [field]: "not-an-array",
         }),
@@ -259,7 +260,7 @@ describe("service Admin request validation", () => {
   it("normalizes valid packages and rejects invalid Nix package names", async () => {
     const valid = {
       id: "repo-nix",
-      url: "https://example.com/repo.git",
+      url: "https://github.com/test/repo.git",
       ref: "main",
       nixPackages: ["nodejs_22", "git", "nodejs_22"],
     };
@@ -278,7 +279,7 @@ describe("service Admin request validation", () => {
     const repository = Schema.decodeUnknownSync(RepositoryRecord)({
       id: "repo-nix",
       organizationId,
-      url: "https://example.com/repo.git",
+      url: "https://github.com/test/repo.git",
       ref: "main",
       teamIds: [],
       projectIds: [],
@@ -317,7 +318,7 @@ describe("service Admin request validation", () => {
             },
             body: JSON.stringify({
               id: "repo-nix",
-              url: "https://example.com/repo.git",
+              url: "https://github.com/test/repo.git",
               ref: "main",
               nixPackages: ["nodejs_22", "git", "nodejs_22"],
             }),
@@ -1419,4 +1420,29 @@ describe("Executor admin endpoints", () => {
     expect(response.status).toBe(204);
     expect(enabled).toBe(false);
   });
+});
+
+it("denies shared Nix cache inspection and pruning to tenant admins", async () => {
+  const handle = createAdminHandle({
+    ...deps,
+    config: { ...config, gatewayAdminOrganizationIds: new Set() },
+  });
+  for (const [path, method] of [
+    ["/api/admin/nix-cache", "GET"],
+    [`/api/admin/nix-cache/${"a".repeat(64)}/prune`, "POST"],
+  ] as const) {
+    const response = await Effect.runPromise(
+      handle(
+        new Request(new URL(path, config.publicUrl), {
+          method,
+          headers: {
+            Cookie: `omp_gateway_admin=${token}`,
+            Origin: config.publicUrl.origin,
+            "X-CSRF-Token": deriveCsrfToken(token),
+          },
+        }),
+      ),
+    );
+    expect(Option.getOrThrow(response).status).toBe(403);
+  }
 });
