@@ -38,6 +38,9 @@ import {
 import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { verifySignature, WebhookPipeline } from "../src/services/webhook.js";
+import { suitePaths } from "./fixtures/paths.js";
+
+const suitePath = suitePaths();
 
 const secret = "webhook-secret";
 const tokenEncryptionKey = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
@@ -53,7 +56,7 @@ const config: GatewayConfigShape = {
   nixBinaryPath: "nix",
   nixpkgsFlakeRef:
     "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-  nixRootsDir: "/tmp/nix-roots",
+  nixRootsDir: suitePath("nix-roots"),
   nixGcMaxBytes: 1_000_000,
   workspaceRoot: "/workspaces",
   ompCliPath: "omp",

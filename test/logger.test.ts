@@ -1,6 +1,5 @@
 import { EventEmitter } from "node:events";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -29,6 +28,9 @@ import {
   PinoLoggerLive,
   redactionPaths,
 } from "../src/services/logger.js";
+import { testPaths } from "./fixtures/paths.js";
+
+const testPath = testPaths();
 
 const LOG_LEVELS = [
   "trace",
@@ -326,7 +328,9 @@ describe("Pino logger plan", () => {
   });
 
   it("writes the same redacted NDJSON line to stdout and a rotated file, then closes it", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "ohmypi-gateway-logs-"));
+    const directory = await mkdtemp(
+      join(testPath("temporary"), "ohmypi-gateway-logs-"),
+    );
     const filePath = join(directory, "gateway.ndjson");
     try {
       const script = `
@@ -496,7 +500,7 @@ describe("GatewayConfig file logging", () => {
         const defaultConfig = yield* GatewayConfig;
         expect(Option.isNone(defaultConfig.logFile)).toBe(true);
 
-        const filePath = join(tmpdir(), "gateway.ndjson");
+        const filePath = join(testPath("temporary"), "gateway.ndjson");
         const configured = yield* GatewayConfig.pipe(
           Effect.provide(
             makeConfigLayer(

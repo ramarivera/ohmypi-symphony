@@ -29,6 +29,9 @@ import {
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { testPaths } from "./fixtures/paths.js";
+
+const testPath = testPaths();
 
 const org = "org-mcp" as OrganizationId;
 const repo = "repo-a" as WorkspaceId;
@@ -414,7 +417,7 @@ describe("MCP server storage and worker config", () => {
   });
 
   it("writes mcp.json at 0600 and git-excludes it from commits", async () => {
-    const root = await mkdtemp(join("/tmp", "mcp-writer-"));
+    const root = await mkdtemp(join(testPath("temporary"), "mcp-writer-"));
     await mkdir(join(root, ".git"), { recursive: true });
     await writeFile(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
 
@@ -456,14 +459,16 @@ describe("MCP server storage and worker config", () => {
       rewritten.split("\n").filter((line) => line === "mcp.json"),
     ).toHaveLength(1);
 
-    const bare = await mkdtemp(join("/tmp", "mcp-writer-bare-"));
+    const bare = await mkdtemp(join(testPath("temporary"), "mcp-writer-bare-"));
     await Effect.runPromise(writeOmpMcpConfig(bare, []));
     expect(JSON.parse(await readFile(join(bare, "mcp.json"), "utf8"))).toEqual({
       mcpServers: {},
     });
   });
   it("appends mcp.json on a new line in an existing git exclude", async () => {
-    const root = await mkdtemp(join("/tmp", "mcp-writer-exclude-"));
+    const root = await mkdtemp(
+      join(testPath("temporary"), "mcp-writer-exclude-"),
+    );
     await mkdir(join(root, ".git", "info"), { recursive: true });
     await writeFile(join(root, ".git", "HEAD"), "ref: refs/heads/main\n");
     await writeFile(join(root, ".git", "info", "exclude"), "foo");
@@ -476,7 +481,9 @@ describe("MCP server storage and worker config", () => {
   });
 
   it("skips tracked mcp.json and logs the session warning", async () => {
-    const root = await mkdtemp(join("/tmp", "mcp-writer-tracked-"));
+    const root = await mkdtemp(
+      join(testPath("temporary"), "mcp-writer-tracked-"),
+    );
     const original = '{"keep":"repo-content"}\n';
     await writeFile(join(root, "mcp.json"), original);
     const init = Bun.spawn(["git", "init", "-q"], {
@@ -525,13 +532,17 @@ describe("MCP server storage and worker config", () => {
     await Effect.runPromise(removeMcpConfig(root));
     expect(await readFile(join(root, "mcp.json"), "utf8")).toBe(original);
 
-    const untracked = await mkdtemp(join("/tmp", "mcp-writer-cleanup-"));
+    const untracked = await mkdtemp(
+      join(testPath("temporary"), "mcp-writer-cleanup-"),
+    );
     await writeFile(join(untracked, "mcp.json"), "generated");
     await Effect.runPromise(removeMcpConfig(untracked));
     await expect(stat(join(untracked, "mcp.json"))).rejects.toThrow();
   });
   it("preserves foreign untracked configs and overwrites gateway configs", async () => {
-    const foreignRoot = await mkdtemp(join("/tmp", "mcp-writer-foreign-"));
+    const foreignRoot = await mkdtemp(
+      join(testPath("temporary"), "mcp-writer-foreign-"),
+    );
     const foreign = '{"other":"keep"}\n';
     await writeFile(join(foreignRoot, "mcp.json"), foreign);
     const logs: Array<{ readonly message: string; readonly event: unknown }> =
@@ -556,7 +567,9 @@ describe("MCP server storage and worker config", () => {
       ),
     ).toBe(true);
 
-    const gatewayRoot = await mkdtemp(join("/tmp", "mcp-writer-gateway-"));
+    const gatewayRoot = await mkdtemp(
+      join(testPath("temporary"), "mcp-writer-gateway-"),
+    );
     await writeFile(
       join(gatewayRoot, "mcp.json"),
       '{"mcpServers":{"old":{"type":"stdio"}}}\n',

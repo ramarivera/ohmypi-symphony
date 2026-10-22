@@ -36,6 +36,9 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "../src/services/store/repositories.js";
+import { suitePaths } from "./fixtures/paths.js";
+
+const suitePath = suitePaths();
 
 const unreachable = (..._args: ReadonlyArray<unknown>) => Effect.never;
 const token = "admin-token";
@@ -59,7 +62,7 @@ const config: GatewayConfigShape = {
   logLevel: "silent",
   logFile: Option.none(),
   databasePath: ":memory:",
-  workspaceRoot: "/tmp/workspaces",
+  workspaceRoot: suitePath("workspaces"),
   ompCliPath: "omp",
   port: 3000,
   leaseDurationMs: 60_000,
@@ -67,7 +70,7 @@ const config: GatewayConfigShape = {
   nixBinaryPath: "nix",
   nixpkgsFlakeRef:
     "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-  nixRootsDir: "/tmp/nix-roots",
+  nixRootsDir: suitePath("nix-roots"),
   nixGcMaxBytes: 1_000_000,
   reconcilerCatchupIntervalMs: 300_000,
   reconcilerCatchupMinAgeMs: 120_000,

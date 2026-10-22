@@ -9,6 +9,9 @@ import { GatewayConfig } from "../src/services/config.js";
 import { OAuth } from "../src/services/oauth.js";
 import { InstallationRepo } from "../src/services/store/repositories.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { suitePaths } from "./fixtures/paths.js";
+
+const suitePath = suitePaths();
 
 const linearTestDouble = vi.hoisted(() => ({
   viewer: {
@@ -57,7 +60,7 @@ const testConfig: GatewayConfigShape = {
   nixBinaryPath: "nix",
   nixpkgsFlakeRef:
     "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-  nixRootsDir: "/tmp/nix-roots",
+  nixRootsDir: suitePath("nix-roots"),
   nixGcMaxBytes: 1_000_000,
   workspaceRoot: "/workspaces",
   ompCliPath: "omp",

@@ -69,6 +69,9 @@ import {
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { testPaths } from "./fixtures/paths.js";
+
+const testPath = testPaths();
 
 describe("Linear worker prompt contract", () => {
   it("adds the Linear activity contract to a created session", () => {
@@ -149,8 +152,8 @@ describe("SessionAuthority behavior invariants", () => {
           yield* installationRepo.put(install(organizationId));
           yield* runRepo.update(sid, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp"),
-            ompSessionFile: Option.some("/tmp/session.jsonl"),
+            workspacePath: Option.some(testPath("temporary")),
+            ompSessionFile: Option.some(testPath("session.jsonl")),
           });
           yield* authority.processSession(sid);
 
@@ -206,8 +209,8 @@ describe("SessionAuthority behavior invariants", () => {
           yield* installationRepo.put(install(organizationId));
           yield* runRepo.update(sid, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp"),
-            ompSessionFile: Option.some("/tmp/session.jsonl"),
+            workspacePath: Option.some(testPath("temporary")),
+            ompSessionFile: Option.some(testPath("session.jsonl")),
           });
           yield* authority.processSession(sid);
 
@@ -290,8 +293,8 @@ describe("SessionAuthority behavior invariants", () => {
           yield* installationRepo.put(install(organizationId));
           yield* runRepo.update(sid, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp"),
-            ompSessionFile: Option.some("/tmp/session.jsonl"),
+            workspacePath: Option.some(testPath("temporary")),
+            ompSessionFile: Option.some(testPath("session.jsonl")),
           });
           yield* authority.processSession(sid);
 
@@ -437,8 +440,10 @@ describe("SessionAuthority behavior invariants", () => {
           yield* runRepo.update(testSessionId, {
             state: "running",
             repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some("/tmp/resume-workspace"),
-            ompSessionFile: Option.some("/tmp/resume-workspace/session.jsonl"),
+            workspacePath: Option.some(testPath("resume-workspace")),
+            ompSessionFile: Option.some(
+              testPath("resume-workspace/session.jsonl"),
+            ),
           });
 
           yield* runInputRepo.enqueue({
@@ -484,9 +489,9 @@ describe("SessionAuthority behavior invariants", () => {
           expect(workerSpawnInputs).toHaveLength(1);
           expect(workerSpawnInputs[0]?.command).toContain("--session");
           expect(workerSpawnInputs[0]?.command).toContain(
-            "/tmp/resume-workspace/session.jsonl",
+            testPath("resume-workspace/session.jsonl"),
           );
-          expect(workerSpawnInputs[0]?.cwd).toBe("/tmp/resume-workspace");
+          expect(workerSpawnInputs[0]?.cwd).toBe(testPath("resume-workspace"));
           expect(workerPrompts).toEqual(["please continue the task"]);
         }),
       ),
@@ -527,8 +532,10 @@ describe("SessionAuthority behavior invariants", () => {
         yield* runRepo.update(testSessionId, {
           state: "running",
           repositoryId: Option.some(repositoryId),
-          workspacePath: Option.some("/tmp/resume-workspace"),
-          ompSessionFile: Option.some("/tmp/resume-workspace/session.jsonl"),
+          workspacePath: Option.some(testPath("resume-workspace")),
+          ompSessionFile: Option.some(
+            testPath("resume-workspace/session.jsonl"),
+          ),
         });
 
         yield* runInputRepo.enqueue({
@@ -588,11 +595,11 @@ describe("SessionAuthority behavior invariants", () => {
           });
           yield* runInputRepo.markProcessed(inputId);
           yield* Effect.promise(() =>
-            mkdir("/tmp/orphan-retry-template", { recursive: true }),
+            mkdir(testPath("orphan-retry-template"), { recursive: true }),
           );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp/orphan-retry-template"),
+            workspacePath: Option.some(testPath("orphan-retry-template")),
           });
 
           yield* authority.processSession(testSessionId);
@@ -617,7 +624,7 @@ describe("SessionAuthority behavior invariants", () => {
             "authority-mcp-repository",
           );
           const workspace = yield* Effect.promise(() =>
-            mkdtemp(join("/tmp", "authority-mcp-config-")),
+            mkdtemp(join(testPath("temporary"), "authority-mcp-config-")),
           );
           yield* installationRepo.put(install(testOrganizationId));
           yield* mcpServerRepo.createMcpServer({
@@ -663,7 +670,7 @@ describe("SessionAuthority behavior invariants", () => {
           const installationRepo = yield* InstallationRepo;
           const mcpServerRepo = yield* McpServerRepo;
           const workspace = yield* Effect.promise(() =>
-            mkdtemp(join("/tmp", "authority-mcp-corrupt-")),
+            mkdtemp(join(testPath("temporary"), "authority-mcp-corrupt-")),
           );
           yield* installationRepo.put(install(testOrganizationId));
           yield* mcpServerRepo.createMcpServer({
@@ -718,7 +725,7 @@ describe("SessionAuthority behavior invariants", () => {
           const runRepo = yield* RunRepo;
           const installationRepo = yield* InstallationRepo;
           const workspace = yield* Effect.promise(() =>
-            mkdtemp(join("/tmp", "authority-mcp-empty-")),
+            mkdtemp(join(testPath("temporary"), "authority-mcp-empty-")),
           );
           yield* installationRepo.put(install(testOrganizationId));
           yield* runRepo.create({
@@ -1121,9 +1128,9 @@ describe("SessionAuthority team-access gate", () => {
           });
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp/team-access-unknown"),
+            workspacePath: Option.some(testPath("team-access-unknown")),
             ompSessionFile: Option.some(
-              "/tmp/team-access-unknown/session.jsonl",
+              testPath("team-access-unknown/session.jsonl"),
             ),
           });
 
@@ -1160,8 +1167,10 @@ describe("SessionAuthority team-access gate", () => {
         });
         yield* runRepo.update(testSessionId, {
           state: "orphaned",
-          workspacePath: Option.some("/tmp/team-access-known"),
-          ompSessionFile: Option.some("/tmp/team-access-known/session.jsonl"),
+          workspacePath: Option.some(testPath("team-access-known")),
+          ompSessionFile: Option.some(
+            testPath("team-access-known/session.jsonl"),
+          ),
         });
 
         yield* authority.processSession(testSessionId);
@@ -1199,9 +1208,9 @@ describe("SessionAuthority team-access gate", () => {
           });
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp/team-access-partial"),
+            workspacePath: Option.some(testPath("team-access-partial")),
             ompSessionFile: Option.some(
-              "/tmp/team-access-partial/session.jsonl",
+              testPath("team-access-partial/session.jsonl"),
             ),
           });
 
@@ -1307,7 +1316,7 @@ describe("SessionAuthority infrastructure failures", () => {
             message: "forced host-tool registration failure",
           });
           yield* Effect.promise(() =>
-            mkdir("/tmp/host-tool-registration", { recursive: true }),
+            mkdir(testPath("host-tool-registration"), { recursive: true }),
           );
           yield* installationRepo.put(install(testOrganizationId));
           yield* runRepo.create({
@@ -1317,9 +1326,9 @@ describe("SessionAuthority infrastructure failures", () => {
           });
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp/host-tool-registration"),
+            workspacePath: Option.some(testPath("host-tool-registration")),
             ompSessionFile: Option.some(
-              "/tmp/host-tool-registration/session.jsonl",
+              testPath("host-tool-registration/session.jsonl"),
             ),
           });
 
@@ -1458,15 +1467,15 @@ describe("SessionAuthority infrastructure failures", () => {
             issueId: Option.none(),
           });
           yield* Effect.promise(() =>
-            mkdir("/tmp/mark-failure", { recursive: true }),
+            mkdir(testPath("mark-failure"), { recursive: true }),
           );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             repositoryId: Option.some(
               Schema.decodeUnknownSync(WorkspaceId)("repo-for-mark-failure"),
             ),
-            workspacePath: Option.some("/tmp/mark-failure"),
-            ompSessionFile: Option.some("/tmp/mark-failure/session.jsonl"),
+            workspacePath: Option.some(testPath("mark-failure")),
+            ompSessionFile: Option.some(testPath("mark-failure/session.jsonl")),
           });
           yield* authority.processSession(testSessionId);
           yield* runInputRepo.enqueue({
@@ -1587,8 +1596,10 @@ describe("SessionAuthority deferred stop handling", () => {
             });
             yield* runRepo.update(testSessionId, {
               state: "orphaned",
-              workspacePath: Option.some("/tmp/deferred-stop"),
-              ompSessionFile: Option.some("/tmp/deferred-stop/session.jsonl"),
+              workspacePath: Option.some(testPath("deferred-stop")),
+              ompSessionFile: Option.some(
+                testPath("deferred-stop/session.jsonl"),
+              ),
             });
             const inputId = Schema.decodeUnknownSync(InputId)(
               "deferred-stop-input",
@@ -1639,8 +1650,10 @@ describe("SessionAuthority host-tool mutation gate", () => {
           });
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp/mutation-gate"),
-            ompSessionFile: Option.some("/tmp/mutation-gate/session.jsonl"),
+            workspacePath: Option.some(testPath("mutation-gate")),
+            ompSessionFile: Option.some(
+              testPath("mutation-gate/session.jsonl"),
+            ),
           });
 
           yield* authority.processSession(testSessionId);
@@ -1702,12 +1715,12 @@ describe("SessionAuthority host-tool mutation gate", () => {
             issueId: Option.some(testIssueId),
           });
           yield* Effect.promise(() =>
-            mkdir("/tmp/external-url", { recursive: true }),
+            mkdir(testPath("external-url"), { recursive: true }),
           );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp/external-url"),
-            ompSessionFile: Option.some("/tmp/external-url/session.jsonl"),
+            workspacePath: Option.some(testPath("external-url")),
+            ompSessionFile: Option.some(testPath("external-url/session.jsonl")),
           });
           yield* authority.processSession(testSessionId);
           const listener = hostToolListener;
@@ -1756,12 +1769,12 @@ describe("SessionAuthority host-tool mutation gate", () => {
               issueId: Option.some(testIssueId),
             });
             yield* Effect.promise(() =>
-              mkdir("/tmp/pr-draft", { recursive: true }),
+              mkdir(testPath("pr-draft"), { recursive: true }),
             );
             yield* runRepo.update(testSessionId, {
               state: "orphaned",
-              workspacePath: Option.some("/tmp/pr-draft"),
-              ompSessionFile: Option.some("/tmp/pr-draft/session.jsonl"),
+              workspacePath: Option.some(testPath("pr-draft")),
+              ompSessionFile: Option.some(testPath("pr-draft/session.jsonl")),
             });
             yield* authority.processSession(testSessionId);
             expect(workerEventListener).toBeDefined();
@@ -1812,13 +1825,13 @@ describe("SessionAuthority host-tool mutation gate", () => {
             issueId: Option.some(testIssueId),
           });
           yield* Effect.promise(() =>
-            mkdir("/tmp/mutation-gate-order", { recursive: true }),
+            mkdir(testPath("mutation-gate-order"), { recursive: true }),
           );
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            workspacePath: Option.some("/tmp/mutation-gate-order"),
+            workspacePath: Option.some(testPath("mutation-gate-order")),
             ompSessionFile: Option.some(
-              "/tmp/mutation-gate-order/session.jsonl",
+              testPath("mutation-gate-order/session.jsonl"),
             ),
           });
           yield* authority.processSession(testSessionId);
@@ -1894,8 +1907,10 @@ describe("SessionAuthority Nix environment preparation", () => {
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some("/tmp/nix-authority"),
-            ompSessionFile: Option.some("/tmp/nix-authority/session.jsonl"),
+            workspacePath: Option.some(testPath("nix-authority")),
+            ompSessionFile: Option.some(
+              testPath("nix-authority/session.jsonl"),
+            ),
           });
           nixPathEntries = ["/nix/store/test-node/bin"];
 
@@ -1914,7 +1929,9 @@ describe("SessionAuthority Nix environment preparation", () => {
           yield* authority.shutdown();
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
-            ompSessionFile: Option.some("/tmp/nix-authority/session.jsonl"),
+            ompSessionFile: Option.some(
+              testPath("nix-authority/session.jsonl"),
+            ),
           });
           yield* authority.processSession(testSessionId);
           expect(nixPreparedRepositories).toEqual([repositoryId, repositoryId]);
@@ -1951,8 +1968,8 @@ describe("SessionAuthority Nix environment preparation", () => {
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some("/tmp/nix-empty"),
-            ompSessionFile: Option.some("/tmp/nix-empty/session.jsonl"),
+            workspacePath: Option.some(testPath("nix-empty")),
+            ompSessionFile: Option.some(testPath("nix-empty/session.jsonl")),
           });
 
           yield* authority.processSession(testSessionId);
@@ -1992,11 +2009,11 @@ describe("SessionAuthority Nix environment preparation", () => {
           yield* runRepo.update(testSessionId, {
             state: "orphaned",
             repositoryId: Option.some(repositoryId),
-            workspacePath: Option.some("/tmp/nix-failing"),
-            ompSessionFile: Option.some("/tmp/nix-failing/session.jsonl"),
+            workspacePath: Option.some(testPath("nix-failing")),
+            ompSessionFile: Option.some(testPath("nix-failing/session.jsonl")),
           });
           yield* Effect.promise(() =>
-            mkdir("/tmp/nix-failing", { recursive: true }),
+            mkdir(testPath("nix-failing"), { recursive: true }),
           );
           nixPrepareError = new NixEnvironmentError({
             message: "Nix preparation failed",

@@ -16,6 +16,7 @@ import { OAuth } from "../src/services/oauth.js";
 import { Reconciler } from "../src/services/reconciler.js";
 import { AdminSessionRepo } from "../src/services/store/repositories.js";
 import { WebhookPipeline } from "../src/services/webhook.js";
+import { testPaths } from "./fixtures/paths.js";
 
 const routes = [...router.routes];
 
@@ -37,6 +38,8 @@ function request(
     }),
   );
 }
+
+const testPath = testPaths();
 
 describe("HTTP router parity", () => {
   it("registers the legacy OAuth start path and all webhook methods", () => {
@@ -257,7 +260,7 @@ describe("HTTP router parity", () => {
       nixBinaryPath: "nix",
       nixpkgsFlakeRef:
         "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-      nixRootsDir: "/tmp/nix-roots",
+      nixRootsDir: testPath("nix-roots"),
       nixGcMaxBytes: 1_000_000,
       workspaceRoot: "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/router-test",
       ompCliPath: "omp",
@@ -345,7 +348,7 @@ describe("HTTP router parity", () => {
           nixBinaryPath: "nix",
           nixpkgsFlakeRef:
             "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-          nixRootsDir: "/tmp/nix-roots",
+          nixRootsDir: testPath("nix-roots"),
           nixGcMaxBytes: 1_000_000,
           workspaceRoot: "/Volumes/ExtSSD/SCRATCHPADS_FOR_AGENTS/router-test",
           ompCliPath: "omp",
@@ -388,9 +391,9 @@ describe("HTTP router parity", () => {
       nixBinaryPath: "nix",
       nixpkgsFlakeRef:
         "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-      nixRootsDir: "/tmp/nix-roots",
+      nixRootsDir: testPath("nix-roots"),
       nixGcMaxBytes: 1_000_000,
-      workspaceRoot: "/tmp/router-prefix",
+      workspaceRoot: testPath("router-prefix"),
       ompCliPath: "omp",
       port: 3000,
       leaseDurationMs: 60_000,
