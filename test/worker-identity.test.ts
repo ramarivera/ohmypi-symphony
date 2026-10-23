@@ -1,4 +1,6 @@
+import { Database } from "bun:sqlite";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { Effect } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,14 +9,17 @@ import {
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
 import { makeWorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
+import * as workerSecurity from "../src/services/worker-security.js";
 import {
   sessionWorkerEnvironment,
   workerUidRange,
 } from "../src/services/worker-security.js";
+import * as workspaceProcess from "../src/services/workspace-process.js";
 
 const roots: string[] = [];
 afterEach(async () => {
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
   await Promise.all(
     roots.splice(0).map((root) => rm(root, { recursive: true, force: true })),
   );
@@ -26,10 +31,9 @@ const withIdentities = async (
     root: string,
   ) => Effect.Effect<void, unknown>,
 ) => {
-  const parent = join(
-    process.env.HOME ?? "/home/ramarivera",
-    "dev/agentic-scratchpads/ohmypi-symphony/uid-isolation/tests",
-  );
+  const parent =
+    process.env.SECURITY_TEST_TMPDIR ??
+    join(homedir(), "dev/agentic-scratchpads/ohmypi-symphony/security/tests");
   await mkdir(parent, { recursive: true });
   const root = await mkdtemp(join(parent, "allocation-"));
   roots.push(root);
@@ -107,6 +111,83 @@ describe("worker identities", () => {
       }),
     );
   });
+  it("denies a retained session's resume on a second connection while its uid is reused", async () => {
+    range("1");
+    await withIdentities((repo, db, root) =>
+      Effect.gen(function* () {
+        yield* repo.acquire("a");
+        db.query(
+          "UPDATE agent_run SET state='succeeded' WHERE session_id='a'",
+        ).run();
+        yield* repo.release("a", join(root, "workspaces"));
+        yield* repo.acquire("b");
+        const other = new Database(join(root, "gateway.sqlite"));
+        try {
+          const result = yield* Effect.either(
+            makeWorkerIdentityRepo(other).acquire(
+              "a",
+              join(root, "workspaces"),
+            ),
+          );
+          expect(result._tag).toBe("Left");
+          expect(
+            db
+              .query("SELECT session_id FROM worker_identity WHERE active=1")
+              .all(),
+          ).toEqual([{ session_id: "b" }]);
+        } finally {
+          other.close();
+        }
+      }),
+    );
+  });
+  it.each(["process", "shared", "seal"] as const)(
+    "quarantines a failed %s retirement and reclaims it on allocation",
+    async (failure) => {
+      range("1");
+      await withIdentities((repo, db, root) =>
+        Effect.gen(function* () {
+          yield* repo.acquire("a");
+          db.query(
+            "UPDATE agent_run SET state='succeeded' WHERE session_id='a'",
+          ).run();
+          const fail = () => {
+            throw new Error("injected retirement failure");
+          };
+          const spy =
+            failure === "process"
+              ? vi
+                  .spyOn(workerSecurity, "stopWorkerUidProcessesSync")
+                  .mockImplementationOnce(fail)
+              : failure === "shared"
+                ? vi
+                    .spyOn(workspaceProcess, "cleanupWorkerSharedFilesSync")
+                    .mockImplementationOnce(fail)
+                : vi
+                    .spyOn(workerSecurity, "sealWorkerUidWorkspacesSync")
+                    .mockImplementationOnce(fail);
+          yield* repo.release("a", join(root, "workspaces"));
+          expect(
+            db
+              .query("SELECT active FROM worker_identity WHERE session_id='a'")
+              .get(),
+          ).toEqual({ active: 1 });
+          expect(
+            db.query("SELECT kind FROM run_event WHERE session_id='a'").get(),
+          ).toEqual({ kind: "worker_uid_quarantined" });
+          spy.mockRestore();
+          expect(yield* repo.acquire("b", join(root, "workspaces"))).toBe(
+            "21001",
+          );
+          expect(
+            db
+              .query("SELECT active FROM worker_identity WHERE session_id='a'")
+              .get(),
+          ).toEqual({ active: 0 });
+        }),
+      );
+    },
+  );
   it("allocates identities for legacy sessions and migrates the single uid env", async () => {
     vi.stubEnv("WORKER_UID", "1001");
     vi.stubEnv("WORKER_UID_BASE", "");

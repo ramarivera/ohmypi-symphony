@@ -123,7 +123,14 @@ gateway connections can't allocate the same active uid. Recovery and resume reus
 the persisted uid. A terminal session releases its slot after worker teardown.
 Before release, the gateway kills remaining processes with that uid, including
 escaped process groups, and seals all its retained workspace and clone roots to
-root-owned mode 0700. That happens before another session can acquire the slot.
+root-owned mode 0700. It also removes its entries in `/tmp`, `/var/tmp`, and
+`/dev/shm` through the installed helper running as the retired uid, with no capabilities. Cleanup never
+follows symlinks or deletes shared entries with gateway privileges. That happens
+before another session can acquire the slot. SIGKILL scans wait up to 500 ms for
+kernel teardown. A failed retirement keeps the uid reserved and records a
+`worker_uid_quarantined` run event. Both new allocations and retention retry
+terminal allocations after their authority lease expires. One failed identity
+doesn't abort cleanup of others.
 A resumed terminal session requires its original uid; if that slot is occupied,
 startup fails with an explicit busy error and follows the normal retry policy.
 Exhaustion likewise fails clearly instead of sharing an identity. Size the range
@@ -148,15 +155,14 @@ SQLite database are also inside that session's private workspace. Existing
 explicitly allowed for omp remain visible to that worker. Gateway-only keys and
 arbitrary environment variables don't.
 
-Shared `/nix`, `/app/nix-profile`, `/app/node_modules`, `/app/dist`,
-and Nix GC roots belong to root and have no group/other write permissions. Only
-the gateway builds/prunes the shared Nix cache; workers can read and execute its
-outputs. `/app/nix-profile` points directly into the immutable store, so workers
-can execute Nix while `/home/bun` remains private to the gateway. The single-user Nix config sets an empty `build-users-group` for the root
-gateway instead of requiring nonexistent `nixbld` accounts. No shared writable cache or supplementary shared group is granted.
-Startup repairs legacy shared-volume ownership. The workspace parent belongs to
-root with mode 0755 so a session can't rename another session's root. Workers
-can't modify executable files that another session loads from these shared paths.
+Shared `/app/node_modules`, `/app/dist`, and Nix GC roots belong to root
+and have no group/other write permissions. The Nix store keeps its Nix-managed
+ownership. `/opt/nix` points into the shared profile without traversing a worker
+HOME. Workers execute gateway-prepared binaries through PATH as described below;
+no read-only store connection or store database access is introduced. Startup
+repairs legacy shared executable ownership without recursively chowning `/nix`.
+The workspace parent belongs to root with mode 0755 so a session can't rename
+another session's root. No shared writable cache or supplementary group is granted.
 
 Native launches without either uid setting retain same-uid workers. The
 allowlist and mode-0600 SQLite files still apply, but same-uid workers can read the
@@ -239,8 +245,10 @@ upstream authorization. Upstream DNS is validated and pinned, redirects are
 rejected, request bodies and legacy SSE events are bounded, and only protocol
 response headers reach workers. Closing or canceling a worker, losing its lease,
 failed startup, or gateway shutdown stops its listener and aborts its streams.
-The main HTTP listener has no new public route. Existing same-uid and peer-worker
-filesystem limitations still apply to session bearers.
+The main HTTP listener has no new public route. The proxy bearer lives only in
+mode-0600 `mcp.json` under the session's mode-0700 workspace. Peer session uids can't read that config or the private
+agent database; knowing another loopback proxy URL doesn't authorize requests.
+Native same-uid filesystem limitations still apply.
 
 The runtime is pinned to OMP 17.1.8 in `package.json` and `Dockerfile`. Its
 `pi-ai/src/auth-storage.ts` caches credentials in `#data`, while

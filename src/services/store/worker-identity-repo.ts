@@ -5,17 +5,67 @@ import {
   stopWorkerUidProcessesSync,
   workerUidRange,
 } from "../worker-security.js";
+import { cleanupWorkerSharedFilesSync } from "../workspace-process.js";
 import { SqliteClient, tryDb } from "./sqlite-client.js";
+
+/** Called inside the caller's immediate transaction. Failures reserve only this uid. */
+export const retireWorkerIdentitySync = (
+  db: Database,
+  sessionId: string,
+  uid: number,
+  workspaceRoot: string,
+): boolean => {
+  try {
+    stopWorkerUidProcessesSync(uid);
+    cleanupWorkerSharedFilesSync(uid);
+    sealWorkerUidWorkspacesSync(workspaceRoot, uid);
+  } catch {
+    const now = Date.now();
+    db.query(
+      `INSERT INTO run_event(source_key, session_id, kind, level, text, payload_json, created_at, updated_at)
+       VALUES (?, ?, 'worker_uid_quarantined', 'warn', ?, ?, ?, ?)
+       ON CONFLICT(source_key) DO UPDATE SET updated_at=excluded.updated_at`,
+    ).run(
+      `worker-uid-quarantined:${sessionId}`,
+      sessionId,
+      "Worker uid retirement failed; identity remains reserved. Allocation and retention will retry.",
+      JSON.stringify({ uid }),
+      now,
+      now,
+    );
+    return false;
+  }
+  db.query("UPDATE worker_identity SET active=0 WHERE session_id=?").run(
+    sessionId,
+  );
+  return true;
+};
 
 /** Synchronous transactions make allocation atomic across gateway connections. */
 export const makeWorkerIdentityRepo = (db: Database) => {
-  const acquire = (sessionId: string) =>
+  const acquire = (sessionId: string, workspaceRoot?: string) =>
     tryDb(
       () =>
         db
           .transaction(() => {
             const range = workerUidRange(process.env);
             if (range === undefined) return undefined;
+            if (workspaceRoot !== undefined) {
+              const retired = db
+                .query<{ session_id: string; uid: number }, [string, number]>(
+                  `SELECT i.session_id, i.uid FROM worker_identity i JOIN agent_run r ON r.session_id=i.session_id
+                 WHERE i.active=1 AND i.session_id<>? AND r.state IN ('succeeded','failed','canceled')
+                 AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?)`,
+                )
+                .all(sessionId, Date.now());
+              for (const row of retired)
+                retireWorkerIdentitySync(
+                  db,
+                  row.session_id,
+                  row.uid,
+                  workspaceRoot,
+                );
+            }
             const previous = db
               .query<{ uid: number; active: number }, [string]>(
                 "SELECT uid, active FROM worker_identity WHERE session_id=?",
@@ -80,11 +130,7 @@ export const makeWorkerIdentityRepo = (db: Database) => {
               !["succeeded", "failed", "canceled"].includes(row.state)
             )
               return;
-            stopWorkerUidProcessesSync(row.uid);
-            sealWorkerUidWorkspacesSync(workspaceRoot, row.uid);
-            db.query(
-              "UPDATE worker_identity SET active=0 WHERE session_id=?",
-            ).run(sessionId);
+            retireWorkerIdentitySync(db, sessionId, row.uid, workspaceRoot);
           })
           .immediate(),
       "WorkerIdentityRepo.release",

@@ -35,6 +35,7 @@ import {
   SqliteClient,
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
+import * as workerSecurity from "../src/services/worker-security.js";
 import { testPaths } from "./fixtures/paths.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -107,6 +108,60 @@ describe("retention", () => {
           { session_id: "leased", active: 1 },
           { session_id: "running", active: 1 },
         ]);
+      }).pipe(withDatabase),
+  );
+
+  it.scopedLive(
+    "keeps a failed identity reserved without aborting other retirement or deleted-workspace records",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        insertRun(db, "failed", "failed", expired);
+        insertRun(db, "healthy", "failed");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('failed', 21001, 1), ('healthy', 21002, 1)",
+        ).run();
+        const seal = workerSecurity.sealWorkerUidWorkspacesSync;
+        vi.spyOn(
+          workerSecurity,
+          "sealWorkerUidWorkspacesSync",
+        ).mockImplementation((path, uid) => {
+          if (uid === 21001) throw new Error("injected seal failure");
+          seal(path, uid);
+        });
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          removeWorkspace: (path) => rmSync(path, { recursive: true }),
+        }).sweep(now);
+        expect(result.skippedWorkspaces).toBe(1);
+        expect(existsSync(expired)).toBe(false);
+        expect(
+          db
+            .query(
+              "SELECT session_id, active FROM worker_identity ORDER BY session_id",
+            )
+            .all(),
+        ).toEqual([
+          { session_id: "failed", active: 1 },
+          { session_id: "healthy", active: 0 },
+        ]);
+        expect(
+          db
+            .query(
+              "SELECT workspace_path FROM agent_run WHERE session_id='failed'",
+            )
+            .get(),
+        ).toEqual({ workspace_path: expired });
+        expect(
+          db
+            .query("SELECT kind FROM run_event WHERE session_id='failed'")
+            .get(),
+        ).toEqual({ kind: "worker_uid_quarantined" });
       }).pipe(withDatabase),
   );
 

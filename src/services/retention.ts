@@ -5,8 +5,8 @@ import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { SqliteClient, tryDb } from "./store/sqlite-client.js";
+import { retireWorkerIdentitySync } from "./store/worker-identity-repo.js";
 import {
-  sealWorkerUidWorkspacesSync,
   stopWorkerUidProcessesSync,
   workerUidRange,
 } from "./worker-security.js";
@@ -198,11 +198,13 @@ export const makeRetention = (input: {
                 continue;
               }
             }
-            if (identity !== null && root !== undefined)
-              sealWorkerUidWorkspacesSync(root, identity.uid);
-            db.query(
-              "UPDATE worker_identity SET active=0 WHERE session_id=?",
-            ).run(row.session_id);
+            if (
+              identity !== null &&
+              !retireWorkerIdentitySync(db, row.session_id, identity.uid, root)
+            ) {
+              skippedWorkspaces++;
+              continue;
+            }
             db.query("DELETE FROM workspace WHERE session_id=?").run(
               row.session_id,
             );
@@ -223,11 +225,12 @@ export const makeRetention = (input: {
           for (const identity of retired) {
             // Without the configured root, fail closed until a later sweep.
             if (root === undefined) continue;
-            stopWorkerUidProcessesSync(identity.uid);
-            sealWorkerUidWorkspacesSync(root, identity.uid);
-            db.query(
-              "UPDATE worker_identity SET active=0 WHERE session_id=?",
-            ).run(identity.session_id);
+            retireWorkerIdentitySync(
+              db,
+              identity.session_id,
+              identity.uid,
+              root,
+            );
           }
           return { workspaces, skippedWorkspaces };
         })

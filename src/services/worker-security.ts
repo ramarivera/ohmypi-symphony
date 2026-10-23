@@ -314,7 +314,9 @@ export const stopWorkerUidProcessesSync = (uid: number): void => {
   if (uid === 0) throw new Error("Cannot retire gateway uid");
   // Repeat after signaling to catch children forked during the first scan. A
   // zombie can't execute; any process that won't exit keeps the uid reserved.
-  for (let pass = 0; pass < 32; pass++) {
+  const deadline = Date.now() + 500;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
     let live = false;
     for (const name of readdirSync("/proc")) {
       if (!/^[1-9][0-9]*$/u.test(name)) continue;
@@ -340,6 +342,9 @@ export const stopWorkerUidProcessesSync = (uid: number): void => {
       }
     }
     if (!live) return;
+    if (Date.now() >= deadline) break;
+    // Let the kernel finish SIGKILL before scanning again.
+    Atomics.wait(pause, 0, 0, 10);
   }
   throw new Error(
     "Worker processes didn't exit; keeping uid reserved for a later retry",

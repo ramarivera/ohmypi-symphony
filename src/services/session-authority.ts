@@ -1831,7 +1831,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
         command.push("--extension", deviationExtensionPath);
 
-        const workerUid = yield* workerIdentities.acquire(run.sessionId);
+        const workerUid = yield* workerIdentities.acquire(
+          run.sessionId,
+          config.workspaceRoot,
+        );
         yield* Effect.tryPromise({
           try: () => prepareWorkerWorkspace(cwd, workerUid),
           catch: () =>
@@ -2621,7 +2624,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   const workspacePath = yield* workspace.materialize(
                     sessionId,
                     resolution.repository,
-                    yield* workerIdentities.acquire(sessionId),
+                    yield* workerIdentities.acquire(
+                      sessionId,
+                      config.workspaceRoot,
+                    ),
                   );
                   yield* updateRun(sessionId, {
                     state: "starting",

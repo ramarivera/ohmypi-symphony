@@ -113,6 +113,24 @@ export const workspaceProcess = async (
   return stdout;
 };
 
+/** Run shared-directory cleanup with exactly the retired worker's privileges. */
+export const cleanupWorkerSharedFilesSync = (uid: number): void => {
+  if (process.getuid?.() !== 0) return;
+  const child = Bun.spawnSync(
+    workspaceWorkerCommand("/", "cleanup-shared", String(uid)),
+    {
+      cwd: dirname(workspaceWorkerScript),
+      env: gitEnvironment(process.env),
+      stdin: Buffer.from("null"),
+      stdout: "pipe",
+      stderr: "pipe",
+      timeout: 5000,
+    },
+  );
+  if (child.exitCode !== 0)
+    throw new Error("Retired worker shared-directory cleanup failed");
+};
+
 /** Staging cleanup has the same uid boundary as terminal workspace retention. */
 export const removeWorkerWorkspace = async (
   cwd: string,
