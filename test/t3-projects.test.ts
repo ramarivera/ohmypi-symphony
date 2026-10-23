@@ -36,7 +36,6 @@ describe("T3 v0.1.2 project provisioning", () => {
             title: "Linear issue 1",
             workspaceRoot: "/app/workspaces/issue-1",
             createWorkspaceRootIfMissing: false,
-            scripts: [],
           },
         ]);
       }),

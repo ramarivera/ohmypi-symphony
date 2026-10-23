@@ -81,7 +81,8 @@ export const ensureT3Project = (options: {
       title: options.title.trim() || projectId,
       workspaceRoot,
       createWorkspaceRootIfMissing: false,
-      scripts: [],
+      // Omitted, not empty: any `scripts` value is a settings mutation that
+      // needs settings:write (requiredScopesForProjectMutation in T3 0.1.2).
     }).pipe(
       Effect.flatMap(Schema.decodeUnknownEffect(Project)),
       Effect.mapError((error) =>

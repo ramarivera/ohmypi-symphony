@@ -224,6 +224,10 @@ export class FakeT3Server {
         return new Response("mutation denied", {
           status: this.projectMutationStatus,
         });
+      // T3 0.1.2 treats any `scripts` value as a settings mutation, which the
+      // gateway's orchestration-only bearer can't perform.
+      if ("scripts" in body)
+        return new Response("settings:write required", { status: 403 });
       if (
         body.type !== "project.create" ||
         typeof body.projectId !== "string" ||
