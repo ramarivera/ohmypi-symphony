@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Effect, Option } from "effect";
 import type { McpServerRecord } from "../domain/models.js";
 import {
+  cleanupWorkspaceProcess,
   gitEnvironment,
   needsWorkspaceIdentity,
   workspaceProcess,
@@ -42,28 +43,38 @@ const isGatewayMcpConfig = (value: unknown): boolean => {
   );
 };
 
-/**
- * Best-effort removal of a generated mcp.json. Repository-tracked files are
- * never removed: only the generated, untracked workspace copy is eligible.
- */
+/** Strict worker-side removal lets the gateway observe failed cleanup over IPC. */
+export const removeMcpConfigFile = async (cwd: string): Promise<void> => {
+  if (await isTrackedMcpConfig(cwd)) return;
+  try {
+    await unlink(join(cwd, "mcp.json"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+};
+
+/** Best-effort removal preserves tracked files and the terminal state of the run. */
 export const removeMcpConfig = (
   cwd: string,
 ): Effect.Effect<void, never, never> =>
-  Effect.promise(async () => {
-    if (needsWorkspaceIdentity()) {
-      await workspaceProcess(cwd, "remove-mcp-config", null).catch(
-        () => undefined,
+  needsWorkspaceIdentity()
+    ? cleanupWorkspaceProcess(
+        cwd,
+        "remove-mcp-config",
+        "mcp.config.cleanup_failed",
+      )
+    : Effect.tryPromise({
+        try: () => removeMcpConfigFile(cwd),
+        catch: (error) => String(error),
+      }).pipe(
+        Effect.catchAll((error) =>
+          Effect.logWarning("mcp.config.cleanup_failed").pipe(
+            Effect.annotateLogs({ cwd, error }),
+          ),
+        ),
       );
-      return;
-    }
-    if (await isTrackedMcpConfig(cwd)) return;
-    try {
-      await unlink(join(cwd, "mcp.json"));
-    } catch {
-      // Cleanup is deliberately best effort: a missing or locked config must
-      // not mask the terminal state of the run.
-    }
-  });
 
 /**
  * Resolve the servers visible to one worker. Repository-scoped entries have

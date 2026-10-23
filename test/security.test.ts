@@ -1,9 +1,11 @@
 import { Database } from "bun:sqlite";
 import { createCipheriv, randomBytes } from "node:crypto";
 import {
+  type FileHandle,
   link,
   mkdir,
   mkdtemp,
+  open,
   realpath,
   rm,
   stat,
@@ -13,7 +15,15 @@ import {
 import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { ConfigProvider, Effect, Either, Fiber, Layer, Schema } from "effect";
+import {
+  ConfigProvider,
+  Effect,
+  Either,
+  Fiber,
+  Layer,
+  Logger,
+  Schema,
+} from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { redact } from "../src/admin-ui/run-detail.js";
 import { OrganizationId } from "../src/domain/ids.js";
@@ -27,7 +37,11 @@ import {
 } from "../src/services/bounded-body.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { makeGitHubApp } from "../src/services/github-app.js";
-import { materializeMcpAgentDb } from "../src/services/mcp-oauth.js";
+import { removeMcpConfig } from "../src/services/mcp-config.js";
+import {
+  materializeMcpAgentDb,
+  removeMcpAgentDb,
+} from "../src/services/mcp-oauth.js";
 import {
   isPublicAddress,
   MCP_MAX_RESPONSE_BYTES,
@@ -51,8 +65,10 @@ import {
 import {
   isHttpsGitHubRepositoryUrl,
   persistGitHubExtraHeader,
+  unsetGitHubExtraHeader,
 } from "../src/services/workspace.js";
 import {
+  cleanupWorkspaceProcess,
   gitEnvironment,
   workspaceProcess,
 } from "../src/services/workspace-process.js";
@@ -82,6 +98,8 @@ afterEach(async () => {
   await Promise.all(
     dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   vi.clearAllMocks();
 });
 const key = Buffer.alloc(32, 0x42).toString("base64");
@@ -179,11 +197,42 @@ describe("security boundaries", () => {
     await writeFile(outside, "gateway", { mode: 0o400 });
     await link(outside, join(workspace, "linked"));
     const before = await stat(outside);
+    // A native unprivileged test can't chown the parent directory to a foreign
+    // uid. Stub that syscall while retaining the real inode ownership/nlink.
+    const handle = await open(workspace, "r");
+    const prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    const chown = vi.spyOn(prototype, "chown").mockResolvedValue(undefined);
+    const foreignUid = (process.getuid?.() ?? 1000) + 1;
     await expect(
-      prepareWorkerWorkspace(workspace, String(process.getuid?.())),
+      prepareWorkerWorkspace(workspace, String(foreignUid)),
     ).rejects.toThrow("Multiply-linked");
+    expect(chown).toHaveBeenCalledExactlyOnceWith(foreignUid, foreignUid);
     expect((await stat(outside)).uid).toBe(before.uid);
     expect(await Bun.file(outside).text()).toBe("gateway");
+  });
+
+  it("resumes with already-owned hardlinked tool state without changing ownership", async () => {
+    const dir = await temporary();
+    const workspace = join(dir, "workspace");
+    await mkdir(join(workspace, ".omp-home"), { recursive: true });
+    await writeFile(join(workspace, ".omp-home", "cache"), "tool-state");
+    await link(
+      join(workspace, ".omp-home", "cache"),
+      join(workspace, "dependency"),
+    );
+    const handle = await open(workspace, "r");
+    const prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    vi.spyOn(prototype, "chown").mockRejectedValue(
+      new Error("Unexpected ownership change"),
+    );
+    for (let attempt = 0; attempt < 2; attempt++)
+      await prepareWorkerWorkspace(workspace, String(process.getuid?.()));
+    expect(await Bun.file(join(workspace, "dependency")).text()).toBe(
+      "tool-state",
+    );
+    expect((await stat(join(workspace, "dependency"))).nlink).toBe(2);
   });
 
   it("runs the materializer entry point and excludes writable tool state", async () => {
@@ -193,7 +242,15 @@ describe("security boundaries", () => {
       stderr: "pipe",
     });
     expect(await initialized.exited).toBe(0);
+    const exclude = join(dir, ".git", "info", "exclude");
+    const original = "# user exclusions\n/custom/\n/.omp-home/";
+    await writeFile(exclude, original);
     await workspaceProcess(dir, "tool-directories", null);
+    const first = await Bun.file(exclude).text();
+    expect(first).toBe(`${original}\n/.omp-tmp/\n`);
+    for (let attempt = 0; attempt < 3; attempt++)
+      await workspaceProcess(dir, "tool-directories", null);
+    expect(await Bun.file(exclude).text()).toBe(first);
     await writeFile(join(dir, ".omp-home", "private"), "secret");
     await writeFile(join(dir, ".omp-tmp", "temporary"), "temp");
     const status = Bun.spawn(["git", "status", "--porcelain"], {
@@ -267,8 +324,136 @@ describe("security boundaries", () => {
       HOME: "/home/git",
       GIT_CONFIG_GLOBAL: "/gitconfig",
       GIT_CONFIG_NOSYSTEM: "1",
+      GIT_ASKPASS: "",
       GIT_TERMINAL_PROMPT: "0",
     });
+  });
+
+  it("fails Git authentication without launching a configured askpass helper", async () => {
+    const dir = await temporary();
+    const marker = join(dir, "askpass-invoked");
+    const helper = join(dir, "askpass");
+    const config = join(dir, "gitconfig");
+    await writeFile(
+      helper,
+      `#!/bin/sh\necho invoked >> '${marker}'\necho credential\n`,
+      { mode: 0o700 },
+    );
+    await writeFile(config, `[core]\naskPass = ${helper}\n`);
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () =>
+        new Response(null, {
+          status: 401,
+          headers: { "WWW-Authenticate": 'Basic realm="test"' },
+        }),
+    });
+    try {
+      const child = Bun.spawn(
+        [
+          "git",
+          "-c",
+          "credential.helper=",
+          "ls-remote",
+          `http://127.0.0.1:${server.port}/repo`,
+        ],
+        {
+          env: gitEnvironment({
+            ...process.env,
+            HOME: dir,
+            GIT_CONFIG_GLOBAL: config,
+            GIT_ASKPASS: helper,
+          }),
+          stdout: "ignore",
+          stderr: "pipe",
+        },
+      );
+      const stderr = await new Response(child.stderr).text();
+      expect(await child.exited).not.toBe(0);
+      expect(stderr).toContain("terminal prompts disabled");
+      expect(await Bun.file(marker).exists()).toBe(false);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("warns with context when delegated credential cleanup fails, while preserving best effort", async () => {
+    const dir = await temporary();
+    // A missing cwd fails the real delegated spawn regardless of runner uid.
+    const missing = join(dir, "missing");
+    vi.stubEnv("WORKER_UID", String((process.getuid?.() ?? 1000) + 1));
+    const logs: Array<{
+      message: unknown;
+      annotations: Record<string, unknown>;
+    }> = [];
+    const logger = Logger.make(({ message, annotations }) => {
+      logs.push({ message, annotations: Object.fromEntries(annotations) });
+    });
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        yield* unsetGitHubExtraHeader(missing, "cleanup-session");
+        yield* removeMcpConfig(missing);
+        yield* removeMcpAgentDb(missing);
+      }).pipe(Effect.provide(Logger.replace(Logger.defaultLogger, logger))),
+    );
+    expect(logs.map((entry) => entry.message)).toEqual([
+      ["workspace.github_cleanup_failed"],
+      ["mcp.config.cleanup_failed"],
+      ["mcp.agent_db.cleanup_failed"],
+    ]);
+    expect(logs[0]?.annotations.sessionId).toBe("cleanup-session");
+    expect(logs.map((entry) => entry.annotations.action)).toEqual([
+      "clear-git",
+      "remove-mcp-config",
+      "remove-agent-db",
+    ]);
+    for (const entry of logs) {
+      expect(entry.annotations.cwd).toBe(missing);
+      expect(entry.annotations.error).toEqual(expect.stringMatching(/.+/u));
+    }
+  });
+
+  it("reports worker-side credential deletion failures over IPC and tolerates missing files", async () => {
+    const dir = await temporary();
+    vi.stubEnv("WORKER_UID", "");
+    await mkdir(join(dir, ".git"));
+    await writeFile(join(dir, ".git", "config"), "[unterminated\n");
+    await mkdir(join(dir, "mcp.json"));
+    await mkdir(join(dir, ".omp-gateway", "agent.db"), { recursive: true });
+    const logs: Array<{
+      message: unknown;
+      annotations: Record<string, unknown>;
+    }> = [];
+    const logger = Logger.make(({ message, annotations }) => {
+      logs.push({ message, annotations: Object.fromEntries(annotations) });
+    });
+    for (const action of [
+      "clear-git",
+      "remove-mcp-config",
+      "remove-agent-db",
+    ]) {
+      await expect(workspaceProcess(dir, action, null)).rejects.toThrow(
+        `Workspace ${action} failed`,
+      );
+      await Effect.runPromise(
+        cleanupWorkspaceProcess(dir, action, "cleanup.failed").pipe(
+          Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+        ),
+      );
+    }
+    expect(logs).toHaveLength(3);
+    expect(logs[0]?.annotations.error).toContain("bad config line");
+    expect(logs[1]?.annotations.error).toContain("mcp.json");
+    expect(logs[2]?.annotations.error).toContain("agent.db");
+    await rm(join(dir, "mcp.json"), { recursive: true });
+    await rm(join(dir, ".omp-gateway"), { recursive: true });
+    await expect(
+      workspaceProcess(dir, "remove-mcp-config", null),
+    ).resolves.toBe("");
+    await expect(workspaceProcess(dir, "remove-agent-db", null)).resolves.toBe(
+      "",
+    );
   });
 
   it.each([

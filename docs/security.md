@@ -42,19 +42,21 @@ The Docker entrypoint runs the gateway as root and locks `/app/data` and
 supplementary groups, capabilities, or privilege escalation. Their HOME and
 TMPDIR point to excluded `.omp-home/` and `.omp-tmp/` directories. The gateway
 assigns workspace files to that uid without following symlinks and rejects
-multiply-linked regular files. MCP materialization, cleanup, and Git credential
-updates execute as the worker uid, including on resume, so worker-planted paths
-never cause privileged gateway writes. Git subprocesses receive a transport
+multiply-linked regular files that require an ownership change. Already-owned
+hardlinks remain valid across retries and resumes. MCP materialization, cleanup,
+and Git credential updates execute as the worker uid, including on resume, so
+worker-planted paths never cause privileged gateway writes. Git subprocesses receive a transport
 environment allowlist, without gateway or model-provider credentials.
 `/app/workspaces` must be a separate writable volume,
 outside `/app/data`; the image sets `WORKSPACE_ROOT=/app/workspaces`.
 
 Remove deployment overrides that force the gateway to run as `bun`. Keep the
 entrypoint capability bounding policy. It drops all capabilities except CHOWN,
-DAC_OVERRIDE, SETUID, SETGID and SETPCAP. DAC_OVERRIDE is needed to traverse
+DAC_OVERRIDE, KILL, SETUID, SETGID and SETPCAP. KILL lets the gateway terminate
+workers running under another uid. DAC_OVERRIDE is needed to traverse
 worker-owned mode-0700 directories during the ownership walk, and SETPCAP is
 needed for the worker's empty capability bounding set. Each worker has no
-capabilities. A deployment may also apply `--cap-drop=ALL` with these five
+capabilities. A deployment may also apply `--cap-drop=ALL` with these six
 `--cap-add` values; omitting DAC_OVERRIDE or SETPCAP breaks workspace preparation
 or worker startup.
 Mount all gateway secret files root-owned with mode **0400**, including Docker

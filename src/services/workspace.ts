@@ -30,6 +30,7 @@ import {
   workerIdentityCommand,
 } from "./worker-security.js";
 import {
+  cleanupWorkspaceProcess,
   gitEnvironment,
   needsWorkspaceIdentity,
   workspaceProcess,
@@ -520,9 +521,12 @@ export const unsetGitHubExtraHeader = (
   sessionId: string,
 ): Effect.Effect<void, never> => {
   if (needsWorkspaceIdentity())
-    return Effect.promise(async () => {
-      await workspaceProcess(target, "clear-git", null).catch(() => undefined);
-    });
+    return cleanupWorkspaceProcess(
+      target,
+      "clear-git",
+      "workspace.github_cleanup_failed",
+      { sessionId },
+    );
   return removeGitHubExtraHeaders(target, sessionId).pipe(
     Effect.catchAll((error) =>
       Effect.logWarning("workspace.github_cleanup_failed").pipe(
@@ -532,7 +536,7 @@ export const unsetGitHubExtraHeader = (
   );
 };
 
-const removeGitHubExtraHeaders = (
+export const removeGitHubExtraHeaders = (
   target: string,
   sessionId: string,
 ): Effect.Effect<void, WorkspaceError> =>

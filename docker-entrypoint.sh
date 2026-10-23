@@ -19,6 +19,6 @@ for name in LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET LINEAR_WEBHOOK_SECRET TOKEN_EN
     fi
   fi
 done
-# Keep only filesystem ownership/access and worker identity transition powers.
+# Keep filesystem access, worker identity transition, and worker signal delivery.
 # SETPCAP is required when setpriv drops every worker bounding capability.
-exec setpriv --bounding-set=-all,+chown,+dac_override,+setgid,+setuid,+setpcap -- "$@"
+exec setpriv --bounding-set=-all,+chown,+dac_override,+kill,+setgid,+setuid,+setpcap -- "$@"

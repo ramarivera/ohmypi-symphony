@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { Effect } from "effect";
 import { workerIdentityCommand } from "./worker-security.js";
 
 /** Git is allowed transport settings, never gateway or model credentials. */
@@ -21,6 +22,7 @@ export const gitEnvironment = (
         input[name] === undefined ? [] : [[name, input[name]]],
       ),
     ),
+    GIT_ASKPASS: "",
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_NOSYSTEM: "1",
   };
@@ -66,3 +68,22 @@ export const workspaceProcess = async (
     throw new Error(`Workspace ${action} failed: ${stderr.trim()}`);
   return stdout;
 };
+
+/** Cleanup stays best effort, but failed delegation must leave an operator signal. */
+export const cleanupWorkspaceProcess = (
+  cwd: string,
+  action: string,
+  event: string,
+  annotations: Record<string, string> = {},
+): Effect.Effect<void> =>
+  Effect.tryPromise({
+    try: () => workspaceProcess(cwd, action, null),
+    catch: (error) => (error instanceof Error ? error.message : String(error)),
+  }).pipe(
+    Effect.asVoid,
+    Effect.catchAll((error) =>
+      Effect.logWarning(event).pipe(
+        Effect.annotateLogs({ ...annotations, cwd, action, error }),
+      ),
+    ),
+  );

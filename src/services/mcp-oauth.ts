@@ -28,6 +28,7 @@ import { TokenCrypto } from "./token-crypto.js";
 import { tokenContext } from "./token-migration.js";
 
 import {
+  cleanupWorkspaceProcess,
   needsWorkspaceIdentity,
   workspaceProcess,
 } from "./workspace-process.js";
@@ -1532,20 +1533,38 @@ export const materializeMcpAgentDb = async (
   }
 };
 
+/** Strict worker-side removal lets the gateway observe failed cleanup over IPC. */
+export const removeMcpAgentDbFile = async (
+  workspace: string,
+): Promise<void> => {
+  try {
+    await unlink(join(workspace, ".omp-gateway", "agent.db"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+};
+
 export const removeMcpAgentDb = (
   workspace: string,
 ): Effect.Effect<void, never, never> =>
-  Effect.promise(async () => {
-    if (needsWorkspaceIdentity()) {
-      await workspaceProcess(workspace, "remove-agent-db", null).catch(
-        () => undefined,
+  needsWorkspaceIdentity()
+    ? cleanupWorkspaceProcess(
+        workspace,
+        "remove-agent-db",
+        "mcp.agent_db.cleanup_failed",
+      )
+    : Effect.tryPromise({
+        try: () => removeMcpAgentDbFile(workspace),
+        catch: (error) => String(error),
+      }).pipe(
+        Effect.catchAll((error) =>
+          Effect.logWarning("mcp.agent_db.cleanup_failed").pipe(
+            Effect.annotateLogs({ cwd: workspace, error }),
+          ),
+        ),
       );
-      return;
-    }
-    try {
-      await unlink(join(workspace, ".omp-gateway", "agent.db"));
-    } catch {}
-  });
 
 export const mcpProviderForServerUrl = (serverUrl: string): string =>
   `${MCP_OAUTH_PROVIDER_PREFIX}${serverUrl}`;

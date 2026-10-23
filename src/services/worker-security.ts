@@ -96,9 +96,10 @@ export const prepareWorkerWorkspace = async (
       const stat = await handle.stat();
       if (!stat.isDirectory() && !stat.isFile())
         throw new Error("Unsupported workspace file type");
-      if (stat.isFile() && stat.nlink !== 1)
+      const owned = stat.uid === Number(uid) && stat.gid === Number(uid);
+      if (stat.isFile() && stat.nlink !== 1 && !owned)
         throw new Error("Multiply-linked workspace files are forbidden");
-      await handle.chown(Number(uid), Number(uid));
+      if (!owned) await handle.chown(Number(uid), Number(uid));
       if (stat.isDirectory()) {
         const fdPath = `/proc/self/fd/${handle.fd}`;
         for (const name of await readdir(fdPath))
