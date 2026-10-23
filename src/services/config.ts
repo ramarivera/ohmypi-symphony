@@ -7,6 +7,7 @@ import {
   Layer,
   Option,
   Redacted,
+  Result,
 } from "effect";
 import type { LogLevel } from "../domain/models.js";
 import { modelProvider } from "./worker-profile.js";
@@ -485,12 +486,14 @@ const isRuntimeMode = (value: string): value is RuntimeMode =>
 
 const t3ModelOptions = (
   raw: string | undefined,
-): Either.Either<T3DriverConfig["modelOptions"], ConfigError.ConfigError> => {
-  if (raw === undefined) return Either.right([]);
-  const invalid = Either.left(
-    ConfigError.InvalidData(
-      ["T3_MODEL_OPTIONS"],
-      'T3_MODEL_OPTIONS must be a JSON object of string or boolean values, e.g. {"effort":"high"}',
+): Result.Result<T3DriverConfig["modelOptions"], Config.ConfigError> => {
+  if (raw === undefined) return Result.succeed([]);
+  const invalid = Result.fail(
+    new Config.ConfigError(
+      new ConfigProvider.SourceError({
+        message:
+          'T3_MODEL_OPTIONS must be a JSON object of string or boolean values, e.g. {"effort":"high"}',
+      }),
     ),
   );
   let parsed: unknown;
@@ -513,34 +516,36 @@ const t3ModelOptions = (
       return invalid;
     }
   }
-  return Either.right(options);
+  return Result.succeed(options);
 };
 
 const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
   function* (): Effect.fn.Return<
     T3DriverConfig | undefined,
-    ConfigError.ConfigError
+    Config.ConfigError
   > {
     const baseUrlValue = yield* optionalValue("T3_BASE_URL");
     if (baseUrlValue === undefined) return undefined;
     const baseUrl = yield* Effect.try({
       try: () => new URL(baseUrlValue),
       catch: () =>
-        ConfigError.InvalidData(
-          ["T3_BASE_URL"],
-          "T3_BASE_URL must be a valid URL",
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: "T3_BASE_URL must be a valid URL",
+          }),
         ),
     });
     if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
       return yield* Effect.fail(
-        ConfigError.InvalidData(
-          ["T3_BASE_URL"],
-          "T3_BASE_URL must use http or https",
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: "T3_BASE_URL must use http or https",
+          }),
         ),
       );
     }
-    const tokenFile = yield* Config.option(Config.string("T3_TOKEN_FILE"));
-    const directToken = yield* Config.option(Config.string("T3_TOKEN"));
+    const tokenFile = yield* Config.option(Config.String("T3_TOKEN_FILE"));
+    const directToken = yield* Config.option(Config.String("T3_TOKEN"));
     const hasDirectToken =
       Option.isSome(directToken) && directToken.value.trim().length > 0;
     // requiredValue validates that the file (or variable) yields a token now.
@@ -555,9 +560,10 @@ const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
       (yield* optionalValue("T3_RUNTIME_MODE")) ?? "auto";
     if (!isRuntimeMode(runtimeModeValue)) {
       return yield* Effect.fail(
-        ConfigError.InvalidData(
-          ["T3_RUNTIME_MODE"],
-          `T3_RUNTIME_MODE must be one of ${RUNTIME_MODES.join(", ")}`,
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: `T3_RUNTIME_MODE must be one of ${RUNTIME_MODES.join(", ")}`,
+          }),
         ),
       );
     }
@@ -565,33 +571,35 @@ const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
       (yield* optionalValue("T3_INTERACTION_MODE")) ?? "default";
     if (interactionMode !== "default" && interactionMode !== "plan") {
       return yield* Effect.fail(
-        ConfigError.InvalidData(
-          ["T3_INTERACTION_MODE"],
-          "T3_INTERACTION_MODE must be default or plan",
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: "T3_INTERACTION_MODE must be default or plan",
+          }),
         ),
       );
     }
     const idNamespace = (yield* optionalValue("T3_ID_NAMESPACE")) ?? "symphony";
     if (!/^[A-Za-z0-9_-]{1,32}$/u.test(idNamespace)) {
       return yield* Effect.fail(
-        ConfigError.InvalidData(
-          ["T3_ID_NAMESPACE"],
-          "T3_ID_NAMESPACE must be 1-32 letters, digits, '_' or '-'",
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: "T3_ID_NAMESPACE must be 1-32 letters, digits, '_' or '-'",
+          }),
         ),
       );
     }
     const modelOptions = t3ModelOptions(
       yield* optionalValue("T3_MODEL_OPTIONS"),
     );
-    if (Either.isLeft(modelOptions))
-      return yield* Effect.fail(modelOptions.left);
+    if (Result.isFailure(modelOptions))
+      return yield* Effect.fail(modelOptions.failure);
     return {
       baseUrl,
       token: tokenSource,
       projectId: yield* requiredValue("T3_PROJECT_ID"),
       providerInstanceId: yield* requiredValue("T3_PROVIDER_INSTANCE"),
       model: yield* requiredValue("T3_MODEL"),
-      modelOptions: modelOptions.right,
+      modelOptions: modelOptions.success,
       runtimeMode: runtimeModeValue,
       interactionMode,
       idNamespace,

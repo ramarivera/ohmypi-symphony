@@ -45,6 +45,7 @@ export class FakeT3Server {
   readonly token = "fake-bearer-token";
   readonly tickets = new Set<string>();
   readonly requests: ReceivedRequest[] = [];
+  readonly clientFrames: Json[] = [];
   readonly threads = new Map<string, FakeThread>();
   readonly receipts = new Map<string, { threadId: string; sequence: number }>();
   readonly upgrades: Array<{ protocol: string | null; ticketOk: boolean }> = [];
@@ -101,6 +102,19 @@ export class FakeT3Server {
 
   closeAllSockets(): void {
     for (const ws of this.sockets) ws.close(1012, "restart");
+  }
+
+  /** Send protocol frames to each subscription, including terminal Exits. */
+  sendToSubscriptions(threadId: string, frames: ReadonlyArray<Json>): void {
+    for (const ws of this.sockets) {
+      for (const [requestId, subscription] of ws.data.subscriptions) {
+        if (subscription.threadId !== threadId) continue;
+        for (const frame of frames) {
+          this.send(ws, { ...frame, requestId });
+          if (frame._tag === "Exit") ws.data.subscriptions.delete(requestId);
+        }
+      }
+    }
   }
 
   thread(threadId: string): FakeThread {
@@ -258,6 +272,7 @@ export class FakeT3Server {
   }
 
   private handleFrame(ws: ServerWebSocket<SocketData>, frame: Json): void {
+    this.clientFrames.push(frame);
     switch (frame._tag) {
       case "Ping":
         this.send(ws, { _tag: "Pong" });

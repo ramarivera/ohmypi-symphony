@@ -59,7 +59,7 @@ export const TERMINAL_ITEM_STATUSES: ReadonlySet<string> = new Set([
 
 /** `AuthWebSocketTicketResult`, auth.ts:243. */
 export const WebSocketTicketResult = Schema.Struct({
-  ticket: Schema.NonEmptyTrimmedString,
+  ticket: Schema.NonEmptyString.check(Schema.isTrimmed()),
   expiresAt: Schema.String,
 });
 
@@ -215,7 +215,7 @@ export const DomainEvent = Schema.Struct({
 export type DomainEvent = typeof DomainEvent.Type;
 
 /** `OrchestrationV2ThreadStreamItem`, orchestrationV2.ts:3307 (narrowed). */
-export const ThreadStreamItem = Schema.Union(
+export const ThreadStreamItem = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("synchronized") }),
   Schema.Struct({
     kind: Schema.Literal("snapshot"),
@@ -227,62 +227,65 @@ export const ThreadStreamItem = Schema.Union(
     sequence: Schema.Number,
     event: DomainEvent,
   }),
-);
+]);
 export type ThreadStreamItem = typeof ThreadStreamItem.Type;
 
 // ---------------------------------------------------------------------------
 // Inputs and commands
 
 /** `RuntimeMode`, providerPolicy.ts:25. */
-export const RuntimeMode = Schema.Literal(
+export const RuntimeMode = Schema.Literals([
   "approval-required",
   "auto-accept-edits",
   "auto",
   "full-access",
-);
+]);
 /** `ProviderInteractionMode`, providerPolicy.ts:34. */
-export const InteractionMode = Schema.Literal("default", "plan");
+export const InteractionMode = Schema.Literals(["default", "plan"]);
 /** `ProviderApprovalDecision`, providerPolicy.ts:50. */
-export const ApprovalDecision = Schema.Literal(
+export const ApprovalDecision = Schema.Literals([
   "accept",
   "acceptForSession",
   "acceptAlways",
   "decline",
   "cancel",
-);
+]);
 
 /** `ProviderOptionSelection`, model.ts:49. */
 export const ProviderOptionSelection = Schema.Struct({
-  id: Schema.NonEmptyTrimmedString,
-  value: Schema.Union(Schema.NonEmptyTrimmedString, Schema.Boolean),
+  id: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  value: Schema.Union([
+    Schema.NonEmptyString.check(Schema.isTrimmed()),
+    Schema.Boolean,
+  ]),
 });
 export type ProviderOptionSelection = typeof ProviderOptionSelection.Type;
 
 /** `ModelSelection` wire form, modelSelection.ts:9. */
 export const ModelSelection = Schema.Struct({
-  instanceId: Schema.NonEmptyTrimmedString,
-  model: Schema.NonEmptyTrimmedString,
+  instanceId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  model: Schema.NonEmptyString.check(Schema.isTrimmed()),
   options: Schema.optional(Schema.Array(ProviderOptionSelection)),
 });
 export type ModelSelection = typeof ModelSelection.Type;
 
 /** `OrchestrationV2ThreadLaunchWorkspaceStrategy`, orchestrationV2.ts:514. */
-export const WorkspaceStrategy = Schema.Union(
+export const WorkspaceStrategy = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("root"),
     branch: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     type: Schema.Literal("existing_worktree"),
-    worktreePath: Schema.NonEmptyTrimmedString,
+    worktreePath: Schema.NonEmptyString.check(Schema.isTrimmed()),
     branch: Schema.optional(Schema.String),
   }),
   Schema.Struct({
     type: Schema.Literal("worktree"),
-    baseRef: Schema.NonEmptyTrimmedString,
+    baseRef: Schema.NonEmptyString.check(Schema.isTrimmed()),
     branch: Schema.optional(Schema.String),
   }),
-);
+]);
 export type WorkspaceStrategy = typeof WorkspaceStrategy.Type;
 
 /**
@@ -300,11 +303,11 @@ export const CREATION_SOURCE = "web" as const;
  * "create or reuse". Idempotency comes from the commandId receipt instead.
  */
 export const LaunchThreadInput = Schema.Struct({
-  commandId: Schema.NonEmptyTrimmedString,
+  commandId: Schema.NonEmptyString.check(Schema.isTrimmed()),
   creationSource: Schema.Literal(CREATION_SOURCE),
-  threadId: Schema.NonEmptyTrimmedString,
-  projectId: Schema.NonEmptyTrimmedString,
-  title: Schema.NonEmptyTrimmedString,
+  threadId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  projectId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  title: Schema.NonEmptyString.check(Schema.isTrimmed()),
   modelSelection: ModelSelection,
   runtimeMode: RuntimeMode,
   interactionMode: InteractionMode,
@@ -320,14 +323,14 @@ export const LaunchThreadResult = Schema.Struct({
 });
 
 /** `message.dispatch` `dispatchMode`, orchestrationV2.ts:2798. */
-export const DispatchMode = Schema.Union(
+export const DispatchMode = Schema.Union([
   Schema.Struct({ type: Schema.Literal("start_immediately") }),
   Schema.Struct({ type: Schema.Literal("queue_after_active") }),
   Schema.Struct({
     type: Schema.Literal("steer_active"),
-    targetRunId: Schema.NonEmptyTrimmedString,
+    targetRunId: Schema.NonEmptyString.check(Schema.isTrimmed()),
   }),
-);
+]);
 export type DispatchMode = typeof DispatchMode.Type;
 
 /** `OrchestrationV2Command` members used by the driver, orchestrationV2.ts:2563. */
@@ -335,42 +338,40 @@ export const MessageDispatchCommand = Schema.Struct({
   type: Schema.Literal("message.dispatch"),
   createdBy: Schema.Literal("user"),
   creationSource: Schema.Literal(CREATION_SOURCE),
-  commandId: Schema.NonEmptyTrimmedString,
-  threadId: Schema.NonEmptyTrimmedString,
-  messageId: Schema.NonEmptyTrimmedString,
+  commandId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  threadId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  messageId: Schema.NonEmptyString.check(Schema.isTrimmed()),
   text: Schema.String,
-  attachments: Schema.Tuple(),
+  attachments: Schema.Tuple([]),
   dispatchMode: DispatchMode,
 });
 export const RunInterruptCommand = Schema.Struct({
   type: Schema.Literal("run.interrupt"),
-  commandId: Schema.NonEmptyTrimmedString,
-  threadId: Schema.NonEmptyTrimmedString,
-  runId: Schema.NonEmptyTrimmedString,
+  commandId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  threadId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  runId: Schema.NonEmptyString.check(Schema.isTrimmed()),
   reason: Schema.optional(Schema.String),
 });
 export const RuntimeRequestRespondCommand = Schema.Struct({
   type: Schema.Literal("runtime-request.respond"),
-  commandId: Schema.NonEmptyTrimmedString,
-  threadId: Schema.NonEmptyTrimmedString,
-  requestId: Schema.NonEmptyTrimmedString,
+  commandId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  threadId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  requestId: Schema.NonEmptyString.check(Schema.isTrimmed()),
   decision: Schema.optional(ApprovalDecision),
-  answers: Schema.optional(
-    Schema.Record({ key: Schema.String, value: Schema.Unknown }),
-  ),
+  answers: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
 });
 export const UserInputDismissCommand = Schema.Struct({
   type: Schema.Literal("thread.user-input.dismiss"),
-  commandId: Schema.NonEmptyTrimmedString,
-  threadId: Schema.NonEmptyTrimmedString,
-  requestId: Schema.NonEmptyTrimmedString,
+  commandId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  threadId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  requestId: Schema.NonEmptyString.check(Schema.isTrimmed()),
 });
-export const DispatchCommand = Schema.Union(
+export const DispatchCommand = Schema.Union([
   MessageDispatchCommand,
   RunInterruptCommand,
   RuntimeRequestRespondCommand,
   UserInputDismissCommand,
-);
+]);
 export type DispatchCommand = typeof DispatchCommand.Type;
 
 /** `OrchestrationV2DispatchCommandResult`, orchestrationV2.ts:3185. */
@@ -378,11 +379,13 @@ export const DispatchCommandResult = Schema.Struct({ sequence: Schema.Number });
 
 /** `OrchestrationV2GetThreadProjectionInput`, orchestrationV2.ts:3190. */
 export const GetThreadProjectionInput = Schema.Struct({
-  threadId: Schema.NonEmptyTrimmedString,
+  threadId: Schema.NonEmptyString.check(Schema.isTrimmed()),
 });
 
 /** `OrchestrationV2SubscribeThreadInput`, orchestrationV2.ts:3202 (subset). */
 export const SubscribeThreadInput = Schema.Struct({
-  threadId: Schema.NonEmptyTrimmedString,
-  afterSequence: Schema.optional(Schema.NonNegativeInt),
+  threadId: Schema.NonEmptyString.check(Schema.isTrimmed()),
+  afterSequence: Schema.optional(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  ),
 });

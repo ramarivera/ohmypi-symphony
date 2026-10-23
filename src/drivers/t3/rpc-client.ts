@@ -1,7 +1,7 @@
 /**
  * Minimal client for T3 Code's WebSocket RPC (`GET /ws`, Effect RPC with
- * JSON serialization). Hand-rolled instead of `@effect/rpc` because T3 runs
- * Effect 4 and this gateway Effect 3; the JSON frames are the stable part.
+ * JSON serialization). Retains the protocol-2 JSON frames of the pinned
+ * server contract, independently of the gateway's Effect runtime.
  *
  * Frames (effect `RpcMessage`): the client sends `Request{id,tag,payload,
  * headers}`, `Ack{requestId}` after every stream `Chunk`, `Interrupt`, and
@@ -12,17 +12,18 @@
  * the short-lived ticket only in the socket URL. Neither appears in errors.
  */
 import {
-  Chunk,
+  Array as Arr,
   Deferred,
   Duration,
   Effect,
+  Exit,
   Queue,
   Redacted,
   Schedule,
   Schema,
   type Scope,
   Stream,
-  Take,
+  type Take,
 } from "effect";
 import {
   ENVIRONMENT_DESCRIPTOR_PATH,
@@ -35,14 +36,14 @@ import {
   WebSocketTicketResult,
 } from "./wire.js";
 
-export const T3RpcErrorReason = Schema.Literal(
+export const T3RpcErrorReason = Schema.Literals([
   "unavailable",
   "auth",
   "protocol",
   "timeout",
   "rejected",
   "lost",
-);
+]);
 export type T3RpcErrorReason = typeof T3RpcErrorReason.Type;
 
 export class T3RpcError extends Schema.TaggedError<T3RpcError>()(
@@ -116,15 +117,17 @@ const httpJson = (
           message: `T3 ${url.pathname} unreachable: ${errorText(error)}`,
         }),
     }).pipe(
-      Effect.timeoutFail({
+      Effect.timeoutOrElse({
         duration: Duration.millis(timeoutMs),
-        onTimeout: () =>
-          new T3RpcError({
-            reason: "timeout",
-            method,
-            sent: true,
-            message: `T3 ${url.pathname} timed out after ${timeoutMs}ms`,
-          }),
+        orElse: () =>
+          Effect.fail(
+            new T3RpcError({
+              reason: "timeout",
+              method,
+              sent: true,
+              message: `T3 ${url.pathname} timed out after ${timeoutMs}ms`,
+            }),
+          ),
       }),
     );
     if (response.status === 401 || response.status === 403) {
@@ -144,7 +147,7 @@ const httpJson = (
       });
     }
     return yield* Effect.tryPromise({
-      try: () => response.json() as Promise<unknown>,
+      try: (): Promise<unknown> => response.json(),
       catch: () =>
         new T3RpcError({
           reason: "protocol",
@@ -156,9 +159,9 @@ const httpJson = (
   });
 
 const decodeOrProtocol =
-  <A, I>(schema: Schema.Schema<A, I>, method: string, what: string) =>
+  <A, I>(schema: Schema.Codec<A, I>, method: string, what: string) =>
   (value: unknown): Effect.Effect<A, T3RpcError> =>
-    Schema.decodeUnknown(schema)(value).pipe(
+    Schema.decodeUnknownEffect(schema)(value).pipe(
       Effect.mapError(
         () =>
           new T3RpcError({
@@ -299,7 +302,7 @@ export const connectT3 = (
     let awaitingPong = false;
 
     const socket = yield* Effect.acquireRelease(
-      Effect.async<WebSocket, T3RpcError>((resume) => {
+      Effect.callback<WebSocket, T3RpcError>((resume) => {
         const ws = new WebSocket(url.toString());
         let settled = false;
         ws.onopen = () => {
@@ -328,15 +331,17 @@ export const connectT3 = (
           if (!settled) ws.close();
         });
       }).pipe(
-        Effect.timeoutFail({
+        Effect.timeoutOrElse({
           duration: Duration.millis(connectTimeoutMs),
-          onTimeout: () =>
-            new T3RpcError({
-              reason: "timeout",
-              method: "connect",
-              sent: false,
-              message: `T3 socket ${where} did not open within ${connectTimeoutMs}ms`,
-            }),
+          orElse: () =>
+            Effect.fail(
+              new T3RpcError({
+                reason: "timeout",
+                method: "connect",
+                sent: false,
+                message: `T3 socket ${where} did not open within ${connectTimeoutMs}ms`,
+              }),
+            ),
         }),
       ),
       (ws) =>
@@ -376,16 +381,19 @@ export const connectT3 = (
       open = false;
       for (const [id, entry] of pending) {
         pending.delete(id);
-        Deferred.unsafeDone(
+        Deferred.doneUnsafe(
           entry.deferred,
           Effect.fail(forRequest(reason, entry.method)),
         );
       }
       for (const [id, entry] of streams) {
         streams.delete(id);
-        entry.queue.unsafeOffer(Take.fail(forRequest(reason, entry.method)));
+        Queue.offerUnsafe(
+          entry.queue,
+          Exit.fail(forRequest(reason, entry.method)),
+        );
       }
-      Deferred.unsafeDone(closed, Effect.succeed(reason));
+      Deferred.doneUnsafe(closed, Effect.succeed(reason));
     }
 
     const handleFrame = (frame: unknown): void => {
@@ -401,7 +409,7 @@ export const connectT3 = (
           const request = pending.get(id);
           if (request !== undefined) {
             pending.delete(id);
-            Deferred.unsafeDone(
+            Deferred.doneUnsafe(
               request.deferred,
               success
                 ? Effect.succeed(frame.exit.value)
@@ -412,10 +420,11 @@ export const connectT3 = (
           const stream = streams.get(id);
           if (stream !== undefined) {
             streams.delete(id);
-            stream.queue.unsafeOffer(
+            Queue.offerUnsafe(
+              stream.queue,
               success
-                ? Take.end
-                : Take.fail(failureFromExit(stream.method, frame.exit)),
+                ? Exit.void
+                : Exit.fail(failureFromExit(stream.method, frame.exit)),
             );
           }
           return;
@@ -425,9 +434,8 @@ export const connectT3 = (
           if (id === null || !Array.isArray(frame.values)) return;
           const stream = streams.get(id);
           if (stream === undefined) return;
-          stream.queue.unsafeOffer(
-            Take.chunk(Chunk.fromIterable<unknown>(frame.values)),
-          );
+          if (Arr.isReadonlyArrayNonEmpty(frame.values))
+            Queue.offerUnsafe(stream.queue, frame.values);
           sendFrame({ _tag: "Ack", requestId: id });
           return;
         }
@@ -532,15 +540,17 @@ export const connectT3 = (
         }
         const timeoutMs = opts?.timeoutMs ?? requestTimeoutMs;
         return yield* Deferred.await(deferred).pipe(
-          Effect.timeoutFail({
+          Effect.timeoutOrElse({
             duration: Duration.millis(timeoutMs),
-            onTimeout: () =>
-              new T3RpcError({
-                reason: "timeout",
-                method,
-                sent: true,
-                message: `T3 ${method} timed out after ${timeoutMs}ms`,
-              }),
+            orElse: () =>
+              Effect.fail(
+                new T3RpcError({
+                  reason: "timeout",
+                  method,
+                  sent: true,
+                  message: `T3 ${method} timed out after ${timeoutMs}ms`,
+                }),
+              ),
           }),
           Effect.onExit(() =>
             Effect.sync(() => {
@@ -557,7 +567,7 @@ export const connectT3 = (
       });
 
     const stream: T3RpcConnection["stream"] = (method, payload) =>
-      Stream.unwrapScoped(
+      Stream.unwrap(
         Effect.gen(function* () {
           const queue =
             yield* Queue.unbounded<Take.Take<unknown, T3RpcError>>();

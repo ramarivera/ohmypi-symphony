@@ -13,19 +13,19 @@ import { createHash } from "node:crypto";
 import {
   Duration,
   Effect,
-  Either,
-  ExecutionStrategy,
   Exit,
   Option,
   Queue,
   type Redacted,
   Ref,
+  Result,
   Schedule,
   Schema,
   Scope,
+  Semaphore,
   Stream,
   SubscriptionRef,
-  Take,
+  type Take,
 } from "effect";
 import type { T3DriverConfig } from "../../services/config.js";
 import {
@@ -258,8 +258,8 @@ const isTerminal = (status: string): status is TurnStatus =>
 const resolveOutcome = (
   state: OutcomeState,
   turnId: string,
-): Option.Option<Either.Either<TurnOutcome, DriverError>> => {
-  if (state.failure !== null) return Option.some(Either.left(state.failure));
+): Option.Option<Result.Result<TurnOutcome, DriverError>> => {
+  if (state.failure !== null) return Option.some(Result.fail(state.failure));
   const seen = new Set<string>();
   let current = turnId;
   while (!seen.has(current)) {
@@ -277,7 +277,7 @@ const resolveOutcome = (
       continue;
     }
     return Option.some(
-      Either.right({
+      Result.succeed({
         turnId: run.id,
         status: run.status,
         finalText: run.finalText,
@@ -293,7 +293,7 @@ const resolveOutcome = (
 };
 
 const decodeProjection = (operation: string) => (value: unknown) =>
-  Schema.decodeUnknown(ThreadProjectionSchema)(value).pipe(
+  Schema.decodeUnknownEffect(ThreadProjectionSchema)(value).pipe(
     Effect.mapError(() =>
       protocolError(
         operation,
@@ -352,11 +352,11 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
       const projectId = input.project ?? options.projectId;
 
       // -- connection management: one live socket, replaced when it dies.
-      const lock = yield* Effect.makeSemaphore(1);
+      const lock = yield* Semaphore.make(1);
       const current = yield* Ref.make<
         Option.Option<{
           readonly connection: T3RpcConnection;
-          readonly scope: Scope.CloseableScope;
+          readonly scope: Scope.Closeable;
         }>
       >(Option.none());
       const connection = lock.withPermits(1)(
@@ -369,12 +369,9 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
             yield* Scope.close(existing.value.scope, Exit.void);
             yield* Ref.set(current, Option.none());
           }
-          const scope = yield* Scope.fork(
-            sessionScope,
-            ExecutionStrategy.sequential,
-          );
+          const scope = yield* Scope.fork(sessionScope, "sequential");
           const fresh = yield* connectT3(connectOptions).pipe(
-            Scope.extend(scope),
+            Scope.provide(scope),
             Effect.tapError(() => Scope.close(scope, Exit.void)),
             Effect.mapError(fromRpcError("connect", false)),
           );
@@ -403,11 +400,11 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
         );
 
       const encode = <A, I>(
-        schema: Schema.Schema<A, I>,
+        schema: Schema.Codec<A, I>,
         value: A,
         operation: string,
       ) =>
-        Schema.encode(schema)(value).pipe(
+        Schema.encodeEffect(schema)(value).pipe(
           Effect.mapError(() =>
             protocolError(
               operation,
@@ -428,11 +425,11 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
       const fetchProjectionSettled = (operation: string) =>
         fetchProjection(operation).pipe(
           Effect.retry({
+            times: 4,
+            while: isTransient,
             schedule: Schedule.exponential(
               Duration.millis(reconnectBaseDelayMs),
             ),
-            times: 4,
-            while: isTransient,
           }),
         );
 
@@ -483,7 +480,7 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
           options.launchTimeoutMs ?? 60_000,
         ).pipe(
           Effect.flatMap((value) =>
-            Schema.decodeUnknown(LaunchThreadResult)(value).pipe(
+            Schema.decodeUnknownEffect(LaunchThreadResult)(value).pipe(
               Effect.mapError(() =>
                 withSubmission("submitted")(
                   protocolError(
@@ -504,7 +501,7 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
             () =>
               fetchProjectionSettled("launchThread").pipe(
                 Effect.asVoid,
-                Effect.orElse(() => launch),
+                Effect.catch(() => launch),
               ),
           ),
         );
@@ -545,7 +542,7 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
           .pipe(
             Stream.mapError(fromRpcError("subscribeThread", false)),
             Stream.mapEffect((raw) =>
-              Schema.decodeUnknown(ThreadStreamItem)(raw).pipe(
+              Schema.decodeUnknownEffect(ThreadStreamItem)(raw).pipe(
                 Effect.mapError(() =>
                   protocolError(
                     "subscribeThread",
@@ -558,7 +555,7 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
               Effect.gen(function* () {
                 yield* Ref.update(received, (count) => count + 1);
                 for (const event of mapper.apply(item)) {
-                  yield* Queue.offer(queue, Take.of(event));
+                  yield* Queue.offer(queue, [event]);
                 }
                 yield* SubscriptionRef.set(outcomes, {
                   runs: new Map(mapper.runViews()),
@@ -603,21 +600,23 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
           );
         }
       }).pipe(
-        Effect.catchAll((error: DriverError) =>
-          Effect.zipRight(
+        Effect.catch((error: DriverError) =>
+          Effect.andThen(
             SubscriptionRef.update(outcomes, (state) => ({
               ...state,
               failure: error,
             })),
-            Queue.offer(queue, Take.fail(error)),
+            Queue.offer(queue, Exit.fail(error)),
           ),
         ),
       );
       yield* Effect.forkIn(pump, sessionScope);
 
       const awaitOutcome = (turnId: string) =>
-        outcomes.changes.pipe(
-          Stream.filterMap((state) => resolveOutcome(state, turnId)),
+        SubscriptionRef.changes(outcomes).pipe(
+          Stream.filterMap((state) =>
+            Result.fromOption(resolveOutcome(state, turnId), () => undefined),
+          ),
           Stream.runHead,
           Effect.flatMap(
             Option.match({
@@ -631,7 +630,7 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
                     message: "The T3 session closed before the turn ended",
                   }),
                 ),
-              onSome: (result) => result,
+              onSome: (result) => Effect.fromResult(result),
             }),
           ),
         );

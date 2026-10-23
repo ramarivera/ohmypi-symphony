@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Either, Layer, Redacted } from "effect";
+import { ConfigProvider, Effect, Layer, Redacted, Result } from "effect";
 import { t3DriverOptionsFromConfig } from "../src/drivers/t3/driver.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { testPaths } from "./fixtures/paths.js";
@@ -27,15 +27,18 @@ const t3Values: ReadonlyArray<readonly [string, string]> = [
 ];
 
 const load = (values: ReadonlyArray<readonly [string, string]>) =>
-  Effect.either(
+  Effect.result(
     Effect.gen(function* () {
       return yield* GatewayConfig;
     }).pipe(
       Effect.provide(
-        GatewayConfig.Default.pipe(
+        GatewayConfig.layer.pipe(
           Layer.provide(
-            Layer.setConfigProvider(
-              ConfigProvider.fromMap(new Map([...baseValues, ...values])),
+            ConfigProvider.layer(
+              ConfigProvider.fromUnknown(
+                Object.fromEntries([...baseValues, ...values]),
+                { preserveEmptyStrings: true },
+              ),
             ),
           ),
         ),
@@ -47,16 +50,17 @@ describe("T3 driver config", () => {
   it.effect("is absent unless T3_BASE_URL is set", () =>
     Effect.gen(function* () {
       const result = yield* load([]);
-      expect(Either.isRight(result)).toBe(true);
-      if (Either.isRight(result)) expect(result.right.t3Driver).toBeUndefined();
+      expect(Result.isSuccess(result)).toBe(true);
+      if (Result.isSuccess(result))
+        expect(result.success.t3Driver).toBeUndefined();
     }),
   );
 
   it.effect("loads defaults and keeps the token redacted", () =>
     Effect.gen(function* () {
       const result = yield* load(t3Values);
-      if (Either.isLeft(result)) throw result.left;
-      const t3 = result.right.t3Driver;
+      if (Result.isFailure(result)) throw result.failure;
+      const t3 = result.success.t3Driver;
       expect(t3).toMatchObject({
         projectId: "project-1",
         providerInstanceId: "codex-cliproxy",
@@ -84,8 +88,8 @@ describe("T3 driver config", () => {
         ["T3_RUNTIME_MODE", "auto-accept-edits"],
         ["T3_ID_NAMESPACE", "sym-prod"],
       ]);
-      if (Either.isLeft(result)) throw result.left;
-      const t3 = result.right.t3Driver;
+      if (Result.isFailure(result)) throw result.failure;
+      const t3 = result.success.t3Driver;
       if (t3 === undefined) throw new Error("expected T3 config");
       const options = t3DriverOptionsFromConfig(t3);
       expect(options.modelSelection).toEqual({
@@ -109,8 +113,8 @@ describe("T3 driver config", () => {
         ...t3Values.filter(([key]) => key !== "T3_TOKEN"),
         ["T3_TOKEN_FILE", path],
       ]);
-      if (Either.isLeft(result)) throw result.left;
-      const t3 = result.right.t3Driver;
+      if (Result.isFailure(result)) throw result.failure;
+      const t3 = result.success.t3Driver;
       expect(t3?.token).toEqual({ _tag: "File", path });
       if (t3 === undefined) throw new Error("expected T3 config");
       const token = yield* t3DriverOptionsFromConfig(t3).token;
@@ -135,7 +139,7 @@ describe("T3 driver config", () => {
       ];
       for (const values of cases) {
         const result = yield* load(values);
-        expect(Either.isLeft(result)).toBe(true);
+        expect(Result.isFailure(result)).toBe(true);
       }
     }),
   );

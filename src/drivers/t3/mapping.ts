@@ -71,7 +71,7 @@ const APPROVAL_VALUES: Readonly<Record<string, string>> = {
 };
 
 const decodeOption =
-  <A, I>(schema: Schema.Schema<A, I>) =>
+  <A>(schema: Schema.Codec<A>) =>
   (value: unknown): Option.Option<A> =>
     Schema.decodeUnknownOption(schema)(value);
 
@@ -82,13 +82,7 @@ const decodeItemBase = decodeOption(TurnItemBase);
 const itemFields = <K extends keyof typeof TurnItemFields>(
   type: K,
   value: unknown,
-): Option.Option<(typeof TurnItemFields)[K]["Type"]> =>
-  decodeOption(
-    TurnItemFields[type] as Schema.Schema<
-      (typeof TurnItemFields)[K]["Type"],
-      (typeof TurnItemFields)[K]["Encoded"]
-    >,
-  )(value);
+) => Schema.decodeUnknownOption(TurnItemFields[type])(value);
 
 const stringify = (value: unknown): string => {
   if (value === undefined || value === null) return "";

@@ -309,7 +309,7 @@ export interface AgentDriver {
   ) => Effect.Effect<AgentSession, DriverError, Scope.Scope>;
 }
 
-export const DriverErrorReason = Schema.Literal(
+export const DriverErrorReason = Schema.Literals([
   "unavailable",
   "auth",
   "protocol",
@@ -317,7 +317,7 @@ export const DriverErrorReason = Schema.Literal(
   "rejected",
   "unsupported",
   "lost",
-);
+]);
 export type DriverErrorReason = typeof DriverErrorReason.Type;
 
 /**
@@ -326,17 +326,17 @@ export type DriverErrorReason = typeof DriverErrorReason.Type;
  * `possibly-submitted` must reconcile through `snapshot` first, `submitted`
  * means the work exists and only the follow-up failed.
  */
-export const DriverSubmission = Schema.Literal(
+export const DriverSubmission = Schema.Literals([
   "not-submitted",
   "possibly-submitted",
   "submitted",
-);
+]);
 export type DriverSubmission = typeof DriverSubmission.Type;
 
 export class DriverError extends Schema.TaggedError<DriverError>()(
   "@Gateway/DriverError",
   {
-    driver: Schema.Literal(...DRIVER_KINDS),
+    driver: Schema.Literals([...DRIVER_KINDS]),
     operation: Schema.String,
     reason: DriverErrorReason,
     submission: DriverSubmission,

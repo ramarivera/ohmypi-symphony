@@ -60,7 +60,7 @@ describe.skipIf(
     instanceId === undefined ||
     model === undefined,
 )("T3 live turn (spends model tokens)", () => {
-  it.scopedLive(
+  it.live(
     "launches a thread and completes one turn",
     () =>
       Effect.gen(function* () {

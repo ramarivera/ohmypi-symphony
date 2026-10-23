@@ -1,6 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import {
-  Chunk,
+  Data,
   Duration,
   Effect,
   Exit,
@@ -19,6 +19,7 @@ import {
   makeT3Driver,
   type T3DriverOptions,
 } from "../src/drivers/t3/driver.js";
+import { connectT3 } from "../src/drivers/t3/rpc-client.js";
 import { FakeT3Server } from "./fixtures/fake-t3.js";
 
 const withServer = Effect.acquireRelease(
@@ -57,13 +58,19 @@ const openInput: OpenSessionInput = {
 };
 const THREAD_ID = "symtest-session-abc";
 
+class T3TestError extends Data.TaggedError("T3TestError")<{
+  readonly message: string;
+}> {}
+
 const waitUntil = (condition: () => boolean, label: string) =>
   Effect.suspend(() =>
-    condition() ? Effect.void : Effect.fail(new Error(`waiting for ${label}`)),
+    condition()
+      ? Effect.void
+      : Effect.fail(new T3TestError({ message: `waiting for ${label}` })),
   ).pipe(
     Effect.retry(
       Schedule.spaced(Duration.millis(5)).pipe(
-        Schedule.upTo(Duration.seconds(3)),
+        Schedule.upTo({ duration: Duration.seconds(3) }),
       ),
     ),
     Effect.orDie,
@@ -80,10 +87,12 @@ const collectUntil = (
   session.events.pipe(
     Stream.takeUntil(last),
     Stream.runCollect,
-    Effect.map(Chunk.toReadonlyArray),
-    Effect.timeoutFail({
+    Effect.timeoutOrElse({
       duration: Duration.seconds(5),
-      onTimeout: () => new Error("timed out collecting events"),
+      orElse: () =>
+        Effect.fail(
+          new T3TestError({ message: "timed out collecting events" }),
+        ),
     }),
   );
 
@@ -91,10 +100,12 @@ const take = (session: AgentSession, count: number) =>
   session.events.pipe(
     Stream.take(count),
     Stream.runCollect,
-    Effect.map(Chunk.toReadonlyArray),
-    Effect.timeoutFail({
+    Effect.timeoutOrElse({
       duration: Duration.seconds(5),
-      onTimeout: () => new Error(`timed out taking ${count} events`),
+      orElse: () =>
+        Effect.fail(
+          new T3TestError({ message: `timed out taking ${count} events` }),
+        ),
     }),
   );
 
@@ -105,19 +116,17 @@ const runningRun = (server: FakeT3Server, runId = "run-1") =>
   server.updateRun(THREAD_ID, runId, { status: "running" });
 
 describe("T3 driver auth and protocol", () => {
-  it.scopedLive(
-    "probes the descriptor and exchanges the bearer for a ticket",
-    () =>
-      Effect.gen(function* () {
-        const server = yield* withServer;
-        const result = yield* driverFor(server).probe;
-        expect(result.detail).toContain("0.1.2-nightly.20261021.3473");
-        expect(result.detail).toContain("protocol 2");
-        expect(server.tickets.size).toBe(1);
-      }),
+  it.live("probes the descriptor and exchanges the bearer for a ticket", () =>
+    Effect.gen(function* () {
+      const server = yield* withServer;
+      const result = yield* driverFor(server).probe;
+      expect(result.detail).toContain("0.1.2-nightly.20261021.3473");
+      expect(result.detail).toContain("protocol 2");
+      expect(server.tickets.size).toBe(1);
+    }),
   );
 
-  it.scopedLive("reports a rejected bearer as an auth error", () =>
+  it.live("reports a rejected bearer as an auth error", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const driver = driverFor(server, {
@@ -133,7 +142,7 @@ describe("T3 driver auth and protocol", () => {
     }),
   );
 
-  it.scopedLive("connects with a single-use ticket and protocol 2", () =>
+  it.live("connects with a single-use ticket and protocol 2", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       yield* driverFor(server).open(openInput);
@@ -143,12 +152,12 @@ describe("T3 driver auth and protocol", () => {
 });
 
 describe("T3 driver launch", () => {
-  it.scopedLive("launches one thread per session key, idempotently", () =>
+  it.live("launches one thread per session key, idempotently", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const driver = driverFor(server);
       const first = yield* Scope.make();
-      const session = yield* driver.open(openInput).pipe(Scope.extend(first));
+      const session = yield* driver.open(openInput).pipe(Scope.provide(first));
       expect(session.ref).toEqual({
         driver: "t3",
         nativeId: THREAD_ID,
@@ -180,7 +189,7 @@ describe("T3 driver launch", () => {
     }),
   );
 
-  it.scopedLive("adopts a launched thread after a lost launch response", () =>
+  it.live("adopts a launched thread after a lost launch response", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       server.dropResponses.add("orchestration.launchThread");
@@ -198,7 +207,7 @@ describe("T3 driver launch", () => {
     }),
   );
 
-  it.scopedLive("hashes session keys that are unsafe as ids", () =>
+  it.live("hashes session keys that are unsafe as ids", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open({
@@ -211,12 +220,12 @@ describe("T3 driver launch", () => {
 });
 
 describe("T3 driver turns and events", () => {
-  it.scopedLive("maps a full run onto normalized events and an outcome", () =>
+  it.live("maps a full run onto normalized events and an outcome", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
       yield* waitUntil(() => subscribeCount(server) === 1, "subscription");
-      const collector = yield* Effect.fork(
+      const collector = yield* Effect.forkChild(
         collectUntil(session, (event) => event._tag === "TurnEnded"),
       );
 
@@ -338,7 +347,7 @@ describe("T3 driver turns and events", () => {
     }),
   );
 
-  it.scopedLive("queues behind an active run and steers into it", () =>
+  it.live("queues behind an active run and steers into it", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -398,7 +407,7 @@ describe("T3 driver turns and events", () => {
 });
 
 describe("T3 driver reconnect", () => {
-  it.scopedLive("resubscribes from afterSequence without duplicates", () =>
+  it.live("resubscribes from afterSequence without duplicates", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -448,7 +457,7 @@ describe("T3 driver reconnect", () => {
     }),
   );
 
-  it.scopedLive("reconciles a snapshot fallback without re-emitting", () =>
+  it.live("reconciles a snapshot fallback without re-emitting", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -506,14 +515,14 @@ describe("T3 driver reconnect", () => {
     }),
   );
 
-  it.scopedLive("resumes a persisted session from its cursor", () =>
+  it.live("resumes a persisted session from its cursor", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const driver = driverFor(server);
       const firstScope = yield* Scope.make();
       const first = yield* driver
         .open(openInput)
-        .pipe(Scope.extend(firstScope));
+        .pipe(Scope.provide(firstScope));
       yield* first.sendTurn({
         clientRequestId: "d-1",
         text: "go",
@@ -541,7 +550,7 @@ describe("T3 driver reconnect", () => {
 });
 
 describe("T3 driver control", () => {
-  it.scopedLive("interrupts the active run", () =>
+  it.live("interrupts the active run", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -562,7 +571,7 @@ describe("T3 driver control", () => {
     }),
   );
 
-  it.scopedLive("surfaces approvals and forwards the decision", () =>
+  it.live("surfaces approvals and forwards the decision", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -628,7 +637,7 @@ describe("T3 driver control", () => {
     }),
   );
 
-  it.scopedLive("surfaces questions and forwards answers or dismissal", () =>
+  it.live("surfaces questions and forwards answers or dismissal", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -702,7 +711,7 @@ describe("T3 driver control", () => {
     }),
   );
 
-  it.scopedLive("adopts a dispatched message after a lost response", () =>
+  it.live("adopts a dispatched message after a lost response", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -733,7 +742,7 @@ describe("T3 driver control", () => {
     }),
   );
 
-  it.scopedLive("retries idempotent commands once after a lost response", () =>
+  it.live("retries idempotent commands once after a lost response", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server).open(openInput);
@@ -756,7 +765,7 @@ describe("T3 driver control", () => {
     }),
   );
 
-  it.scopedLive("fails the event stream after the reconnect budget", () =>
+  it.live("fails the event stream after the reconnect budget", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
       const session = yield* driverFor(server, {
@@ -780,6 +789,152 @@ describe("T3 driver control", () => {
       });
       const outcomeError = yield* Effect.flip(handle.outcome);
       expect(outcomeError.reason).toBe("lost");
+    }),
+  );
+});
+
+describe("T3 Effect v4 transport lifecycle", () => {
+  const connect = (server: FakeT3Server) =>
+    connectT3({
+      baseUrl: server.baseUrl,
+      token: Effect.succeed(Redacted.make(server.token)),
+      pingIntervalMs: 1_000,
+      requestTimeoutMs: 2_000,
+    });
+
+  it.live("allows a resumed RPC waiter to close its own connection scope", () =>
+    Effect.gen(function* () {
+      const server = yield* withServer;
+      yield* driverFor(server).open(openInput);
+      const scope = yield* Scope.fork(yield* Effect.scope);
+      const connection = yield* connect(server).pipe(Scope.provide(scope));
+      const projection = yield* connection
+        .request("orchestration.getThreadProjection", { threadId: THREAD_ID })
+        .pipe(Effect.tap(() => Scope.close(scope, Exit.void)));
+      expect(projection).toMatchObject({ thread: { id: THREAD_ID } });
+      expect(connection.isOpen()).toBe(false);
+      const closed = yield* connection.closed;
+      expect(closed.message).toBe("T3 connection closed by the gateway");
+      const rejected = yield* Effect.flip(
+        connection.request("orchestration.getThreadProjection", {
+          threadId: THREAD_ID,
+        }),
+      );
+      expect(rejected.sent).toBe(false);
+      expect(
+        server.clientFrames.filter((frame) => frame._tag === "Interrupt"),
+      ).toHaveLength(0);
+    }),
+  );
+
+  it.live(
+    "acks a consumed chunk and interrupts the subscription on early exit",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* withServer;
+        yield* driverFor(server).open(openInput);
+        const connection = yield* connect(server);
+        const values = yield* connection
+          .stream("orchestration.subscribeThread", { threadId: THREAD_ID })
+          .pipe(Stream.take(1), Stream.runCollect);
+        expect(values).toHaveLength(1);
+        expect(values[0]).toMatchObject({ kind: "snapshot" });
+        yield* waitUntil(
+          () => server.clientFrames.some((frame) => frame._tag === "Interrupt"),
+          "stream interrupt",
+        );
+        const interrupt = server.clientFrames.find(
+          (frame) => frame._tag === "Interrupt",
+        );
+        if (interrupt === undefined)
+          throw new Error("expected stream interrupt");
+        expect(server.clientFrames).toContainEqual({
+          _tag: "Ack",
+          requestId: interrupt.requestId,
+        });
+        expect(connection.isOpen()).toBe(true);
+        const projection = yield* connection.request(
+          "orchestration.getThreadProjection",
+          { threadId: THREAD_ID },
+        );
+        expect(projection).toMatchObject({ thread: { id: THREAD_ID } });
+      }),
+  );
+
+  it.live(
+    "skips empty chunks and drains buffered values before a successful Exit",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* withServer;
+        yield* driverFor(server).open(openInput);
+        const connection = yield* connect(server);
+        const collector = yield* Effect.forkChild(
+          connection
+            .stream("orchestration.subscribeThread", { threadId: THREAD_ID })
+            .pipe(Stream.runCollect),
+        );
+        yield* waitUntil(
+          () => subscribeCount(server) === 2,
+          "transport subscription",
+        );
+        server.sendToSubscriptions(THREAD_ID, [
+          { _tag: "Chunk", values: [] },
+          { _tag: "Chunk", values: [{ kind: "synchronized" }] },
+          { _tag: "Exit", exit: { _tag: "Success", value: null } },
+        ]);
+        const values = yield* Fiber.join(collector);
+        expect(values).toHaveLength(2);
+        expect(values[0]).toMatchObject({ kind: "snapshot" });
+        expect(values[1]).toEqual({ kind: "synchronized" });
+      }),
+  );
+
+  it.live("preserves a server failure Exit after buffered stream values", () =>
+    Effect.gen(function* () {
+      const server = yield* withServer;
+      yield* driverFor(server).open(openInput);
+      const connection = yield* connect(server);
+      const received: unknown[] = [];
+      const collector = yield* Effect.forkChild(
+        connection
+          .stream("orchestration.subscribeThread", { threadId: THREAD_ID })
+          .pipe(
+            Stream.runForEach((value) =>
+              Effect.sync(() => {
+                received.push(value);
+              }),
+            ),
+            Effect.flip,
+          ),
+      );
+      yield* waitUntil(
+        () => subscribeCount(server) === 2,
+        "transport subscription",
+      );
+      server.sendToSubscriptions(THREAD_ID, [
+        { _tag: "Chunk", values: [{ kind: "synchronized" }] },
+        {
+          _tag: "Exit",
+          exit: {
+            _tag: "Failure",
+            cause: [
+              {
+                _tag: "Fail",
+                error: {
+                  _tag: "SubscribeError",
+                  message: "subscription rejected",
+                },
+              },
+            ],
+          },
+        },
+      ]);
+      const error = yield* Fiber.join(collector);
+      expect(error.reason).toBe("rejected");
+      expect(error.remoteTag).toBe("SubscribeError");
+      expect(error.sent).toBe(true);
+      expect(received).toHaveLength(2);
+      expect(received[1]).toEqual({ kind: "synchronized" });
     }),
   );
 });
