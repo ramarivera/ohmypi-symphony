@@ -170,6 +170,7 @@ function eventMarkup(event: RunDetailEvent): string {
 export function renderRunDetailBody(
   model: RunDetailModel,
   csrfToken: string | null = null,
+  nextEventsUrl: string | null = null,
 ): string {
   const counts: Record<RunDetailLevel, number> = {
     debug: 0,
@@ -262,6 +263,7 @@ export function renderRunDetailBody(
     </div>
     <p class="run-timeline-empty"${model.events.length === 0 ? "" : " hidden"}>No run events have been recorded yet.</p>
     <div class="run-events">${model.events.map(eventMarkup).join("\n")}</div>
+    ${nextEventsUrl === null ? "" : `<a rel="next" href="${escapeHtml(nextEventsUrl)}">Next events</a>`}
   </section>
 </main>
 <script>window.__OHMYPI_RUN_POLL__ = ${String(!terminal)};</script>`;
@@ -381,7 +383,7 @@ export const RUN_DETAIL_SCRIPT = `
   var root = document.querySelector("[data-run-updated-at]");
   if (!root) return;
   var previous = root.getAttribute("data-run-updated-at");
-  var jsonUrl = window.location.pathname + ".json";
+  var jsonUrl = window.location.pathname + ".json" + window.location.search;
   window.setInterval(function () {
     window.fetch(jsonUrl, { headers: { Accept: "application/json" }, cache: "no-store" })
       .then(function (response) { return response.ok ? response.json() : null; })

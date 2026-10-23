@@ -121,10 +121,11 @@ ${ADMIN_SCRIPT}`,
 export function renderRunDetailPage(
   model: RunDetailModel,
   csrfToken: string | null = null,
+  nextEventsUrl: string | null = null,
 ): string {
   return renderDocument({
     title: `OhMyPi run ${model.run.sessionId}`,
-    body: renderRunDetailBody(model, csrfToken),
+    body: renderRunDetailBody(model, csrfToken, nextEventsUrl),
     script: `${THEME_SCRIPT}
 ${RUN_DETAIL_SCRIPT}`,
     extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,
