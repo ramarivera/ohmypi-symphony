@@ -714,6 +714,15 @@ function redactedStringField(
   return field === null ? null : redact(field);
 }
 
+function hasIssueEvent(events: ReadonlyArray<RunEvent>): boolean {
+  return events.some(
+    (event) =>
+      record(event.payload) &&
+      record(event.payload.agentSession) &&
+      record(event.payload.agentSession.issue),
+  );
+}
+
 function issueForRun(
   run: AgentRun,
   events: ReadonlyArray<RunEvent>,
@@ -747,6 +756,7 @@ function redactOption(value: Option.Option<string>): string | null {
 function runDetailModel(
   run: AgentRun,
   events: ReadonlyArray<RunEvent>,
+  issueEvents: ReadonlyArray<RunEvent> = events,
 ): RunDetailModel {
   return {
     run: {
@@ -772,7 +782,7 @@ function runDetailModel(
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
     },
-    issue: issueForRun(run, events),
+    issue: issueForRun(run, issueEvents),
     events: events.map((event) => ({
       sourceKey: redact(String(event.sourceKey)),
       kind: redact(event.kind),
@@ -1095,7 +1105,13 @@ export const createAdminHandle = (deps: AdminDeps) =>
             nextEventsUrl = `${url.pathname}?${query}`;
           }
         }
-        const model = runDetailModel(run, events);
+        // Issue metadata arrives with the first webhook events, so later pages
+        // read it from the head of the timeline instead of the current page.
+        const issueEvents =
+          pageOptions.cursor === undefined || hasIssueEvent(events)
+            ? events
+            : yield* deps.runEventRepo.list(sessionId, { limit: 100 });
+        const model = runDetailModel(run, events, issueEvents);
 
         const rawToken = findCookieValue(request, ADMIN_COOKIE);
         const adminSession =

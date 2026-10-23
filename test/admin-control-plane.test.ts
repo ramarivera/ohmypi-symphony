@@ -1093,6 +1093,54 @@ describe("admin run-event pagination", () => {
     ),
   );
 
+  it.live("keeps linked issue metadata on continuation pages", () =>
+    withApp(
+      Effect.gen(function* () {
+        const { path, token } = yield* seed(3);
+        const events = yield* RunEventRepo;
+        yield* events.upsert({
+          sessionId: sessionId("pagination/run"),
+          sourceKey: sourceKey("event:0000:created"),
+          kind: "created",
+          level: "info",
+          now: 999,
+          payload: {
+            agentSession: {
+              issue: {
+                identifier: "SYM-23",
+                title: "Paginate run events",
+                url: "https://linear.app/acme/issue/SYM-23",
+              },
+            },
+          },
+        });
+        const issueSchema = Schema.Struct({
+          issue: Schema.Struct({
+            identifier: Schema.NullOr(Schema.String),
+            title: Schema.NullOr(Schema.String),
+            url: Schema.NullOr(Schema.String),
+          }),
+        });
+        const expected = {
+          identifier: "SYM-23",
+          title: "Paginate run events",
+          url: "https://linear.app/acme/issue/SYM-23",
+        };
+        let next: string | null = `${path}.json?limit=1`;
+        let pages = 0;
+        while (next !== null) {
+          if (++pages > 4) throw new Error("Pagination did not terminate");
+          const response = yield* fetchApp(adminRequest(next, { token }));
+          const body: unknown = yield* Effect.promise(() => response.json());
+          const detail = yield* Schema.decodeUnknownEffect(issueSchema)(body);
+          expect(detail.issue).toEqual(expected);
+          next = nextPath(response);
+        }
+        expect(pages).toBe(4);
+      }),
+    ),
+  );
+
   it.live(
     "rejects malformed cursors with 400 and keeps authentication first",
     () =>
