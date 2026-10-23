@@ -42,12 +42,6 @@ services:
       context: ../..
     image: ohmypi-symphony:tailscale
     restart: unless-stopped
-    # This base's TokenCrypto still reads TOKEN_ENCRYPTION_KEY directly. Load it
-    # inside the container; Compose/inspect only see the file path and command.
-    command:
-      - sh
-      - -ec
-      - 'export TOKEN_ENCRYPTION_KEY="$$(cat /run/secrets/token_encryption_key)"; exec bun dist/index.js'
     network_mode: service:tailscale
     depends_on:
       tailscale:
@@ -55,12 +49,23 @@ services:
         restart: true
     security_opt:
       - no-new-privileges:true
-    # Preserve the Dockerfile's non-root USER. No network capabilities are needed.
+    # Root gateway supervisor; workers drop to uid/gid 1001 via setpriv.
+    # Keep exactly the six capabilities required by docs/security.md.
     cap_drop:
       - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - SETUID
+      - SETGID
+      - SETPCAP
     environment:
       PUBLIC_URL: ${PUBLIC_URL:-https://symphony.YOUR-TAILNET.ts.net}
       PORT: "3000"
+      LINEAR_ALLOWED_ORGANIZATION_IDS: ${LINEAR_ALLOWED_ORGANIZATION_IDS:-}
+      GATEWAY_ADMIN_ORGANIZATION_IDS: ${GATEWAY_ADMIN_ORGANIZATION_IDS:-}
+      GITHUB_APP_ALLOWED_OWNERS_JSON: ${GITHUB_APP_ALLOWED_OWNERS_JSON:-{}}
       LINEAR_CLIENT_ID_FILE: /run/secrets/linear_client_id
       LINEAR_CLIENT_SECRET_FILE: /run/secrets/linear_client_secret
       LINEAR_WEBHOOK_SECRET_FILE: /run/secrets/linear_webhook_secret

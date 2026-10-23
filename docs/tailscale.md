@@ -53,18 +53,21 @@ This example doesn't enable Funnel or configure a public ingress.
    Don't put actual credentials in `.env`, Compose arguments, or shell history.
 
    Local Compose secrets are read-only file mounts, not an encrypted secret store.
-   Protect the source files from other host users, while allowing the image's
-   non-root `bun` user to read its four gateway files. Compose file secrets don't
-   implement ownership remapping with `uid`/`gid`/`mode`; use host ownership or ACLs.
+   Gateway source files must be root-owned with mode 0400, including the four
+   gateway files above. Startup rejects insecure `_FILE` mounts. Protect their
+   parent directory from worker writes. Compose file secrets don't implement
+   ownership remapping with `uid`/`gid`/`mode`; set ownership and permissions on
+   the Docker host. See [gateway security](security.md) for the complete policy.
    Only the sidecar receives the Tailscale key. Its native
    `TS_AUTHKEY=file:/run/secrets/ts_authkey` support avoids exporting the key value.
    `TS_AUTHKEY_FILE` in `.env` selects the **host file**, not a containerboot option.
-   At this base, `TokenCrypto` reads `TOKEN_ENCRYPTION_KEY` directly even though
-   gateway configuration supports `_FILE`. The Compose command loads that one
-   value from its secret file inside the container before executing Bun. It never
-   enters Compose's environment or rendered configuration. Treat process
-   environments as sensitive and retain your worker environment filtering.
-4. Set `TS_HOSTNAME` and `PUBLIC_URL` in `.env`. With only private HTTPS, use the
+   The gateway reads `TOKEN_ENCRYPTION_KEY_FILE` directly. Preserve the image's
+   entrypoint and default command; no shell export of the encryption key is needed.
+4. Set `TS_HOSTNAME`, `PUBLIC_URL` and `LINEAR_ALLOWED_ORGANIZATION_IDS` in `.env`.
+   Production startup requires the allowed organization list. Configure
+   `GATEWAY_ADMIN_ORGANIZATION_IDS` and `GITHUB_APP_ALLOWED_OWNERS_JSON` as described
+   in [gateway security](security.md) before using those administrative features.
+   With only private HTTPS, use the
    node's actual full `https://symphony.<tailnet>.ts.net` name. For Linear delivery,
    use the public URL described above. Optionally add your actual tailnet search
    suffix to `resolv.conf` for short hostnames.
@@ -171,19 +174,16 @@ deployment, so no userspace override is supplied.
 
 ## Hardening and worker identities
 
-Both containers use `no-new-privileges`. The gateway drops all capabilities and
-retains the Dockerfile's `USER bun`. It receives no TUN device, Tailscale state,
-LocalAPI socket, or auth key. Only the sidecar receives network capabilities.
+Both containers use `no-new-privileges`. The gateway keeps the image's root
+supervisor and entrypoint, with exactly CHOWN, DAC_OVERRIDE, KILL, SETUID, SETGID
+and SETPCAP after `cap_drop: ALL`. Workers drop to uid/gid 1001 through `setpriv`,
+with no supplementary groups, capabilities or privilege escalation. See
+[gateway security](security.md) for the authoritative worker and workspace policy.
+The entrypoint locks `/app/data` and `/app/logs` to root-owned mode 0700;
+`/app/workspaces` stays a separate writable volume. Never force `user: bun` or
+remove DAC_OVERRIDE or SETPCAP. The gateway receives no TUN device, Tailscale
+state, LocalAPI socket or auth key. Only the sidecar receives network capabilities.
 
-At base commit `3c33866` there is no `docs/security.md` and no `setpriv` UID 1001
-worker implementation. This example preserves that base's non-root model. When
-combining it with a hardened gateway that launches workers through `setpriv`, keep
-that image's root supervisor, exact capability allowlist, UID/GID settings, writable
-volume ownership and worker secret mounts. In particular, add its required
-`SETUID`/`SETGID` and any other documented supervisor capabilities back after
-`cap_drop: ALL`; don't blindly apply this base's capability list to that image.
-Preserve that hardened image's startup command as well when adapting the secret
-file loading command above.
 No network capability is needed by the supervisor or UID 1001 worker. The DNS file
 is world-readable, so dropping UID doesn't affect resolution. `no-new-privileges`
 allows a supervisor with existing identity-changing capabilities to drop UID; it
@@ -240,7 +240,8 @@ internal Docker network, fresh volumes, an empty auth-key file, dummy gateway
 credentials and `PUBLIC_URL=http://localhost:3000`. Temporarily use
 `condition: service_started` for the gateway and omit Serve. Assert `NeedsLogin`,
 an unhealthy sidecar, equal `/proc/self/ns/net` links, a responding gateway health
-endpoint through sidecar localhost, and non-root gateway/worker execution. Tear
+endpoint through sidecar localhost, a root gateway with the six-capability policy,
+and a worker launched through `setpriv` as uid/gid 1001 with no capabilities. Tear
 down only that probe's containers and volumes. This tests local wiring; it cannot
 prove authenticated MagicDNS, tailnet HTTPS, policy or remote Mac builds.
 
