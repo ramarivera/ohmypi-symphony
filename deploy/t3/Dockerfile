@@ -66,10 +66,10 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash ca-certificates curl git jq libatomic1 openssh-client procps ripgrep tini \
   && rm -rf /var/lib/apt/lists/*
-# uid/gid 1000 matches the gateway image's `bun` user, so both containers can
-# write the shared /app/workspaces volume.
-RUN groupadd --gid 1000 t3 \
-  && useradd --uid 1000 --gid 1000 --create-home --home-dir /home/t3 --shell /bin/bash t3 \
+# Match the gateway's worker uid/gid, not its root control-plane identity.
+# Both worker implementations can write the shared /app/workspaces volume.
+RUN groupadd --gid 1001 t3 \
+  && useradd --uid 1001 --gid 1001 --create-home --home-dir /home/t3 --shell /bin/bash t3 \
   && install -d -m 0750 -o t3 -g t3 /data /data/t3 /data/gateway-auth \
   && install -d -m 0755 -o t3 -g t3 /app /app/workspaces
 COPY --from=fetch /opt/t3 /opt/t3

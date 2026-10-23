@@ -22,11 +22,11 @@ epic `sym-gmy`.
 ```text
             private stack network (not edge-proxy-published)
  gateway ──────────── HTTP + WS RPC :3773 ──────────────▶ t3 sidecar
- (bun, uid 1000)       Bearer → /api/auth/websocket-ticket   t3 serve (uid 1000)
+ (root, workers 1001)       Bearer → /api/auth/websocket-ticket   t3 serve (uid 1001)
    │                   → /ws?wsTicket=…&orchestrationProtocol=2   ├─ codex app-server ─┐
    │                                                              └─ claude (SDK)    ─┤
    │  /app/workspaces  ◀──── shared volume, same path ────▶  /app/workspaces          │
-   │  /run/secrets/t3-gateway-token ◀── t3-gateway-auth volume (ro)                   │
+   │  /run/secrets/t3-gateway-token ◀── root-owned 0400 copy (ro)                   │
    ▼                                                                                  ▼
  Linear                                               https://cliproxyapi.ai.roxasroot.net
                                                        (/v1 for Codex, root for Claude)
@@ -40,9 +40,11 @@ epic `sym-gmy`.
 - `/mcp` is a separate audience. T3 only accepts `mcp-client` sessions there, so the
   gateway token gets a 401 on `/mcp`. That's expected.
 - Workspaces live on a volume mounted at `/app/workspaces` in both containers. T3
-  projects are registered by path, so the path has to match. Both containers run as
-  uid/gid 1000 (the gateway image's `bun` user and this image's `t3` user), so files
-  either side creates stay writable by the other.
+  projects are registered by path, so the path has to match. T3 and gateway workers
+  run as uid/gid 1001, so their workspace files stay writable by either worker
+  implementation. The gateway control plane stays root. See
+  [gateway security](security.md) for the capability policy and uid boundary.
+  Never mount gateway data, logs, or secrets into T3.
 
 ## Image contents and pins
 
@@ -132,8 +134,12 @@ Container commands: `serve [flags]` (default) renders and runs `t3 serve --no-br
 | Mount | Contents | Notes |
 | --- | --- | --- |
 | `/data/t3` | `T3CODE_HOME`: `userdata/state*.sqlite`, `settings.json`, T3 `secrets/`, `codex-cliproxy/`, `claude-cliproxy/` | Persistent. Grows with thread history (workbench's `statev2.sqlite` is 1.47 GB), so back it up and watch disk |
-| `/data/gateway-auth` | `t3-gateway-token` (0400) and `t3-gateway-token.json` (session id, expiry, no token) | Mount read-only into the gateway |
+| `/data/gateway-auth` | `t3-gateway-token` (0400) and `t3-gateway-token.json` (session id, expiry, no token) | Token staging only; never mount this worker-owned volume into the gateway |
 | `/app/workspaces` | Shared with the gateway, same path | Must be git repos or worktrees for T3 projects |
+
+Existing sidecar volumes from the uid 1000 image need a stopped-container backup
+and an operator-managed ownership migration to uid/gid 1001 before starting this
+image. Do not reuse them unchanged or recursively chown gateway data or secrets.
 
 ## Auth bootstrap
 
@@ -156,15 +162,25 @@ docker compose exec t3 t3-issue-gateway-token --ttl 7d   # shorter
 The script runs
 `t3 auth session issue --scope orchestration:read --scope orchestration:operate --ttl <ttl> --label "ohmypi-symphony gateway" --json`
 against the server's data dir. It writes only the token to
-`/data/gateway-auth/t3-gateway-token` (mode 0400, uid 1000, atomic rename) and the
+`/data/gateway-auth/t3-gateway-token` (mode 0400, uid 1001, atomic rename) and the
 non-secret metadata to `t3-gateway-token.json`. It works while the server is running,
 because it talks to the same SQLite auth store.
 
-The gateway reads the token as a `_FILE` secret, POSTs it as a bearer to
+An operator must copy the staged token into a separate root-owned file with mode
+0400 and mount that file read-only at `/run/secrets/t3-gateway-token` in the
+gateway. Its parent directory must also be root-owned and unwritable by workers.
+Do not mount the T3-owned staging volume into the gateway: uid 1001 must not
+control gateway secret paths. For example, copy the file out with `docker cp`,
+then use `sudo install -o root -g root -m 0400` to install it in the deployment
+secret directory. Apply the same root-owned 0400 policy to every gateway secret,
+including Docker secrets, as required by [gateway security](security.md).
+
+The gateway reads the installed token as a `_FILE` secret, POSTs it as a bearer to
 `/api/auth/websocket-ticket`, and connects to
 `/ws?wsTicket=<ticket>&orchestrationProtocol=2`.
 
-Rotation: run the script again, restart the gateway, then revoke the old session.
+Rotation: run the script again, install the new root-owned 0400 copy, restart the
+gateway, then revoke the old session.
 The script prints the exact `t3 auth session revoke <id>` command. Sessions expire
 at the TTL and there's no refresh, so schedule rotation before expiry (lane C2).
 
@@ -188,7 +204,12 @@ What's lost compared with the host install:
 
 Don't install systemd or mount the host's user bus to get this back.
 
-## Verification (2026-10-23, workbench, image `ohmypi-symphony-t3:dev`)
+## Earlier verification (2026-10-23, workbench, image `ohmypi-symphony-t3:dev`)
+
+These receipts predate the uid 1001 image change. They prove the original uid 1000
+image behavior; rebuild and rerun them before claiming runtime acceptance of this
+revision. The gateway driver defaults to `auto`; the earlier explicit full-access
+probe below does not change that default.
 
 Evidence lives in `~/dev/agentic-scratchpads/ohmypi-symphony/t3-sidecar/`:
 
@@ -213,12 +234,14 @@ Evidence lives in `~/dev/agentic-scratchpads/ohmypi-symphony/t3-sidecar/`:
 - `negative-tests.log`: missing URL, missing key, and both key forms set each fail
   fast with exit 64.
 
-Smoke run:
+Smoke run. Prepare the CLIProxyAPI key file as uid/gid 1001, mode 0400, so the
+non-root T3 process can read it. Gateway secret files use root ownership instead.
 
 ```bash
 docker build -f deploy/t3/Dockerfile -t ohmypi-symphony-t3:dev deploy/t3
 docker run -d --name t3-sidecar-smoke -p 127.0.0.1:37730:3773 \
   -v t3-sidecar-smoke-data:/data/t3 -v t3-sidecar-smoke-auth:/data/gateway-auth \
+  --security-opt no-new-privileges:true --cap-drop ALL \
   -v "$PWD/cliproxy-key:/run/secrets/cliproxyapi-key:ro" \
   -e CLIPROXYAPI_BASE_URL=https://cliproxyapi.ai.roxasroot.net \
   -e CLIPROXYAPI_API_KEY_FILE=/run/secrets/cliproxyapi-key \
@@ -257,6 +280,9 @@ The ohmypi-symphony compose stack on arch-cachy (`home/stacks/…`, registered i
    `deploy/t3`, or from a published image tag. Settings:
    - `restart: unless-stopped`, `init` not needed (tini is PID 1), and a `mem_limit`
      (no per-agent cgroups, see above).
+   - `security_opt: ["no-new-privileges:true"]` and `cap_drop: ["ALL"]`.
+     Keep the image's uid/gid 1001; never run T3 as root. The gateway retains the
+     six capabilities documented in [gateway security](security.md).
    - Networks: a private stack network shared with the gateway. Don't publish 3773
      on the host or route it through the edge proxy. The container must resolve and
      reach `cliproxyapi.ai.roxasroot.net` over Tailscale, the same way the gateway
@@ -267,12 +293,14 @@ The ohmypi-symphony compose stack on arch-cachy (`home/stacks/…`, registered i
    source of truth where it lives today, and don't commit it to fnox or the stack dir
    in plaintext.
 3. **Volumes:** a named `t3-data` volume at `/data/t3`; a named `t3-gateway-auth`
-   volume at `/data/gateway-auth` (rw in t3, ro in the gateway); and the gateway's
+   volume at `/data/gateway-auth` for T3 staging only; and the gateway's
    existing workspaces volume at `/app/workspaces` in both.
 4. **Gateway env** (the client lane defines the exact names): T3 URL `http://t3:3773`
-   and the token as a `_FILE` secret pointing into the `t3-gateway-auth` mount.
+   and `T3_TOKEN_FILE=/run/secrets/t3-gateway-token`, pointing to the separate
+   root-owned mode-0400 secret copy mounted read-only into the gateway.
 5. **Bootstrap and rotation:** a mise or stack task that runs
-   `docker compose exec t3 t3-issue-gateway-token` after first deploy, plus a reminder
+   `docker compose exec t3 t3-issue-gateway-token` after first deploy, installs the
+   root-owned mode-0400 gateway copy, and restarts the gateway, plus a reminder
    or timer to rotate before the 30-day expiry and revoke the previous session.
 6. **Optional:** `T3_CODEX_CONFIG_EXTRA_FILE` with `[mcp_servers.*]` once the gateway
    exposes Linear host tools as an MCP server. The Claude side needs its own MCP
