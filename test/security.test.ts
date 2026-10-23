@@ -2,9 +2,11 @@ import { Database } from "bun:sqlite";
 import { createCipheriv, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import {
+  type FileHandle,
   link,
   mkdir,
   mkdtemp,
+  open,
   readdir,
   realpath,
   rm,
@@ -58,6 +60,7 @@ import {
 } from "../src/services/token-migration.js";
 import {
   prepareWorkerWorkspace,
+  prepareWorkerWorkspaceSync,
   workerEnvironment,
   workerIdentityCommand,
   workerMcpCredential,
@@ -218,18 +221,38 @@ describe("security boundaries", () => {
     const before = await stat(outside);
     // A native unprivileged test can't chown the parent directory to a foreign
     // uid. Stub that syscall while retaining the real inode ownership/nlink.
-    const chown = vi.spyOn(fs, "fchownSync").mockReturnValue(undefined);
+    const handle = await open(workspace, "r");
+    const prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    const chown = vi.spyOn(prototype, "chown").mockResolvedValue(undefined);
     const foreignUid = (process.getuid?.() ?? 1000) + 1;
     await expect(
       prepareWorkerWorkspace(workspace, String(foreignUid)),
     ).rejects.toThrow("Multiply-linked");
+    expect(chown).toHaveBeenCalledExactlyOnceWith(foreignUid, foreignUid);
+    expect((await stat(outside)).uid).toBe(before.uid);
+    expect(await Bun.file(outside).text()).toBe("gateway");
+  });
+
+  it("rejects hardlinks in the synchronous retention walk too", async () => {
+    const dir = await temporary();
+    const workspace = join(dir, "workspace");
+    await mkdir(workspace);
+    const outside = join(dir, "outside");
+    await writeFile(outside, "gateway", { mode: 0o400 });
+    await link(outside, join(workspace, "linked"));
+    const before = await stat(outside);
+    const chown = vi.spyOn(fs, "fchownSync").mockReturnValue(undefined);
+    const foreignUid = (process.getuid?.() ?? 1000) + 1;
+    expect(() =>
+      prepareWorkerWorkspaceSync(workspace, String(foreignUid)),
+    ).toThrow("Multiply-linked");
     expect(chown).toHaveBeenCalledExactlyOnceWith(
       expect.any(Number),
       foreignUid,
       foreignUid,
     );
     expect((await stat(outside)).uid).toBe(before.uid);
-    expect(await Bun.file(outside).text()).toBe("gateway");
   });
 
   it("resumes with already-owned hardlinked tool state without changing ownership", async () => {
@@ -241,9 +264,12 @@ describe("security boundaries", () => {
       join(workspace, ".omp-home", "cache"),
       join(workspace, "dependency"),
     );
-    vi.spyOn(fs, "fchownSync").mockImplementation(() => {
-      throw new Error("Unexpected ownership change");
-    });
+    const handle = await open(workspace, "r");
+    const prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    vi.spyOn(prototype, "chown").mockRejectedValue(
+      new Error("Unexpected ownership change"),
+    );
     for (let attempt = 0; attempt < 2; attempt++)
       await prepareWorkerWorkspace(workspace, String(process.getuid?.()));
     expect(await Bun.file(join(workspace, "dependency")).text()).toBe(

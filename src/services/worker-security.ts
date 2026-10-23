@@ -7,7 +7,15 @@ import {
   openSync,
   readdirSync,
   realpathSync,
+  type Stats,
 } from "node:fs";
+import {
+  type FileHandle,
+  lstat,
+  open,
+  readdir,
+  realpath,
+} from "node:fs/promises";
 import { join } from "node:path";
 
 // No prefixes such as AWS_*, GITHUB_*, PI_*, or *_FILE. New gateway secrets
@@ -72,36 +80,85 @@ export const workerIdentityCommand = (
   ];
 };
 
+const NO_FOLLOW_FLAGS =
+  constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+const validWorkerUid = (uid: string | undefined): number | undefined => {
+  if (uid === undefined || uid === "") return undefined;
+  if (!/^[1-9][0-9]*$/u.test(uid)) throw new Error("Invalid worker uid");
+  return Number(uid);
+};
+
+const isSymlinkLoop = (error: unknown): boolean =>
+  error instanceof Error && "code" in error && error.code === "ELOOP";
+
+/** Whether this node must be chowned; throws for files the worker must never own. */
+const needsChown = (stat: Stats, uid: number): boolean => {
+  if (!stat.isDirectory() && !stat.isFile())
+    throw new Error("Unsupported workspace file type");
+  const owned = stat.uid === uid && stat.gid === uid;
+  if (stat.isFile() && stat.nlink !== 1 && !owned)
+    throw new Error("Multiply-linked workspace files are forbidden");
+  return !owned;
+};
+
 /** Give only the worker workspace to its uid. Never follow repository symlinks. */
+export const prepareWorkerWorkspace = async (
+  cwd: string,
+  workerUid: string | undefined,
+): Promise<void> => {
+  const uid = validWorkerUid(workerUid);
+  if (uid === undefined) return;
+  const root = await realpath(cwd);
+  if (root !== cwd || (await lstat(cwd)).isSymbolicLink())
+    throw new Error("Worker workspace must be canonical");
+  const visit = async (path: string): Promise<void> => {
+    let handle: FileHandle;
+    try {
+      handle = await open(path, NO_FOLLOW_FLAGS);
+    } catch (error) {
+      if (isSymlinkLoop(error)) return;
+      throw error;
+    }
+    try {
+      const stat = await handle.stat();
+      if (needsChown(stat, uid)) await handle.chown(uid, uid);
+      if (stat.isDirectory()) {
+        const fdPath = `/proc/self/fd/${handle.fd}`;
+        for (const name of await readdir(fdPath))
+          await visit(join(fdPath, name));
+      }
+    } finally {
+      await handle.close();
+    }
+  };
+  await visit(root);
+};
+
+/**
+ * Synchronous twin for retention, whose SQLite reopen fence must not yield.
+ * Resume and clone paths use the async walk so large trees don't block the loop.
+ */
 export const prepareWorkerWorkspaceSync = (
   cwd: string,
-  uid: string | undefined,
+  workerUid: string | undefined,
 ): void => {
-  if (uid === undefined || uid === "") return;
-  if (!/^[1-9][0-9]*$/u.test(uid)) throw new Error("Invalid worker uid");
+  const uid = validWorkerUid(workerUid);
+  if (uid === undefined) return;
   const root = realpathSync(cwd);
   if (root !== cwd || lstatSync(cwd).isSymbolicLink())
     throw new Error("Worker workspace must be canonical");
   const visit = (path: string): void => {
     let fd: number;
     try {
-      fd = openSync(
-        path,
-        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-      );
+      fd = openSync(path, NO_FOLLOW_FLAGS);
     } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ELOOP")
-        return;
+      if (isSymlinkLoop(error)) return;
       throw error;
     }
     try {
       const stat = fstatSync(fd);
-      if (!stat.isDirectory() && !stat.isFile())
-        throw new Error("Unsupported workspace file type");
-      const owned = stat.uid === Number(uid) && stat.gid === Number(uid);
-      if (stat.isFile() && stat.nlink !== 1 && !owned)
-        throw new Error("Multiply-linked workspace files are forbidden");
-      if (!owned) fchownSync(fd, Number(uid), Number(uid));
+      if (needsChown(stat, uid)) fchownSync(fd, uid, uid);
       if (stat.isDirectory()) {
         const fdPath = `/proc/self/fd/${fd}`;
         for (const name of readdirSync(fdPath)) visit(join(fdPath, name));
@@ -112,12 +169,6 @@ export const prepareWorkerWorkspaceSync = (
   };
   visit(root);
 };
-
-// Keep the preparation API while sharing retention's synchronous ownership walk.
-export const prepareWorkerWorkspace = async (
-  cwd: string,
-  uid: string | undefined,
-): Promise<void> => prepareWorkerWorkspaceSync(cwd, uid);
 
 /** Workers never receive renewal material or access tokens lasting over an hour. */
 export const workerMcpCredential = (
