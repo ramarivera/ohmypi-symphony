@@ -1,4 +1,4 @@
-import { Clock, Effect, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Schema } from "effect";
 import { DatabaseError, type RowDecodeError } from "../../domain/errors.js";
 import type { DeliveryId } from "../../domain/ids.js";
 import {
@@ -11,18 +11,17 @@ import {
 
 const DeliveryIdentityRow = Schema.Struct({
   payload_hash: Schema.String,
-  status: Schema.Literal("pending", "processed", "failed"),
+  status: Schema.Literals(["pending", "processed", "failed"]),
 });
 
 type DeliveryIdentityRow = Schema.Schema.Type<typeof DeliveryIdentityRow>;
 
 export type DeliveryClaimResult = "claimed" | "duplicate" | "conflict";
 
-export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
+export class DeliveryRepo extends Context.Service<DeliveryRepo>()(
   "DeliveryRepo",
   {
-    accessors: true,
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
       const accept = Effect.fn("DeliveryRepo.accept")(function* (input: {
@@ -155,4 +154,7 @@ export class DeliveryRepo extends Effect.Service<DeliveryRepo>()(
       return { accept, claim, mark, recoverPendingDeliveries };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies;
+}

@@ -1,8 +1,10 @@
 import {
   Cause,
   Clock,
+  Context,
   Deferred,
   Effect,
+  Layer,
   Option,
   Queue,
   Ref,
@@ -26,10 +28,8 @@ export interface ReconcilerStatus {
 // the next sweep.
 const MAX_CATCHUP_CANDIDATES_PER_SWEEP = 25;
 
-export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
-  accessors: true,
-  dependencies: [SessionAuthority.Default],
-  effect: Effect.gen(function* () {
+export class Reconciler extends Context.Service<Reconciler>()("Reconciler", {
+  make: Effect.gen(function* () {
     const statusRef = yield* Ref.make<ReconcilerStatus>({
       running: true,
       lastStartedAt: Option.none(),
@@ -337,4 +337,9 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
 
     return { tick, catchup, trigger, awaitTrigger, status };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([SessionAuthority.layer]),
+  );
+}

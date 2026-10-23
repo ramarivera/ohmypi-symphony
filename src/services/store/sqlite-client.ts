@@ -1,17 +1,17 @@
 import { Database } from "bun:sqlite";
 import { chmod, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Context, Effect, Exit, Layer, ParseResult, Schema } from "effect";
+import { Context, Effect, Exit, Layer, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 
 export interface SqliteClientShape {
   readonly db: Database;
 }
 
-export class SqliteClient extends Context.Tag("SqliteClient")<
+export class SqliteClient extends Context.Service<
   SqliteClient,
   SqliteClientShape
->() {}
+>()("SqliteClient") {}
 
 export const tryDb = <A>(
   f: () => A,
@@ -44,14 +44,13 @@ export const transact = <A, E, R>(
       yield* restore(tryDb(begin, "BEGIN"));
       const result = yield* Effect.exit(restore(effect));
 
-      return yield* Exit.matchEffect(result, {
+      return yield* Exit.match(result, {
         onSuccess: (value) =>
           tryDb(commit, "COMMIT").pipe(
             Effect.catchTag("@Gateway/DatabaseError", (error) =>
               Effect.gen(function* () {
-                yield* Effect.orElse(
-                  tryDb(rollback, "ROLLBACK"),
-                  () => Effect.void,
+                yield* tryDb(rollback, "ROLLBACK").pipe(
+                  Effect.catch(() => Effect.void),
                 );
                 return yield* Effect.fail(error);
               }),
@@ -60,24 +59,24 @@ export const transact = <A, E, R>(
           ),
         onFailure: (cause) =>
           tryDb(rollback, "ROLLBACK").pipe(
-            Effect.orElse(() => Effect.void),
-            Effect.zipRight(Effect.failCause(cause)),
+            Effect.catch(() => Effect.void),
+            Effect.andThen(Effect.failCause(cause)),
           ),
       });
     }),
   );
 
 export const decodeRow = <A, I, R>(
-  schema: Schema.Schema<A, I, R>,
+  schema: Schema.Codec<A, I, R>,
   row: unknown,
   entity: string,
 ): Effect.Effect<A, RowDecodeError, R> =>
-  Schema.decodeUnknown(schema)(row).pipe(
+  Schema.decodeUnknownEffect(schema)(row).pipe(
     Effect.catchTag(
-      "ParseError",
+      "SchemaError",
       (error) =>
         new RowDecodeError({
-          message: ParseResult.TreeFormatter.formatErrorSync(error),
+          message: "Stored data is invalid",
           entity,
           cause: String(error),
         }),
@@ -85,7 +84,7 @@ export const decodeRow = <A, I, R>(
   );
 
 export const decodeRows = <A, I, R>(
-  schema: Schema.Schema<A, I, R>,
+  schema: Schema.Codec<A, I, R>,
   rows: ReadonlyArray<unknown>,
   entity: string,
 ): Effect.Effect<ReadonlyArray<A>, RowDecodeError, R> =>
@@ -97,10 +96,10 @@ export const runChanges = (
   result: unknown,
   operation: string,
 ): Effect.Effect<number, DatabaseError> =>
-  Schema.decodeUnknown(RunResult)(result).pipe(
+  Schema.decodeUnknownEffect(RunResult)(result).pipe(
     Effect.map((r) => r.changes),
     Effect.catchTag(
-      "ParseError",
+      "SchemaError",
       () =>
         new DatabaseError({
           message: `${operation}: run result did not contain changes`,
@@ -389,7 +388,7 @@ const migrate = (db: Database): void => {
 export const SqliteClientLive = (
   path: string,
 ): Layer.Layer<SqliteClient, DatabaseError, never> =>
-  Layer.scoped(
+  Layer.effect(
     SqliteClient,
     Effect.acquireRelease(
       Effect.gen(function* () {

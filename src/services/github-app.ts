@@ -1,5 +1,5 @@
 import { createSign } from "node:crypto";
-import { Deferred, Effect, FiberId, Redacted, Schema } from "effect";
+import { Context, Deferred, Effect, Layer, Redacted, Schema } from "effect";
 import { GatewayConfig } from "./config.js";
 
 const GITHUB_API = "https://api.github.com";
@@ -18,7 +18,7 @@ export class GitHubAppError extends Schema.TaggedError<GitHubAppError>()(
   {
     message: Schema.String,
     operation: Schema.String,
-    reason: Schema.Literal(
+    reason: Schema.Literals([
       "disabled",
       "invalid_repository",
       "jwt",
@@ -27,7 +27,7 @@ export class GitHubAppError extends Schema.TaggedError<GitHubAppError>()(
       "invalid_response",
       "not_installed",
       "tenant_forbidden",
-    ),
+    ]),
     status: Schema.optional(Schema.Number),
   },
 ) {}
@@ -180,9 +180,7 @@ export const makeGitHubApp = (input: {
       const existing = inFlight.get(key);
       if (existing !== undefined) return yield* Deferred.await(existing);
 
-      const deferred = Deferred.unsafeMake<string, GitHubAppError>(
-        FiberId.none,
-      );
+      const deferred = Deferred.makeUnsafe<string, GitHubAppError>();
       inFlight.set(key, deferred);
       const mint = Effect.gen(function* () {
         const jwt = yield* Effect.try({
@@ -293,13 +291,14 @@ export const makeGitHubApp = (input: {
         return token;
       });
       return yield* mint.pipe(
-        // onExit (not tap/tapError): interruption must also release waiters.
-        Effect.onExit((exit) => Deferred.done(deferred, exit)),
+        // Clear ownership before notifying waiters, which may retry inline.
         Effect.ensuring(
           Effect.sync(() => {
             if (inFlight.get(key) === deferred) inFlight.delete(key);
           }),
         ),
+        // onExit (not tap/tapError): interruption must also release waiters.
+        Effect.onExit((exit) => Deferred.done(deferred, exit)),
       );
     },
   );
@@ -307,10 +306,8 @@ export const makeGitHubApp = (input: {
   return { getInstallationToken };
 };
 
-export class GitHubApp extends Effect.Service<GitHubApp>()("GitHubApp", {
-  accessors: true,
-  dependencies: [GatewayConfig.Default],
-  effect: Effect.gen(function* () {
+export class GitHubApp extends Context.Service<GitHubApp>()("GitHubApp", {
+  make: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     return makeGitHubApp({
       appId: config.githubAppId,
@@ -321,4 +318,9 @@ export class GitHubApp extends Effect.Service<GitHubApp>()("GitHubApp", {
           : Redacted.value(config.githubAppPrivateKey),
     });
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([GatewayConfig.layer]),
+  );
+}

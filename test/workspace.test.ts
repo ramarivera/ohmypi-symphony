@@ -13,16 +13,9 @@ import {
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
-import {
-  ConfigProvider,
-  Effect,
-  Either,
-  Layer,
-  Logger,
-  Schema,
-  TestClock,
-} from "effect";
-import * as fc from "effect/FastCheck";
+import { ConfigProvider, Effect, Layer, Logger, Result, Schema } from "effect";
+import { TestClock } from "effect/testing";
+import * as fc from "fast-check";
 import { describe, expect, vi } from "vitest";
 import { WorkspaceError } from "../src/domain/errors.js";
 import {
@@ -195,25 +188,28 @@ const gitFixture = Effect.acquireRelease(
 );
 
 const gatewayConfigLayer = (workspaceRoot: string) =>
-  GatewayConfig.Default.pipe(
+  GatewayConfig.layer.pipe(
     Layer.provide(
-      Layer.setConfigProvider(
-        ConfigProvider.fromMap(
-          new Map([
-            ["LINEAR_CLIENT_ID", "workspace-test-client"],
-            ["LINEAR_CLIENT_SECRET", "workspace-test-client-secret"],
-            ["LINEAR_WEBHOOK_SECRET", "workspace-test-webhook-secret"],
-            ["TOKEN_ENCRYPTION_KEY", TEST_KEY_BASE64],
-            ["PUBLIC_URL", "http://localhost:3000"],
-            ["WORKSPACE_ROOT", workspaceRoot],
-          ]),
+      ConfigProvider.layer(
+        ConfigProvider.fromUnknown(
+          Object.fromEntries(
+            new Map([
+              ["LINEAR_CLIENT_ID", "workspace-test-client"],
+              ["LINEAR_CLIENT_SECRET", "workspace-test-client-secret"],
+              ["LINEAR_WEBHOOK_SECRET", "workspace-test-webhook-secret"],
+              ["TOKEN_ENCRYPTION_KEY", TEST_KEY_BASE64],
+              ["PUBLIC_URL", "http://localhost:3000"],
+              ["WORKSPACE_ROOT", workspaceRoot],
+            ]),
+          ),
+          { preserveEmptyStrings: true },
         ),
       ),
     ),
   );
 
 const workspaceLayer = (workspaceRoot: string) =>
-  Layer.mergeAll(WorkspaceRepo.Default, Workspace.Default).pipe(
+  Layer.mergeAll(WorkspaceRepo.layer, Workspace.layer).pipe(
     Layer.provide(
       Layer.mergeAll(
         SqliteClientLive(":memory:"),
@@ -266,19 +262,19 @@ const resolveWith = (
   );
 
 const expectWorkspaceFailure = <A>(
-  result: Either.Either<A, WorkspaceError>,
+  result: Result.Result<A, WorkspaceError>,
   reason: WorkspaceError["reason"],
 ) => {
-  expect(Either.isLeft(result)).toBe(true);
-  if (Either.isRight(result)) {
+  expect(Result.isFailure(result)).toBe(true);
+  if (Result.isSuccess(result)) {
     throw new Error("Expected WorkspaceError");
   }
-  expect(result.left._tag).toBe("@Gateway/WorkspaceError");
-  expect(result.left.reason).toBe(reason);
+  expect(result.failure._tag).toBe("@Gateway/WorkspaceError");
+  expect(result.failure.reason).toBe(reason);
 };
 
 const createRepository = (
-  repo: WorkspaceRepo,
+  repo: WorkspaceRepo["Service"],
   fixture: GitFixture,
   id: string,
   overrides: Partial<{
@@ -301,7 +297,7 @@ const createRepository = (
   });
 
 describe("Workspace", () => {
-  it.scopedLive(
+  it.live(
     "routes explicit repository, labels, project, team, and default mappings by precedence",
     () =>
       Effect.gen(function* () {
@@ -406,42 +402,40 @@ describe("Workspace", () => {
       }),
   );
 
-  it.scopedLive(
-    "reports all competing repository mappings as an ambiguity",
-    () =>
-      Effect.gen(function* () {
-        const fixture = yield* gitFixture;
-        yield* withWorkspace(
-          fixture.workspaceRoot,
-          Effect.gen(function* () {
-            const repository = yield* WorkspaceRepo;
-            const workspace = yield* Workspace;
-            yield* createRepository(repository, fixture, "team-one", {
-              teamIds: ["team"],
-            });
-            yield* createRepository(repository, fixture, "team-two", {
-              teamIds: ["team"],
-            });
+  it.live("reports all competing repository mappings as an ambiguity", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      yield* withWorkspace(
+        fixture.workspaceRoot,
+        Effect.gen(function* () {
+          const repository = yield* WorkspaceRepo;
+          const workspace = yield* Workspace;
+          yield* createRepository(repository, fixture, "team-one", {
+            teamIds: ["team"],
+          });
+          yield* createRepository(repository, fixture, "team-two", {
+            teamIds: ["team"],
+          });
 
-            expect(
-              yield* workspace.resolve({
-                organizationId: organizationId("org"),
-                repositoryId: null,
-                issueLabels: [],
-                projectLabels: [],
-                projectId: null,
-                teamId: teamId("team"),
-              }),
-            ).toMatchObject({
-              kind: "ambiguous",
-              repositories: [{ id: "team-one" }, { id: "team-two" }],
-            });
-          }),
-        );
-      }),
+          expect(
+            yield* workspace.resolve({
+              organizationId: organizationId("org"),
+              repositoryId: null,
+              issueLabels: [],
+              projectLabels: [],
+              projectId: null,
+              teamId: teamId("team"),
+            }),
+          ).toMatchObject({
+            kind: "ambiguous",
+            repositories: [{ id: "team-one" }, { id: "team-two" }],
+          });
+        }),
+      );
+    }),
   );
 
-  it.scopedLive(
+  it.live(
     "materializes a detached checkout once and safely reuses its repository-bound target",
     () =>
       Effect.gen(function* () {
@@ -497,7 +491,7 @@ describe("Workspace", () => {
       }),
   );
 
-  it.scopedLive("refreshes GitHub credentials when reusing a workspace", () =>
+  it.live("refreshes GitHub credentials when reusing a workspace", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
       const id = sessionId("github-reuse-refresh");
@@ -564,55 +558,53 @@ describe("Workspace", () => {
     }),
   );
 
-  it.scopedLive(
-    "unsets GitHub credentials when reusing without configuration",
-    () =>
-      Effect.gen(function* () {
-        const fixture = yield* gitFixture;
-        const id = sessionId("github-reuse-unset");
-        const record = repositoryRecord({
-          id: "github-reuse-unset",
-          url: "https://github.com/octo-org/private-repo.git",
-        });
-        yield* fixtureIo("workspace root creation", () =>
-          mkdir(fixture.workspaceRoot, { recursive: true }),
-        );
-        const target = join(fixture.workspaceRoot, safeSessionKey(id));
-        yield* fixtureIo("workspace target creation", () => mkdir(target));
-        yield* runGit(["init"], target);
-        yield* runGit(
-          [
-            "config",
-            "--local",
-            "http.https://github.com/.extraheader",
-            buildGitHubExtraHeader("stale-token"),
-          ],
-          target,
-        );
+  it.live("unsets GitHub credentials when reusing without configuration", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const id = sessionId("github-reuse-unset");
+      const record = repositoryRecord({
+        id: "github-reuse-unset",
+        url: "https://github.com/octo-org/private-repo.git",
+      });
+      yield* fixtureIo("workspace root creation", () =>
+        mkdir(fixture.workspaceRoot, { recursive: true }),
+      );
+      const target = join(fixture.workspaceRoot, safeSessionKey(id));
+      yield* fixtureIo("workspace target creation", () => mkdir(target));
+      yield* runGit(["init"], target);
+      yield* runGit(
+        [
+          "config",
+          "--local",
+          "http.https://github.com/.extraheader",
+          buildGitHubExtraHeader("stale-token"),
+        ],
+        target,
+      );
 
-        yield* fixtureIo("workspace marker creation", () =>
-          writeFile(
-            join(target, MARKER_FILE),
-            JSON.stringify({
-              repositoryId: record.id,
-              url: record.url,
-              ref: record.ref,
-            }),
-          ),
-        );
-        const workspace = yield* makeWorkspace({
-          workspaceRoot: fixture.workspaceRoot,
-          repo: { listRepositories: () => Effect.succeed([]) },
-          githubApp: undefined,
-        });
-        yield* workspace.materialize(id, record);
-        expect(
-          yield* readGitConfig("http.https://github.com/.extraheader", target),
-        ).toBeUndefined();
-      }),
+      yield* fixtureIo("workspace marker creation", () =>
+        writeFile(
+          join(target, MARKER_FILE),
+          JSON.stringify({
+            repositoryId: record.id,
+            url: record.url,
+            ref: record.ref,
+          }),
+        ),
+      );
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: undefined,
+      });
+      yield* workspace.materialize(id, record);
+      expect(
+        yield* readGitConfig("http.https://github.com/.extraheader", target),
+      ).toBeUndefined();
+    }),
   );
 
-  it.scopedLive(
+  it.live(
     "preserves a user-installed GitHub extraheader when clearing credentials",
     () =>
       Effect.gen(function* () {
@@ -663,7 +655,7 @@ describe("Workspace", () => {
       }),
   );
 
-  it.scopedLive(
+  it.live(
     "preserves foreign GitHub extraheaders alongside gateway credentials",
     () =>
       Effect.gen(function* () {
@@ -726,7 +718,7 @@ describe("Workspace", () => {
       }),
   );
 
-  it.scopedLive("scrubs GitHub credentials from clone failures", () =>
+  it.live("scrubs GitHub credentials from clone failures", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
       const token = "credential-token";
@@ -737,7 +729,7 @@ describe("Workspace", () => {
           getInstallationToken: () => Effect.succeed(token),
         },
       });
-      const result = yield* Effect.either(
+      const result = yield* Effect.result(
         workspace.materialize(
           sessionId("github-clone-failure"),
           repositoryRecord({
@@ -746,15 +738,17 @@ describe("Workspace", () => {
           }),
         ),
       );
-      expect(Either.isLeft(result)).toBe(true);
-      if (Either.isRight(result)) return;
-      expect(result.left.message).toContain("git clone");
-      expect(result.left.message).not.toContain(token);
-      expect(result.left.message).not.toContain(buildGitHubExtraHeader(token));
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isSuccess(result)) return;
+      expect(result.failure.message).toContain("git clone");
+      expect(result.failure.message).not.toContain(token);
+      expect(result.failure.message).not.toContain(
+        buildGitHubExtraHeader(token),
+      );
     }),
   );
 
-  it.scopedLive("cleans GitHub credentials from a terminal workspace", () =>
+  it.live("cleans GitHub credentials from a terminal workspace", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
       const id = sessionId("github-terminal-cleanup");
@@ -785,55 +779,51 @@ describe("Workspace", () => {
     }),
   );
 
-  it.scopedLive(
-    "rejects SSH-style GitHub URLs before minting credentials",
-    () =>
-      Effect.gen(function* () {
-        const fixture = yield* gitFixture;
-        const id = sessionId("github-ssh-reuse");
-        const record = repositoryRecord({
-          id: "github-ssh-reuse",
-          url: "git@github.com:octo-org/private-repo.git",
-        });
-        yield* fixtureIo("workspace root creation", () =>
-          mkdir(fixture.workspaceRoot, { recursive: true }),
-        );
-        const target = join(fixture.workspaceRoot, safeSessionKey(id));
-        yield* fixtureIo("workspace target creation", () => mkdir(target));
-        yield* runGit(["init"], target);
-        yield* fixtureIo("workspace marker creation", () =>
-          writeFile(
-            join(target, MARKER_FILE),
-            JSON.stringify({
-              repositoryId: record.id,
-              url: record.url,
-              ref: record.ref,
-            }),
-          ),
-        );
-        let tokenCalls = 0;
-        const workspace = yield* makeWorkspace({
-          workspaceRoot: fixture.workspaceRoot,
-          repo: { listRepositories: () => Effect.succeed([]) },
-          githubApp: {
-            getInstallationToken: () => {
-              tokenCalls += 1;
-              return Effect.succeed("unexpected-token");
-            },
+  it.live("rejects SSH-style GitHub URLs before minting credentials", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const id = sessionId("github-ssh-reuse");
+      const record = repositoryRecord({
+        id: "github-ssh-reuse",
+        url: "git@github.com:octo-org/private-repo.git",
+      });
+      yield* fixtureIo("workspace root creation", () =>
+        mkdir(fixture.workspaceRoot, { recursive: true }),
+      );
+      const target = join(fixture.workspaceRoot, safeSessionKey(id));
+      yield* fixtureIo("workspace target creation", () => mkdir(target));
+      yield* runGit(["init"], target);
+      yield* fixtureIo("workspace marker creation", () =>
+        writeFile(
+          join(target, MARKER_FILE),
+          JSON.stringify({
+            repositoryId: record.id,
+            url: record.url,
+            ref: record.ref,
+          }),
+        ),
+      );
+      let tokenCalls = 0;
+      const workspace = yield* makeWorkspace({
+        workspaceRoot: fixture.workspaceRoot,
+        repo: { listRepositories: () => Effect.succeed([]) },
+        githubApp: {
+          getInstallationToken: () => {
+            tokenCalls += 1;
+            return Effect.succeed("unexpected-token");
           },
-        });
-        const rejected = yield* Effect.either(
-          workspace.materialize(id, record),
-        );
-        expect(Either.isLeft(rejected)).toBe(true);
-        expect(tokenCalls).toBe(0);
-        expect(
-          yield* readGitConfig("http.https://github.com/.extraheader", target),
-        ).toBeUndefined();
-      }),
+        },
+      });
+      const rejected = yield* Effect.result(workspace.materialize(id, record));
+      expect(Result.isFailure(rejected)).toBe(true);
+      expect(tokenCalls).toBe(0);
+      expect(
+        yield* readGitConfig("http.https://github.com/.extraheader", target),
+      ).toBeUndefined();
+    }),
   );
 
-  it.scopedLive(
+  it.live(
     "rejects invalid repository records with their typed repository error",
     () =>
       Effect.gen(function* () {
@@ -842,7 +832,7 @@ describe("Workspace", () => {
           fixture.workspaceRoot,
           Effect.gen(function* () {
             const repository = yield* WorkspaceRepo;
-            const result = yield* Effect.either(
+            const result = yield* Effect.result(
               repository.createRepository({
                 organizationId: organizationId("org"),
                 id: workspaceId("unsafe-repository"),
@@ -850,21 +840,21 @@ describe("Workspace", () => {
                 ref: "main",
               }),
             );
-            expect(Either.isLeft(result)).toBe(true);
-            if (Either.isRight(result))
+            expect(Result.isFailure(result)).toBe(true);
+            if (Result.isSuccess(result))
               throw new Error("Expected RowDecodeError");
-            if (result.left._tag !== "@Gateway/RowDecodeError") {
+            if (result.failure._tag !== "@Gateway/RowDecodeError") {
               throw new Error(
-                `Expected RowDecodeError, got ${result.left._tag}`,
+                `Expected RowDecodeError, got ${result.failure._tag}`,
               );
             }
-            expect(result.left.entity).toBe("RepositoryRecord");
+            expect(result.failure.entity).toBe("RepositoryRecord");
           }),
         );
       }),
   );
 
-  it.scopedLive("rejects root and target symlinks without following them", () =>
+  it.live("rejects root and target symlinks without following them", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
       yield* withWorkspace(
@@ -883,7 +873,7 @@ describe("Workspace", () => {
             githubApp: undefined,
           });
           expectWorkspaceFailure(
-            yield* Effect.either(
+            yield* Effect.result(
               linkedWorkspace.materialize(sessionId("linked-root"), record),
             ),
             "root_not_directory",
@@ -905,7 +895,7 @@ describe("Workspace", () => {
             githubApp: undefined,
           });
           expectWorkspaceFailure(
-            yield* Effect.either(
+            yield* Effect.result(
               workspace.materialize(sessionId("linked-target"), record),
             ),
             "target_not_directory",
@@ -915,7 +905,7 @@ describe("Workspace", () => {
     }),
   );
 
-  it.scopedLive(
+  it.live(
     "rejects mismatched reuse and failed checkouts without creating a valid marker",
     () =>
       Effect.gen(function* () {
@@ -938,7 +928,7 @@ describe("Workspace", () => {
             const reusedSession = sessionId("mismatched-reuse");
             yield* workspace.materialize(reusedSession, firstRepository);
             expectWorkspaceFailure(
-              yield* Effect.either(
+              yield* Effect.result(
                 workspace.materialize(reusedSession, secondRepository),
               ),
               "marker_mismatch",
@@ -954,7 +944,7 @@ describe("Workspace", () => {
             );
             const failingSession = sessionId("failed-checkout");
             expectWorkspaceFailure(
-              yield* Effect.either(
+              yield* Effect.result(
                 workspace.materialize(failingSession, failingRepository),
               ),
               "git_failed",
@@ -964,192 +954,202 @@ describe("Workspace", () => {
               safeSessionKey("failed-checkout"),
             );
             expect(
-              yield* Effect.either(
+              yield* Effect.result(
                 fixtureIo("failed workspace marker read", () =>
                   readFile(join(failedTarget, MARKER_FILE), "utf8"),
                 ),
               ),
-            ).toMatchObject({ _tag: "Left" });
+            ).toMatchObject({ _tag: "Failure" });
           }),
         );
       }),
   );
 
-  it.scopedLive(
-    "releases every bounded git fixture when its scope closes",
-    () =>
-      Effect.gen(function* () {
-        const root = yield* Effect.scoped(
-          Effect.gen(function* () {
-            const fixture = yield* gitFixture;
-            return fixture.root;
-          }),
-        );
-        const metadata = yield* Effect.either(
-          fixtureIo("post-scope fixture stat", () => lstat(root)),
-        );
-        expect(Either.isLeft(metadata)).toBe(true);
-      }),
+  it.live("releases every bounded git fixture when its scope closes", () =>
+    Effect.gen(function* () {
+      const root = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const fixture = yield* gitFixture;
+          return fixture.root;
+        }),
+      );
+      const metadata = yield* Effect.result(
+        fixtureIo("post-scope fixture stat", () => lstat(root)),
+      );
+      expect(Result.isFailure(metadata)).toBe(true);
+    }),
   );
 });
 
 describe("Workspace properties", () => {
-  it.prop(
-    "generated repository contexts retain explicit, label, project, team, and default precedence",
-    { suffix: fc.integer({ min: 1, max: 1_000_000 }) },
-    ({ suffix }) => {
-      const org = `org-${suffix}`;
-      const issueLabel = `issue-${suffix}`;
-      const projectLabel = `project-label-${suffix}`;
-      const project = `project-${suffix}`;
-      const team = `team-${suffix}`;
-      const repositories = [
-        repositoryRecord({ id: `explicit-${suffix}`, organization: org }),
-        repositoryRecord({
-          id: `issue-${suffix}`,
-          organization: org,
-          labels: [issueLabel],
-        }),
-        repositoryRecord({
-          id: `project-label-${suffix}`,
-          organization: org,
-          labels: [projectLabel],
-        }),
-        repositoryRecord({
-          id: `project-${suffix}`,
-          organization: org,
-          projectIds: [project],
-        }),
-        repositoryRecord({
-          id: `team-${suffix}`,
-          organization: org,
-          teamIds: [team],
-        }),
-        repositoryRecord({
-          id: `default-${suffix}`,
-          organization: org,
-          isDefault: true,
-        }),
-      ];
-      const context = {
-        organizationId: org,
-        repositoryId: null,
-        issueLabels: [issueLabel],
-        projectLabels: [projectLabel],
-        projectId: project,
-        teamId: team,
-      };
+  it("generated repository contexts retain explicit, label, project, team, and default precedence", () =>
+    fc.assert(
+      fc.property(
+        fc.record({ suffix: fc.integer({ min: 1, max: 1_000_000 }) }),
+        ({ suffix }) => {
+          const org = `org-${suffix}`;
+          const issueLabel = `issue-${suffix}`;
+          const projectLabel = `project-label-${suffix}`;
+          const project = `project-${suffix}`;
+          const team = `team-${suffix}`;
+          const repositories = [
+            repositoryRecord({ id: `explicit-${suffix}`, organization: org }),
+            repositoryRecord({
+              id: `issue-${suffix}`,
+              organization: org,
+              labels: [issueLabel],
+            }),
+            repositoryRecord({
+              id: `project-label-${suffix}`,
+              organization: org,
+              labels: [projectLabel],
+            }),
+            repositoryRecord({
+              id: `project-${suffix}`,
+              organization: org,
+              projectIds: [project],
+            }),
+            repositoryRecord({
+              id: `team-${suffix}`,
+              organization: org,
+              teamIds: [team],
+            }),
+            repositoryRecord({
+              id: `default-${suffix}`,
+              organization: org,
+              isDefault: true,
+            }),
+          ];
+          const context = {
+            organizationId: org,
+            repositoryId: null,
+            issueLabels: [issueLabel],
+            projectLabels: [projectLabel],
+            projectId: project,
+            teamId: team,
+          };
 
-      expect(
-        resolveWith(repositories, {
-          ...context,
-          repositoryId: `explicit-${suffix}`,
-        }),
-      ).toMatchObject({
-        kind: "match",
-        repository: { id: `explicit-${suffix}` },
-      });
-      expect(resolveWith(repositories, context)).toMatchObject({
-        kind: "match",
-        repository: { id: `issue-${suffix}` },
-      });
-      expect(
-        resolveWith(repositories, { ...context, issueLabels: [] }),
-      ).toMatchObject({
-        kind: "match",
-        repository: { id: `project-label-${suffix}` },
-      });
-      expect(
-        resolveWith(repositories, {
-          ...context,
-          issueLabels: [],
-          projectLabels: [],
-        }),
-      ).toMatchObject({
-        kind: "match",
-        repository: { id: `project-${suffix}` },
-      });
-      expect(
-        resolveWith(repositories, {
-          ...context,
-          issueLabels: [],
-          projectLabels: [],
-          projectId: null,
-        }),
-      ).toMatchObject({ kind: "match", repository: { id: `team-${suffix}` } });
-      expect(
-        resolveWith(repositories, {
-          ...context,
-          issueLabels: [],
-          projectLabels: [],
-          projectId: null,
-          teamId: null,
-        }),
-      ).toMatchObject({
-        kind: "match",
-        repository: { id: `default-${suffix}` },
-      });
-    },
-  );
+          expect(
+            resolveWith(repositories, {
+              ...context,
+              repositoryId: `explicit-${suffix}`,
+            }),
+          ).toMatchObject({
+            kind: "match",
+            repository: { id: `explicit-${suffix}` },
+          });
+          expect(resolveWith(repositories, context)).toMatchObject({
+            kind: "match",
+            repository: { id: `issue-${suffix}` },
+          });
+          expect(
+            resolveWith(repositories, { ...context, issueLabels: [] }),
+          ).toMatchObject({
+            kind: "match",
+            repository: { id: `project-label-${suffix}` },
+          });
+          expect(
+            resolveWith(repositories, {
+              ...context,
+              issueLabels: [],
+              projectLabels: [],
+            }),
+          ).toMatchObject({
+            kind: "match",
+            repository: { id: `project-${suffix}` },
+          });
+          expect(
+            resolveWith(repositories, {
+              ...context,
+              issueLabels: [],
+              projectLabels: [],
+              projectId: null,
+            }),
+          ).toMatchObject({
+            kind: "match",
+            repository: { id: `team-${suffix}` },
+          });
+          expect(
+            resolveWith(repositories, {
+              ...context,
+              issueLabels: [],
+              projectLabels: [],
+              projectId: null,
+              teamId: null,
+            }),
+          ).toMatchObject({
+            kind: "match",
+            repository: { id: `default-${suffix}` },
+          });
+        },
+      ),
+    ));
 
-  it.prop(
-    "generated competing mappings remain explicit ambiguities with a stable candidate order",
-    { suffix: fc.integer({ min: 1, max: 1_000_000 }) },
-    ({ suffix }) => {
-      const label = `shared-${suffix}`;
-      const repositories = [
-        repositoryRecord({ id: `first-${suffix}`, labels: [label] }),
-        repositoryRecord({ id: `second-${suffix}`, labels: [label] }),
-      ];
-      const context = {
-        organizationId: "org",
-        repositoryId: null,
-        issueLabels: [label],
-        projectLabels: [],
-        projectId: null,
-        teamId: null,
-      };
-      const first = resolveWith(repositories, context);
-      const second = resolveWith(repositories, context);
-      expect(first).toEqual({ kind: "ambiguous", repositories });
-      expect(second).toEqual(first);
-    },
-  );
+  it("generated competing mappings remain explicit ambiguities with a stable candidate order", () =>
+    fc.assert(
+      fc.property(
+        fc.record({ suffix: fc.integer({ min: 1, max: 1_000_000 }) }),
+        ({ suffix }) => {
+          const label = `shared-${suffix}`;
+          const repositories = [
+            repositoryRecord({ id: `first-${suffix}`, labels: [label] }),
+            repositoryRecord({ id: `second-${suffix}`, labels: [label] }),
+          ];
+          const context = {
+            organizationId: "org",
+            repositoryId: null,
+            issueLabels: [label],
+            projectLabels: [],
+            projectId: null,
+            teamId: null,
+          };
+          const first = resolveWith(repositories, context);
+          const second = resolveWith(repositories, context);
+          expect(first).toEqual({ kind: "ambiguous", repositories });
+          expect(second).toEqual(first);
+        },
+      ),
+    ));
 
-  it.prop(
-    "normalized nested paths stay contained while normalized traversals are rejected",
-    {
-      segments: fc.array(fc.constantFrom("alpha", "beta", "gamma", "delta"), {
-        maxLength: 8,
-      }),
-      outsideSegment: fc.constantFrom("outside", "other", "escape"),
-    },
-    ({ segments, outsideSegment }) => {
-      const root = "/workspace-root";
-      expect(isWithin(root, join(root, ...segments))).toBe(true);
-      expect(
-        isWithin(root, join(root, "safe", "..", "..", outsideSegment)),
-      ).toBe(false);
-      expect(isWithin(root, join(root, "..", outsideSegment))).toBe(false);
-    },
-  );
+  it("normalized nested paths stay contained while normalized traversals are rejected", () =>
+    fc.assert(
+      fc.property(
+        fc.record({
+          segments: fc.array(
+            fc.constantFrom("alpha", "beta", "gamma", "delta"),
+            {
+              maxLength: 8,
+            },
+          ),
+          outsideSegment: fc.constantFrom("outside", "other", "escape"),
+        }),
+        ({ segments, outsideSegment }) => {
+          const root = "/workspace-root";
+          expect(isWithin(root, join(root, ...segments))).toBe(true);
+          expect(
+            isWithin(root, join(root, "safe", "..", "..", outsideSegment)),
+          ).toBe(false);
+          expect(isWithin(root, join(root, "..", outsideSegment))).toBe(false);
+        },
+      ),
+    ));
 
-  it.prop(
-    "workspace identity is deterministic, fixed-width, and collision-resistant for generated session IDs",
-    {
-      first: fc.uuid(),
-      second: fc.uuid(),
-    },
-    ({ first, second }) => {
-      const firstKey = safeSessionKey(first);
-      expect(safeSessionKey(first)).toBe(firstKey);
-      expect(firstKey).toMatch(/^[a-f0-9]{32}$/u);
-      if (first !== second) expect(safeSessionKey(second)).not.toBe(firstKey);
-    },
-  );
+  it("workspace identity is deterministic, fixed-width, and collision-resistant for generated session IDs", () =>
+    fc.assert(
+      fc.property(
+        fc.record({ first: fc.uuid(), second: fc.uuid() }),
+        ({ first, second }) => {
+          const firstKey = safeSessionKey(first);
+          expect(safeSessionKey(first)).toBe(firstKey);
+          expect(firstKey).toMatch(/^[a-f0-9]{32}$/u);
+          if (first !== second)
+            expect(safeSessionKey(second)).not.toBe(firstKey);
+        },
+      ),
+    ));
 });
 
-it.scopedLive(
+it.live(
   "keeps GitHub credentials off every Git argv while cloning and checking out a real fixture",
   () =>
     Effect.gen(function* () {
@@ -1190,7 +1190,7 @@ it.scopedLive(
 );
 
 describe("Workspace recovery regressions", () => {
-  it.scopedLive("retries cleanly when fetch fails after cloning", () =>
+  it.live("retries cleanly when fetch fails after cloning", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
       const workspace = yield* makeWorkspace({
@@ -1205,9 +1205,10 @@ describe("Workspace recovery regressions", () => {
       });
       const result = yield* workspace
         .materialize("atomic-session", repository)
-        .pipe(Effect.either);
-      expect(Either.isLeft(result)).toBe(true);
-      if (Either.isLeft(result)) expect(result.left.reason).toBe("git_failed");
+        .pipe(Effect.result);
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result))
+        expect(result.failure.reason).toBe("git_failed");
       expect(
         yield* fixtureIo("list workspace root", () =>
           readdir(fixture.workspaceRoot),
@@ -1230,7 +1231,7 @@ describe("Workspace recovery regressions", () => {
     }),
   );
 
-  it.scopedLive(
+  it.live(
     "preserves a marker-less checkout while creating its replacement",
     () =>
       Effect.gen(function* () {
@@ -1276,7 +1277,7 @@ describe("Workspace recovery regressions", () => {
       }),
   );
 
-  it.scopedLive(
+  it.live(
     "reclaims dead local clone owners and preserves live, foreign and legacy staging",
     () =>
       Effect.gen(function* () {
@@ -1320,7 +1321,7 @@ describe("Workspace recovery regressions", () => {
       }),
   );
 
-  it.scoped(
+  it.effect(
     "backs off a failed staging scan and retries after its deadline",
     () =>
       Effect.gen(function* () {
@@ -1380,7 +1381,7 @@ describe("Workspace recovery regressions", () => {
               readdir(fixture.workspaceRoot),
             ),
           ).toContain(abandoned);
-        }).pipe(Effect.provide(Logger.replace(Logger.defaultLogger, logger)));
+        }).pipe(Effect.provide(Logger.layer([logger])));
         expect(attempts).toBe(1);
         yield* workspace.materialize("second", repository);
         expect(attempts).toBe(1);
@@ -1396,50 +1397,48 @@ describe("Workspace recovery regressions", () => {
       }),
   );
 
-  it.scopedLive(
-    "bounds a hanging git subprocess and kills its process group",
-    () =>
-      Effect.gen(function* () {
-        const fixture = yield* gitFixture;
-        const pidFile = join(fixture.root, "descendant.pid");
-        const result = yield* runGitOutput(
-          [
-            "-c",
-            `alias.hang=!sleep 60 & child=$!; echo $child > '${pidFile}'; wait $child`,
-            "hang",
-          ],
-          fixture.root,
-          "git-timeout",
-          300,
-        ).pipe(Effect.either);
-        expect(Either.isLeft(result)).toBe(true);
-        if (Either.isLeft(result))
-          expect(result.left.message).toContain("timed out after 300ms");
-        const pid = Number(
-          yield* fixtureIo("read descendant pid", () =>
-            readFile(pidFile, "utf8"),
-          ),
-        );
-        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
-        const gone = yield* fixtureIo("await descendant exit", async () => {
-          const deadline = Date.now() + 3000;
-          while (Date.now() < deadline) {
-            try {
-              process.kill(pid, 0);
-            } catch (error) {
-              if (
-                error instanceof Error &&
-                "code" in error &&
-                error.code === "ESRCH"
-              )
-                return true;
-              throw error;
-            }
-            await Bun.sleep(20);
+  it.live("bounds a hanging git subprocess and kills its process group", () =>
+    Effect.gen(function* () {
+      const fixture = yield* gitFixture;
+      const pidFile = join(fixture.root, "descendant.pid");
+      const result = yield* runGitOutput(
+        [
+          "-c",
+          `alias.hang=!sleep 60 & child=$!; echo $child > '${pidFile}'; wait $child`,
+          "hang",
+        ],
+        fixture.root,
+        "git-timeout",
+        300,
+      ).pipe(Effect.result);
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result))
+        expect(result.failure.message).toContain("timed out after 300ms");
+      const pid = Number(
+        yield* fixtureIo("read descendant pid", () =>
+          readFile(pidFile, "utf8"),
+        ),
+      );
+      expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+      const gone = yield* fixtureIo("await descendant exit", async () => {
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(pid, 0);
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              "code" in error &&
+              error.code === "ESRCH"
+            )
+              return true;
+            throw error;
           }
-          return false;
-        });
-        expect(gone).toBe(true);
-      }),
+          await Bun.sleep(20);
+        }
+        return false;
+      });
+      expect(gone).toBe(true);
+    }),
   );
 });

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { it } from "@effect/vitest";
-import { Deferred, Effect, Either, Fiber, Option, Schema } from "effect";
-import * as fc from "effect/FastCheck";
+import { Deferred, Effect, Fiber, Option, Result, Schema } from "effect";
+import * as fc from "fast-check";
 import { describe, expect } from "vitest";
 import { OrganizationId, WorkspaceId } from "../src/domain/ids.js";
 import {
@@ -62,7 +62,7 @@ const fixture = () => {
     nixRootsDir: "/roots",
     nixGcMaxBytes: 1234,
     repo: {
-      get: (key) => Effect.succeed(Option.fromNullable(entries.get(key))),
+      get: (key) => Effect.succeed(Option.fromNullishOr(entries.get(key))),
       upsert: (entry) =>
         Effect.sync(() => void entries.set(entry.cacheKey, entry)),
       list: () => Effect.succeed([...entries.values()]),
@@ -89,22 +89,24 @@ const fixture = () => {
 };
 
 describe("NixEnvironment", () => {
-  it.prop(
-    "derives deterministic canonical keys from package sets",
-    {
-      packages: fc.array(
-        fc.constantFrom("git", "nodejs_22", "python3.pkgs.foo"),
+  it("derives deterministic canonical keys from package sets", () =>
+    fc.assert(
+      fc.property(
+        fc.record({
+          packages: fc.array(
+            fc.constantFrom("git", "nodejs_22", "python3.pkgs.foo"),
+          ),
+        }),
+        ({ packages }) => {
+          const ref =
+            "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567";
+          const reversed = [...packages].reverse();
+          const unique = [...new Set(packages)];
+          expect(nixCacheKey(ref, packages)).toBe(nixCacheKey(ref, reversed));
+          expect(nixCacheKey(ref, packages)).toBe(nixCacheKey(ref, unique));
+        },
       ),
-    },
-    ({ packages }) => {
-      const ref =
-        "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567";
-      const reversed = [...packages].reverse();
-      const unique = [...new Set(packages)];
-      expect(nixCacheKey(ref, packages)).toBe(nixCacheKey(ref, reversed));
-      expect(nixCacheKey(ref, packages)).toBe(nixCacheKey(ref, unique));
-    },
-  );
+    ));
 
   it("builds once for concurrent callers and reuses persisted metadata", async () => {
     const state = fixture();
@@ -206,15 +208,15 @@ describe("NixEnvironment", () => {
     return Effect.gen(function* () {
       const service = yield* makeNixEnvironment(retryDependencies);
       const selectedRepository = repository(["git"]);
-      const first = yield* Effect.either(service.prepare(selectedRepository));
-      expect(Either.isLeft(first)).toBe(true);
+      const first = yield* Effect.result(service.prepare(selectedRepository));
+      expect(Result.isFailure(first)).toBe(true);
       const retried = yield* service.prepare(selectedRepository);
       expect(retried.reused).toBe(false);
       expect(buildCalls).toBe(2);
     });
   });
 
-  it.scopedLive(
+  it.live(
     "builds different keys concurrently while budget collection waits for every build",
     () =>
       Effect.gen(function* () {
@@ -246,15 +248,15 @@ describe("NixEnvironment", () => {
           },
         });
         yield* Effect.gen(function* () {
-          const first = yield* Effect.fork(
+          const first = yield* Effect.forkChild(
             service.prepare(repository(["git"])),
           );
-          const second = yield* Effect.fork(
+          const second = yield* Effect.forkChild(
             service.prepare(repository(["nodejs"])),
           );
           yield* Deferred.await(bothStarted);
-          const budget = yield* Effect.fork(service.enforceBudget(100));
-          yield* Effect.yieldNow();
+          const budget = yield* Effect.forkChild(service.enforceBudget(100));
+          yield* Effect.yieldNow;
           expect(measurements).toBe(0);
           expect(state.removals).toEqual([]);
           yield* Deferred.succeed(release, undefined);
@@ -353,11 +355,11 @@ describe("NixEnvironment", () => {
     );
     const unsafe = { ...repository([]), nixPackages: ["../escape"] as never };
     const result = await Effect.runPromise(
-      Effect.either(service.prepare(unsafe)),
+      Effect.result(service.prepare(unsafe)),
     );
-    expect(Either.isLeft(result)).toBe(true);
-    if (Either.isLeft(result))
-      expect(result.left._tag).toBe("@Gateway/NixEnvironmentError");
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result))
+      expect(result.failure._tag).toBe("@Gateway/NixEnvironmentError");
     expect(state.commands).toHaveLength(0);
   });
 
@@ -367,9 +369,9 @@ describe("NixEnvironment", () => {
       makeNixEnvironment(state.dependencies),
     );
     const result = await Effect.runPromise(
-      Effect.either(service.prune("../../escape")),
+      Effect.result(service.prune("../../escape")),
     );
-    expect(Either.isLeft(result)).toBe(true);
+    expect(Result.isFailure(result)).toBe(true);
     expect(state.removals).toEqual([]);
     expect(state.commands).toEqual([]);
   });
@@ -412,11 +414,11 @@ describe("NixEnvironment", () => {
       makeNixEnvironment(failingDependencies),
     );
     const result = await Effect.runPromise(
-      Effect.either(service.prepare(repository(["git"]))),
+      Effect.result(service.prepare(repository(["git"]))),
     );
-    expect(Either.isLeft(result)).toBe(true);
-    if (Either.isLeft(result))
-      expect(result.left._tag).toBe("@Gateway/NixEnvironmentError");
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result))
+      expect(result.failure._tag).toBe("@Gateway/NixEnvironmentError");
   });
   it("evicts LRU out-links until the measured store meets its budget and preserves active keys", async () => {
     const state = fixture();
@@ -519,12 +521,12 @@ describe("NixEnvironment", () => {
     );
     await Effect.runPromise(service.prepare(repository(["git"])));
     const result = await Effect.runPromise(
-      Effect.either(service.enforceBudget(100)),
+      Effect.result(service.enforceBudget(100)),
     );
-    expect(Either.isLeft(result)).toBe(true);
+    expect(Result.isFailure(result)).toBe(true);
     expect(state.removals).toEqual([]);
   });
-  it.scopedLive(
+  it.live(
     "protects persisted active references, live terminal leases and unknown configuration history",
     () =>
       Effect.gen(function* () {
@@ -569,8 +571,8 @@ describe("NixEnvironment", () => {
         protectedCacheKeys: () => Effect.succeed(new Set([key])),
       }),
     );
-    const result = await Effect.runPromise(Effect.either(service.prune(key)));
-    expect(Either.isLeft(result)).toBe(true);
+    const result = await Effect.runPromise(Effect.result(service.prune(key)));
+    expect(Result.isFailure(result)).toBe(true);
     expect(state.removals).toEqual([]);
     expect(state.commands).toEqual([]);
   });
@@ -625,8 +627,8 @@ describe("NixEnvironment", () => {
       if (keepProtected)
         await Effect.runPromise(service.prepare(repository(["nodejs"])));
       expect(
-        Either.isLeft(
-          await Effect.runPromise(Effect.either(service.enforceBudget(100))),
+        Result.isFailure(
+          await Effect.runPromise(Effect.result(service.enforceBudget(100))),
         ),
       ).toBe(true);
       expect(state.entries.size).toBe(keepProtected ? 1 : 0);
@@ -663,10 +665,10 @@ describe("Nix liveness regressions", () => {
         });
         const result = yield* service
           .prepare(repository(["git"]))
-          .pipe(Effect.either);
-        expect(Either.isLeft(result)).toBe(true);
-        if (Either.isLeft(result))
-          expect(result.left.message).toContain("timed out after 30ms");
+          .pipe(Effect.result);
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result))
+          expect(result.failure.message).toContain("timed out after 30ms");
         expect(aborted).toBe(true);
         hang = false;
         expect(
@@ -698,10 +700,10 @@ describe("Nix liveness regressions", () => {
         });
         const result = yield* service
           .prepare(repository(["git"]))
-          .pipe(Effect.either);
-        expect(Either.isLeft(result)).toBe(true);
-        if (Either.isLeft(result))
-          expect(result.left.message).toContain("timed out after 500ms");
+          .pipe(Effect.result);
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result))
+          expect(result.failure.message).toContain("timed out after 500ms");
         const pid = Number(
           yield* Effect.promise(() => readFile(pidFile, "utf8")),
         );
@@ -743,11 +745,11 @@ describe("Nix liveness regressions", () => {
       });
       const result = yield* service
         .prepare(repository(["git"]))
-        .pipe(Effect.either);
-      expect(Either.isLeft(result)).toBe(true);
-      if (Either.isLeft(result)) {
-        expect(result.left.message).toContain("specific build failure");
-        expect(result.left.message.length).toBeLessThan(4200);
+        .pipe(Effect.result);
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure.message).toContain("specific build failure");
+        expect(result.failure.message.length).toBeLessThan(4200);
       }
     }),
   );

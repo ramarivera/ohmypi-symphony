@@ -13,6 +13,7 @@ import {
   Redacted,
   Schema,
 } from "effect";
+import * as fc from "fast-check";
 import pino from "pino";
 import { describe, expect, vi } from "vitest";
 import { DatabaseError } from "../src/domain/errors.js";
@@ -74,34 +75,40 @@ const config: GatewayConfigShape = {
   logFile: Option.none(),
 };
 const configProviderFor = (gatewayConfig: GatewayConfigShape) =>
-  ConfigProvider.fromMap(
-    new Map([
-      ...(gatewayConfig.allowedOrganizationIds === undefined
-        ? []
-        : [
-            [
-              "LINEAR_ALLOWED_ORGANIZATION_IDS",
-              [...gatewayConfig.allowedOrganizationIds].join(","),
-            ] as const,
-          ]),
-      ["LINEAR_CLIENT_ID", gatewayConfig.linearClientId],
-      ["LINEAR_CLIENT_SECRET", "client-secret"],
-      ["LINEAR_WEBHOOK_SECRET", secret],
-      ["TOKEN_ENCRYPTION_KEY", tokenEncryptionKey],
-      ["PUBLIC_URL", gatewayConfig.publicUrl.toString()],
-      ["DATABASE_PATH", gatewayConfig.databasePath],
-      ["WORKSPACE_ROOT", gatewayConfig.workspaceRoot],
-      ["OMP_CLI_PATH", gatewayConfig.ompCliPath],
-      ["PORT", String(gatewayConfig.port)],
-      ["LEASE_DURATION_MS", String(gatewayConfig.leaseDurationMs)],
-      ["RECONCILER_INTERVAL_MS", String(gatewayConfig.reconcilerIntervalMs)],
-      ["WEBHOOK_REPLAY_WINDOW_MS", String(gatewayConfig.webhookReplayWindowMs)],
-      ["LOG_LEVEL", gatewayConfig.logLevel],
-      ["NIX_BINARY_PATH", gatewayConfig.nixBinaryPath],
-      ["NIXPKGS_FLAKE_REF", gatewayConfig.nixpkgsFlakeRef],
-      ["NIX_ROOTS_DIR", gatewayConfig.nixRootsDir],
-      ["NIX_GC_MAX_BYTES", String(gatewayConfig.nixGcMaxBytes)],
-    ]),
+  ConfigProvider.fromUnknown(
+    Object.fromEntries(
+      new Map([
+        ...(gatewayConfig.allowedOrganizationIds === undefined
+          ? []
+          : [
+              [
+                "LINEAR_ALLOWED_ORGANIZATION_IDS",
+                [...gatewayConfig.allowedOrganizationIds].join(","),
+              ] as const,
+            ]),
+        ["LINEAR_CLIENT_ID", gatewayConfig.linearClientId],
+        ["LINEAR_CLIENT_SECRET", "client-secret"],
+        ["LINEAR_WEBHOOK_SECRET", secret],
+        ["TOKEN_ENCRYPTION_KEY", tokenEncryptionKey],
+        ["PUBLIC_URL", gatewayConfig.publicUrl.toString()],
+        ["DATABASE_PATH", gatewayConfig.databasePath],
+        ["WORKSPACE_ROOT", gatewayConfig.workspaceRoot],
+        ["OMP_CLI_PATH", gatewayConfig.ompCliPath],
+        ["PORT", String(gatewayConfig.port)],
+        ["LEASE_DURATION_MS", String(gatewayConfig.leaseDurationMs)],
+        ["RECONCILER_INTERVAL_MS", String(gatewayConfig.reconcilerIntervalMs)],
+        [
+          "WEBHOOK_REPLAY_WINDOW_MS",
+          String(gatewayConfig.webhookReplayWindowMs),
+        ],
+        ["LOG_LEVEL", gatewayConfig.logLevel],
+        ["NIX_BINARY_PATH", gatewayConfig.nixBinaryPath],
+        ["NIXPKGS_FLAKE_REF", gatewayConfig.nixpkgsFlakeRef],
+        ["NIX_ROOTS_DIR", gatewayConfig.nixRootsDir],
+        ["NIX_GC_MAX_BYTES", String(gatewayConfig.nixGcMaxBytes)],
+      ]),
+    ),
+    { preserveEmptyStrings: true },
   );
 
 const sessionId = (value: string) => Schema.decodeUnknownSync(SessionId)(value);
@@ -114,20 +121,20 @@ const projectId = (value: string) => Schema.decodeUnknownSync(ProjectId)(value);
 
 const makeLayer = (gatewayConfig: GatewayConfigShape) =>
   Layer.mergeAll(
-    GatewayConfig.Default,
-    TokenCrypto.Default,
-    InstallationRepo.Default,
-    DeliveryRepo.Default,
-    RunEventRepo.Default,
-    RunRepo.Default,
-    PromptTemplateRepo.Default,
-    RunInputRepo.Default,
-    WebhookPipeline.Default,
+    GatewayConfig.layer,
+    TokenCrypto.layer,
+    InstallationRepo.layer,
+    DeliveryRepo.layer,
+    RunEventRepo.layer,
+    RunRepo.layer,
+    PromptTemplateRepo.layer,
+    RunInputRepo.layer,
+    WebhookPipeline.layer,
   ).pipe(
     Layer.provide(
       Layer.mergeAll(
         SqliteClientLive(":memory:"),
-        Layer.setConfigProvider(configProviderFor(gatewayConfig)),
+        ConfigProvider.layer(configProviderFor(gatewayConfig)),
       ),
     ),
   );
@@ -383,7 +390,7 @@ const expectSome = <A>(value: Option.Option<A>): A | undefined => {
   return Option.isSome(value) ? value.value : undefined;
 };
 describe("WebhookPipeline Pino lifecycle logs", () => {
-  it.scopedLive(
+  it.live(
     "emits correlated success and controlled-rejection logs through the gateway graph",
     () => {
       const chunks: string[] = [];
@@ -393,20 +400,21 @@ describe("WebhookPipeline Pino lifecycle logs", () => {
           callback();
         },
       });
-      const pinoLoggerLive = Logger.replace(
-        Logger.defaultLogger,
+      const pinoLoggerLive = Logger.layer([
         makePinoEffectLogger(pino({ base: null, level: "info" }, stream)),
-      );
+      ]);
 
       return withWebhook(
         Effect.gen(function* () {
           const now = yield* currentTime;
           yield* install();
-          const accepted = yield* WebhookPipeline.handle(
-            signedRequest(createdPayload(now)),
+          const accepted = yield* WebhookPipeline.use((service) =>
+            service.handle(signedRequest(createdPayload(now))),
           );
-          const rejected = yield* WebhookPipeline.handle(
-            signedRequest(createdPayload(now), { method: "GET" }),
+          const rejected = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(createdPayload(now), { method: "GET" }),
+            ),
           );
           expect(accepted.status).toBe(200);
           expect(rejected.status).toBe(405);
@@ -440,18 +448,20 @@ describe("WebhookPipeline Pino lifecycle logs", () => {
 });
 
 describe("Linear webhook input correctness", () => {
-  it.scopedLive("created event is durably stored and acknowledged", () =>
+  it.live("created event is durably stored and acknowledged", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now)),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(createdPayload(now))),
         );
 
         expect(response.status).toBe(200);
         expect(yield* Effect.promise(() => response.text())).toBe("OK");
-        const run = expectSome(yield* RunRepo.get(sessionId("session-1")));
+        const run = expectSome(
+          yield* RunRepo.use((service) => service.get(sessionId("session-1"))),
+        );
         expect(run).toMatchObject({
           organizationId: organizationId("org"),
           issueId: Option.some(issueId("issue-1")),
@@ -459,7 +469,9 @@ describe("Linear webhook input correctness", () => {
           projectId: Option.some(projectId("project-1")),
           desiredState: "running",
         });
-        const inputs = yield* RunInputRepo.pending(sessionId("session-1"));
+        const inputs = yield* RunInputRepo.use((service) =>
+          service.pending(sessionId("session-1")),
+        );
         expect(inputs).toHaveLength(1);
         expect(inputs[0]).toMatchObject({
           id: "session-1:created",
@@ -484,24 +496,28 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "created input uses structured context and guidance, not tracker text as policy",
     () =>
       withWebhook(
         Effect.gen(function* () {
           const now = yield* currentTime;
           yield* install();
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(
-              createdPayload(now, {
-                promptContext: "Please resolve this",
-                guidance: [{ body: "Use idiomatic TypeScript" }],
-              }),
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(
+                createdPayload(now, {
+                  promptContext: "Please resolve this",
+                  guidance: [{ body: "Use idiomatic TypeScript" }],
+                }),
+              ),
             ),
           );
 
           expect(response.status).toBe(200);
-          const [input] = yield* RunInputRepo.pending(sessionId("session-1"));
+          const [input] = yield* RunInputRepo.use((service) =>
+            service.pending(sessionId("session-1")),
+          );
           const body = input?.body ?? "";
           expect(body.startsWith("User request:\nPlease resolve this")).toBe(
             true,
@@ -516,14 +532,13 @@ describe("Linear webhook input correctness", () => {
       ),
   );
 
-  it.scopedLive(
-    "created handles nullable fields and falls back to summary",
-    () =>
-      withWebhook(
-        Effect.gen(function* () {
-          const now = yield* currentTime;
-          yield* install();
-          const response = yield* WebhookPipeline.handle(
+  it.live("created handles nullable fields and falls back to summary", () =>
+    withWebhook(
+      Effect.gen(function* () {
+        const now = yield* currentTime;
+        yield* install();
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
             signedRequest(
               createdPayload(now, {
                 promptContext: null,
@@ -537,121 +552,137 @@ describe("Linear webhook input correctness", () => {
                 }),
               }),
             ),
-          );
+          ),
+        );
 
-          expect(response.status).toBe(200);
-          const run = expectSome(yield* RunRepo.get(sessionId("session-1")));
-          expect(run).toMatchObject({
-            issueId: Option.none(),
-            teamId: Option.none(),
-            projectId: Option.none(),
-          });
-          const [input] = yield* RunInputRepo.pending(sessionId("session-1"));
-          expect(input).toMatchObject({
-            kind: "created",
-            body: "User request:\nSummary of direct chat",
-          });
-        }),
-      ),
+        expect(response.status).toBe(200);
+        const run = expectSome(
+          yield* RunRepo.use((service) => service.get(sessionId("session-1"))),
+        );
+        expect(run).toMatchObject({
+          issueId: Option.none(),
+          teamId: Option.none(),
+          projectId: Option.none(),
+        });
+        const [input] = yield* RunInputRepo.use((service) =>
+          service.pending(sessionId("session-1")),
+        );
+        expect(input).toMatchObject({
+          kind: "created",
+          body: "User request:\nSummary of direct chat",
+        });
+      }),
+    ),
   );
 
-  it.scopedLive(
+  it.live(
     "accepts real Linear AgentSessionEvent created payload with null guidance and no agentSession.type",
     () =>
       withWebhook(
         Effect.gen(function* () {
           const now = yield* currentTime;
           yield* install();
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(
-              createdPayload(now, {
-                webhookId: "webhook-uuid",
-                createdAt: "2024-01-01T00:00:00.000Z",
-                guidance: null,
-                previousComments: [
-                  {
-                    id: "prev-1",
-                    body: "Earlier comment",
-                    userId: "user-1",
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(
+                createdPayload(now, {
+                  webhookId: "webhook-uuid",
+                  createdAt: "2024-01-01T00:00:00.000Z",
+                  guidance: null,
+                  previousComments: [
+                    {
+                      id: "prev-1",
+                      body: "Earlier comment",
+                      userId: "user-1",
+                      issueId: "issue-1",
+                    },
+                  ],
+                  agentSession: agentSessionBase({
+                    commentId: "comment-1",
+                    sourceCommentId: null,
                     issueId: "issue-1",
-                  },
-                ],
-                agentSession: agentSessionBase({
-                  commentId: "comment-1",
-                  sourceCommentId: null,
-                  issueId: "issue-1",
-                  pullRequestId: null,
-                  slugId: "slug-1",
-                  archivedAt: null,
-                  startedAt: null,
-                  endedAt: null,
-                  dismissedAt: null,
-                  dismissedById: null,
-                  externalLink: null,
-                  summary: null,
-                  url: "https://linear.app/issue/TEAM-123/session-1",
-                  externalUrls: [],
-                  context: [],
-                  sourceMetadata: { source: "linear" },
-                  plan: null,
-                  workspaceDiff: null,
-                  creatorId: "user-1",
-                  creator: {
-                    id: "user-1",
-                    name: "Test User",
-                    email: "test@example.com",
-                    avatarUrl: "https://example.com/avatar.png",
-                    url: "https://linear.app/user/user-1",
-                  },
-                  comment: {
-                    id: "comment-1",
-                    body: "A thread comment",
-                    userId: "user-1",
-                    issueId: "issue-1",
-                  },
-                  issue: {
-                    id: "issue-1",
-                    title: "Fix the bug",
-                    description: "The bug description",
-                    identifier: "TEAM-123",
-                    url: "https://linear.app/issue/TEAM-123",
-                    teamId: "team-a",
-                    team: { id: "team-a" },
-                  },
+                    pullRequestId: null,
+                    slugId: "slug-1",
+                    archivedAt: null,
+                    startedAt: null,
+                    endedAt: null,
+                    dismissedAt: null,
+                    dismissedById: null,
+                    externalLink: null,
+                    summary: null,
+                    url: "https://linear.app/issue/TEAM-123/session-1",
+                    externalUrls: [],
+                    context: [],
+                    sourceMetadata: { source: "linear" },
+                    plan: null,
+                    workspaceDiff: null,
+                    creatorId: "user-1",
+                    creator: {
+                      id: "user-1",
+                      name: "Test User",
+                      email: "test@example.com",
+                      avatarUrl: "https://example.com/avatar.png",
+                      url: "https://linear.app/user/user-1",
+                    },
+                    comment: {
+                      id: "comment-1",
+                      body: "A thread comment",
+                      userId: "user-1",
+                      issueId: "issue-1",
+                    },
+                    issue: {
+                      id: "issue-1",
+                      title: "Fix the bug",
+                      description: "The bug description",
+                      identifier: "TEAM-123",
+                      url: "https://linear.app/issue/TEAM-123",
+                      teamId: "team-a",
+                      team: { id: "team-a" },
+                    },
+                  }),
                 }),
-              }),
+              ),
             ),
           );
 
           expect(response.status).toBe(200);
-          const run = expectSome(yield* RunRepo.get(sessionId("session-1")));
+          const run = expectSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          );
           expect(run).toMatchObject({
             organizationId: organizationId("org"),
             issueId: Option.some(issueId("issue-1")),
             teamId: Option.some(teamId("team-a")),
           });
-          const [input] = yield* RunInputRepo.pending(sessionId("session-1"));
+          const [input] = yield* RunInputRepo.use((service) =>
+            service.pending(sessionId("session-1")),
+          );
           expect(input?.kind).toBe("created");
           expect(input?.body).not.toContain("Guidance:");
         }),
       ),
   );
 
-  it.scopedLive("prompted event appends agent activity body", () =>
+  it.live("prompted event appends agent activity body", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
         expect(
-          (yield* WebhookPipeline.handle(signedRequest(createdPayload(now))))
-            .status,
+          (yield* WebhookPipeline.use((service) =>
+            service.handle(signedRequest(createdPayload(now))),
+          )).status,
         ).toBe(200);
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(promptedPayload(now)),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(promptedPayload(now))),
         );
 
         expect(response.status).toBe(200);
-        const inputs = yield* RunInputRepo.pending(sessionId("session-1"));
+        const inputs = yield* RunInputRepo.use((service) =>
+          service.pending(sessionId("session-1")),
+        );
         expect(inputs).toHaveLength(2);
         expect(inputs.find((input) => input.kind === "prompted")).toMatchObject(
           {
@@ -665,23 +696,33 @@ describe("Linear webhook input correctness", () => {
       }),
     ),
   );
-  it.scopedLive("prompted inputs store the raw activity body", () =>
+  it.live("prompted inputs store the raw activity body", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        yield* PromptTemplateRepo.upsert({
-          organizationId: organizationId("org"),
-          kind: "prompted",
-          body: "Follow-up:\n{{userRequest}}",
-          updatedAt: now,
-        });
-        yield* WebhookPipeline.handle(signedRequest(createdPayload(now)));
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(promptedPayload(now, { webhookId: "prompt-template" })),
+        yield* PromptTemplateRepo.use((service) =>
+          service.upsert({
+            organizationId: organizationId("org"),
+            kind: "prompted",
+            body: "Follow-up:\n{{userRequest}}",
+            updatedAt: now,
+          }),
+        );
+        yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(createdPayload(now))),
+        );
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(
+              promptedPayload(now, { webhookId: "prompt-template" }),
+            ),
+          ),
         );
         expect(response.status).toBe(200);
-        const inputs = yield* RunInputRepo.pending(sessionId("session-1"));
+        const inputs = yield* RunInputRepo.use((service) =>
+          service.pending(sessionId("session-1")),
+        );
         // Raw body is stored even with a template configured: rendering
         // happens at prompt construction so repository selection and UI
         // answers see the user's literal text.
@@ -692,7 +733,7 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive("prompted with stop signal cancels the run", () =>
+  it.live("prompted with stop signal cancels the run", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
@@ -705,65 +746,93 @@ describe("Linear webhook input correctness", () => {
             signal: "stop",
           },
         });
-        yield* WebhookPipeline.handle(signedRequest(createdPayload(now)));
-        const response = yield* WebhookPipeline.handle(signedRequest(payload));
+        yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(createdPayload(now))),
+        );
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(payload)),
+        );
 
         expect(response.status).toBe(200);
-        const inputs = yield* RunInputRepo.pending(sessionId("session-1"));
+        const inputs = yield* RunInputRepo.use((service) =>
+          service.pending(sessionId("session-1")),
+        );
         expect(inputs.find((input) => input.kind === "stop")).toBeDefined();
         expect(
-          expectSome(yield* RunRepo.get(sessionId("session-1")))?.desiredState,
+          expectSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          )?.desiredState,
         ).toBe("canceled");
       }),
     ),
   );
 
-  it.scopedLive("stop action cancels the run", () =>
+  it.live("stop action cancels the run", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        yield* WebhookPipeline.handle(signedRequest(createdPayload(now)));
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(stopPayload(now)),
+        yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(createdPayload(now))),
+        );
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(stopPayload(now))),
         );
 
         expect(response.status).toBe(200);
         expect(
-          expectSome(yield* RunRepo.get(sessionId("session-1")))?.desiredState,
+          expectSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          )?.desiredState,
         ).toBe("canceled");
-        const inputs = yield* RunInputRepo.pending(sessionId("session-1"));
+        const inputs = yield* RunInputRepo.use((service) =>
+          service.pending(sessionId("session-1")),
+        );
         expect(inputs).toHaveLength(2);
         expect(inputs[1]).toMatchObject({ kind: "stop", body: "Stop" });
       }),
     ),
   );
 
-  it.scopedLive("prompted events after stop are accepted for resume", () =>
+  it.live("prompted events after stop are accepted for resume", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        yield* WebhookPipeline.handle(signedRequest(createdPayload(now)));
-        yield* WebhookPipeline.handle(signedRequest(stopPayload(now)));
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(promptedPayload(now)),
+        yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(createdPayload(now))),
+        );
+        yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(stopPayload(now))),
+        );
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(promptedPayload(now))),
         );
 
         // The prompt is enqueued alongside the stop; the session authority
         // decides between honoring the cancellation and resuming the run.
         expect(response.status).toBe(200);
         expect(
-          yield* RunInputRepo.pending(sessionId("session-1")),
+          yield* RunInputRepo.use((service) =>
+            service.pending(sessionId("session-1")),
+          ),
         ).toHaveLength(3);
         expect(
-          expectSome(yield* RunRepo.get(sessionId("session-1")))?.desiredState,
+          expectSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          )?.desiredState,
         ).toBe("canceled");
       }),
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "AppUserNotification unassignment stops every non-terminal issue run idempotently",
     () =>
       withWebhook(
@@ -771,34 +840,46 @@ describe("Linear webhook input correctness", () => {
           const now = yield* currentTime;
           yield* install();
           for (const id of ["session-a", "session-b", "session-terminal"]) {
-            yield* RunRepo.create({
-              sessionId: sessionId(id),
-              organizationId: organizationId("org"),
-              issueId: Option.some(issueId("issue-1")),
-              now,
-            });
+            yield* RunRepo.use((service) =>
+              service.create({
+                sessionId: sessionId(id),
+                organizationId: organizationId("org"),
+                issueId: Option.some(issueId("issue-1")),
+                now,
+              }),
+            );
           }
-          yield* RunRepo.update(sessionId("session-terminal"), {
-            state: "succeeded",
-          });
+          yield* RunRepo.use((service) =>
+            service.update(sessionId("session-terminal"), {
+              state: "succeeded",
+            }),
+          );
           const payload = appUserNotificationPayload(
             now,
             "issueUnassignedFromYou",
           );
-          const first = yield* WebhookPipeline.handle(
-            signedRequest(payload, { delivery: "notification-delivery-1" }),
+          const first = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(payload, { delivery: "notification-delivery-1" }),
+            ),
           );
-          const second = yield* WebhookPipeline.handle(
-            signedRequest(payload, { delivery: "notification-delivery-2" }),
+          const second = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(payload, { delivery: "notification-delivery-2" }),
+            ),
           );
 
           expect(first.status).toBe(200);
           expect(second.status).toBe(200);
           for (const id of ["session-a", "session-b"]) {
             expect(
-              expectSome(yield* RunRepo.get(sessionId(id)))?.desiredState,
+              expectSome(
+                yield* RunRepo.use((service) => service.get(sessionId(id))),
+              )?.desiredState,
             ).toBe("canceled");
-            const inputs = yield* RunInputRepo.pending(sessionId(id));
+            const inputs = yield* RunInputRepo.use((service) =>
+              service.pending(sessionId(id)),
+            );
             expect(inputs).toHaveLength(1);
             expect(inputs[0]).toMatchObject({
               id: `${id}:stop:notification-1`,
@@ -806,40 +887,54 @@ describe("Linear webhook input correctness", () => {
             });
           }
           expect(
-            expectSome(yield* RunRepo.get(sessionId("session-terminal")))
-              ?.desiredState,
+            expectSome(
+              yield* RunRepo.use((service) =>
+                service.get(sessionId("session-terminal")),
+              ),
+            )?.desiredState,
           ).toBe("running");
           expect(
-            yield* RunInputRepo.pending(sessionId("session-terminal")),
+            yield* RunInputRepo.use((service) =>
+              service.pending(sessionId("session-terminal")),
+            ),
           ).toHaveLength(0);
         }),
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "AppUserNotification status changes enqueue a deferred stop and ignore non-cancel actions",
     () =>
       withWebhook(
         Effect.gen(function* () {
           const now = yield* currentTime;
           yield* install();
-          yield* RunRepo.create({
-            sessionId: sessionId("session-a"),
-            organizationId: organizationId("org"),
-            issueId: Option.some(issueId("issue-1")),
-            now,
-          });
-          const status = yield* WebhookPipeline.handle(
-            signedRequest(
-              appUserNotificationPayload(now, "issueStatusChanged"),
+          yield* RunRepo.use((service) =>
+            service.create({
+              sessionId: sessionId("session-a"),
+              organizationId: organizationId("org"),
+              issueId: Option.some(issueId("issue-1")),
+              now,
+            }),
+          );
+          const status = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(
+                appUserNotificationPayload(now, "issueStatusChanged"),
+              ),
             ),
           );
           expect(status.status).toBe(200);
           expect(
-            expectSome(yield* RunRepo.get(sessionId("session-a")))
-              ?.desiredState,
+            expectSome(
+              yield* RunRepo.use((service) =>
+                service.get(sessionId("session-a")),
+              ),
+            )?.desiredState,
           ).toBe("running");
-          const inputs = yield* RunInputRepo.pending(sessionId("session-a"));
+          const inputs = yield* RunInputRepo.use((service) =>
+            service.pending(sessionId("session-a")),
+          );
           expect(inputs).toHaveLength(1);
           expect(inputs[0]?.payload).toMatchObject({
             type: "AppUserNotification",
@@ -847,32 +942,36 @@ describe("Linear webhook input correctness", () => {
             notification: { issueId: "issue-1" },
           });
 
-          const ignored = yield* WebhookPipeline.handle(
-            signedRequest(
-              appUserNotificationPayload(now, "issueCommentMention", {
-                webhookId: "notification-webhook-ignored",
-              }),
+          const ignored = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(
+                appUserNotificationPayload(now, "issueCommentMention", {
+                  webhookId: "notification-webhook-ignored",
+                }),
+              ),
             ),
           );
           expect(ignored.status).toBe(200);
           expect(
-            yield* RunInputRepo.pending(sessionId("session-a")),
+            yield* RunInputRepo.use((service) =>
+              service.pending(sessionId("session-a")),
+            ),
           ).toHaveLength(1);
         }),
       ),
   );
 
-  it.scopedLive("dedupes by Linear-Delivery id", () =>
+  it.live("dedupes by Linear-Delivery id", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
         const payload = createdPayload(now);
-        const response1 = yield* WebhookPipeline.handle(
-          signedRequest(payload, { delivery: "d1" }),
+        const response1 = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(payload, { delivery: "d1" })),
         );
-        const response2 = yield* WebhookPipeline.handle(
-          signedRequest(payload, { delivery: "d1" }),
+        const response2 = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(payload, { delivery: "d1" })),
         );
 
         expect(response1.status).toBe(200);
@@ -881,13 +980,15 @@ describe("Linear webhook input correctness", () => {
           "Duplicate delivery",
         );
         expect(
-          yield* RunInputRepo.pending(sessionId("session-1")),
+          yield* RunInputRepo.use((service) =>
+            service.pending(sessionId("session-1")),
+          ),
         ).toHaveLength(1);
       }),
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "dedupes logical input on replay with a different Linear-Delivery id",
     () =>
       withWebhook(
@@ -897,23 +998,29 @@ describe("Linear webhook input correctness", () => {
           const payload = createdPayload(now);
           const body = JSON.stringify(payload);
           const signature = sign(body);
-          const response1 = yield* WebhookPipeline.handle(
-            signedRequest(payload, { delivery: "d1", body, signature }),
+          const response1 = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(payload, { delivery: "d1", body, signature }),
+            ),
           );
-          const response2 = yield* WebhookPipeline.handle(
-            signedRequest(payload, { delivery: "d2", body, signature }),
+          const response2 = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(payload, { delivery: "d2", body, signature }),
+            ),
           );
 
           expect(response1.status).toBe(200);
           expect(response2.status).toBe(200);
           expect(
-            yield* RunInputRepo.pending(sessionId("session-1")),
+            yield* RunInputRepo.use((service) =>
+              service.pending(sessionId("session-1")),
+            ),
           ).toHaveLength(1);
         }),
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "rejects stale and future timestamps with exact replay response",
     () =>
       withWebhook(
@@ -921,25 +1028,29 @@ describe("Linear webhook input correctness", () => {
           const now = yield* currentTime;
           yield* install();
           for (const timestamp of [now - 120_000, now + 120_000]) {
-            const response = yield* WebhookPipeline.handle(
-              signedRequest(createdPayload(timestamp), {
-                delivery: `outside-window-${timestamp}`,
-                includeTimestampHeader: true,
-              }),
+            const response = yield* WebhookPipeline.use((service) =>
+              service.handle(
+                signedRequest(createdPayload(timestamp), {
+                  delivery: `outside-window-${timestamp}`,
+                  includeTimestampHeader: true,
+                }),
+              ),
             );
             expect(response.status).toBe(401);
             expect(yield* Effect.promise(() => response.text())).toBe(
               "Webhook timestamp outside replay window",
             );
           }
-          expect(yield* RunRepo.get(sessionId("session-1"))).toEqual(
-            Option.none(),
-          );
+          expect(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          ).toEqual(Option.none());
         }),
       ),
   );
 
-  it.scopedLive("rejects invalid and tampered HMACs without persistence", () =>
+  it.live("rejects invalid and tampered HMACs without persistence", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
@@ -957,33 +1068,37 @@ describe("Linear webhook input correctness", () => {
             signature: sign(body),
           }),
         ]) {
-          const response = yield* WebhookPipeline.handle(request);
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(request),
+          );
           expect(response.status).toBe(401);
           expect(yield* Effect.promise(() => response.text())).toBe(
             "Invalid signature",
           );
         }
-        expect(yield* RunRepo.get(sessionId("session-1"))).toEqual(
-          Option.none(),
-        );
+        expect(
+          yield* RunRepo.use((service) => service.get(sessionId("session-1"))),
+        ).toEqual(Option.none());
       }),
     ),
   );
 
-  it.scopedLive("rejects missing signature and non-POST methods", () =>
+  it.live("rejects missing signature and non-POST methods", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         const missing = signedRequest(createdPayload(now));
         missing.headers.delete("linear-signature");
-        const missingResponse = yield* WebhookPipeline.handle(missing);
+        const missingResponse = yield* WebhookPipeline.use((service) =>
+          service.handle(missing),
+        );
         expect(missingResponse.status).toBe(400);
         expect(yield* Effect.promise(() => missingResponse.text())).toBe(
           "Missing signature",
         );
 
-        const methodResponse = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now), { method: "GET" }),
+        const methodResponse = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(createdPayload(now), { method: "GET" })),
         );
         expect(methodResponse.status).toBe(405);
         expect(yield* Effect.promise(() => methodResponse.text())).toBe(
@@ -993,13 +1108,15 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive("rejects malformed AgentSessionEvent payloads", () =>
+  it.live("rejects malformed AgentSessionEvent payloads", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now, { agentSession: undefined })),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(createdPayload(now, { agentSession: undefined })),
+          ),
         );
         expect(response.status).toBe(400);
         expect(yield* Effect.promise(() => response.text())).toContain(
@@ -1008,7 +1125,32 @@ describe("Linear webhook input correctness", () => {
       }),
     ),
   );
-  it.scopedLive("does not expose malformed notification payload details", () =>
+  it.live(
+    "keeps malformed session input out of webhook responses and logs",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const secret = "malformed-session-private-token";
+          const logs: unknown[] = [];
+          const logger = Logger.make((entry) => {
+            logs.push({ message: entry.message, cause: entry.cause });
+          });
+          const now = yield* Clock.currentTimeMillis;
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(createdPayload(now, { agentSession: secret })),
+            ),
+          ).pipe(Effect.provide(Logger.layer([logger])));
+          expect(response.status).toBe(400);
+          expect(yield* Effect.promise(() => response.text())).toBe(
+            "AgentSessionEvent payload is invalid",
+          );
+          expect(JSON.stringify(logs)).not.toContain(secret);
+        }),
+      ),
+  );
+  it.live("does not expose malformed notification payload details", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
@@ -1018,7 +1160,9 @@ describe("Linear webhook input correctness", () => {
           ...appUserNotificationPayload(now, "issueStatusChanged"),
           notification: secretContent,
         };
-        const response = yield* WebhookPipeline.handle(signedRequest(payload));
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(payload)),
+        );
         const body = yield* Effect.promise(() => response.text());
         expect(response.status).toBe(400);
         expect(body).toBe("AppUserNotification payload is invalid");
@@ -1027,13 +1171,17 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive("rejects cross-tenant OAuth client identity", () =>
+  it.live("rejects cross-tenant OAuth client identity", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now, { oauthClientId: "other-client" })),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(
+              createdPayload(now, { oauthClientId: "other-client" }),
+            ),
+          ),
         );
         expect(response.status).toBe(401);
         expect(yield* Effect.promise(() => response.text())).toBe(
@@ -1043,12 +1191,12 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive("rejects absent and revoked installations", () =>
+  it.live("rejects absent and revoked installations", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
-        const absent = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now)),
+        const absent = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(createdPayload(now))),
         );
         expect(absent.status).toBe(401);
         expect(yield* Effect.promise(() => absent.text())).toBe(
@@ -1056,8 +1204,12 @@ describe("Linear webhook input correctness", () => {
         );
 
         yield* install({ revokedAt: Option.some(now - 1_000) });
-        const revoked = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now, { webhookId: "revoked-webhook" })),
+        const revoked = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(
+              createdPayload(now, { webhookId: "revoked-webhook" }),
+            ),
+          ),
         );
         expect(revoked.status).toBe(401);
         expect(yield* Effect.promise(() => revoked.text())).toBe(
@@ -1067,78 +1219,93 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive(
-    "OAuthApp revoked cancels runs and marks installation revoked",
-    () =>
-      withWebhook(
-        Effect.gen(function* () {
-          const now = yield* currentTime;
-          yield* install();
-          yield* RunRepo.create({
+  it.live("OAuthApp revoked cancels runs and marks installation revoked", () =>
+    withWebhook(
+      Effect.gen(function* () {
+        const now = yield* currentTime;
+        yield* install();
+        yield* RunRepo.use((service) =>
+          service.create({
             sessionId: sessionId("session-1"),
             organizationId: organizationId("org"),
             issueId: Option.some(issueId("issue-1")),
             teamId: Option.some(teamId("team-a")),
             now,
-          });
+          }),
+        );
 
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(oauthAppPayload(now)),
-          );
-          expect(response.status).toBe(200);
-          expect(yield* Effect.promise(() => response.text())).toBe("OK");
-          const installation = expectSome(
-            yield* InstallationRepo.get(organizationId("org")),
-          );
-          expect(installation?.revokedAt).toEqual(Option.some(now));
-          expect(
-            expectSome(yield* RunRepo.get(sessionId("session-1")))
-              ?.desiredState,
-          ).toBe("canceled");
-        }),
-      ),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(oauthAppPayload(now))),
+        );
+        expect(response.status).toBe(200);
+        expect(yield* Effect.promise(() => response.text())).toBe("OK");
+        const installation = expectSome(
+          yield* InstallationRepo.use((service) =>
+            service.get(organizationId("org")),
+          ),
+        );
+        expect(installation?.revokedAt).toEqual(Option.some(now));
+        expect(
+          expectSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          )?.desiredState,
+        ).toBe("canceled");
+      }),
+    ),
   );
 
-  it.scopedLive("PermissionChange updates team access and cancels runs", () =>
+  it.live("PermissionChange updates team access and cancels runs", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install({
           accessibleTeamIds: Option.some([teamId("team-a"), teamId("team-b")]),
         });
-        yield* RunRepo.create({
-          sessionId: sessionId("session-1"),
-          organizationId: organizationId("org"),
-          issueId: Option.some(issueId("issue-1")),
-          teamId: Option.some(teamId("team-b")),
-          now,
-        });
+        yield* RunRepo.use((service) =>
+          service.create({
+            sessionId: sessionId("session-1"),
+            organizationId: organizationId("org"),
+            issueId: Option.some(issueId("issue-1")),
+            teamId: Option.some(teamId("team-b")),
+            now,
+          }),
+        );
 
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(permissionChangePayload(now)),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(signedRequest(permissionChangePayload(now))),
         );
         expect(response.status).toBe(200);
         const installation = expectSome(
-          yield* InstallationRepo.get(organizationId("org")),
+          yield* InstallationRepo.use((service) =>
+            service.get(organizationId("org")),
+          ),
         );
         expect(installation?.accessibleTeamIds).toEqual(
           Option.some([teamId("team-a")]),
         );
         expect(
-          expectSome(yield* RunRepo.get(sessionId("session-1")))?.desiredState,
+          expectSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          )?.desiredState,
         ).toBe("canceled");
       }),
     ),
   );
 
-  it.scopedLive("PermissionChange rejects mismatched app-user identity", () =>
+  it.live("PermissionChange rejects mismatched app-user identity", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(
-            permissionChangePayload(now, { appUserId: "other-user" }),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(
+              permissionChangePayload(now, { appUserId: "other-user" }),
+            ),
           ),
         );
         expect(response.status).toBe(401);
@@ -1146,7 +1313,9 @@ describe("Linear webhook input correctness", () => {
           "App user mismatch",
         );
         const installation = expectSome(
-          yield* InstallationRepo.get(organizationId("org")),
+          yield* InstallationRepo.use((service) =>
+            service.get(organizationId("org")),
+          ),
         );
         expect(installation?.accessibleTeamIds).toEqual(
           Option.some([teamId("team-a")]),
@@ -1155,7 +1324,7 @@ describe("Linear webhook input correctness", () => {
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "PermissionChange accepts dashed and case variants of the client id",
     () =>
       withWebhook(
@@ -1166,8 +1335,10 @@ describe("Linear webhook input correctness", () => {
           // webhook categories (console hex vs dashed UUID); the comparison
           // is normalized, so both forms must pass.
           for (const oauthClientId of ["CLIENT", "c-l-i-e-n-t"]) {
-            const response = yield* WebhookPipeline.handle(
-              signedRequest(permissionChangePayload(now, { oauthClientId })),
+            const response = yield* WebhookPipeline.use((service) =>
+              service.handle(
+                signedRequest(permissionChangePayload(now, { oauthClientId })),
+              ),
             );
             expect(response.status, oauthClientId).toBe(200);
           }
@@ -1175,7 +1346,7 @@ describe("Linear webhook input correctness", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "PermissionChange accepts the OAuth client UUID form Linear actually sends",
     () =>
       withWebhook(
@@ -1185,16 +1356,20 @@ describe("Linear webhook input correctness", () => {
           // Live capture 2026-08-11: PermissionChange carries the OAuth
           // client's internal UUID (no shared hex with the console client_id).
           // HMAC is the auth boundary; org + appUserId pin tenant and app.
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(
-              permissionChangePayload(now, {
-                oauthClientId: "c2e52980-f2d4-4ecf-bc59-06c73dfb42b3",
-              }),
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              signedRequest(
+                permissionChangePayload(now, {
+                  oauthClientId: "c2e52980-f2d4-4ecf-bc59-06c73dfb42b3",
+                }),
+              ),
             ),
           );
           expect(response.status).toBe(200);
           const installation = expectSome(
-            yield* InstallationRepo.get(organizationId("org")),
+            yield* InstallationRepo.use((service) =>
+              service.get(organizationId("org")),
+            ),
           );
           expect(installation?.accessibleTeamIds).toEqual(
             Option.some([teamId("team-a")]),
@@ -1202,61 +1377,73 @@ describe("Linear webhook input correctness", () => {
         }),
       ),
   );
-  it.scopedLive("acknowledges unknown event types without side effects", () =>
+  it.live("acknowledges unknown event types without side effects", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now, { type: "Unknown" })),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(createdPayload(now, { type: "Unknown" })),
+          ),
         );
         expect(response.status).toBe(200);
-        expect(yield* RunRepo.get(sessionId("session-1"))).toEqual(
-          Option.none(),
-        );
+        expect(
+          yield* RunRepo.use((service) => service.get(sessionId("session-1"))),
+        ).toEqual(Option.none());
       }),
     ),
   );
 
-  it.scopedLive("acknowledges unknown AgentSession actions without input", () =>
+  it.live("acknowledges unknown AgentSession actions without input", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(createdPayload(now, { action: "updated" })),
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(createdPayload(now, { action: "updated" })),
+          ),
         );
         expect(response.status).toBe(200);
         expect(
-          yield* RunInputRepo.pending(sessionId("session-1")),
+          yield* RunInputRepo.use((service) =>
+            service.pending(sessionId("session-1")),
+          ),
         ).toHaveLength(0);
       }),
     ),
   );
 
-  it.scopedLive("resolves team and project from child objects", () =>
+  it.live("resolves team and project from child objects", () =>
     withWebhook(
       Effect.gen(function* () {
         const now = yield* currentTime;
         yield* install();
-        const response = yield* WebhookPipeline.handle(
-          signedRequest(
-            createdPayload(now, {
-              agentSession: agentSessionBase({
-                issueId: "issue-1",
-                issue: {
-                  id: "issue-1",
-                  title: "Fix the bug",
-                  team: { id: "team-child" },
-                  project: { id: "project-child" },
-                },
+        const response = yield* WebhookPipeline.use((service) =>
+          service.handle(
+            signedRequest(
+              createdPayload(now, {
+                agentSession: agentSessionBase({
+                  issueId: "issue-1",
+                  issue: {
+                    id: "issue-1",
+                    title: "Fix the bug",
+                    team: { id: "team-child" },
+                    project: { id: "project-child" },
+                  },
+                }),
               }),
-            }),
+            ),
           ),
         );
         expect(response.status).toBe(200);
         expect(
-          expectSome(yield* RunRepo.get(sessionId("session-1"))),
+          expectSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          ),
         ).toMatchObject({
           teamId: Option.some(teamId("team-child")),
           projectId: Option.some(projectId("project-child")),
@@ -1267,174 +1454,283 @@ describe("Linear webhook input correctness", () => {
 });
 
 describe("webhook signature invariants", () => {
-  it.prop(
-    "HMAC-SHA256 verification accepts matching bytes and rejects tampered bytes or secrets",
-    {
-      body: Schema.String.pipe(Schema.minLength(1)),
-      otherBody: Schema.String.pipe(Schema.minLength(1)),
-      secret1: Schema.String.pipe(Schema.minLength(1)),
-      secret2: Schema.String.pipe(Schema.minLength(1)),
-    },
-    ({ body, otherBody, secret1, secret2 }) => {
-      const bytes = new TextEncoder().encode(body);
-      const signature = sign(body, secret1);
-      expect(verifySignature(bytes, signature, Redacted.make(secret1))).toBe(
-        true,
-      );
-      expect(verifySignature(bytes, signature, Redacted.make(secret2))).toBe(
-        secret1 === secret2,
-      );
-      expect(
-        verifySignature(
-          new TextEncoder().encode(otherBody),
-          signature,
-          Redacted.make(secret1),
-        ),
-      ).toBe(otherBody === body);
-    },
-  );
+  it("HMAC-SHA256 verification accepts matching bytes and rejects tampered bytes or secrets", () =>
+    fc.assert(
+      fc.property(
+        fc.record({
+          body: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          otherBody: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          secret1: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          secret2: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+        }),
+        ({ body, otherBody, secret1, secret2 }) => {
+          const bytes = new TextEncoder().encode(body);
+          const signature = sign(body, secret1);
+          expect(
+            verifySignature(bytes, signature, Redacted.make(secret1)),
+          ).toBe(true);
+          expect(
+            verifySignature(bytes, signature, Redacted.make(secret2)),
+          ).toBe(secret1 === secret2);
+          expect(
+            verifySignature(
+              new TextEncoder().encode(otherBody),
+              signature,
+              Redacted.make(secret1),
+            ),
+          ).toBe(otherBody === body);
+        },
+      ),
+    ));
 
-  it.prop(
-    "AgentSessionEvent schemas preserve decoded nullable fields through encode/decode",
-    {
-      prompt: Schema.String,
-      guidance: Schema.String,
-      summary: Schema.String,
-    },
-    ({ prompt, guidance, summary }) => {
-      const raw = createdPayload(1_000, {
-        promptContext: prompt,
-        guidance: [{ body: guidance }],
-        agentSession: agentSessionBase({ summary }),
-      });
-      const decoded = Schema.decodeUnknownSync(AgentSessionEvent)(raw);
-      const encoded = Schema.encodeUnknownSync(AgentSessionEvent)(decoded);
-      expect(Schema.decodeUnknownSync(AgentSessionEvent)(encoded)).toEqual(
-        decoded,
-      );
-    },
-  );
+  it("AgentSessionEvent schemas preserve decoded nullable fields through encode/decode", () =>
+    fc.assert(
+      fc.property(
+        fc.record({
+          prompt: fc.string(),
+          guidance: fc.string(),
+          summary: fc.string(),
+        }),
+        ({ prompt, guidance, summary }) => {
+          const raw = createdPayload(1_000, {
+            promptContext: prompt,
+            guidance: [{ body: guidance }],
+            agentSession: agentSessionBase({ summary }),
+          });
+          const decoded = Schema.decodeUnknownSync(AgentSessionEvent)(raw);
+          const encoded = Schema.encodeUnknownSync(AgentSessionEvent)(decoded);
+          expect(Schema.decodeUnknownSync(AgentSessionEvent)(encoded)).toEqual(
+            decoded,
+          );
+        },
+      ),
+    ));
 });
 
 describe("webhook replay, delivery, and identity invariants", () => {
-  it.scopedLive.prop(
+  it.live(
     "replay-window boundaries accept exactly within the window and reject one millisecond outside",
-    {
-      window: Schema.Number.pipe(Schema.int(), Schema.between(1, 10_000)),
-      boundary: Schema.Literal(
-        "inside",
-        "lower",
-        "upper",
-        "too-old",
-        "too-new",
-      ),
-    },
-    ({ window, boundary }) =>
-      withWebhook(
-        Effect.gen(function* () {
-          const now = 1_000_000;
-          const timestamp =
-            boundary === "inside"
-              ? now
-              : boundary === "lower"
-                ? now - window
-                : boundary === "upper"
-                  ? now + window
-                  : boundary === "too-old"
-                    ? now - window - 1
-                    : now + window + 1;
-          const clock = Clock.make();
-          clock.unsafeCurrentTimeMillis = () => now;
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(oauthAppPayload(timestamp, { action: "created" })),
-          ).pipe(Effect.withClock(clock));
-          const accepted =
-            boundary === "inside" ||
-            boundary === "lower" ||
-            boundary === "upper";
-          expect(response.status).toBe(accepted ? 200 : 401);
-        }),
-        { ...config, webhookReplayWindowMs: window },
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          window: fc
+            .integer({ min: 1, max: 10_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 1, maximum: 10_000 }),
+                  ),
+                ),
+              ),
+            ),
+          boundary: fc.constantFrom(
+            ...["inside", "lower", "upper", "too-old", "too-new"],
+          ),
+        });
+        const check = ({
+          window,
+          boundary,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withWebhook(
+            Effect.gen(function* () {
+              const now = 1_000_000;
+              const timestamp =
+                boundary === "inside"
+                  ? now
+                  : boundary === "lower"
+                    ? now - window
+                    : boundary === "upper"
+                      ? now + window
+                      : boundary === "too-old"
+                        ? now - window - 1
+                        : now + window + 1;
+              const liveClock = yield* Clock.Clock;
+              const clock = {
+                currentTimeNanosUnsafe:
+                  liveClock.currentTimeNanosUnsafe.bind(liveClock),
+                currentTimeNanos: liveClock.currentTimeNanos,
+                monotonicTimeNanosUnsafe:
+                  liveClock.monotonicTimeNanosUnsafe.bind(liveClock),
+                monotonicTimeNanos: liveClock.monotonicTimeNanos,
+                sleep: liveClock.sleep.bind(liveClock),
+                currentTimeMillisUnsafe: () => now,
+                currentTimeMillis: Effect.succeed(now),
+              };
+              const response = yield* WebhookPipeline.use((service) =>
+                service.handle(
+                  signedRequest(
+                    oauthAppPayload(timestamp, { action: "created" }),
+                  ),
+                ),
+              ).pipe(Effect.provideService(Clock.Clock, clock));
+              const accepted =
+                boundary === "inside" ||
+                boundary === "lower" ||
+                boundary === "upper";
+              expect(response.status).toBe(accepted ? 200 : 401);
+            }),
+            { ...config, webhookReplayWindowMs: window },
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 
-  it.scopedLive.prop(
+  it.live(
     "a repeated delivery id is idempotent after durable processing",
-    { delivery: Schema.String.pipe(Schema.minLength(1)) },
-    ({ delivery }) =>
-      withWebhook(
-        Effect.gen(function* () {
-          const now = yield* currentTime;
-          yield* install();
-          const payload = createdPayload(now);
-          const first = yield* WebhookPipeline.handle(
-            signedRequest(payload, { delivery }),
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          delivery: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+        });
+        const check = ({
+          delivery,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withWebhook(
+            Effect.gen(function* () {
+              const now = yield* currentTime;
+              yield* install();
+              const payload = createdPayload(now);
+              const first = yield* WebhookPipeline.use((service) =>
+                service.handle(signedRequest(payload, { delivery })),
+              );
+              const second = yield* WebhookPipeline.use((service) =>
+                service.handle(signedRequest(payload, { delivery })),
+              );
+              expect(first.status).toBe(200);
+              expect(second.status).toBe(200);
+              expect(yield* Effect.promise(() => second.text())).toBe(
+                "Duplicate delivery",
+              );
+              expect(
+                yield* RunInputRepo.use((service) =>
+                  service.pending(sessionId("session-1")),
+                ),
+              ).toHaveLength(1);
+            }),
           );
-          const second = yield* WebhookPipeline.handle(
-            signedRequest(payload, { delivery }),
-          );
-          expect(first.status).toBe(200);
-          expect(second.status).toBe(200);
-          expect(yield* Effect.promise(() => second.text())).toBe(
-            "Duplicate delivery",
-          );
-          expect(
-            yield* RunInputRepo.pending(sessionId("session-1")),
-          ).toHaveLength(1);
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 
-  it.scopedLive.prop(
+  it.live(
     "all generated AgentSession installation identity mismatch forms are rejected",
-    {
-      mismatch: Schema.Literal(
-        "organization",
-        "embedded-app-user",
-        "installation-app-user",
-      ),
-    },
-    ({ mismatch }) =>
-      withWebhook(
-        Effect.gen(function* () {
-          const now = yield* currentTime;
-          const payload =
-            mismatch === "organization"
-              ? createdPayload(now, {
-                  organizationId: "org-2",
-                  agentSession: agentSessionBase({ organizationId: "org" }),
-                })
-              : mismatch === "embedded-app-user"
-                ? createdPayload(now, {
-                    appUserId: "other-user",
-                    agentSession: agentSessionBase({ appUserId: "app-user" }),
-                  })
-                : createdPayload(now, {
-                    appUserId: "other-user",
-                    agentSession: agentSessionBase({ appUserId: "other-user" }),
-                  });
-          if (mismatch === "organization") {
-            yield* install({ organizationId: organizationId("org-2") });
-          } else {
-            yield* install();
-          }
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(payload),
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          mismatch: fc.constantFrom(
+            ...["organization", "embedded-app-user", "installation-app-user"],
+          ),
+        });
+        const check = ({
+          mismatch,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withWebhook(
+            Effect.gen(function* () {
+              const now = yield* currentTime;
+              const payload =
+                mismatch === "organization"
+                  ? createdPayload(now, {
+                      organizationId: "org-2",
+                      agentSession: agentSessionBase({ organizationId: "org" }),
+                    })
+                  : mismatch === "embedded-app-user"
+                    ? createdPayload(now, {
+                        appUserId: "other-user",
+                        agentSession: agentSessionBase({
+                          appUserId: "app-user",
+                        }),
+                      })
+                    : createdPayload(now, {
+                        appUserId: "other-user",
+                        agentSession: agentSessionBase({
+                          appUserId: "other-user",
+                        }),
+                      });
+              if (mismatch === "organization") {
+                yield* install({ organizationId: organizationId("org-2") });
+              } else {
+                yield* install();
+              }
+              const response = yield* WebhookPipeline.use((service) =>
+                service.handle(signedRequest(payload)),
+              );
+              expect(response.status).toBe(401);
+              expect(
+                yield* RunRepo.use((service) =>
+                  service.get(sessionId("session-1")),
+                ),
+              ).toEqual(Option.none());
+            }),
           );
-          expect(response.status).toBe(401);
-          expect(yield* RunRepo.get(sessionId("session-1"))).toEqual(
-            Option.none(),
-          );
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 });
 
 describe("webhook admission security", () => {
-  it.scopedLive(
+  it.live(
     "rejects a signed unadmitted org before delivery/run persistence",
     () =>
       withWebhook(
@@ -1444,36 +1740,46 @@ describe("webhook admission security", () => {
           const req = signedRequest(createdPayload(now), {
             delivery: "denied-delivery",
           });
-          const response = yield* WebhookPipeline.handle(req);
-          expect(response.status).toBe(403);
-          expect(yield* RunRepo.get(sessionId("session-1"))).toEqual(
-            Option.none(),
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(req),
           );
+          expect(response.status).toBe(403);
           expect(
-            yield* RunInputRepo.pending(sessionId("session-1")),
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          ).toEqual(Option.none());
+          expect(
+            yield* RunInputRepo.use((service) =>
+              service.pending(sessionId("session-1")),
+            ),
           ).toHaveLength(0);
           expect(
-            yield* DeliveryRepo.claim({
-              id: "denied-delivery" as import("../src/domain/ids.js").DeliveryId,
-              organizationId: "org",
-              payloadHash: "different",
-              payload: {},
-            }),
+            yield* DeliveryRepo.use((service) =>
+              service.claim({
+                id: "denied-delivery" as import("../src/domain/ids.js").DeliveryId,
+                organizationId: "org",
+                payloadHash: "different",
+                payload: {},
+              }),
+            ),
           ).toBe("claimed");
         }),
         { ...config, allowedOrganizationIds: new Set(["other-org"]) },
       ),
   );
-  it.scopedLive(
+  it.live(
     "caps webhook bodies before HMAC verification even without Content-Length",
     () =>
       withWebhook(
         Effect.gen(function* () {
-          const response = yield* WebhookPipeline.handle(
-            new Request("https://gateway.example/webhooks/linear", {
-              method: "POST",
-              body: "x".repeat(1024 * 1024 + 1),
-            }),
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(
+              new Request("https://gateway.example/webhooks/linear", {
+                method: "POST",
+                body: "x".repeat(1024 * 1024 + 1),
+              }),
+            ),
           );
           expect(response.status).toBe(413);
         }),
@@ -1482,47 +1788,49 @@ describe("webhook admission security", () => {
 });
 
 describe("Interrupted webhook delivery recovery", () => {
-  it.scopedLive(
-    "reclaims a delivery when its processing fiber was interrupted",
-    () =>
-      withWebhook(
-        Effect.gen(function* () {
-          yield* install();
-          const installationRepo = yield* InstallationRepo;
-          const pipeline = yield* WebhookPipeline;
-          const entered = yield* Deferred.make<void>();
-          const spy = vi
-            .spyOn(installationRepo, "get")
-            .mockImplementation(() =>
-              Deferred.succeed(entered, undefined).pipe(
-                Effect.zipRight(Effect.never),
-              ),
-            );
-          const now = yield* Clock.currentTimeMillis;
-          const payload = createdPayload(now);
-          const fiber = yield* Effect.fork(
-            pipeline.handle(
-              signedRequest(payload, { delivery: "interrupted-webhook" }),
+  it.live("reclaims a delivery when its processing fiber was interrupted", () =>
+    withWebhook(
+      Effect.gen(function* () {
+        yield* install();
+        const installationRepo = yield* InstallationRepo;
+        const pipeline = yield* WebhookPipeline;
+        const entered = yield* Deferred.make<void>();
+        const spy = vi
+          .spyOn(installationRepo, "get")
+          .mockImplementation(() =>
+            Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Effect.never),
             ),
           );
-          yield* Deferred.await(entered);
-          yield* Fiber.interrupt(fiber);
-          spy.mockRestore();
-          const response = yield* pipeline.handle(
+        const now = yield* Clock.currentTimeMillis;
+        const payload = createdPayload(now);
+        const fiber = yield* Effect.forkChild(
+          pipeline.handle(
             signedRequest(payload, { delivery: "interrupted-webhook" }),
-          );
-          expect(response.status).toBe(200);
-          expect(yield* Effect.promise(() => response.text())).toBe("OK");
-          expect(
-            Option.isSome(yield* RunRepo.get(sessionId("session-1"))),
-          ).toBe(true);
-        }),
-      ),
+          ),
+        );
+        yield* Deferred.await(entered);
+        yield* Fiber.interrupt(fiber);
+        spy.mockRestore();
+        const response = yield* pipeline.handle(
+          signedRequest(payload, { delivery: "interrupted-webhook" }),
+        );
+        expect(response.status).toBe(200);
+        expect(yield* Effect.promise(() => response.text())).toBe("OK");
+        expect(
+          Option.isSome(
+            yield* RunRepo.use((service) =>
+              service.get(sessionId("session-1")),
+            ),
+          ),
+        ).toBe(true);
+      }),
+    ),
   );
 });
 
 describe("Webhook cleanup write failures", () => {
-  it.scopedLive(
+  it.live(
     "logs failed cleanup and retries it on redelivery without a restart",
     () =>
       withWebhook(
@@ -1536,7 +1844,7 @@ describe("Webhook cleanup write failures", () => {
             .spyOn(installations, "get")
             .mockImplementation(() =>
               Deferred.succeed(entered, undefined).pipe(
-                Effect.zipRight(Effect.never),
+                Effect.andThen(Effect.never),
               ),
             );
           const mark = vi
@@ -1549,14 +1857,12 @@ describe("Webhook cleanup write failures", () => {
             messages.push(String(options.message));
           });
           const payload = createdPayload(yield* Clock.currentTimeMillis);
-          const processing = yield* Effect.fork(
+          const processing = yield* Effect.forkChild(
             pipeline
               .handle(
                 signedRequest(payload, { delivery: "cleanup-write-failure" }),
               )
-              .pipe(
-                Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
-              ),
+              .pipe(Effect.provide(Logger.layer([logger]))),
           );
           yield* Deferred.await(entered);
           yield* Fiber.interrupt(processing);
@@ -1574,7 +1880,11 @@ describe("Webhook cleanup write failures", () => {
           expect(retried.status).toBe(200);
           expect(yield* Effect.promise(() => retried.text())).toBe("OK");
           expect(
-            Option.isSome(yield* RunRepo.get(sessionId("session-1"))),
+            Option.isSome(
+              yield* RunRepo.use((service) =>
+                service.get(sessionId("session-1")),
+              ),
+            ),
           ).toBe(true);
         }),
       ),
@@ -1582,7 +1892,7 @@ describe("Webhook cleanup write failures", () => {
 });
 
 describe("Webhook claim-owned failure marking", () => {
-  it.scopedLive.each(["identity", "payload"] as const)(
+  it.live.each(["identity", "payload"] as const)(
     "persists a safe reason for a post-claim %s failure",
     (kind) =>
       withWebhook(
@@ -1598,8 +1908,8 @@ describe("Webhook claim-owned failure marking", () => {
             kind === "identity"
               ? { ...original, oauthClientId: "untrusted-client-value" }
               : { ...original, agentSession: "untrusted-session-value" };
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(payload),
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(signedRequest(payload)),
           );
           expect(response.status).toBe(kind === "identity" ? 401 : 400);
           expect(mark).toHaveBeenCalledTimes(1);
@@ -1613,7 +1923,7 @@ describe("Webhook claim-owned failure marking", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "does not overwrite a reclaimed delivery after a tagged processing failure",
     () =>
       withWebhook(
@@ -1670,7 +1980,7 @@ describe("Webhook claim-owned failure marking", () => {
       ),
   );
 
-  it.scopedLive("does not mark a delivery when the claim itself fails", () =>
+  it.live("does not mark a delivery when the claim itself fails", () =>
     withWebhook(
       Effect.gen(function* () {
         yield* install();
@@ -1683,8 +1993,8 @@ describe("Webhook claim-owned failure marking", () => {
         const mark = vi.spyOn(deliveries, "mark");
         yield* Effect.gen(function* () {
           const payload = createdPayload(yield* Clock.currentTimeMillis);
-          const response = yield* WebhookPipeline.handle(
-            signedRequest(payload),
+          const response = yield* WebhookPipeline.use((service) =>
+            service.handle(signedRequest(payload)),
           );
           expect(response.status).toBe(500);
           expect(mark).not.toHaveBeenCalled();

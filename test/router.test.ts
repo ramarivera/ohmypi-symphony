@@ -1,4 +1,3 @@
-import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { describe, expect, it } from "@effect/vitest";
 import {
   Clock,
@@ -11,6 +10,8 @@ import {
   Redacted,
   Schema,
 } from "effect";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
+import * as fc from "fast-check";
 import { OAuthStateError } from "../src/domain/errors.js";
 import { AppUserId, OrganizationId, type TeamId } from "../src/domain/ids.js";
 import {
@@ -18,7 +19,7 @@ import {
   mcpOauthCallback,
   oauthCallback,
   oauthStart,
-  router,
+  routes,
   safeReturnTo,
   webhook,
 } from "../src/http/router.js";
@@ -29,8 +30,6 @@ import { Reconciler } from "../src/services/reconciler.js";
 import { AdminSessionRepo } from "../src/services/store/repositories.js";
 import { WebhookPipeline } from "../src/services/webhook.js";
 import { testPaths } from "./fixtures/paths.js";
-
-const routes = [...router.routes];
 
 function route(method: string, path: string) {
   return routes.find(
@@ -62,16 +61,14 @@ describe("HTTP router parity", () => {
 
   it("delegates non-POST webhook methods so the pipeline owns 405 behavior", async () => {
     const methods: string[] = [];
-    const pipeline: WebhookPipeline = {
-      _tag: "WebhookPipeline",
+    const pipeline: WebhookPipeline["Service"] = {
       handle: (incoming: Request) =>
         Effect.sync(() => {
           methods.push(incoming.method);
           return new Response("Method not allowed", { status: 405 });
         }),
     };
-    const reconciler: Reconciler = {
-      _tag: "Reconciler",
+    const reconciler: Reconciler["Service"] = {
       tick: () => Effect.succeed(undefined),
       catchup: () => Effect.void,
       trigger: () => Effect.void,
@@ -101,13 +98,11 @@ describe("HTTP router parity", () => {
 
   it("enqueues reconciliation without delaying a successful webhook response", async () => {
     let triggerCalls = 0;
-    const pipeline: WebhookPipeline = {
-      _tag: "WebhookPipeline",
+    const pipeline: WebhookPipeline["Service"] = {
       handle: (_incoming: Request) =>
         Effect.succeed(new Response(null, { status: 204 })),
     };
-    const reconciler: Reconciler = {
-      _tag: "Reconciler",
+    const reconciler: Reconciler["Service"] = {
       tick: () => Effect.void,
       catchup: () => Effect.void,
       trigger: () =>
@@ -138,46 +133,71 @@ describe("HTTP router parity", () => {
     expect(triggerCalls).toBe(1);
   });
 
-  it.effect.prop(
+  it.effect(
     "triggers reconciliation exactly for generated successful webhook statuses",
-    { status: Schema.Number.pipe(Schema.int(), Schema.between(200, 599)) },
-    ({ status }) => {
-      let triggerCalls = 0;
-      const pipeline: WebhookPipeline = {
-        _tag: "WebhookPipeline",
-        handle: () => Effect.succeed(new Response(null, { status })),
-      };
-      const reconciler: Reconciler = {
-        _tag: "Reconciler",
-        tick: () => Effect.void,
-        catchup: () => Effect.void,
-        trigger: () =>
-          Effect.sync(() => {
-            triggerCalls += 1;
-          }),
-        awaitTrigger: () => Effect.never,
-        status: () =>
-          Effect.succeed({
-            running: false,
-            lastStartedAt: Option.none(),
-            lastCompletedAt: Option.none(),
-            lastError: Option.none(),
-          }),
-      };
-      return Effect.gen(function* () {
-        const response = yield* webhook;
-        expect(response.status).toBe(status);
-        expect(triggerCalls).toBe(status >= 200 && status < 300 ? 1 : 0);
-      }).pipe(
-        Effect.provideService(
-          HttpServerRequest.HttpServerRequest,
-          request("POST", "/webhooks/linear"),
-        ),
-        Effect.provideService(WebhookPipeline, pipeline),
-        Effect.provideService(Reconciler, reconciler),
-      );
-    },
-    { fastCheck: { numRuns: 20 } },
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          status: fc
+            .integer({ min: 200, max: 599 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 200, maximum: 599 }),
+                  ),
+                ),
+              ),
+            ),
+        });
+        const check = ({
+          status,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) => {
+          let triggerCalls = 0;
+          const pipeline: WebhookPipeline["Service"] = {
+            handle: () => Effect.succeed(new Response(null, { status })),
+          };
+          const reconciler: Reconciler["Service"] = {
+            tick: () => Effect.void,
+            catchup: () => Effect.void,
+            trigger: () =>
+              Effect.sync(() => {
+                triggerCalls += 1;
+              }),
+            awaitTrigger: () => Effect.never,
+            status: () =>
+              Effect.succeed({
+                running: false,
+                lastStartedAt: Option.none(),
+                lastCompletedAt: Option.none(),
+                lastError: Option.none(),
+              }),
+          };
+          return Effect.gen(function* () {
+            const response = yield* webhook;
+            expect(response.status).toBe(status);
+            expect(triggerCalls).toBe(status >= 200 && status < 300 ? 1 : 0);
+          }).pipe(
+            Effect.provideService(
+              HttpServerRequest.HttpServerRequest,
+              request("POST", "/webhooks/linear"),
+            ),
+            Effect.provideService(WebhookPipeline, pipeline),
+            Effect.provideService(Reconciler, reconciler),
+          );
+        };
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
   );
 
   it("adds legacy security headers and structured lifecycle logging to OAuth start", async () => {
@@ -189,8 +209,7 @@ describe("HTTP router parity", () => {
           : String(message),
       );
     });
-    const oauth: OAuth = {
-      _tag: "OAuth",
+    const oauth: OAuth["Service"] = {
       startAuthorization: () =>
         Effect.succeed({
           state: "test-state",
@@ -207,26 +226,31 @@ describe("HTTP router parity", () => {
         ),
         Effect.provideService(OAuth, oauth),
         Effect.provide(
-          GatewayConfig.Default.pipe(
-            Layer.provide(
-              Layer.setConfigProvider(
-                ConfigProvider.fromMap(
-                  new Map([
-                    ["LINEAR_CLIENT_ID", "test"],
-                    ["LINEAR_CLIENT_SECRET", "test"],
-                    ["LINEAR_WEBHOOK_SECRET", "test"],
-                    [
-                      "TOKEN_ENCRYPTION_KEY",
-                      Buffer.alloc(32).toString("base64"),
-                    ],
-                    ["PUBLIC_URL", "http://localhost:3000"],
-                  ]),
+          Layer.mergeAll(
+            Logger.layer([logger]),
+            GatewayConfig.layer.pipe(
+              Layer.provide(
+                ConfigProvider.layer(
+                  ConfigProvider.fromUnknown(
+                    Object.fromEntries(
+                      new Map([
+                        ["LINEAR_CLIENT_ID", "test"],
+                        ["LINEAR_CLIENT_SECRET", "test"],
+                        ["LINEAR_WEBHOOK_SECRET", "test"],
+                        [
+                          "TOKEN_ENCRYPTION_KEY",
+                          Buffer.alloc(32).toString("base64"),
+                        ],
+                        ["PUBLIC_URL", "http://localhost:3000"],
+                      ]),
+                    ),
+                    { preserveEmptyStrings: true },
+                  ),
                 ),
               ),
             ),
           ),
         ),
-        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
       ),
     );
 
@@ -260,8 +284,7 @@ describe("HTTP router parity", () => {
           : String(message),
       );
     });
-    const oauth: OAuth = {
-      _tag: "OAuth",
+    const oauth: OAuth["Service"] = {
       startAuthorization: () =>
         Effect.succeed({
           state: "test-state",
@@ -285,8 +308,7 @@ describe("HTTP router parity", () => {
           canAccessAllPublicTeams: Option.none(),
         }),
     };
-    const config: GatewayConfig = {
-      _tag: "GatewayConfig",
+    const config: GatewayConfig["Service"] = {
       githubAppId: undefined,
       githubAppPrivateKey: undefined,
       linearClientId: "client",
@@ -312,8 +334,7 @@ describe("HTTP router parity", () => {
       webhookReplayWindowMs: 60_000,
       repositorySuggestionConfidenceThreshold: 0.8,
     };
-    const adminSessionRepo: AdminSessionRepo = {
-      _tag: "AdminSessionRepo",
+    const adminSessionRepo: AdminSessionRepo["Service"] = {
       create: (_input) => Effect.void,
       get: (_tokenHash, _now) => Effect.succeed(Option.none()),
       deleteAdminSession: (_tokenHash) => Effect.succeed(false),
@@ -327,7 +348,7 @@ describe("HTTP router parity", () => {
         Effect.provideService(OAuth, oauth),
         Effect.provideService(GatewayConfig, config),
         Effect.provideService(AdminSessionRepo, adminSessionRepo),
-        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+        Effect.provide(Logger.layer([logger])),
       ),
     );
     const webResponse = HttpServerResponse.toWeb(response);
@@ -356,8 +377,7 @@ describe("HTTP router parity", () => {
           : String(message),
       );
     });
-    const oauth: OAuth = {
-      _tag: "OAuth",
+    const oauth: OAuth["Service"] = {
       startAuthorization: () =>
         Effect.succeed({
           state: "test-state",
@@ -374,7 +394,6 @@ describe("HTTP router parity", () => {
         ),
         Effect.provideService(OAuth, oauth),
         Effect.provideService(GatewayConfig, {
-          _tag: "GatewayConfig",
           githubAppId: undefined,
           githubAppPrivateKey: undefined,
           linearClientId: "client",
@@ -401,12 +420,11 @@ describe("HTTP router parity", () => {
           repositorySuggestionConfidenceThreshold: 0.8,
         }),
         Effect.provideService(AdminSessionRepo, {
-          _tag: "AdminSessionRepo",
           create: (_input) => Effect.void,
           get: (_tokenHash, _now) => Effect.succeed(Option.none()),
           deleteAdminSession: (_tokenHash) => Effect.succeed(false),
         }),
-        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+        Effect.provide(Logger.layer([logger])),
       ),
     );
 
@@ -416,8 +434,7 @@ describe("HTTP router parity", () => {
     );
   });
   it("preserves the configured deployment prefix after MCP OAuth callback", async () => {
-    const config: GatewayConfig = {
-      _tag: "GatewayConfig",
+    const config: GatewayConfig["Service"] = {
       githubAppId: undefined,
       githubAppPrivateKey: undefined,
       linearClientId: "client",
@@ -444,11 +461,9 @@ describe("HTTP router parity", () => {
       repositorySuggestionConfidenceThreshold: 0.8,
     };
     const mcpOAuth = {
-      _tag: "McpOAuth",
       completeMcpAuthorization: () => Effect.succeed(undefined),
-    } as unknown as McpOAuth;
-    const adminSessionRepo: AdminSessionRepo = {
-      _tag: "AdminSessionRepo",
+    } as unknown as McpOAuth["Service"];
+    const adminSessionRepo: AdminSessionRepo["Service"] = {
       create: (_input) => Effect.void,
       get: (_tokenHash, _now) =>
         Effect.succeed(
@@ -523,7 +538,7 @@ describe("Health reports reconciler liveness", () => {
   ])("returns $expected for running=$running completion age=$age", (testCase) =>
     Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis;
-      const reconciler = Reconciler.make({
+      const reconciler = Reconciler.of({
         tick: () => Effect.void,
         catchup: () => Effect.void,
         trigger: () => Effect.void,
@@ -540,7 +555,7 @@ describe("Health reports reconciler liveness", () => {
               testCase.progressAge === undefined
                 ? Option.none()
                 : Option.some(now - testCase.progressAge),
-            lastError: Option.fromNullable(testCase.error),
+            lastError: Option.fromNullishOr(testCase.error),
           }),
       });
       const response = yield* health.pipe(

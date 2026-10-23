@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, realpath, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { Deferred, Effect, Option } from "effect";
+import { Context, Deferred, Effect, Layer, Option, Semaphore } from "effect";
 import {
   type DatabaseError,
   NixEnvironmentError,
@@ -209,10 +209,10 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
         NixEnvironmentError | DatabaseError | RowDecodeError
       >
     >();
-    const inflightMutex = yield* Effect.makeSemaphore(1);
+    const inflightMutex = yield* Semaphore.make(1);
     // Builds share the lock; pruning and GC acquire every permit exclusively.
     const cachePermits = Number.MAX_SAFE_INTEGER;
-    const cacheMutex = yield* Effect.makeSemaphore(cachePermits);
+    const cacheMutex = yield* Semaphore.make(cachePermits);
 
     const rootFor = Effect.fn("NixEnvironment.rootFor")(function* (
       cacheKey: string,
@@ -300,12 +300,14 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
         catch: (cause) =>
           failure("process_failed", "Nix build could not be started", cause),
       }).pipe(
-        Effect.timeoutFail({
+        Effect.timeoutOrElse({
           duration: input.timeoutMs ?? 600_000,
-          onTimeout: () =>
-            failure(
-              "process_failed",
-              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+          orElse: () =>
+            Effect.fail(
+              failure(
+                "process_failed",
+                `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+              ),
             ),
         }),
       );
@@ -353,12 +355,14 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
             cause,
           ),
       }).pipe(
-        Effect.timeoutFail({
+        Effect.timeoutOrElse({
           duration: input.timeoutMs ?? 600_000,
-          onTimeout: () =>
-            failure(
-              "process_failed",
-              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+          orElse: () =>
+            Effect.fail(
+              failure(
+                "process_failed",
+                `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+              ),
             ),
         }),
       );
@@ -432,7 +436,7 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
         }),
       );
       if (claim.leader) {
-        yield* Effect.forkDaemon(
+        yield* Effect.forkDetach(
           Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
               const completed = yield* Effect.exit(
@@ -440,12 +444,14 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
                   cacheMutex.withPermits(1)(prepareFresh(cacheKey, packages)),
                 ),
               );
-              yield* Deferred.done(claim.deferred, completed);
               yield* inflightMutex.withPermits(1)(
                 Effect.sync(() => {
                   inflight.delete(cacheKey);
                 }),
               );
+              // v4 resumes Deferred waiters inline. Clear the flight first so
+              // a caller retrying the failure cannot rejoin the completed flight.
+              yield* Deferred.done(claim.deferred, completed);
             }),
           ),
         );
@@ -477,12 +483,14 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
             cause,
           ),
       }).pipe(
-        Effect.timeoutFail({
+        Effect.timeoutOrElse({
           duration: input.timeoutMs ?? 600_000,
-          onTimeout: () =>
-            failure(
-              "process_failed",
-              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+          orElse: () =>
+            Effect.fail(
+              failure(
+                "process_failed",
+                `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+              ),
             ),
         }),
       );
@@ -536,12 +544,14 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
             cause,
           ),
       }).pipe(
-        Effect.timeoutFail({
+        Effect.timeoutOrElse({
           duration: input.timeoutMs ?? 600_000,
-          onTimeout: () =>
-            failure(
-              "process_failed",
-              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+          orElse: () =>
+            Effect.fail(
+              failure(
+                "process_failed",
+                `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+              ),
             ),
         }),
       );
@@ -698,12 +708,10 @@ export const protectedNixCacheKeys = (
     return protectedKeys;
   });
 
-export class NixEnvironment extends Effect.Service<NixEnvironment>()(
+export class NixEnvironment extends Context.Service<NixEnvironment>()(
   "NixEnvironment",
   {
-    accessors: true,
-    dependencies: [GatewayConfig.Default, NixCacheRepo.Default],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const config = yield* GatewayConfig;
       const repo = yield* NixCacheRepo;
       const { db } = yield* SqliteClient;
@@ -723,4 +731,9 @@ export class NixEnvironment extends Effect.Service<NixEnvironment>()(
       });
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([GatewayConfig.layer, NixCacheRepo.layer]),
+  );
+}

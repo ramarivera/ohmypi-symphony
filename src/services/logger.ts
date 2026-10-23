@@ -3,14 +3,11 @@ import {
   Cause,
   Context,
   Effect,
-  FiberRef,
-  FiberRefs,
-  HashMap,
   Layer,
-  List,
   Logger,
   LogLevel,
   Option,
+  References,
 } from "effect";
 import * as Tracer from "effect/Tracer";
 import pino from "pino";
@@ -123,49 +120,49 @@ export const buildPinoLoggerPlan = ({
 export const makePinoEffectLogger = (
   logger: pino.Logger,
 ): Logger.Logger<unknown, void> =>
-  Logger.make(({ logLevel, message, annotations, spans, cause, context }) => {
-    const fields: Record<string, unknown> = Object.fromEntries(
-      HashMap.entries(annotations),
-    );
-    const spanLabels = List.toArray(spans).map((span) => span.label);
+  Logger.make(({ logLevel, message, cause, fiber }) => {
+    const fields: Record<string, unknown> = {
+      ...fiber.getRef(References.CurrentLogAnnotations),
+    };
+    const spanLabels = fiber
+      .getRef(References.CurrentLogSpans)
+      .map(([label]) => label);
     if (spanLabels.length > 0) fields.spans = spanLabels;
-    const parentSpan = Context.getOption(
-      FiberRefs.getOrDefault(context, FiberRef.currentContext),
-      Tracer.ParentSpan,
-    );
+    const parentSpan = Context.getOption(fiber.context, Tracer.ParentSpan);
     if (Option.isSome(parentSpan)) {
       fields.trace_id = parentSpan.value.traceId;
       fields.span_id = parentSpan.value.spanId;
       if (parentSpan.value._tag === "Span")
         fields.span_name = parentSpan.value.name;
     } else fields.uncorrelated = true;
-    if (cause !== undefined && !Cause.isEmpty(cause))
+    if (cause !== undefined && cause.reasons.length > 0)
       fields.cause = Cause.pretty(cause);
     const text = Array.isArray(message)
       ? message.map(String).join(" ")
       : String(message);
-    if (LogLevel.greaterThanEqual(logLevel, LogLevel.Fatal))
+    if (LogLevel.isGreaterThanOrEqualTo(logLevel, "Fatal"))
       logger.fatal(fields, text);
-    else if (LogLevel.greaterThanEqual(logLevel, LogLevel.Error))
+    else if (LogLevel.isGreaterThanOrEqualTo(logLevel, "Error"))
       logger.error(fields, text);
-    else if (LogLevel.greaterThanEqual(logLevel, LogLevel.Warning))
+    else if (LogLevel.isGreaterThanOrEqualTo(logLevel, "Warn"))
       logger.warn(fields, text);
-    else if (LogLevel.greaterThanEqual(logLevel, LogLevel.Info))
+    else if (LogLevel.isGreaterThanOrEqualTo(logLevel, "Info"))
       logger.info(fields, text);
-    else if (LogLevel.greaterThanEqual(logLevel, LogLevel.Debug))
+    else if (LogLevel.isGreaterThanOrEqualTo(logLevel, "Debug"))
       logger.debug(fields, text);
     else logger.trace(fields, text);
   });
 
 export interface ManagedPinoTransport {
+  readonly ready?: boolean;
   readonly flushSync: () => void;
   readonly end: () => void;
   readonly once: {
-    (event: "close", listener: () => void): unknown;
+    (event: "close" | "ready", listener: () => void): unknown;
     (event: "error", listener: (error: Error) => void): unknown;
   };
   readonly off: {
-    (event: "close", listener: () => void): unknown;
+    (event: "close" | "ready", listener: () => void): unknown;
     (event: "error", listener: (error: Error) => void): unknown;
   };
 }
@@ -173,9 +170,10 @@ export interface ManagedPinoTransport {
 export const closePinoTransport = (
   transport: ManagedPinoTransport,
 ): Effect.Effect<void> =>
-  Effect.async<void>((resume) => {
+  Effect.callback<void>((resume) => {
     let completed = false;
     const cleanup = () => {
+      transport.off("ready", flushAndEnd);
       transport.off("close", onClose);
       transport.off("error", onError);
     };
@@ -188,24 +186,28 @@ export const closePinoTransport = (
     const onClose = () => complete(Effect.void);
     const onError = (error: Error) => complete(Effect.die(error));
 
+    const flushAndEnd = () => {
+      try {
+        transport.flushSync();
+        transport.end();
+      } catch (error) {
+        onError(error instanceof Error ? error : new Error(String(error)));
+      }
+    };
     transport.once("close", onClose);
     transport.once("error", onError);
-    try {
-      transport.flushSync();
-      transport.end();
-    } catch (error) {
-      onError(error instanceof Error ? error : new Error(String(error)));
-    }
+    // v4 can finalize before Bun has delivered the worker's ready event.
+    // flushSync would block that event loop while waiting for the worker.
+    if (transport.ready === false) transport.once("ready", flushAndEnd);
+    else flushAndEnd();
 
     return Effect.sync(cleanup);
   });
 
-export class GatewayLogger extends Effect.Service<GatewayLogger>()(
+export class GatewayLogger extends Context.Service<GatewayLogger>()(
   "GatewayLogger",
   {
-    accessors: true,
-    dependencies: [GatewayConfig.Default],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const config = yield* GatewayConfig;
       const plan = buildPinoLoggerPlan(config);
       const resource = yield* Effect.acquireRelease(
@@ -224,14 +226,15 @@ export class GatewayLogger extends Effect.Service<GatewayLogger>()(
       return { logger: resource.logger };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([GatewayConfig.layer]),
+  );
+}
 
-export const PinoLoggerLive = Layer.unwrapEffect(
+export const PinoLoggerLive = Layer.unwrap(
   Effect.map(GatewayLogger, ({ logger }) =>
-    Layer.mergeAll(
-      Logger.remove(Logger.defaultLogger),
-      Logger.remove(Logger.prettyLoggerDefault),
-      Logger.add(makePinoEffectLogger(logger)),
-    ),
+    Logger.layer([makePinoEffectLogger(logger)]),
   ),
 );

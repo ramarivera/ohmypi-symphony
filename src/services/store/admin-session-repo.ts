@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import type { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import { OrganizationId } from "../../domain/ids.js";
 import { decodeRow, runChanges, SqliteClient, tryDb } from "./sqlite-client.js";
@@ -13,11 +13,10 @@ const AdminSessionRow = Schema.Struct({
 
 type AdminSessionRow = Schema.Schema.Type<typeof AdminSessionRow>;
 
-export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
+export class AdminSessionRepo extends Context.Service<AdminSessionRepo>()(
   "AdminSessionRepo",
   {
-    accessors: true,
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
       const create = Effect.fn("AdminSessionRepo.create")(function* (input: {
@@ -101,4 +100,7 @@ export class AdminSessionRepo extends Effect.Service<AdminSessionRepo>()(
       return { create, get, deleteAdminSession };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies;
+}

@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type {
   OrganizationId,
@@ -210,11 +210,10 @@ const parseStringArray = (
     return value;
   });
 
-export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
+export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
   "WorkspaceRepo",
   {
-    accessors: true,
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
       const setWorkspace = Effect.fn("WorkspaceRepo.setWorkspace")(
@@ -549,4 +548,7 @@ export class WorkspaceRepo extends Effect.Service<WorkspaceRepo>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies;
+}

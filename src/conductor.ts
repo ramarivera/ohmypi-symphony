@@ -1,7 +1,7 @@
-import { HttpServer } from "@effect/platform";
 import { BunHttpServer } from "@effect/platform-bun";
 import { Effect, Layer, Schedule } from "effect";
-import { router } from "./http/router.js";
+import { HttpRouter } from "effect/http";
+import { RouterLive } from "./http/router.js";
 import { Admin } from "./services/admin.js";
 import { GatewayConfig } from "./services/config.js";
 import { Executor } from "./services/executor.js";
@@ -34,7 +34,7 @@ import { TokenCrypto } from "./services/token-crypto.js";
 import { WebhookPipeline } from "./services/webhook.js";
 import { Workspace } from "./services/workspace.js";
 
-const sqliteClientLayer = Layer.unwrapEffect(
+const sqliteClientLayer = Layer.unwrap(
   Effect.gen(function* () {
     const { databasePath } = yield* GatewayConfig;
     return SqliteClientLive(databasePath);
@@ -42,64 +42,66 @@ const sqliteClientLayer = Layer.unwrapEffect(
 );
 
 export const GatewayServicesLive = Layer.mergeAll(
-  TokenCrypto.Default,
-  AdminSessionRepo.Default,
-  InstallationRepo.Default,
-  DeliveryRepo.Default,
-  RunRepo.Default,
-  RunInputRepo.Default,
-  RunEventRepo.Default,
-  ProjectionRepo.Default,
-  WorkspaceRepo.Default,
-  PromptTemplateRepo.Default,
-  ExecutorInstanceRepo.Default,
-  Executor.Default,
-  McpServerRepo.Default,
-  LinearGateway.Default,
-  WebhookPipeline.Default,
-  ActivityProjector.Default,
-  SessionAuthority.Default,
-  NixEnvironment.Default,
-  RpcWorker.Default,
-  GitHubApp.Default,
-  OAuth.Default,
-  McpOAuth.Default,
-  Reconciler.Default,
-  Retention.Default,
-  Workspace.Default,
-  Admin.Default,
+  TokenCrypto.layer,
+  AdminSessionRepo.layer,
+  InstallationRepo.layer,
+  DeliveryRepo.layer,
+  RunRepo.layer,
+  RunInputRepo.layer,
+  RunEventRepo.layer,
+  ProjectionRepo.layer,
+  WorkspaceRepo.layer,
+  PromptTemplateRepo.layer,
+  ExecutorInstanceRepo.layer,
+  Executor.layer,
+  McpServerRepo.layer,
+  LinearGateway.layer,
+  WebhookPipeline.layer,
+  ActivityProjector.layer,
+  SessionAuthority.layer,
+  NixEnvironment.layer,
+  RpcWorker.layer,
+  GitHubApp.layer,
+  OAuth.layer,
+  McpOAuth.layer,
+  Reconciler.layer,
+  Retention.layer,
+  Workspace.layer,
+  Admin.layer,
 ).pipe(
   Layer.provideMerge(sqliteClientLayer),
-  Layer.provideMerge(GatewayConfig.Default),
+  Layer.provideMerge(GatewayConfig.layer),
 );
 
 // Recovery must finish before accepting deliveries or starting reconciliation.
 export const recoverGateway = Effect.gen(function* () {
-  yield* RunRepo.recoverInterruptedRuns();
-  yield* DeliveryRepo.recoverPendingDeliveries();
+  yield* RunRepo.use((service) => service.recoverInterruptedRuns());
+  yield* DeliveryRepo.use((service) => service.recoverPendingDeliveries());
 });
 
 const recoveredServices = Layer.provideMerge(
-  Layer.scopedDiscard(recoverGateway),
+  Layer.effectDiscard(recoverGateway),
   GatewayServicesLive,
 );
 
 const gatewayLoggerLive = PinoLoggerLive.pipe(
-  Layer.provideMerge(GatewayLogger.Default),
-  Layer.provideMerge(GatewayConfig.Default),
+  Layer.provideMerge(GatewayLogger.layer),
+  Layer.provideMerge(GatewayConfig.layer),
 );
 
-const scheduledReconciler = Layer.unwrapEffect(
+const scheduledReconciler = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const periodic = Effect.repeat(
-      Reconciler.tick(),
+      Reconciler.use((service) => service.tick()),
       Schedule.spaced(config.reconcilerIntervalMs),
     );
     const triggered = Effect.forever(
-      Reconciler.awaitTrigger().pipe(Effect.zipRight(Reconciler.tick())),
+      Reconciler.use((service) => service.awaitTrigger()).pipe(
+        Effect.andThen(Reconciler.use((service) => service.tick())),
+      ),
     );
-    return Layer.scopedDiscard(
+    return Layer.effectDiscard(
       Effect.all([periodic, triggered], {
         concurrency: "unbounded",
         discard: true,
@@ -108,19 +110,19 @@ const scheduledReconciler = Layer.unwrapEffect(
   }),
 );
 
-const serverLayer = Layer.unwrapEffect(
+const serverLayer = Layer.unwrap(
   Effect.map(GatewayConfig, ({ port }) => BunHttpServer.layer({ port })),
 );
 
 const servicesWithServer = Layer.provideMerge(serverLayer, recoveredServices);
 const servicesWithHttp = Layer.provideMerge(
-  HttpServer.serve(router),
+  HttpRouter.serve(RouterLive, { disableLogger: true, disableListenLog: true }),
   servicesWithServer,
 );
 const servicesWithScheduler = Layer.provideMerge(
   Layer.merge(
     scheduledReconciler,
-    Layer.scopedDiscard(
+    Layer.effectDiscard(
       Effect.flatMap(Retention, (retention) =>
         Effect.forkScoped(retention.run),
       ),

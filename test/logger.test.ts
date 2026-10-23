@@ -8,16 +8,14 @@ import {
   Cause,
   ConfigProvider,
   Effect,
-  FiberId,
-  FiberRefs,
-  HashMap,
   Layer,
-  List,
   Logger,
-  LogLevel,
   Option,
+  Redacted,
+  References,
   Schema,
 } from "effect";
+import * as fc from "fast-check";
 import pino from "pino";
 import { GatewayConfig } from "../src/services/config.js";
 import {
@@ -81,14 +79,20 @@ function makeConfigLayer(
     ...(logLevel === undefined ? [] : [["LOG_LEVEL", logLevel] as const]),
     ...overrides,
   ]);
-  return GatewayConfig.Default.pipe(
-    Layer.provide(Layer.setConfigProvider(ConfigProvider.fromMap(values))),
+  return Layer.fresh(GatewayConfig.layer).pipe(
+    Layer.provide(
+      ConfigProvider.layer(
+        ConfigProvider.fromUnknown(Object.fromEntries(values), {
+          preserveEmptyStrings: true,
+        }),
+      ),
+    ),
   );
 }
 
 function makeLoggerLayer(logLevel: string, capture: Capture) {
   const configLayer = makeConfigLayer(logLevel);
-  const gatewayLayer = Layer.scoped(
+  const gatewayLayer = Layer.effect(
     GatewayLogger,
     Effect.gen(function* () {
       const config = yield* GatewayConfig;
@@ -115,7 +119,7 @@ function makeLoggerLayer(logLevel: string, capture: Capture) {
             stream.end();
           }),
       );
-      return new GatewayLogger({ logger });
+      return GatewayLogger.of({ logger });
     }),
   );
   return PinoLoggerLive.pipe(
@@ -160,21 +164,23 @@ describe("GatewayLogger and PinoLoggerLive", () => {
         token: "t",
         nested: { token: "inner", deep: { authorization: "auth" } },
       }),
-      Effect.tap(() => {
-        const message = capture.last();
-        expect(message).not.toBeNull();
-        expect(message?.authorization).toBe("[REDACTED]");
-        expect(message?.cookie).toBe("[REDACTED]");
-        expect(message?.accessToken).toBe("[REDACTED]");
-        expect(message?.refreshToken).toBe("[REDACTED]");
-        expect(message?.clientSecret).toBe("[REDACTED]");
-        expect(message?.webhookSecret).toBe("[REDACTED]");
-        expect(message?.token).toBe("[REDACTED]");
-        expect(message?.nested).toMatchObject({
-          token: "[REDACTED]",
-          deep: { authorization: "[REDACTED]" },
-        });
-      }),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const message = capture.last();
+          expect(message).not.toBeNull();
+          expect(message?.authorization).toBe("[REDACTED]");
+          expect(message?.cookie).toBe("[REDACTED]");
+          expect(message?.accessToken).toBe("[REDACTED]");
+          expect(message?.refreshToken).toBe("[REDACTED]");
+          expect(message?.clientSecret).toBe("[REDACTED]");
+          expect(message?.webhookSecret).toBe("[REDACTED]");
+          expect(message?.token).toBe("[REDACTED]");
+          expect(message?.nested).toMatchObject({
+            token: "[REDACTED]",
+            deep: { authorization: "[REDACTED]" },
+          });
+        }),
+      ),
       Effect.provide(makeLoggerLayer("info", capture)),
     );
   });
@@ -183,11 +189,13 @@ describe("GatewayLogger and PinoLoggerLive", () => {
     const capture = makeCapture();
     return Effect.logInfo("public-check").pipe(
       Effect.annotateLogs({ event: "ok", public: "visible" }),
-      Effect.tap(() => {
-        const message = capture.last();
-        expect(message).not.toBeNull();
-        expect(message?.public).toBe("visible");
-      }),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const message = capture.last();
+          expect(message).not.toBeNull();
+          expect(message?.public).toBe("visible");
+        }),
+      ),
       Effect.provide(makeLoggerLayer("info", capture)),
     );
   });
@@ -196,12 +204,14 @@ describe("GatewayLogger and PinoLoggerLive", () => {
     const capture = makeCapture();
     return Effect.logInfo("child.log").pipe(
       Effect.annotateLogs({ component: "test", event: "child.log" }),
-      Effect.tap(() => {
-        const message = capture.last();
-        expect(message).not.toBeNull();
-        expect(message?.component).toBe("test");
-        expect(message?.event).toBe("child.log");
-      }),
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const message = capture.last();
+          expect(message).not.toBeNull();
+          expect(message?.component).toBe("test");
+          expect(message?.event).toBe("child.log");
+        }),
+      ),
       Effect.provide(makeLoggerLayer("info", capture)),
     );
   });
@@ -216,26 +226,23 @@ it.effect("preserves span, annotation, level, and Cause correlation", () => {
     },
   });
   const bridge = makePinoEffectLogger(pino({ base: null }, stream));
-  const bridgeLive = Logger.replace(Logger.defaultLogger, bridge);
+  const bridgeLive = Logger.layer([bridge]);
 
   return Effect.gen(function* () {
     yield* Effect.logWarning("correlated warning").pipe(
       Effect.annotateLogs({ operation: "gateway.test" }),
       Effect.withSpan("GatewayLogger.correlation"),
     );
-    yield* Effect.sync(() =>
-      bridge.log({
-        fiberId: FiberId.none,
-        logLevel: LogLevel.Error,
-        message: "controlled failure",
-        cause: Cause.fail("database unavailable"),
-        context: FiberRefs.empty(),
-        spans: List.empty(),
-        annotations: HashMap.fromIterable([
-          ["errorTag", "@Gateway/DatabaseError"],
-        ]),
-        date: new Date(),
-      }),
+    yield* Effect.withFiber((fiber) =>
+      Effect.sync(() =>
+        bridge.log({
+          fiber,
+          logLevel: "Error",
+          message: "controlled failure",
+          cause: Cause.fail("database unavailable"),
+          date: new Date(),
+        }),
+      ).pipe(Effect.annotateLogs({ errorTag: "@Gateway/DatabaseError" })),
     );
 
     const correlated = JSON.parse(capture.chunks[0] ?? "") as CapturedMessage;
@@ -337,9 +344,9 @@ describe("Pino logger plan", () => {
         import { ConfigProvider, Effect, Layer } from "effect";
         import { GatewayLogger, PinoLoggerLive } from "./src/services/logger.ts";
 
-        const configProvider = Layer.setConfigProvider(
-          ConfigProvider.fromMap(
-            new Map([
+        const configProvider = ConfigProvider.layer(
+          ConfigProvider.fromUnknown(
+            Object.fromEntries(new Map([
               ["LINEAR_CLIENT_ID", "client"],
               ["LINEAR_CLIENT_SECRET", "client-secret"],
               ["LINEAR_WEBHOOK_SECRET", "webhook-secret"],
@@ -350,11 +357,11 @@ describe("Pino logger plan", () => {
               ["LOG_FILE_FREQUENCY", "daily"],
               ["LOG_FILE_SIZE", "25m"],
               ["LOG_FILE_LIMIT", "14"],
-            ]),
+            ])), { preserveEmptyStrings: true },
           ),
         );
         const loggerLive = PinoLoggerLive.pipe(
-          Layer.provide(GatewayLogger.Default),
+          Layer.provide(GatewayLogger.layer),
           Layer.provide(configProvider),
         );
         await Effect.runPromise(
@@ -411,36 +418,52 @@ describe("Pino logger plan", () => {
     }
   });
 
-  it.effect.prop(
+  it.effect(
     "preserves rotation bounds for generated supported log-file configurations",
-    {
-      frequency: Schema.Literal("daily", "hourly"),
-      size: Schema.Literal("1b", "25m", "1g"),
-      limit: Schema.Literal(1, 14, 100),
-    },
-    ({ frequency, size, limit }) =>
-      Effect.sync(() => {
-        const plan = buildPinoLoggerPlan({
-          logLevel: "info",
-          logFile: Option.some({
-            path: "/var/log/gateway.ndjson",
-            frequency,
-            size,
-            limit,
-          }),
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          frequency: fc.constantFrom(...(["daily", "hourly"] as const)),
+          size: fc.constantFrom(...(["1b", "25m", "1g"] as const)),
+          limit: fc.constantFrom(...([1, 14, 100] as const)),
         });
-        const rollTarget = plan.transport?.targets[1];
-        expect(rollTarget).toMatchObject({
-          target: fileURLToPath(import.meta.resolve("pino-roll")),
-          options: {
-            frequency,
-            size,
-            limit: { count: limit },
-            mkdir: true,
-          },
-        });
+        const check = ({
+          frequency,
+          size,
+          limit,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          Effect.sync(() => {
+            const plan = buildPinoLoggerPlan({
+              logLevel: "info",
+              logFile: Option.some({
+                path: "/var/log/gateway.ndjson",
+                frequency,
+                size,
+                limit,
+              }),
+            });
+            const rollTarget = plan.transport?.targets[1];
+            expect(rollTarget).toMatchObject({
+              target: fileURLToPath(import.meta.resolve("pino-roll")),
+              options: {
+                frequency,
+                size,
+                limit: { count: limit },
+                mkdir: true,
+              },
+            });
+          });
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
       }),
-    { fastCheck: { numRuns: 20 } },
   );
 });
 
@@ -452,43 +475,64 @@ describe("GatewayConfig log-level normalization", () => {
     }).pipe(Effect.provide(makeConfigLayer())),
   );
 
-  it.effect.prop(
+  it.effect(
     "accepts every canonical valid level and rejects generated invalid levels",
-    {
-      valid: Schema.Literal(...LOG_LEVELS),
-      invalid: Schema.String.pipe(
-        Schema.minLength(1),
-        Schema.filter((value) => {
-          const normalized = value.trim().toLowerCase();
-          return (
-            normalized.length > 0 &&
-            !LOG_LEVELS.includes(normalized as GatewayLogLevel)
-          );
-        }),
-      ),
-    },
-    ({ valid, invalid }) =>
+    () =>
       Effect.gen(function* () {
-        const validResult = yield* Effect.either(
+        const cases = fc.record({
+          valid: fc.constantFrom(...LOG_LEVELS),
+          invalid: fc.string().filter(
+            Schema.is(
+              Schema.String.pipe(
+                Schema.check(Schema.isMinLength(1)),
+                Schema.check(
+                  Schema.makeFilter((value) => {
+                    const normalized = value.trim().toLowerCase();
+                    return (
+                      normalized.length > 0 &&
+                      !LOG_LEVELS.includes(normalized as GatewayLogLevel)
+                    );
+                  }),
+                ),
+              ),
+            ),
+          ),
+        });
+        const check = ({
+          valid,
+          invalid,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
           Effect.gen(function* () {
-            return yield* GatewayConfig;
-          }).pipe(Effect.provide(makeConfigLayer(valid))),
-        );
-        expect(validResult._tag).toBe("Right");
-        if (validResult._tag === "Right")
-          expect(validResult.right.logLevel).toBe(valid);
+            const validResult = yield* Effect.result(
+              Effect.gen(function* () {
+                return yield* GatewayConfig;
+              }).pipe(Effect.provide(makeConfigLayer(valid))),
+            );
+            expect(validResult._tag).toBe("Success");
+            if (validResult._tag === "Success")
+              expect(validResult.success.logLevel).toBe(valid);
 
-        const invalidResult = yield* Effect.either(
-          Effect.gen(function* () {
-            return yield* GatewayConfig;
-          }).pipe(Effect.provide(makeConfigLayer(invalid))),
+            const invalidResult = yield* Effect.result(
+              Effect.gen(function* () {
+                return yield* GatewayConfig;
+              }).pipe(Effect.provide(makeConfigLayer(invalid))),
+            );
+            expect(invalidResult._tag).toBe("Success");
+            if (invalidResult._tag === "Success") {
+              expect(invalidResult.success.logLevel).toBe("info");
+            }
+          });
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
         );
-        expect(invalidResult._tag).toBe("Right");
-        if (invalidResult._tag === "Right") {
-          expect(invalidResult.right.logLevel).toBe("info");
-        }
       }),
-    { fastCheck: { numRuns: 20 } },
   );
 });
 
@@ -527,7 +571,7 @@ describe("GatewayConfig file logging", () => {
 
   it.effect("rejects invalid rotation settings before startup", () =>
     Effect.gen(function* () {
-      const invalidFrequency = yield* Effect.either(
+      const invalidFrequency = yield* Effect.result(
         GatewayConfig.pipe(
           Effect.provide(
             makeConfigLayer(
@@ -537,51 +581,144 @@ describe("GatewayConfig file logging", () => {
           ),
         ),
       );
-      const invalidSize = yield* Effect.either(
+      const invalidSize = yield* Effect.result(
         GatewayConfig.pipe(
           Effect.provide(
             makeConfigLayer(undefined, new Map([["LOG_FILE_SIZE", "zero"]])),
           ),
         ),
       );
-      const invalidLimit = yield* Effect.either(
+      const invalidLimit = yield* Effect.result(
         GatewayConfig.pipe(
           Effect.provide(
             makeConfigLayer(undefined, new Map([["LOG_FILE_LIMIT", "0"]])),
           ),
         ),
       );
-      expect(invalidFrequency._tag).toBe("Left");
-      expect(invalidSize._tag).toBe("Left");
-      expect(invalidLimit._tag).toBe("Left");
+      expect(invalidFrequency._tag).toBe("Failure");
+      expect(invalidSize._tag).toBe("Failure");
+      expect(invalidLimit._tag).toBe("Failure");
     }).pipe(Effect.provide(makeConfigLayer())),
   );
 });
 
 describe("redaction invariants", () => {
-  it.effect.prop(
+  it.effect(
     "redacts generated token values while preserving unrelated annotations",
-    {
-      secret: Schema.String.pipe(Schema.minLength(1)),
-      public: Schema.String.pipe(Schema.minLength(1)),
-    },
-    ({ secret, public: publicValue }) => {
-      const capture = makeCapture();
-      return Effect.gen(function* () {
-        yield* Effect.logInfo("redaction-property").pipe(
-          Effect.annotateLogs({
-            token: secret,
-            nested: { authorization: secret },
-            public: publicValue,
-          }),
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          secret: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          public: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+        });
+        const check = ({
+          secret,
+          public: publicValue,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) => {
+          const capture = makeCapture();
+          return Effect.gen(function* () {
+            yield* Effect.logInfo("redaction-property").pipe(
+              Effect.annotateLogs({
+                token: secret,
+                nested: { authorization: secret },
+                public: publicValue,
+              }),
+            );
+            const message = capture.last();
+            expect(message).not.toBeNull();
+            expect(message?.token).toBe("[REDACTED]");
+            expect(message?.nested).toMatchObject({
+              authorization: "[REDACTED]",
+            });
+            expect(message?.public).toBe(publicValue);
+          }).pipe(Effect.provide(makeLoggerLayer("info", capture)));
+        };
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
         );
-        const message = capture.last();
-        expect(message).not.toBeNull();
-        expect(message?.token).toBe("[REDACTED]");
-        expect(message?.nested).toMatchObject({ authorization: "[REDACTED]" });
-        expect(message?.public).toBe(publicValue);
-      }).pipe(Effect.provide(makeLoggerLayer("info", capture)));
-    },
-    { fastCheck: { numRuns: 20 } },
+      }),
   );
 });
+
+it.effect(
+  "keeps singleton and multipart messages, spans, and Redacted causes safe",
+  () => {
+    const capture = makeCapture();
+    const secret = "logger-boundary-private-token";
+    return Effect.gen(function* () {
+      const loggerCount = yield* Effect.withFiber((fiber) =>
+        Effect.succeed(fiber.getRef(References.CurrentLoggers).size),
+      );
+      expect(loggerCount).toBe(1);
+      yield* Effect.logWarning("singleton").pipe(
+        Effect.withLogSpan("boundary"),
+      );
+      yield* Effect.logInfo("multiple", "parts");
+      yield* Effect.logError(
+        Redacted.make(secret),
+        Cause.fail(Redacted.make(secret)),
+      ).pipe(Effect.annotateLogs({ accessToken: secret }));
+      expect(capture.chunks).toHaveLength(3);
+      expect(JSON.parse(capture.chunks[0] ?? "")).toMatchObject({
+        msg: "singleton",
+        level: 40,
+        spans: ["boundary"],
+      });
+      expect(JSON.parse(capture.chunks[1] ?? "")).toMatchObject({
+        msg: "multiple parts",
+        level: 30,
+      });
+      expect(JSON.parse(capture.chunks[2] ?? "").accessToken).toBe(
+        "[REDACTED]",
+      );
+      expect(capture.chunks.join("")).not.toContain(secret);
+    }).pipe(Effect.provide(makeLoggerLayer("info", capture)));
+  },
+);
+
+it.effect("waits for a starting transport before synchronous flush", () =>
+  Effect.gen(function* () {
+    class StartingTransport extends EventEmitter {
+      ready = false;
+      operations: string[] = [];
+      flushSync() {
+        expect(this.ready).toBe(true);
+        this.operations.push("flush");
+      }
+      end() {
+        this.operations.push("end");
+        this.emit("close");
+      }
+    }
+    const transport = new StartingTransport();
+    queueMicrotask(() => {
+      transport.ready = true;
+      transport.operations.push("ready");
+      transport.emit("ready");
+    });
+    yield* closePinoTransport(transport);
+    expect(transport.operations).toEqual(["ready", "flush", "end"]);
+    expect(transport.listenerCount("ready")).toBe(0);
+    expect(transport.listenerCount("close")).toBe(0);
+    expect(transport.listenerCount("error")).toBe(0);
+  }),
+);

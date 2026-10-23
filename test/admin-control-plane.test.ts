@@ -1,4 +1,3 @@
-import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { it } from "@effect/vitest";
 import {
   ConfigProvider,
@@ -8,6 +7,8 @@ import {
   Schema,
   type Scope,
 } from "effect";
+import { HttpServerRequest, HttpServerResponse } from "effect/http";
+import * as fc from "fast-check";
 import { describe, expect } from "vitest";
 import type {
   AppUserId,
@@ -20,7 +21,7 @@ import type {
   TeamId,
   WorkspaceId,
 } from "../src/domain/ids.js";
-import { httpApp, router } from "../src/http/router.js";
+import { httpApp, routes } from "../src/http/router.js";
 import {
   Admin,
   createAdminSession,
@@ -55,32 +56,34 @@ const suitePath = suitePaths();
 const PUBLIC_URL = "http://localhost:3000";
 const TEST_KEY = Buffer.from(new Uint8Array(32).fill(9)).toString("base64");
 
-const configProvider = ConfigProvider.fromMap(
-  new Map<string, string>([
-    ["PUBLIC_URL", PUBLIC_URL],
-    ["LINEAR_CLIENT_ID", "client"],
-    ["LINEAR_CLIENT_SECRET", "secret"],
-    ["LINEAR_WEBHOOK_SECRET", "webhook"],
-    ["TOKEN_ENCRYPTION_KEY", TEST_KEY],
-    ["DATABASE_PATH", ":memory:"],
-    ["WORKSPACE_ROOT", suitePath("gateway-admin-workspaces")],
-    ["PORT", "3000"],
-    ["OMP_CLI_PATH", "omp"],
-    ["LEASE_DURATION_MS", "60000"],
-    ["WEBHOOK_REPLAY_WINDOW_MS", "60000"],
-    ["LOG_LEVEL", "silent"],
-    ["NIX_BINARY_PATH", "nix"],
-    [
-      "NIXPKGS_FLAKE_REF",
-      "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-    ],
-    ["NIX_ROOTS_DIR", suitePath("gateway-admin-nix-roots")],
-    ["NIX_GC_MAX_BYTES", "1000000"],
-  ]),
+const configProvider = ConfigProvider.fromUnknown(
+  Object.fromEntries(
+    new Map<string, string>([
+      ["PUBLIC_URL", PUBLIC_URL],
+      ["LINEAR_CLIENT_ID", "client"],
+      ["LINEAR_CLIENT_SECRET", "secret"],
+      ["LINEAR_WEBHOOK_SECRET", "webhook"],
+      ["TOKEN_ENCRYPTION_KEY", TEST_KEY],
+      ["DATABASE_PATH", ":memory:"],
+      ["WORKSPACE_ROOT", suitePath("gateway-admin-workspaces")],
+      ["PORT", "3000"],
+      ["OMP_CLI_PATH", "omp"],
+      ["LEASE_DURATION_MS", "60000"],
+      ["WEBHOOK_REPLAY_WINDOW_MS", "60000"],
+      ["LOG_LEVEL", "silent"],
+      ["NIX_BINARY_PATH", "nix"],
+      [
+        "NIXPKGS_FLAKE_REF",
+        "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
+      ],
+      ["NIX_ROOTS_DIR", suitePath("gateway-admin-nix-roots")],
+      ["NIX_GC_MAX_BYTES", "1000000"],
+    ]),
+  ),
+  { preserveEmptyStrings: true },
 );
 
 const reconcilerLayer = Layer.succeed(Reconciler, {
-  _tag: "Reconciler",
   status: () =>
     Effect.succeed({
       running: false,
@@ -121,29 +124,29 @@ const withApp = <A, E>(
   Effect.gen(function* () {
     yield* Effect.scope;
     const services = Layer.mergeAll(
-      GatewayConfig.Default,
-      TokenCrypto.Default,
-      AdminSessionRepo.Default,
-      DeliveryRepo.Default,
-      InstallationRepo.Default,
-      OAuth.Default,
-      McpOAuth.Default,
-      RunEventRepo.Default,
-      RunInputRepo.Default,
-      McpServerRepo.Default,
-      RunRepo.Default,
-      WebhookPipeline.Default,
-      WorkspaceRepo.Default,
-      Workspace.Default,
-      NixCacheRepo.Default,
-      NixEnvironment.Default,
-      Admin.Default,
+      GatewayConfig.layer,
+      TokenCrypto.layer,
+      AdminSessionRepo.layer,
+      DeliveryRepo.layer,
+      InstallationRepo.layer,
+      OAuth.layer,
+      McpOAuth.layer,
+      RunEventRepo.layer,
+      RunInputRepo.layer,
+      McpServerRepo.layer,
+      RunRepo.layer,
+      WebhookPipeline.layer,
+      WorkspaceRepo.layer,
+      Workspace.layer,
+      NixCacheRepo.layer,
+      NixEnvironment.layer,
+      Admin.layer,
       reconcilerLayer,
     ).pipe(
       Layer.provide(
         Layer.mergeAll(
           SqliteClientLive(":memory:"),
-          Layer.setConfigProvider(configProvider),
+          ConfigProvider.layer(configProvider),
         ),
       ),
     );
@@ -213,7 +216,7 @@ const requireSome = <A>(value: Option.Option<A>): A => {
 };
 
 describe("admin control plane", () => {
-  it.scopedLive("removes repository map path from config", () =>
+  it.live("removes repository map path from config", () =>
     withApp(
       Effect.gen(function* () {
         const config = yield* GatewayConfig;
@@ -222,7 +225,7 @@ describe("admin control plane", () => {
     ),
   );
 
-  it.scopedLive("creates and isolates repositories by organization", () =>
+  it.live("creates and isolates repositories by organization", () =>
     withApp(
       Effect.gen(function* () {
         const repo = yield* WorkspaceRepo;
@@ -262,7 +265,7 @@ describe("admin control plane", () => {
     ),
   );
 
-  it.scopedLive("enforces only one default repository per organization", () =>
+  it.live("enforces only one default repository per organization", () =>
     withApp(
       Effect.gen(function* () {
         const repo = yield* WorkspaceRepo;
@@ -305,7 +308,7 @@ describe("admin control plane", () => {
     ),
   );
 
-  it.scopedLive("updates and deletes repositories", () =>
+  it.live("updates and deletes repositories", () =>
     withApp(
       Effect.gen(function* () {
         const repo = yield* WorkspaceRepo;
@@ -350,126 +353,124 @@ describe("admin control plane", () => {
     ),
   );
 
-  it.scopedLive(
-    "resolves repositories with correct precedence and ambiguity",
-    () =>
-      withApp(
-        Effect.gen(function* () {
-          const repo = yield* WorkspaceRepo;
-          const workspace = yield* Workspace;
-          const organization = organizationId("routing");
-          const now = Date.now();
-          const createRepository = (
-            id: string,
-            options: {
-              readonly labels?: ReadonlyArray<string>;
-              readonly projectIds?: ReadonlyArray<ProjectId>;
-              readonly teamIds?: ReadonlyArray<TeamId>;
-              readonly isDefault?: boolean;
-            } = {},
-          ) =>
-            repo.createRepository({
-              organizationId: organization,
-              id: workspaceId(id),
-              url: `https://github.com/test/${id}.git`,
-              ref: "main",
-              teamIds: options.teamIds ?? [],
-              projectIds: options.projectIds ?? [],
-              labels: options.labels ?? [],
-              isDefault: options.isDefault ?? false,
-              now,
-            });
-          yield* createRepository("default-repo", { isDefault: true });
-          yield* createRepository("issue-labels", { labels: ["ui"] });
-          yield* createRepository("project-labels", { labels: ["platform"] });
-          yield* createRepository("project-id", {
-            projectIds: [projectId("project-x")],
+  it.live("resolves repositories with correct precedence and ambiguity", () =>
+    withApp(
+      Effect.gen(function* () {
+        const repo = yield* WorkspaceRepo;
+        const workspace = yield* Workspace;
+        const organization = organizationId("routing");
+        const now = Date.now();
+        const createRepository = (
+          id: string,
+          options: {
+            readonly labels?: ReadonlyArray<string>;
+            readonly projectIds?: ReadonlyArray<ProjectId>;
+            readonly teamIds?: ReadonlyArray<TeamId>;
+            readonly isDefault?: boolean;
+          } = {},
+        ) =>
+          repo.createRepository({
+            organizationId: organization,
+            id: workspaceId(id),
+            url: `https://github.com/test/${id}.git`,
+            ref: "main",
+            teamIds: options.teamIds ?? [],
+            projectIds: options.projectIds ?? [],
+            labels: options.labels ?? [],
+            isDefault: options.isDefault ?? false,
+            now,
           });
-          yield* createRepository("team-id", { teamIds: [teamId("ops")] });
-          yield* createRepository("ambiguous-team", {
-            teamIds: [teamId("ops")],
-          });
+        yield* createRepository("default-repo", { isDefault: true });
+        yield* createRepository("issue-labels", { labels: ["ui"] });
+        yield* createRepository("project-labels", { labels: ["platform"] });
+        yield* createRepository("project-id", {
+          projectIds: [projectId("project-x")],
+        });
+        yield* createRepository("team-id", { teamIds: [teamId("ops")] });
+        yield* createRepository("ambiguous-team", {
+          teamIds: [teamId("ops")],
+        });
 
-          expect(
-            yield* workspace.resolve({
-              organizationId: organization,
-              repositoryId: workspaceId("project-id"),
-              issueLabels: [],
-              projectLabels: [],
-              projectId: null,
-              teamId: null,
-            }),
-          ).toMatchObject({
-            kind: "match",
-            repository: { id: workspaceId("project-id") },
-          });
-          expect(
-            yield* workspace.resolve({
-              organizationId: organization,
-              repositoryId: null,
-              issueLabels: ["ui"],
-              projectLabels: [],
-              projectId: null,
-              teamId: null,
-            }),
-          ).toMatchObject({
-            kind: "match",
-            repository: { id: workspaceId("issue-labels") },
-          });
-          expect(
-            yield* workspace.resolve({
-              organizationId: organization,
-              repositoryId: null,
-              issueLabels: [],
-              projectLabels: ["platform"],
-              projectId: projectId("project-x"),
-              teamId: null,
-            }),
-          ).toMatchObject({
-            kind: "match",
-            repository: { id: workspaceId("project-labels") },
-          });
-          expect(
-            yield* workspace.resolve({
-              organizationId: organization,
-              repositoryId: null,
-              issueLabels: [],
-              projectLabels: [],
-              projectId: projectId("project-x"),
-              teamId: null,
-            }),
-          ).toMatchObject({
-            kind: "match",
-            repository: { id: workspaceId("project-id") },
-          });
-          expect(
-            yield* workspace.resolve({
-              organizationId: organization,
-              repositoryId: null,
-              issueLabels: [],
-              projectLabels: [],
-              projectId: null,
-              teamId: teamId("ops"),
-            }),
-          ).toMatchObject({ kind: "ambiguous" });
-          expect(
-            yield* workspace.resolve({
-              organizationId: organization,
-              repositoryId: null,
-              issueLabels: [],
-              projectLabels: [],
-              projectId: null,
-              teamId: null,
-            }),
-          ).toMatchObject({
-            kind: "match",
-            repository: { id: workspaceId("default-repo") },
-          });
-        }),
-      ),
+        expect(
+          yield* workspace.resolve({
+            organizationId: organization,
+            repositoryId: workspaceId("project-id"),
+            issueLabels: [],
+            projectLabels: [],
+            projectId: null,
+            teamId: null,
+          }),
+        ).toMatchObject({
+          kind: "match",
+          repository: { id: workspaceId("project-id") },
+        });
+        expect(
+          yield* workspace.resolve({
+            organizationId: organization,
+            repositoryId: null,
+            issueLabels: ["ui"],
+            projectLabels: [],
+            projectId: null,
+            teamId: null,
+          }),
+        ).toMatchObject({
+          kind: "match",
+          repository: { id: workspaceId("issue-labels") },
+        });
+        expect(
+          yield* workspace.resolve({
+            organizationId: organization,
+            repositoryId: null,
+            issueLabels: [],
+            projectLabels: ["platform"],
+            projectId: projectId("project-x"),
+            teamId: null,
+          }),
+        ).toMatchObject({
+          kind: "match",
+          repository: { id: workspaceId("project-labels") },
+        });
+        expect(
+          yield* workspace.resolve({
+            organizationId: organization,
+            repositoryId: null,
+            issueLabels: [],
+            projectLabels: [],
+            projectId: projectId("project-x"),
+            teamId: null,
+          }),
+        ).toMatchObject({
+          kind: "match",
+          repository: { id: workspaceId("project-id") },
+        });
+        expect(
+          yield* workspace.resolve({
+            organizationId: organization,
+            repositoryId: null,
+            issueLabels: [],
+            projectLabels: [],
+            projectId: null,
+            teamId: teamId("ops"),
+          }),
+        ).toMatchObject({ kind: "ambiguous" });
+        expect(
+          yield* workspace.resolve({
+            organizationId: organization,
+            repositoryId: null,
+            issueLabels: [],
+            projectLabels: [],
+            projectId: null,
+            teamId: null,
+          }),
+        ).toMatchObject({
+          kind: "match",
+          repository: { id: workspaceId("default-repo") },
+        });
+      }),
+    ),
   );
 
-  it.scopedLive(
+  it.live(
     "creates opaque sessions, serves public routes, and protects admin routes",
     () =>
       withApp(
@@ -499,7 +500,7 @@ describe("admin control plane", () => {
       ),
   );
 
-  it.scopedLive("revokes sessions and clears the admin cookie on logout", () =>
+  it.live("revokes sessions and clears the admin cookie on logout", () =>
     withApp(
       Effect.gen(function* () {
         const now = Date.now();
@@ -525,7 +526,7 @@ describe("admin control plane", () => {
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "enforces admin authentication, CSRF, origin, and repository CRUD",
     () =>
       withApp(
@@ -668,7 +669,7 @@ describe("admin control plane", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "authenticates run details, scopes them to their org, and redacts HTML and JSON",
     () =>
       withApp(
@@ -798,7 +799,7 @@ describe("admin control plane", () => {
       ),
   );
 
-  it.scopedLive("redacts installation secrets from bootstrap", () =>
+  it.live("redacts installation secrets from bootstrap", () =>
     withApp(
       Effect.gen(function* () {
         const now = Date.now();
@@ -836,7 +837,7 @@ describe("admin control plane", () => {
     ),
   );
 
-  it.scopedLive("previews matching, default, and ambiguous repositories", () =>
+  it.live("previews matching, default, and ambiguous repositories", () =>
     withApp(
       Effect.gen(function* () {
         const now = Date.now();
@@ -909,65 +910,92 @@ describe("admin control plane", () => {
 });
 
 describe("admin session and routing invariants", () => {
-  it.prop(
-    "token and CSRF derivations are deterministic and separate input domains",
-    {
-      rawA: Schema.String,
-      rawB: Schema.String,
-      csrfA: Schema.String,
-      csrfB: Schema.String,
-    },
-    ({ rawA, rawB, csrfA, csrfB }) => {
-      expect(tokenHash(rawA)).toBe(tokenHash(rawA));
-      expect(deriveCsrfToken(rawA)).toBe(deriveCsrfToken(rawA));
-      expect(csrfHash(csrfA)).toBe(csrfHash(csrfA));
-      if (rawA !== rawB)
-        expect(deriveCsrfToken(rawA)).not.toBe(deriveCsrfToken(rawB));
-      if (csrfA !== csrfB) expect(csrfHash(csrfA)).not.toBe(csrfHash(csrfB));
-    },
-  );
+  it("token and CSRF derivations are deterministic and separate input domains", () =>
+    fc.assert(
+      fc.property(
+        fc.record({
+          rawA: fc.string(),
+          rawB: fc.string(),
+          csrfA: fc.string(),
+          csrfB: fc.string(),
+        }),
+        ({ rawA, rawB, csrfA, csrfB }) => {
+          expect(tokenHash(rawA)).toBe(tokenHash(rawA));
+          expect(deriveCsrfToken(rawA)).toBe(deriveCsrfToken(rawA));
+          expect(csrfHash(csrfA)).toBe(csrfHash(csrfA));
+          if (rawA !== rawB)
+            expect(deriveCsrfToken(rawA)).not.toBe(deriveCsrfToken(rawB));
+          if (csrfA !== csrfB)
+            expect(csrfHash(csrfA)).not.toBe(csrfHash(csrfB));
+        },
+      ),
+    ));
 
-  it.effect.prop(
+  it.effect(
     "repository resolution never returns a repository owned by another organization",
-    {
-      owner: Schema.String.pipe(
-        Schema.filter((value) => value.trim().length > 0),
-      ),
-      label: Schema.String,
-    },
-    ({ owner, label }) =>
-      Effect.scoped(
-        withApp(
-          Effect.gen(function* () {
-            const repo = yield* WorkspaceRepo;
-            const workspace = yield* Workspace;
-            yield* repo.createRepository({
-              organizationId: organizationId(owner),
-              id: workspaceId("private-repository"),
-              url: "https://github.com/test/private.git",
-              ref: "main",
-              labels: [label],
-              isDefault: true,
-            });
-            expect(
-              yield* workspace.resolve({
-                organizationId: organizationId(`${owner}:other`),
-                repositoryId: null,
-                issueLabels: [label],
-                projectLabels: [],
-                projectId: null,
-                teamId: null,
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          owner: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(
+                  Schema.check(
+                    Schema.makeFilter((value) => value.trim().length > 0),
+                  ),
+                ),
+              ),
+            ),
+          label: fc.string(),
+        });
+        const check = ({
+          owner,
+          label,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          Effect.scoped(
+            withApp(
+              Effect.gen(function* () {
+                const repo = yield* WorkspaceRepo;
+                const workspace = yield* Workspace;
+                yield* repo.createRepository({
+                  organizationId: organizationId(owner),
+                  id: workspaceId("private-repository"),
+                  url: "https://github.com/test/private.git",
+                  ref: "main",
+                  labels: [label],
+                  isDefault: true,
+                });
+                expect(
+                  yield* workspace.resolve({
+                    organizationId: organizationId(`${owner}:other`),
+                    repositoryId: null,
+                    issueLabels: [label],
+                    projectLabels: [],
+                    projectId: null,
+                    teamId: null,
+                  }),
+                ).toEqual({ kind: "none" });
               }),
-            ).toEqual({ kind: "none" });
-          }),
-        ),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+            ),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 });
 
 describe("route authentication inventory", () => {
-  it.scopedLive(
+  it.live(
     "requires login for every registered route outside the explicit protocol exemptions",
     () =>
       withApp(
@@ -980,7 +1008,7 @@ describe("route authentication inventory", () => {
             "POST /webhooks/linear",
           ]);
           const encountered = new Set<string>();
-          for (const route of router.routes) {
+          for (const route of routes) {
             const methods =
               route.method === "*"
                 ? ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
@@ -1007,27 +1035,26 @@ describe("route authentication inventory", () => {
         }),
       ),
   );
-  it.scopedLive(
-    "deletes all admin sessions when their installation is revoked",
-    () =>
-      withApp(
-        Effect.gen(function* () {
-          const { token } = yield* createSession("org-revoked", Date.now());
-          expect(
-            (yield* fetchApp(adminRequest("/admin", { token }))).status,
-          ).toBe(200);
-          yield* InstallationRepo.revoke(
-            organizationId("org-revoked"),
-            Date.now(),
-          );
-          expect(
-            (yield* fetchApp(adminRequest("/api/admin/bootstrap", { token })))
-              .status,
-          ).toBe(401);
-          expect(yield* AdminSessionRepo.get(tokenHash(token))).toEqual(
-            Option.none(),
-          );
-        }),
-      ),
+  it.live("deletes all admin sessions when their installation is revoked", () =>
+    withApp(
+      Effect.gen(function* () {
+        const { token } = yield* createSession("org-revoked", Date.now());
+        expect(
+          (yield* fetchApp(adminRequest("/admin", { token }))).status,
+        ).toBe(200);
+        yield* InstallationRepo.use((service) =>
+          service.revoke(organizationId("org-revoked"), Date.now()),
+        );
+        expect(
+          (yield* fetchApp(adminRequest("/api/admin/bootstrap", { token })))
+            .status,
+        ).toBe(401);
+        expect(
+          yield* AdminSessionRepo.use((service) =>
+            service.get(tokenHash(token)),
+          ),
+        ).toEqual(Option.none());
+      }),
+    ),
   );
 });

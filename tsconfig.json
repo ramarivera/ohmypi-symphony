@@ -13,7 +13,20 @@
     "verbatimModuleSyntax": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "plugins": [{ "name": "@effect/language-service" }]
+    "plugins": [
+      {
+        "name": "@effect/language-service",
+        "allowedUnstableApis": [
+          "@effect/platform-bun/BunHttpServer",
+          "@effect/platform-bun/BunHttpServerRequest",
+          "@effect/platform-bun/BunRuntime",
+          "@effect/vitest",
+          "effect/http/HttpRouter",
+          "effect/http/HttpServerRequest",
+          "effect/http/HttpServerResponse"
+        ]
+      }
+    ]
   },
   "include": ["src/**/*.ts", "test/**/*.ts"]
 }

@@ -7,13 +7,14 @@ import {
   Context,
   Deferred,
   Effect,
-  Either,
   Fiber,
   Layer,
   Option,
+  Result,
   Schema,
-  TestClock,
 } from "effect";
+import { TestClock } from "effect/testing";
+import * as fc from "fast-check";
 import {
   DatabaseError,
   InterruptedRunNoActionableInputError,
@@ -123,297 +124,379 @@ describe("Linear worker prompt contract", () => {
 });
 
 describe("SessionAuthority behavior invariants", () => {
-  it.effect.prop(
+  it.effect(
     "persists each worker event once with distinct sequence keys",
-    {
-      sessionId: Schema.UUID,
-      type: Schema.Literal(
-        "agent_start",
-        "turn_start",
-        "turn_end",
-        "tool_execution_start",
-        "tool_execution_end",
-        "message_end",
-        "prompt_result",
-      ),
-    },
-    ({ sessionId, type }) =>
-      withAuthority(() =>
-        Effect.gen(function* () {
-          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          type: fc.constantFrom(
+            ...[
+              "agent_start",
+              "turn_start",
+              "turn_end",
+              "tool_execution_start",
+              "tool_execution_end",
+              "message_end",
+              "prompt_result",
+            ],
+          ),
+        });
+        const check = ({
+          sessionId,
+          type,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withAuthority(() =>
+            Effect.gen(function* () {
+              const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+              const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+                `organization-${sessionId}`,
+              );
+              const authority = yield* SessionAuthority;
+              const runRepo = yield* RunRepo;
+              const installationRepo = yield* InstallationRepo;
+              const runEventRepo = yield* RunEventRepo;
+              yield* runRepo.create({
+                sessionId: sid,
+                organizationId,
+                issueId: Option.none(),
+              });
+              yield* installationRepo.put(install(organizationId));
+              yield* runRepo.update(sid, {
+                state: "orphaned",
+                workspacePath: Option.some(testPath("temporary")),
+                ompSessionFile: Option.some(testPath("session.jsonl")),
+              });
+              yield* authority.processSession(sid);
+
+              const projected = yield* Deferred.make<void>();
+              projectionWaiter = projected;
+              projectionExpected = 2;
+              const event: RpcEvent = { type };
+              yield* Effect.sync(() => {
+                if (workerEventListener === undefined)
+                  throw new Error("worker event listener was not registered");
+                workerEventListener(event);
+                workerEventListener(event);
+              });
+              yield* Deferred.await(projected);
+
+              const persisted = (yield* runEventRepo.list(sid)).filter(
+                (item) =>
+                  typeof item.payload === "object" &&
+                  item.payload !== null &&
+                  "type" in item.payload &&
+                  item.payload.type === type,
+              );
+              expect(persisted).toHaveLength(2);
+              expect(
+                new Set(persisted.map((item) => item.sourceKey)).size,
+              ).toBe(2);
+              expect(persisted.map((item) => item.payload)).toEqual([
+                event,
+                event,
+              ]);
+            }),
           );
-          const authority = yield* SessionAuthority;
-          const runRepo = yield* RunRepo;
-          const installationRepo = yield* InstallationRepo;
-          const runEventRepo = yield* RunEventRepo;
-          yield* runRepo.create({
-            sessionId: sid,
-            organizationId,
-            issueId: Option.none(),
-          });
-          yield* installationRepo.put(install(organizationId));
-          yield* runRepo.update(sid, {
-            state: "orphaned",
-            workspacePath: Option.some(testPath("temporary")),
-            ompSessionFile: Option.some(testPath("session.jsonl")),
-          });
-          yield* authority.processSession(sid);
-
-          const projected = yield* Deferred.make<void>();
-          projectionWaiter = projected;
-          projectionExpected = 2;
-          const event: RpcEvent = { type };
-          yield* Effect.sync(() => {
-            if (workerEventListener === undefined)
-              throw new Error("worker event listener was not registered");
-            workerEventListener(event);
-            workerEventListener(event);
-          });
-          yield* Deferred.await(projected);
-
-          const persisted = (yield* runEventRepo.list(sid)).filter(
-            (item) =>
-              typeof item.payload === "object" &&
-              item.payload !== null &&
-              "type" in item.payload &&
-              item.payload.type === type,
-          );
-          expect(persisted).toHaveLength(2);
-          expect(new Set(persisted.map((item) => item.sourceKey)).size).toBe(2);
-          expect(persisted.map((item) => item.payload)).toEqual([event, event]);
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 10 } },
-  );
-
-  it.effect.prop(
-    "records UI requests and transitions the run to waiting",
-    {
-      sessionId: Schema.UUID,
-      requestId: Schema.String.pipe(Schema.minLength(1)),
-    },
-    ({ sessionId, requestId }) =>
-      withAuthority(() =>
-        Effect.gen(function* () {
-          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
-          );
-          const authority = yield* SessionAuthority;
-          const runRepo = yield* RunRepo;
-          const installationRepo = yield* InstallationRepo;
-          const runEventRepo = yield* RunEventRepo;
-          yield* runRepo.create({
-            sessionId: sid,
-            organizationId,
-            issueId: Option.none(),
-          });
-          yield* installationRepo.put(install(organizationId));
-          yield* runRepo.update(sid, {
-            state: "orphaned",
-            workspacePath: Option.some(testPath("temporary")),
-            ompSessionFile: Option.some(testPath("session.jsonl")),
-          });
-          yield* authority.processSession(sid);
-
-          const elicitationObserved = yield* Deferred.make<void>();
-          elicitationWaiter = elicitationObserved;
-          const event: RpcEvent = {
-            type: "extension_ui_request",
-            id: requestId,
-            method: "confirm",
-            title: "Continue?",
-            message: "Proceed with the task?",
-            options: ["yes", "no"],
-          };
-          yield* Effect.sync(() => {
-            if (workerEventListener === undefined)
-              throw new Error("worker event listener was not registered");
-            workerEventListener(event);
-          });
-          yield* Deferred.await(elicitationObserved);
-
-          const run = yield* runRepo.get(sid);
-          const persisted = yield* runEventRepo.list(sid);
-          const uiEvent = persisted.find(
-            (item) =>
-              typeof item.payload === "object" &&
-              item.payload !== null &&
-              "type" in item.payload &&
-              item.payload.type === "extension_ui_request",
-          );
-          expect(Option.isSome(run)).toBe(true);
-          if (Option.isSome(run)) expect(run.value.state).toBe("waiting");
-          expect(uiEvent).toMatchObject({
-            sourceKey: `rpc-ui:${requestId}`,
-            kind: "extension_ui_request",
-            level: "warn",
-            payload: event,
-          });
-          expect(projectorElicitations).toContainEqual({
-            sessionId: sid,
-            sourceKey: `rpc-ui:${requestId}`,
-            text: "Continue?\n\nProceed with the task?",
-            options: ["yes", "no"],
-          });
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
-  );
-
-  it.effect.prop(
-    "round-trips generated worker events through event and projector layers",
-    {
-      sessionId: Schema.UUID,
-      type: Schema.Literal(
-        "agent_start",
-        "turn_start",
-        "turn_end",
-        "agent_end",
-        "tool_execution_start",
-        "message_end",
-        "prompt_result",
-        "progress",
-      ),
-    },
-    ({ sessionId, type }) =>
-      withAuthority(() =>
-        Effect.gen(function* () {
-          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
-          );
-          const authority = yield* SessionAuthority;
-          const runRepo = yield* RunRepo;
-          const installationRepo = yield* InstallationRepo;
-          const runEventRepo = yield* RunEventRepo;
-          yield* runRepo.create({
-            sessionId: sid,
-            organizationId,
-            issueId: Option.none(),
-          });
-          yield* installationRepo.put(install(organizationId));
-          yield* runRepo.update(sid, {
-            state: "orphaned",
-            workspacePath: Option.some(testPath("temporary")),
-            ompSessionFile: Option.some(testPath("session.jsonl")),
-          });
-          yield* authority.processSession(sid);
-
-          const projected = yield* Deferred.make<void>();
-          projectionWaiter = projected;
-          projectionExpected = 1;
-          const event: RpcEvent = { type };
-          yield* Effect.sync(() => {
-            if (workerEventListener === undefined)
-              throw new Error("worker event listener was not registered");
-            workerEventListener(event);
-          });
-          yield* Deferred.await(projected);
-
-          const persisted = (yield* runEventRepo.list(sid)).filter(
-            (item) =>
-              typeof item.payload === "object" &&
-              item.payload !== null &&
-              "type" in item.payload &&
-              item.payload.type === type,
-          );
-          expect(persisted).toHaveLength(1);
-          expect(persisted[0]?.payload).toEqual(event);
-          expect(persisted[0]?.sessionId).toBe(sid);
-          expect(persisted[0]?.level).toMatch(
-            /^(debug|info|warn|result|error)$/,
-          );
-          expect(projectorEvents).toContainEqual({
-            sessionId: sid,
-            sequence: expect.any(Number),
-            event,
-          });
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
-  );
-
-  it.effect.prop(
-    "persists cancellation outcomes for both stop and canceled desired state",
-    {
-      sessionId: Schema.UUID,
-      desiredState: Schema.Literal("running", "canceled"),
-      inputKind: Schema.Literal("prompted", "stop"),
-    },
-    ({ sessionId, desiredState, inputKind }) =>
-      withAuthority((db) =>
-        Effect.gen(function* () {
-          const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
-          const organizationId = Schema.decodeUnknownSync(OrganizationId)(
-            `organization-${sessionId}`,
-          );
-          const authority = yield* SessionAuthority;
-          const runRepo = yield* RunRepo;
-          const runInputRepo = yield* RunInputRepo;
-          const runEventRepo = yield* RunEventRepo;
-          const installationRepo = yield* InstallationRepo;
-          const inputId = Schema.decodeUnknownSync(InputId)(
-            `input-${sessionId}`,
-          );
-          yield* runRepo.create({
-            sessionId: sid,
-            organizationId,
-            issueId: Option.none(),
-          });
-          yield* installationRepo.put(install(organizationId));
-          yield* runInputRepo.enqueue({
-            id: inputId,
-            sessionId: sid,
-            kind: inputKind,
-            body: inputKind === "stop" ? "stop" : "cancel this run",
-            payload: { source: "property" },
-          });
-          if (desiredState === "canceled" && inputKind === "prompted") {
-            yield* Effect.sync(() =>
-              db
-                .query(
-                  "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
-                )
-                .run(sid),
-            );
-          }
-          yield* authority.processSession(sid);
-
-          const run = yield* runRepo.get(sid);
-          const persisted = yield* runEventRepo.list(sid);
-          const shouldCancel =
-            desiredState === "canceled" || inputKind === "stop";
-          expect(Option.isSome(run)).toBe(true);
-          if (Option.isSome(run)) {
-            expect(run.value.state).toBe(shouldCancel ? "canceled" : "waiting");
-            expect(run.value.desiredState).toBe(
-              shouldCancel ? "canceled" : "running",
-            );
-          }
-          expect(
-            persisted.some(
-              (item) =>
-                item.kind === "state" &&
-                typeof item.payload === "object" &&
-                item.payload !== null &&
-                "to" in item.payload &&
-                item.payload.to === (shouldCancel ? "canceled" : "waiting"),
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
             ),
-          ).toBe(true);
-          if (shouldCancel) {
-            expect(projectorTerminals).toContainEqual({
-              sessionId: sid,
-              sourceKey: `stop:${sid}`,
-              kind: "response",
-              text: "Stopped as requested.",
-            });
-          }
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+            { numRuns: 10 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.effect(
+    "records UI requests and transitions the run to waiting",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          requestId: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+        });
+        const check = ({
+          sessionId,
+          requestId,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withAuthority(() =>
+            Effect.gen(function* () {
+              const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+              const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+                `organization-${sessionId}`,
+              );
+              const authority = yield* SessionAuthority;
+              const runRepo = yield* RunRepo;
+              const installationRepo = yield* InstallationRepo;
+              const runEventRepo = yield* RunEventRepo;
+              yield* runRepo.create({
+                sessionId: sid,
+                organizationId,
+                issueId: Option.none(),
+              });
+              yield* installationRepo.put(install(organizationId));
+              yield* runRepo.update(sid, {
+                state: "orphaned",
+                workspacePath: Option.some(testPath("temporary")),
+                ompSessionFile: Option.some(testPath("session.jsonl")),
+              });
+              yield* authority.processSession(sid);
+
+              const elicitationObserved = yield* Deferred.make<void>();
+              elicitationWaiter = elicitationObserved;
+              const event: RpcEvent = {
+                type: "extension_ui_request",
+                id: requestId,
+                method: "confirm",
+                title: "Continue?",
+                message: "Proceed with the task?",
+                options: ["yes", "no"],
+              };
+              yield* Effect.sync(() => {
+                if (workerEventListener === undefined)
+                  throw new Error("worker event listener was not registered");
+                workerEventListener(event);
+              });
+              yield* Deferred.await(elicitationObserved);
+
+              const run = yield* runRepo.get(sid);
+              const persisted = yield* runEventRepo.list(sid);
+              const uiEvent = persisted.find(
+                (item) =>
+                  typeof item.payload === "object" &&
+                  item.payload !== null &&
+                  "type" in item.payload &&
+                  item.payload.type === "extension_ui_request",
+              );
+              expect(Option.isSome(run)).toBe(true);
+              if (Option.isSome(run)) expect(run.value.state).toBe("waiting");
+              expect(uiEvent).toMatchObject({
+                sourceKey: `rpc-ui:${requestId}`,
+                kind: "extension_ui_request",
+                level: "warn",
+                payload: event,
+              });
+              expect(projectorElicitations).toContainEqual({
+                sessionId: sid,
+                sourceKey: `rpc-ui:${requestId}`,
+                text: "Continue?\n\nProceed with the task?",
+                options: ["yes", "no"],
+              });
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.effect(
+    "round-trips generated worker events through event and projector layers",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          type: fc.constantFrom(
+            ...[
+              "agent_start",
+              "turn_start",
+              "turn_end",
+              "agent_end",
+              "tool_execution_start",
+              "message_end",
+              "prompt_result",
+              "progress",
+            ],
+          ),
+        });
+        const check = ({
+          sessionId,
+          type,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withAuthority(() =>
+            Effect.gen(function* () {
+              const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+              const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+                `organization-${sessionId}`,
+              );
+              const authority = yield* SessionAuthority;
+              const runRepo = yield* RunRepo;
+              const installationRepo = yield* InstallationRepo;
+              const runEventRepo = yield* RunEventRepo;
+              yield* runRepo.create({
+                sessionId: sid,
+                organizationId,
+                issueId: Option.none(),
+              });
+              yield* installationRepo.put(install(organizationId));
+              yield* runRepo.update(sid, {
+                state: "orphaned",
+                workspacePath: Option.some(testPath("temporary")),
+                ompSessionFile: Option.some(testPath("session.jsonl")),
+              });
+              yield* authority.processSession(sid);
+
+              const projected = yield* Deferred.make<void>();
+              projectionWaiter = projected;
+              projectionExpected = 1;
+              const event: RpcEvent = { type };
+              yield* Effect.sync(() => {
+                if (workerEventListener === undefined)
+                  throw new Error("worker event listener was not registered");
+                workerEventListener(event);
+              });
+              yield* Deferred.await(projected);
+
+              const persisted = (yield* runEventRepo.list(sid)).filter(
+                (item) =>
+                  typeof item.payload === "object" &&
+                  item.payload !== null &&
+                  "type" in item.payload &&
+                  item.payload.type === type,
+              );
+              expect(persisted).toHaveLength(1);
+              expect(persisted[0]?.payload).toEqual(event);
+              expect(persisted[0]?.sessionId).toBe(sid);
+              expect(persisted[0]?.level).toMatch(
+                /^(debug|info|warn|result|error)$/,
+              );
+              expect(projectorEvents).toContainEqual({
+                sessionId: sid,
+                sequence: expect.any(Number),
+                event,
+              });
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.effect(
+    "persists cancellation outcomes for both stop and canceled desired state",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          desiredState: fc.constantFrom(...(["running", "canceled"] as const)),
+          inputKind: fc.constantFrom(...(["prompted", "stop"] as const)),
+        });
+        const check = ({
+          sessionId,
+          desiredState,
+          inputKind,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withAuthority((db) =>
+            Effect.gen(function* () {
+              const sid = Schema.decodeUnknownSync(SessionId)(sessionId);
+              const organizationId = Schema.decodeUnknownSync(OrganizationId)(
+                `organization-${sessionId}`,
+              );
+              const authority = yield* SessionAuthority;
+              const runRepo = yield* RunRepo;
+              const runInputRepo = yield* RunInputRepo;
+              const runEventRepo = yield* RunEventRepo;
+              const installationRepo = yield* InstallationRepo;
+              const inputId = Schema.decodeUnknownSync(InputId)(
+                `input-${sessionId}`,
+              );
+              yield* runRepo.create({
+                sessionId: sid,
+                organizationId,
+                issueId: Option.none(),
+              });
+              yield* installationRepo.put(install(organizationId));
+              yield* runInputRepo.enqueue({
+                id: inputId,
+                sessionId: sid,
+                kind: inputKind,
+                body: inputKind === "stop" ? "stop" : "cancel this run",
+                payload: { source: "property" },
+              });
+              if (desiredState === "canceled" && inputKind === "prompted") {
+                yield* Effect.sync(() =>
+                  db
+                    .query(
+                      "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
+                    )
+                    .run(sid),
+                );
+              }
+              yield* authority.processSession(sid);
+
+              const run = yield* runRepo.get(sid);
+              const persisted = yield* runEventRepo.list(sid);
+              const shouldCancel =
+                desiredState === "canceled" || inputKind === "stop";
+              expect(Option.isSome(run)).toBe(true);
+              if (Option.isSome(run)) {
+                expect(run.value.state).toBe(
+                  shouldCancel ? "canceled" : "waiting",
+                );
+                expect(run.value.desiredState).toBe(
+                  shouldCancel ? "canceled" : "running",
+                );
+              }
+              expect(
+                persisted.some(
+                  (item) =>
+                    item.kind === "state" &&
+                    typeof item.payload === "object" &&
+                    item.payload !== null &&
+                    "to" in item.payload &&
+                    item.payload.to === (shouldCancel ? "canceled" : "waiting"),
+                ),
+              ).toBe(true);
+              if (shouldCancel) {
+                expect(projectorTerminals).toContainEqual({
+                  sessionId: sid,
+                  sourceKey: `stop:${sid}`,
+                  kind: "response",
+                  text: "Stopped as requested.",
+                });
+              }
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 
   it.effect(
@@ -502,7 +585,7 @@ describe("SessionAuthority behavior invariants", () => {
     { timeout: 15_000 },
   );
 
-  it.scopedLive("renders the prompted template at prompt time", () =>
+  it.live("renders the prompted template at prompt time", () =>
     withAuthority(() =>
       Effect.gen(function* () {
         const authority = yield* SessionAuthority;
@@ -566,54 +649,49 @@ describe("SessionAuthority behavior invariants", () => {
       }),
     ),
   );
-  it.scopedLive(
-    "renders a prompted template when retrying an orphaned run",
-    () =>
-      withAuthority(() =>
-        Effect.gen(function* () {
-          const authority = yield* SessionAuthority;
-          const installationRepo = yield* InstallationRepo;
-          const runRepo = yield* RunRepo;
-          const runInputRepo = yield* RunInputRepo;
-          const templateRepo = yield* PromptTemplateRepo;
-          yield* installationRepo.put(install(testOrganizationId));
-          yield* templateRepo.upsert({
-            organizationId: testOrganizationId,
-            kind: "prompted",
-            body: "Retry:\n{{userRequest}}",
-            updatedAt: 0,
-          });
-          yield* runRepo.create({
-            sessionId: testSessionId,
-            organizationId: testOrganizationId,
-            issueId: Option.none(),
-          });
-          const inputId =
-            Schema.decodeUnknownSync(InputId)("orphan-retry-input");
-          yield* runInputRepo.enqueue({
-            id: inputId,
-            sessionId: testSessionId,
-            kind: "prompted",
-            body: "continue after interruption",
-            payload: {},
-          });
-          yield* runInputRepo.markProcessed(inputId);
-          yield* Effect.promise(() =>
-            mkdir(testPath("orphan-retry-template"), { recursive: true }),
-          );
-          yield* runRepo.update(testSessionId, {
-            state: "orphaned",
-            workspacePath: Option.some(testPath("orphan-retry-template")),
-          });
+  it.live("renders a prompted template when retrying an orphaned run", () =>
+    withAuthority(() =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const installationRepo = yield* InstallationRepo;
+        const runRepo = yield* RunRepo;
+        const runInputRepo = yield* RunInputRepo;
+        const templateRepo = yield* PromptTemplateRepo;
+        yield* installationRepo.put(install(testOrganizationId));
+        yield* templateRepo.upsert({
+          organizationId: testOrganizationId,
+          kind: "prompted",
+          body: "Retry:\n{{userRequest}}",
+          updatedAt: 0,
+        });
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.none(),
+        });
+        const inputId = Schema.decodeUnknownSync(InputId)("orphan-retry-input");
+        yield* runInputRepo.enqueue({
+          id: inputId,
+          sessionId: testSessionId,
+          kind: "prompted",
+          body: "continue after interruption",
+          payload: {},
+        });
+        yield* runInputRepo.markProcessed(inputId);
+        yield* Effect.promise(() =>
+          mkdir(testPath("orphan-retry-template"), { recursive: true }),
+        );
+        yield* runRepo.update(testSessionId, {
+          state: "orphaned",
+          workspacePath: Option.some(testPath("orphan-retry-template")),
+        });
 
-          yield* authority.processSession(testSessionId);
+        yield* authority.processSession(testSessionId);
 
-          expect(workerSpawnInputs).toHaveLength(1);
-          expect(workerPrompts).toEqual([
-            "Retry:\ncontinue after interruption",
-          ]);
-        }),
-      ),
+        expect(workerSpawnInputs).toHaveLength(1);
+        expect(workerPrompts).toEqual(["Retry:\ncontinue after interruption"]);
+      }),
+    ),
   );
   it.effect(
     "materializes configured MCP servers through the real authority layer",
@@ -678,7 +756,7 @@ describe("SessionAuthority behavior invariants", () => {
             Schema.decodeUnknownSync(McpServerId)("proxy-events");
           const url = "https://mcp.example/server";
           const workspace = testPath("proxy-workspace");
-          yield* InstallationRepo.put(install(org));
+          yield* InstallationRepo.use((service) => service.put(install(org)));
           yield* repo.createMcpServer({
             organizationId: org,
             id: serverId,
@@ -718,16 +796,20 @@ describe("SessionAuthority behavior invariants", () => {
             1,
             1,
           );
-          yield* RunRepo.create({
-            sessionId: sid,
-            organizationId: org,
-            issueId: Option.none(),
-          });
-          yield* RunRepo.update(sid, {
-            state: "orphaned",
-            workspacePath: Option.some(workspace),
-            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
-          });
+          yield* RunRepo.use((service) =>
+            service.create({
+              sessionId: sid,
+              organizationId: org,
+              issueId: Option.none(),
+            }),
+          );
+          yield* RunRepo.use((service) =>
+            service.update(sid, {
+              state: "orphaned",
+              workspacePath: Option.some(workspace),
+              ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+            }),
+          );
           yield* authority.processSession(sid);
           const contents = yield* Effect.promise(() =>
             readFile(join(workspace, "mcp.json"), "utf8"),
@@ -768,7 +850,9 @@ describe("SessionAuthority behavior invariants", () => {
           expect(retries.map((retry) => retry.status)).toEqual(
             Array(12).fill(502),
           );
-          const events = yield* RunEventRepo.list(sid);
+          const events = yield* RunEventRepo.use((service) =>
+            service.list(sid),
+          );
           expect(
             events.filter((event) => event.kind === "mcp_refresh_failed"),
           ).toHaveLength(1);
@@ -833,7 +917,7 @@ describe("SessionAuthority behavior invariants", () => {
             workspacePath: Option.some(workspace),
             ompSessionFile: Option.some(join(workspace, "session.jsonl")),
           });
-          yield* Effect.either(authority.processSession(testSessionId));
+          yield* Effect.result(authority.processSession(testSessionId));
           const updated = yield* runRepo.get(testSessionId);
           expect(Option.isSome(updated)).toBe(true);
           if (Option.isSome(updated)) {
@@ -906,7 +990,10 @@ const testConfigProvider = (
       ["GITHUB_APP_PRIVATE_KEY", "test-private-key"],
     );
   }
-  return ConfigProvider.fromMap(new Map([...values, ...valuesOverride]));
+  return ConfigProvider.fromUnknown(
+    Object.fromEntries(new Map([...values, ...valuesOverride])),
+    { preserveEmptyStrings: true },
+  );
 };
 let workerEventListener: ((event: RpcEvent) => void) | undefined;
 let projectionWaiter: Deferred.Deferred<void, never> | undefined;
@@ -944,20 +1031,20 @@ const signalProjection = (): void => {
     projectionWaiter !== undefined &&
     projectorEvents.length >= projectionExpected
   ) {
-    Deferred.unsafeDone(projectionWaiter, Effect.void);
+    Deferred.doneUnsafe(projectionWaiter, Effect.void);
     projectionWaiter = undefined;
   }
 };
 
 const signalElicitation = (): void => {
   if (elicitationWaiter !== undefined) {
-    Deferred.unsafeDone(elicitationWaiter, Effect.void);
+    Deferred.doneUnsafe(elicitationWaiter, Effect.yieldNow);
     elicitationWaiter = undefined;
   }
 };
 
 let terminalFailure: DatabaseError | undefined;
-const mockProjector = ActivityProjector.make({
+const mockProjector = ActivityProjector.of({
   thought: () => Effect.succeed(true),
   deviation: () => Effect.succeed(true),
   elicitation: (sessionId, sourceKey, text, options) =>
@@ -969,7 +1056,8 @@ const mockProjector = ActivityProjector.make({
   terminal: (sessionId, sourceKey, kind, text) =>
     Effect.gen(function* () {
       projectorTerminals.push({ sessionId, sourceKey, kind, text });
-      if (terminalFailure !== undefined) yield* Effect.fail(terminalFailure);
+      if (terminalFailure !== undefined)
+        return yield* Effect.fail(terminalFailure);
       return true;
     }),
   plan: () => Effect.succeed(true),
@@ -1042,7 +1130,7 @@ const mockWorker: RpcWorkerHandle = {
     }),
 };
 
-const mockRpcWorker = RpcWorker.make({
+const mockRpcWorker = RpcWorker.of({
   spawn: (input) =>
     Effect.sync(() => {
       workerSpawnInputs.push(input);
@@ -1060,7 +1148,7 @@ let nixPrepareBlock:
   | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> }
   | undefined;
 const nixPreparedRepositories: Array<string> = [];
-const mockNixEnvironment = NixEnvironment.make({
+const mockNixEnvironment = NixEnvironment.of({
   enforceBudget: () =>
     Effect.succeed({ removed: 0, sizeBytes: 0, withinBudget: true }),
   prepare: (repository) => {
@@ -1089,13 +1177,13 @@ const toolCommentCalls: Array<{
 }> = [];
 let commentEnteredSignal: Deferred.Deferred<void> | undefined;
 let commentRelease: Deferred.Deferred<void> | undefined;
-const mockToolsGateway = LinearGateway.make({
+const mockToolsGateway = LinearGateway.of({
   createActivity: () => Effect.die(new Error("unused in authority tests")),
   updateSession: () => Effect.die(new Error("unused in authority tests")),
   createIssueComment: (input) =>
     Effect.gen(function* () {
       if (commentEnteredSignal !== undefined) {
-        Deferred.unsafeDone(commentEnteredSignal, Effect.void);
+        Deferred.doneUnsafe(commentEnteredSignal, Effect.void);
       }
       if (commentRelease !== undefined) {
         yield* Deferred.await(commentRelease);
@@ -1207,24 +1295,24 @@ const withAuthority = <A, E>(
       const githubAppOverride: Layer.Layer<GitHubApp> =
         options?.githubApp === undefined
           ? (Layer.empty as Layer.Layer<GitHubApp>)
-          : Layer.succeed(GitHubApp, options.githubApp as GitHubApp);
+          : Layer.succeed(GitHubApp, options.githubApp as GitHubApp["Service"]);
       const linearGatewayOverride: Layer.Layer<LinearGateway> =
         options?.withLinearGateway === true
           ? Layer.succeed(LinearGateway, mockToolsGateway)
           : (Layer.empty as Layer.Layer<LinearGateway>);
       const dependencies = Layer.mergeAll(
-        GatewayConfig.Default,
-        TokenCrypto.Default,
-        InstallationRepo.Default,
-        McpServerRepo.Default,
-        McpOAuth.Default,
-        PromptTemplateRepo.Default,
-        RunEventRepo.Default,
-        RunInputRepo.Default,
-        RunRepo.Default,
-        WorkspaceRepo.Default,
-        WorkerIdentityRepo.Default,
-        GitHubApp.Default,
+        GatewayConfig.layer,
+        TokenCrypto.layer,
+        InstallationRepo.layer,
+        McpServerRepo.layer,
+        McpOAuth.layer,
+        PromptTemplateRepo.layer,
+        RunEventRepo.layer,
+        RunInputRepo.layer,
+        RunRepo.layer,
+        WorkspaceRepo.layer,
+        WorkerIdentityRepo.layer,
+        GitHubApp.layer,
         githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
         Layer.succeed(RpcWorker, mockRpcWorker),
@@ -1234,7 +1322,7 @@ const withAuthority = <A, E>(
         Layer.provide(
           Layer.mergeAll(
             Layer.succeed(SqliteClient, sqlite),
-            Layer.setConfigProvider(
+            ConfigProvider.layer(
               testConfigProvider(
                 options?.githubApp !== undefined,
                 options?.config,
@@ -1243,7 +1331,7 @@ const withAuthority = <A, E>(
           ),
         ),
       );
-      const authority = SessionAuthority.DefaultWithoutDependencies.pipe(
+      const authority = SessionAuthority.layerWithoutDependencies.pipe(
         Layer.provide(dependencies),
       );
       const result = yield* effect(sqlite.db).pipe(
@@ -1272,7 +1360,7 @@ const install = (organizationId: OrganizationId): Installation => ({
 });
 
 describe("SessionAuthority team-access gate", () => {
-  it.scopedLive(
+  it.live(
     "proceeds when the installation team-access snapshot is unknown (null)",
     () =>
       withAuthority(() =>
@@ -1312,7 +1400,7 @@ describe("SessionAuthority team-access gate", () => {
       ),
   );
 
-  it.scopedLive("releases the persisted worker uid after cancellation", () =>
+  it.live("releases the persisted worker uid after cancellation", () =>
     withAuthority((db) =>
       Effect.gen(function* () {
         const authority = yield* SessionAuthority;
@@ -1340,7 +1428,7 @@ describe("SessionAuthority team-access gate", () => {
     ),
   );
 
-  it.scopedLive("cancels when a known snapshot excludes the run's team", () =>
+  it.live("cancels when a known snapshot excludes the run's team", () =>
     withAuthority(() =>
       Effect.gen(function* () {
         const authority = yield* SessionAuthority;
@@ -1379,7 +1467,7 @@ describe("SessionAuthority team-access gate", () => {
       }),
     ),
   );
-  it.scopedLive(
+  it.live(
     "cancels when only the public-team access snapshot is known and false",
     () =>
       withAuthority(() =>
@@ -1423,7 +1511,7 @@ describe("SessionAuthority team-access gate", () => {
 });
 
 describe("SessionAuthority infrastructure failures", () => {
-  it.scopedLive(
+  it.live(
     "keeps a run lookup database failure distinct from an absent run",
     () =>
       withAuthority((db) =>
@@ -1431,18 +1519,18 @@ describe("SessionAuthority infrastructure failures", () => {
           const authority = yield* SessionAuthority;
           yield* Effect.sync(() => db.exec("DROP TABLE agent_run"));
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("@Gateway/DatabaseError");
           }
         }),
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "surfaces terminal state persistence failure instead of reporting terminal handling",
     () =>
       withAuthority((db) =>
@@ -1460,18 +1548,18 @@ describe("SessionAuthority infrastructure failures", () => {
             ),
           );
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("@Gateway/DatabaseError");
           }
         }),
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "propagates projection persistence failure after terminal state persistence",
     () =>
       withAuthority(() =>
@@ -1485,18 +1573,18 @@ describe("SessionAuthority infrastructure failures", () => {
           });
           terminalFailure = new DatabaseError({ message: "projection failed" });
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("@Gateway/DatabaseError");
           }
         }),
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "stops and unregisters a worker when host-tool registration fails",
     () =>
       withAuthority(() =>
@@ -1525,12 +1613,12 @@ describe("SessionAuthority infrastructure failures", () => {
             ),
           });
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left).toMatchObject({
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure).toMatchObject({
               _tag: "@Gateway/RpcProtocolError",
               method: "set_host_tools",
               message: "forced host-tool registration failure",
@@ -1542,7 +1630,7 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "returns a typed error for an interrupted run without actionable input",
     () =>
       withAuthority(() =>
@@ -1561,12 +1649,12 @@ describe("SessionAuthority infrastructure failures", () => {
             workspacePath: Option.some(authorityTestRoot),
           });
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left).toBeInstanceOf(
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure).toBeInstanceOf(
               InterruptedRunNoActionableInputError,
             );
           }
@@ -1574,7 +1662,7 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 
-  it.scopedLive("surfaces a run-event persistence failure", () =>
+  it.live("surfaces a run-event persistence failure", () =>
     withAuthority((db) =>
       Effect.gen(function* () {
         const runEventRepo = yield* RunEventRepo;
@@ -1590,7 +1678,7 @@ describe("SessionAuthority infrastructure failures", () => {
           ),
         );
 
-        const result = yield* Effect.either(
+        const result = yield* Effect.result(
           runEventRepo.upsert({
             sourceKey: Schema.decodeUnknownSync(SourceKey)("authority-event"),
             sessionId: testSessionId,
@@ -1602,15 +1690,15 @@ describe("SessionAuthority infrastructure failures", () => {
             now: 0,
           }),
         );
-        expect(Either.isLeft(result)).toBe(true);
-        if (Either.isLeft(result)) {
-          expect(result.left._tag).toBe("@Gateway/DatabaseError");
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) {
+          expect(result.failure._tag).toBe("@Gateway/DatabaseError");
         }
       }),
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "rolls back a run transition when its admin event cannot be persisted",
     () =>
       withAuthority((db) =>
@@ -1628,12 +1716,12 @@ describe("SessionAuthority infrastructure failures", () => {
             ),
           );
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("@Gateway/DatabaseError");
           }
           const run = yield* runRepo.get(testSessionId);
           expect(Option.isSome(run)).toBe(true);
@@ -1642,7 +1730,7 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "surfaces markProcessed failure after a successful worker action",
     () =>
       withAuthority((db) =>
@@ -1682,12 +1770,12 @@ describe("SessionAuthority infrastructure failures", () => {
             ),
           );
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left._tag).toBe("@Gateway/DatabaseError");
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("@Gateway/DatabaseError");
           }
           const run = yield* runRepo.get(testSessionId);
           expect(Option.isSome(run)).toBe(true);
@@ -1697,7 +1785,7 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "continues terminal handling when best-effort lease release fails",
     () =>
       withAuthority((db) =>
@@ -1735,40 +1823,38 @@ describe("SessionAuthority infrastructure failures", () => {
       ),
   );
 
-  it.scopedLive(
-    "keeps the primary projection failure when lease cleanup fails",
-    () =>
-      withAuthority((db) =>
-        Effect.gen(function* () {
-          const authority = yield* SessionAuthority;
-          const runRepo = yield* RunRepo;
-          yield* runRepo.create({
-            sessionId: testSessionId,
-            organizationId: testOrganizationId,
-            issueId: Option.none(),
-          });
-          yield* Effect.sync(() =>
-            db.exec(
-              "CREATE TRIGGER reject_lease_release BEFORE UPDATE ON agent_run WHEN NEW.lease_owner IS NULL BEGIN SELECT RAISE(FAIL, 'lease release failed'); END",
-            ),
-          );
-          terminalFailure = new DatabaseError({
-            message: "primary projection failure",
-          });
+  it.live("keeps the primary projection failure when lease cleanup fails", () =>
+    withAuthority((db) =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const runRepo = yield* RunRepo;
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.none(),
+        });
+        yield* Effect.sync(() =>
+          db.exec(
+            "CREATE TRIGGER reject_lease_release BEFORE UPDATE ON agent_run WHEN NEW.lease_owner IS NULL BEGIN SELECT RAISE(FAIL, 'lease release failed'); END",
+          ),
+        );
+        terminalFailure = new DatabaseError({
+          message: "primary projection failure",
+        });
 
-          const result = yield* Effect.either(
-            authority.processSession(testSessionId),
-          );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left.message).toBe("primary projection failure");
-          }
-        }),
-      ),
+        const result = yield* Effect.result(
+          authority.processSession(testSessionId),
+        );
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) {
+          expect(result.failure.message).toBe("primary projection failure");
+        }
+      }),
+    ),
   );
 });
 describe("SessionAuthority deferred stop handling", () => {
-  it.scopedLive(
+  it.live(
     "skips a deferred stop after repeated lookup failures instead of canceling",
     () =>
       withAuthority(
@@ -1825,7 +1911,7 @@ describe("SessionAuthority deferred stop handling", () => {
   );
 });
 describe("SessionAuthority host-tool mutation gate", () => {
-  it.scopedLive("refuses mutating host tools once the run is canceled", () =>
+  it.live("refuses mutating host tools once the run is canceled", () =>
     withAuthority(
       () =>
         Effect.gen(function* () {
@@ -1892,7 +1978,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
       { withLinearGateway: true },
     ),
   );
-  it.scopedLive("normalizes external URLs before sending", () =>
+  it.live("normalizes external URLs before sending", () =>
     withAuthority(
       () =>
         Effect.gen(function* () {
@@ -1944,7 +2030,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "reports a pull request from the saved assistant draft at agent end",
     () =>
       withAuthority(
@@ -2001,7 +2087,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
       ),
   );
 
-  it.scopedLive("cancel waits for an in-flight mutation holding the gate", () =>
+  it.live("cancel waits for an in-flight mutation holding the gate", () =>
     withAuthority(
       () =>
         Effect.gen(function* () {
@@ -2034,7 +2120,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
           // holds the session gate.
           commentEnteredSignal = yield* Deferred.make<void>();
           commentRelease = yield* Deferred.make<void>();
-          const mutationFiber = yield* Effect.fork(
+          const mutationFiber = yield* Effect.forkChild(
             listener({
               id: "call-blocked",
               toolCallId: "tool-blocked",
@@ -2054,11 +2140,11 @@ describe("SessionAuthority host-tool mutation gate", () => {
             body: "Stop requested",
             payload: {},
           });
-          const cancelFiber = yield* Effect.fork(
+          const cancelFiber = yield* Effect.forkChild(
             authority.processSession(testSessionId),
           );
-          yield* Effect.yieldNow();
-          Deferred.unsafeDone(commentRelease, Effect.void);
+          yield* Effect.yieldNow;
+          Deferred.doneUnsafe(commentRelease, Effect.void);
           yield* Fiber.await(mutationFiber);
           yield* Fiber.join(cancelFiber);
           expect(orderEvents).toContain("worker-stopped");
@@ -2070,7 +2156,7 @@ describe("SessionAuthority host-tool mutation gate", () => {
 });
 
 describe("SessionAuthority Nix environment preparation", () => {
-  it.scopedLive(
+  it.live(
     "prepares repository dependencies before the first worker and its orphan retry",
     () =>
       withAuthority(() =>
@@ -2135,7 +2221,7 @@ describe("SessionAuthority Nix environment preparation", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "keeps the inherited environment unchanged for an empty dependency result",
     () =>
       withAuthority(() =>
@@ -2176,7 +2262,7 @@ describe("SessionAuthority Nix environment preparation", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "records a typed preparation failure without spawning an RPC worker",
     () =>
       withAuthority(() =>
@@ -2215,12 +2301,12 @@ describe("SessionAuthority Nix environment preparation", () => {
             reason: "process_failed",
           });
 
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             authority.processSession(testSessionId),
           );
-          expect(Either.isLeft(result)).toBe(true);
-          if (Either.isLeft(result)) {
-            expect(result.left._tag).toBe("@Gateway/NixEnvironmentError");
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("@Gateway/NixEnvironmentError");
           }
           expect(workerSpawnInputs).toHaveLength(0);
           const run = yield* runRepo.get(testSessionId);
@@ -2241,17 +2327,23 @@ const seedInterrupted = (
   state: "starting" | "running" | "waiting" | "orphaned" = "orphaned",
 ) =>
   Effect.gen(function* () {
-    yield* InstallationRepo.put(install(testOrganizationId));
-    yield* RunRepo.create({
-      sessionId: sid,
-      organizationId: testOrganizationId,
-      issueId: Option.none(),
-    });
-    yield* RunRepo.update(sid, {
-      state,
-      workspacePath: Option.some(authorityTestRoot),
-      ompSessionFile: Option.some(join(authorityTestRoot, "session.jsonl")),
-    });
+    yield* InstallationRepo.use((service) =>
+      service.put(install(testOrganizationId)),
+    );
+    yield* RunRepo.use((service) =>
+      service.create({
+        sessionId: sid,
+        organizationId: testOrganizationId,
+        issueId: Option.none(),
+      }),
+    );
+    yield* RunRepo.use((service) =>
+      service.update(sid, {
+        state,
+        workspacePath: Option.some(authorityTestRoot),
+        ompSessionFile: Option.some(join(authorityTestRoot, "session.jsonl")),
+      }),
+    );
   });
 
 describe("Recovery and concurrency regressions", () => {
@@ -2262,12 +2354,16 @@ describe("Recovery and concurrency regressions", () => {
         Effect.gen(function* () {
           const authority = yield* SessionAuthority;
           yield* seedInterrupted(testSessionId, state);
-          yield* RunRepo.update(testSessionId, {
-            ompSessionFile: Option.none(),
-          });
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              ompSessionFile: Option.none(),
+            }),
+          );
           for (let attempt = 1; attempt <= 5; attempt++) {
             yield* authority.processRunnable();
-            const run = yield* RunRepo.get(testSessionId);
+            const run = yield* RunRepo.use((service) =>
+              service.get(testSessionId),
+            );
             if (Option.isNone(run)) throw new Error("run missing");
             expect(run.value.attempt).toBe(attempt);
             expect(run.value.state).toBe(attempt === 5 ? "failed" : "orphaned");
@@ -2275,12 +2371,16 @@ describe("Recovery and concurrency regressions", () => {
               const next = Option.getOrThrow(run.value.nextAttemptAt);
               expect(next).toBeGreaterThan(yield* Clock.currentTimeMillis);
               yield* authority.processRunnable();
-              expect(yield* RunRepo.get(testSessionId)).toEqual(run);
+              expect(
+                yield* RunRepo.use((service) => service.get(testSessionId)),
+              ).toEqual(run);
               yield* TestClock.setTime(next + 1);
             }
           }
           expect(
-            Option.getOrThrow(yield* RunRepo.get(testSessionId)).leaseOwner,
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).leaseOwner,
           ).toEqual(Option.none());
         }),
       ),
@@ -2293,11 +2393,15 @@ describe("Recovery and concurrency regressions", () => {
         Effect.gen(function* () {
           const authority = yield* SessionAuthority;
           yield* seedInterrupted(testSessionId, "starting");
-          yield* RunRepo.update(testSessionId, {
-            workspacePath: Option.none(),
-          });
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              workspacePath: Option.none(),
+            }),
+          );
           yield* authority.processRunnable();
-          const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+          const run = Option.getOrThrow(
+            yield* RunRepo.use((service) => service.get(testSessionId)),
+          );
           expect(run.state).toBe("orphaned");
           expect(run.attempt).toBe(1);
           expect(Option.getOrNull(run.terminalReason)).toContain(
@@ -2307,7 +2411,7 @@ describe("Recovery and concurrency regressions", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "isolates materialization errors and continues to newer sessions",
     () =>
       withAuthority(() =>
@@ -2317,37 +2421,49 @@ describe("Recovery and concurrency regressions", () => {
           const good = Schema.decodeUnknownSync(SessionId)("z-newer-session");
           const repoId =
             Schema.decodeUnknownSync(WorkspaceId)("broken-local-repo");
-          yield* InstallationRepo.put(install(testOrganizationId));
-          yield* WorkspaceRepo.createRepository({
-            organizationId: testOrganizationId,
-            id: repoId,
-            url: join(authorityTestRoot, "missing-repository"),
-            ref: "main",
-            isDefault: true,
-          });
-          yield* RunRepo.create({
-            sessionId: bad,
-            organizationId: testOrganizationId,
-            issueId: Option.none(),
-          });
-          yield* RunInputRepo.enqueue({
-            id: Schema.decodeUnknownSync(InputId)("clone-input"),
-            sessionId: bad,
-            kind: "created",
-            body: "work",
-            payload: { organizationId: testOrganizationId },
-          });
+          yield* InstallationRepo.use((service) =>
+            service.put(install(testOrganizationId)),
+          );
+          yield* WorkspaceRepo.use((service) =>
+            service.createRepository({
+              organizationId: testOrganizationId,
+              id: repoId,
+              url: join(authorityTestRoot, "missing-repository"),
+              ref: "main",
+              isDefault: true,
+            }),
+          );
+          yield* RunRepo.use((service) =>
+            service.create({
+              sessionId: bad,
+              organizationId: testOrganizationId,
+              issueId: Option.none(),
+            }),
+          );
+          yield* RunInputRepo.use((service) =>
+            service.enqueue({
+              id: Schema.decodeUnknownSync(InputId)("clone-input"),
+              sessionId: bad,
+              kind: "created",
+              body: "work",
+              payload: { organizationId: testOrganizationId },
+            }),
+          );
           yield* seedInterrupted(good);
           yield* authority.processRunnable();
-          const failed = Option.getOrThrow(yield* RunRepo.get(bad));
+          const failed = Option.getOrThrow(
+            yield* RunRepo.use((service) => service.get(bad)),
+          );
           expect(failed.state).toBe("orphaned");
           expect(failed.attempt).toBe(1);
           expect(Option.getOrNull(failed.terminalReason)).toContain(
             "Repository must be an HTTPS GitHub URL with a valid ref",
           );
-          expect(Option.getOrThrow(yield* RunRepo.get(good)).state).toBe(
-            "running",
-          );
+          expect(
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(good)),
+            ).state,
+          ).toBe("running");
           expect(yield* authority.activeWorkerCount()).toBe(1);
         }),
       ),
@@ -2365,34 +2481,42 @@ describe("Recovery and concurrency regressions", () => {
             yield* authority.processSession(busy);
             yield* seedInterrupted(testSessionId);
             const deadline = (yield* Clock.currentTimeMillis) + 60_000;
-            yield* RunRepo.update(testSessionId, {
-              nextAttemptAt: Option.some(deadline),
-            });
+            yield* RunRepo.use((service) =>
+              service.update(testSessionId, {
+                nextAttemptAt: Option.some(deadline),
+              }),
+            );
             const inputId = Schema.decodeUnknownSync(InputId)("backoff-stop");
-            yield* RunInputRepo.enqueue({
-              id: inputId,
-              sessionId: testSessionId,
-              kind: "stop",
-              body: "Issue status changed",
-              payload: {
-                type: "AppUserNotification",
-                action: "issueStatusChanged",
-                notification: { issueId: "issue-1" },
-              },
-            });
+            yield* RunInputRepo.use((service) =>
+              service.enqueue({
+                id: inputId,
+                sessionId: testSessionId,
+                kind: "stop",
+                body: "Issue status changed",
+                payload: {
+                  type: "AppUserNotification",
+                  action: "issueStatusChanged",
+                  notification: { issueId: "issue-1" },
+                },
+              }),
+            );
             linearIssueStateType = issueState;
             linearIssueLookupFails = issueState === "unavailable";
             yield* authority.processSession(testSessionId);
-            const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+            const run = Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            );
             expect(run.state).toBe(
               issueState === "canceled" ? "canceled" : "orphaned",
             );
             expect(run.desiredState).toBe(
               issueState === "canceled" ? "canceled" : "running",
             );
-            expect(yield* RunInputRepo.pending(testSessionId)).toHaveLength(
-              issueState === "unavailable" ? 1 : 0,
-            );
+            expect(
+              yield* RunInputRepo.use((service) =>
+                service.pending(testSessionId),
+              ),
+            ).toHaveLength(issueState === "unavailable" ? 1 : 0);
             expect(run.attempt).toBe(0);
             expect(run.leaseOwner).toEqual(Option.none());
             expect(workerSpawnInputs).toHaveLength(1);
@@ -2409,25 +2533,37 @@ describe("Recovery and concurrency regressions", () => {
         (db) =>
           Effect.gen(function* () {
             yield* seedInterrupted(testSessionId);
-            yield* RunInputRepo.enqueue({
-              id: Schema.decodeUnknownSync(InputId)("foreign-owned-stop"),
-              sessionId: testSessionId,
-              kind: "stop",
-              body: "Issue status changed",
-              payload: {
-                type: "AppUserNotification",
-                action: "issueStatusChanged",
-                notification: { issueId: "issue-1" },
-              },
-            });
+            yield* RunInputRepo.use((service) =>
+              service.enqueue({
+                id: Schema.decodeUnknownSync(InputId)("foreign-owned-stop"),
+                sessionId: testSessionId,
+                kind: "stop",
+                body: "Issue status changed",
+                payload: {
+                  type: "AppUserNotification",
+                  action: "issueStatusChanged",
+                  notification: { issueId: "issue-1" },
+                },
+              }),
+            );
             db.query(
               "UPDATE agent_run SET lease_owner='other-authority', lease_expires_at=? WHERE session_id=?",
             ).run((yield* Clock.currentTimeMillis) + 60_000, testSessionId);
             linearIssueStateType = "canceled";
-            const before = yield* RunRepo.get(testSessionId);
-            yield* SessionAuthority.processSession(testSessionId);
-            expect(yield* RunRepo.get(testSessionId)).toEqual(before);
-            expect(yield* RunInputRepo.pending(testSessionId)).toHaveLength(1);
+            const before = yield* RunRepo.use((service) =>
+              service.get(testSessionId),
+            );
+            yield* SessionAuthority.use((service) =>
+              service.processSession(testSessionId),
+            );
+            expect(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).toEqual(before);
+            expect(
+              yield* RunInputRepo.use((service) =>
+                service.pending(testSessionId),
+              ),
+            ).toHaveLength(1);
           }),
         { withLinearGateway: true },
       ),
@@ -2441,64 +2577,80 @@ describe("Recovery and concurrency regressions", () => {
           yield* seedInterrupted(testSessionId);
           const repositoryId =
             Schema.decodeUnknownSync(WorkspaceId)("targeted-retry");
-          yield* WorkspaceRepo.createRepository({
-            organizationId: testOrganizationId,
-            id: repositoryId,
-            url: "https://example.invalid/unused",
-            ref: "main",
-          });
-          yield* RunRepo.update(testSessionId, {
-            repositoryId: Option.some(repositoryId),
-          });
+          yield* WorkspaceRepo.use((service) =>
+            service.createRepository({
+              organizationId: testOrganizationId,
+              id: repositoryId,
+              url: "https://example.invalid/unused",
+              ref: "main",
+            }),
+          );
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              repositoryId: Option.some(repositoryId),
+            }),
+          );
           const deadline = (yield* Clock.currentTimeMillis) + 60_000;
-          yield* RunRepo.update(testSessionId, {
-            nextAttemptAt: Option.some(deadline),
-          });
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              nextAttemptAt: Option.some(deadline),
+            }),
+          );
           if (schedule !== "missing")
-            yield* RunEventRepo.upsert({
-              sourceKey: Schema.decodeUnknownSync(SourceKey)(
-                `retry:${testSessionId}:0`,
-              ),
-              sessionId: testSessionId,
-              kind: "retry",
-              level: "info",
-              payload: {
-                nextAttemptAt:
-                  schedule === "mismatched" ? deadline + 1 : deadline,
-                scheduledAt: schedule === "invalid" ? "bad" : 0,
-              },
-            });
+            yield* RunEventRepo.use((service) =>
+              service.upsert({
+                sourceKey: Schema.decodeUnknownSync(SourceKey)(
+                  `retry:${testSessionId}:0`,
+                ),
+                sessionId: testSessionId,
+                kind: "retry",
+                level: "info",
+                payload: {
+                  nextAttemptAt:
+                    schedule === "mismatched" ? deadline + 1 : deadline,
+                  scheduledAt: schedule === "invalid" ? "bad" : 0,
+                },
+              }),
+            );
           if (schedule === "missing") {
             db.query("DELETE FROM run_event WHERE source_key=?").run(
               `retry:${testSessionId}:0`,
             );
           }
           // An unrelated, unreadable payload must not be loaded on a retry tick.
-          yield* RunEventRepo.upsert({
-            sourceKey: Schema.decodeUnknownSync(SourceKey)(
-              `rpc:${testSessionId}:7:progress`,
-            ),
-            sessionId: testSessionId,
-            kind: "progress",
-            level: "info",
-          });
+          yield* RunEventRepo.use((service) =>
+            service.upsert({
+              sourceKey: Schema.decodeUnknownSync(SourceKey)(
+                `rpc:${testSessionId}:7:progress`,
+              ),
+              sessionId: testSessionId,
+              kind: "progress",
+              level: "info",
+            }),
+          );
           db.query(
             "UPDATE run_event SET payload_json='invalid' WHERE kind='progress'",
           ).run();
-          yield* RunInputRepo.enqueue({
-            id: Schema.decodeUnknownSync(InputId)("fresh-prompt"),
-            sessionId: testSessionId,
-            kind: "prompted",
-            body: "Continue",
-            payload: {},
-            createdAt: 1,
-          });
-          yield* SessionAuthority.processSession(testSessionId);
+          yield* RunInputRepo.use((service) =>
+            service.enqueue({
+              id: Schema.decodeUnknownSync(InputId)("fresh-prompt"),
+              sessionId: testSessionId,
+              kind: "prompted",
+              body: "Continue",
+              payload: {},
+              createdAt: 1,
+            }),
+          );
+          yield* SessionAuthority.use((service) =>
+            service.processSession(testSessionId),
+          );
           expect(workerSpawnInputs).toHaveLength(
             schedule === "matching" ? 1 : 0,
           );
           expect(
-            Option.getOrThrow(yield* RunRepo.get(testSessionId)).attempt,
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).attempt,
           ).toBe(schedule === "matching" ? 1 : 0);
         }),
       ),
@@ -2509,15 +2661,17 @@ describe("Recovery and concurrency regressions", () => {
       Effect.gen(function* () {
         const authority = yield* SessionAuthority;
         yield* seedInterrupted(testSessionId);
-        yield* RunEventRepo.upsert({
-          sessionId: testSessionId,
-          sourceKey: Schema.decodeUnknownSync(SourceKey)(
-            `rpc:${testSessionId}:40:progress`,
-          ),
-          kind: "progress",
-          level: "info",
-          payload: { type: "progress", message: "old" },
-        });
+        yield* RunEventRepo.use((service) =>
+          service.upsert({
+            sessionId: testSessionId,
+            sourceKey: Schema.decodeUnknownSync(SourceKey)(
+              `rpc:${testSessionId}:40:progress`,
+            ),
+            kind: "progress",
+            level: "info",
+            payload: { type: "progress", message: "old" },
+          }),
+        );
         // Sequence seeding must read keys without decoding historical payloads.
         db.query(
           "UPDATE run_event SET payload_json='unreadable history' WHERE source_key=?",
@@ -2533,20 +2687,22 @@ describe("Recovery and concurrency regressions", () => {
           yield* Deferred.await(observed);
           expect(projectorEvents.at(-1)?.sequence).toBe(sequence);
           yield* authority.shutdown();
-          yield* RunRepo.update(testSessionId, {
-            state: "orphaned",
-            ompSessionFile: Option.some(
-              join(authorityTestRoot, "session.jsonl"),
-            ),
-          });
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              state: "orphaned",
+              ompSessionFile: Option.some(
+                join(authorityTestRoot, "session.jsonl"),
+              ),
+            }),
+          );
         }
         db.query("UPDATE run_event SET payload_json=? WHERE source_key=?").run(
           JSON.stringify({ type: "progress", message: "old" }),
           `rpc:${testSessionId}:40:progress`,
         );
-        const events = (yield* RunEventRepo.list(testSessionId)).filter(
-          (event) => event.kind === "progress",
-        );
+        const events = (yield* RunEventRepo.use((service) =>
+          service.list(testSessionId),
+        )).filter((event) => event.kind === "progress");
         expect(events).toHaveLength(3);
         expect(
           events.find((event) => event.sourceKey.endsWith(":40:progress"))
@@ -2568,18 +2724,24 @@ describe("Recovery and concurrency regressions", () => {
           type: "worker_exited",
           message: "worker exited with code 17",
         });
-        yield* Effect.repeat(Effect.yieldNow(), {
+        yield* Effect.repeat(Effect.yieldNow, {
           until: () => orderEvents.includes("worker-stopped"),
         });
-        yield* Effect.repeat(Effect.yieldNow(), {
+        yield* Effect.repeat(Effect.yieldNow, {
           until: () => workerEventListener === undefined,
         });
         // Wait for the event consumer's failure transaction, without a real clock.
-        yield* Effect.repeat(RunRepo.get(testSessionId), {
-          until: (run) => Option.isSome(run) && run.value.state === "orphaned",
-        });
+        yield* Effect.repeat(
+          RunRepo.use((service) => service.get(testSessionId)),
+          {
+            until: (run) =>
+              Option.isSome(run) && run.value.state === "orphaned",
+          },
+        );
         expect(yield* authority.activeWorkerCount()).toBe(0);
-        const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+        const run = Option.getOrThrow(
+          yield* RunRepo.use((service) => service.get(testSessionId)),
+        );
         expect(run.attempt).toBe(1);
         expect(Option.getOrNull(run.terminalReason)).toContain("code 17");
         expect(Option.isSome(run.nextAttemptAt)).toBe(true);
@@ -2593,41 +2755,55 @@ describe("Recovery and concurrency regressions", () => {
       withAuthority(() =>
         Effect.gen(function* () {
           yield* seedInterrupted(testSessionId);
-          yield* RunRepo.update(testSessionId, {
-            state: "waiting",
-            workspacePath: Option.none(),
-            ompSessionFile: Option.none(),
-          });
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              state: "waiting",
+              workspacePath: Option.none(),
+              ompSessionFile: Option.none(),
+            }),
+          );
           for (let tick = 0; tick < 4; tick++)
-            yield* SessionAuthority.processRunnable();
-          const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+            yield* SessionAuthority.use((service) => service.processRunnable());
+          const run = Option.getOrThrow(
+            yield* RunRepo.use((service) => service.get(testSessionId)),
+          );
           expect(run.state).toBe("waiting");
           expect(run.attempt).toBe(0);
           expect(run.terminalReason).toEqual(Option.none());
           expect(workerSpawnInputs).toHaveLength(0);
           const repositoryId =
             Schema.decodeUnknownSync(WorkspaceId)("waiting-repository");
-          yield* WorkspaceRepo.createRepository({
-            organizationId: testOrganizationId,
-            id: repositoryId,
-            url: "https://github.com/fixture/waiting.git",
-            ref: "main",
-          });
-          yield* RunRepo.update(testSessionId, {
-            workspacePath: Option.some(authorityTestRoot),
-            repositoryId: Option.some(repositoryId),
-          });
-          yield* RunInputRepo.enqueue({
-            id: Schema.decodeUnknownSync(InputId)("waiting-prompt"),
-            sessionId: testSessionId,
-            kind: "prompted",
-            body: "Start working",
-            payload: {},
-          });
-          yield* SessionAuthority.processSession(testSessionId);
+          yield* WorkspaceRepo.use((service) =>
+            service.createRepository({
+              organizationId: testOrganizationId,
+              id: repositoryId,
+              url: "https://github.com/fixture/waiting.git",
+              ref: "main",
+            }),
+          );
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              workspacePath: Option.some(authorityTestRoot),
+              repositoryId: Option.some(repositoryId),
+            }),
+          );
+          yield* RunInputRepo.use((service) =>
+            service.enqueue({
+              id: Schema.decodeUnknownSync(InputId)("waiting-prompt"),
+              sessionId: testSessionId,
+              kind: "prompted",
+              body: "Start working",
+              payload: {},
+            }),
+          );
+          yield* SessionAuthority.use((service) =>
+            service.processSession(testSessionId),
+          );
           expect(workerSpawnInputs).toHaveLength(1);
           expect(
-            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).state,
           ).toBe("running");
         }),
       ),
@@ -2652,8 +2828,12 @@ describe("Recovery and concurrency regressions", () => {
             );
             expect(workerSpawnInputs).toHaveLength(1);
             expect(yield* authority.activeWorkerCount()).toBe(1);
-            const first = Option.getOrThrow(yield* RunRepo.get(testSessionId));
-            const second = Option.getOrThrow(yield* RunRepo.get(next));
+            const first = Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            );
+            const second = Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(next)),
+            );
             const blocked = first.state === "running" ? next : testSessionId;
             expect(
               [first.state, second.state].filter(
@@ -2661,14 +2841,18 @@ describe("Recovery and concurrency regressions", () => {
               ),
             ).toHaveLength(1);
             expect(
-              Option.getOrThrow(yield* RunRepo.get(blocked)).state,
+              Option.getOrThrow(
+                yield* RunRepo.use((service) => service.get(blocked)),
+              ).state,
             ).not.toBe("running");
             yield* authority.shutdown();
             yield* authority.processSession(blocked);
             expect(workerSpawnInputs).toHaveLength(2);
-            expect(Option.getOrThrow(yield* RunRepo.get(blocked)).state).toBe(
-              "running",
-            );
+            expect(
+              Option.getOrThrow(
+                yield* RunRepo.use((service) => service.get(blocked)),
+              ).state,
+            ).toBe("running");
           }),
         { config: [["MAX_CONCURRENT_WORKERS", "1"]] },
       ),
@@ -2687,25 +2871,31 @@ describe("Recovery and concurrency regressions", () => {
               Schema.decodeUnknownSync(SessionId)("slow-preparation");
             const repoId = Schema.decodeUnknownSync(WorkspaceId)("slow-nix");
             yield* seedInterrupted(blocked);
-            yield* WorkspaceRepo.createRepository({
-              organizationId: testOrganizationId,
-              id: repoId,
-              url: "https://example.invalid/unused",
-              ref: "main",
-            });
-            yield* RunRepo.update(blocked, {
-              repositoryId: Option.some(repoId),
-            });
+            yield* WorkspaceRepo.use((service) =>
+              service.createRepository({
+                organizationId: testOrganizationId,
+                id: repoId,
+                url: "https://example.invalid/unused",
+                ref: "main",
+              }),
+            );
+            yield* RunRepo.use((service) =>
+              service.update(blocked, {
+                repositoryId: Option.some(repoId),
+              }),
+            );
             const entered = yield* Deferred.make<void>();
             const release = yield* Deferred.make<void>();
             nixPrepareBlock = { entered, release };
-            const preparation = yield* Effect.fork(
+            const preparation = yield* Effect.forkChild(
               authority.processSession(blocked),
             );
             yield* Deferred.await(entered);
             for (let step = 0; step < 12; step++) yield* TestClock.adjust(100);
             const now = yield* Clock.currentTimeMillis;
-            const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+            const run = Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            );
             expect(Option.getOrThrow(run.leaseExpiresAt)).toBeGreaterThan(now);
             expect(yield* authority.activeWorkerCount()).toBe(1);
             yield* Deferred.succeed(release, undefined);
@@ -2761,14 +2951,20 @@ describe("Authority lease loss", () => {
             until: (count) => count === 0,
           });
           expect(
-            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).state,
           ).toBe("running");
           expect(
-            Option.getOrThrow(yield* RunRepo.get(testSessionId)).leaseOwner,
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).leaseOwner,
           ).toEqual(Option.some("replacement"));
           expect(yield* authority.activeWorkerCount()).toBe(0);
           expect(
-            (yield* RunEventRepo.list(testSessionId)).some((event) =>
+            (yield* RunEventRepo.use((service) =>
+              service.list(testSessionId),
+            )).some((event) =>
               Option.getOrElse(event.text, () => "").includes("succeeded"),
             ),
           ).toBe(false);
@@ -2785,30 +2981,36 @@ describe("Recovery admission fencing", () => {
         yield* seedInterrupted(testSessionId);
         const repoId =
           Schema.decodeUnknownSync(WorkspaceId)("preparation-fence");
-        yield* WorkspaceRepo.createRepository({
-          organizationId: testOrganizationId,
-          id: repoId,
-          url: "https://example.invalid/unused",
-          ref: "main",
-        });
-        yield* RunRepo.update(testSessionId, {
-          repositoryId: Option.some(repoId),
-        });
+        yield* WorkspaceRepo.use((service) =>
+          service.createRepository({
+            organizationId: testOrganizationId,
+            id: repoId,
+            url: "https://example.invalid/unused",
+            ref: "main",
+          }),
+        );
+        yield* RunRepo.use((service) =>
+          service.update(testSessionId, {
+            repositoryId: Option.some(repoId),
+          }),
+        );
         const entered = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         nixPrepareBlock = { entered, release };
-        const preparing = yield* Effect.fork(
-          authority.processSession(testSessionId).pipe(Effect.either),
+        const preparing = yield* Effect.forkChild(
+          authority.processSession(testSessionId).pipe(Effect.result),
         );
         yield* Deferred.await(entered);
         db.query(
           "UPDATE agent_run SET lease_owner='replacement' WHERE session_id=?",
         ).run(testSessionId);
         yield* Deferred.succeed(release, undefined);
-        expect(Either.isLeft(yield* Fiber.join(preparing))).toBe(true);
+        expect(Result.isFailure(yield* Fiber.join(preparing))).toBe(true);
         expect(workerSpawnInputs).toEqual([]);
         expect(
-          Option.getOrThrow(yield* RunRepo.get(testSessionId)).leaseOwner,
+          Option.getOrThrow(
+            yield* RunRepo.use((service) => service.get(testSessionId)),
+          ).leaseOwner,
         ).toEqual(Option.some("replacement"));
       }),
     ),
@@ -2825,7 +3027,9 @@ describe("Recovery admission fencing", () => {
             testSessionId,
           );
           yield* authority.processRunnable();
-          const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+          const run = Option.getOrThrow(
+            yield* RunRepo.use((service) => service.get(testSessionId)),
+          );
           expect(run.state).toBe("failed");
           expect(run.attempt).toBe(5);
           expect(workerSpawnInputs).toEqual([]);
@@ -2855,26 +3059,37 @@ describe("Recovery review regressions", () => {
           yield* Deferred.await(entered);
           expect(yield* authority.activeWorkerCount()).toBe(1);
           // This prompt predates the scheduled retry and must remain under backoff.
-          yield* RunInputRepo.enqueue({
-            id: Schema.decodeUnknownSync(InputId)("during-teardown"),
-            sessionId: testSessionId,
-            kind: "prompted",
-            body: "continue",
-            payload: {},
-            createdAt: yield* Clock.currentTimeMillis,
+          yield* Effect.gen(function* () {
+            const service = yield* RunInputRepo;
+            return yield* service.enqueue({
+              id: Schema.decodeUnknownSync(InputId)("during-teardown"),
+              sessionId: testSessionId,
+              kind: "prompted",
+              body: "continue",
+              payload: {},
+              createdAt: yield* Clock.currentTimeMillis,
+            });
           });
-          const processing = yield* Effect.fork(
+          const processing = yield* Effect.forkChild(
             authority.processSession(testSessionId),
           );
-          yield* Effect.yieldNow();
-          expect(Option.isNone(yield* Fiber.poll(processing))).toBe(true);
+          yield* Effect.yieldNow;
+          expect(
+            Option.isNone(
+              yield* Effect.sync(() =>
+                Option.fromUndefinedOr(processing.pollUnsafe()),
+              ),
+            ),
+          ).toBe(true);
           expect(workerSpawnInputs).toHaveLength(1);
           yield* Deferred.succeed(release, undefined);
           yield* Fiber.join(processing);
           expect(workerSpawnInputs).toHaveLength(1);
           expect(yield* authority.activeWorkerCount()).toBe(0);
           expect(
-            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).state,
           ).toBe("orphaned");
         }),
       ),
@@ -2889,46 +3104,62 @@ describe("Recovery review regressions", () => {
           yield* seedInterrupted(testSessionId);
           const repositoryId =
             Schema.decodeUnknownSync(WorkspaceId)("retry-workspace");
-          yield* WorkspaceRepo.createRepository({
-            organizationId: testOrganizationId,
-            id: repositoryId,
-            url: "https://example.invalid/retry",
-            ref: "main",
-          });
-          yield* RunRepo.update(testSessionId, {
-            repositoryId: Option.some(repositoryId),
-          });
+          yield* WorkspaceRepo.use((service) =>
+            service.createRepository({
+              organizationId: testOrganizationId,
+              id: repositoryId,
+              url: "https://example.invalid/retry",
+              ref: "main",
+            }),
+          );
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              repositoryId: Option.some(repositoryId),
+            }),
+          );
           yield* TestClock.adjust(1000);
-          yield* RunInputRepo.enqueue({
-            id: Schema.decodeUnknownSync(InputId)("old-retry-input"),
-            sessionId: testSessionId,
-            kind: "prompted",
-            body: "old input",
-            payload: {},
-            createdAt: 1000,
-          });
-          yield* RunRepo.update(testSessionId, {
-            state: "orphaned",
-            nextAttemptAt: Option.some(300000),
-          });
+          yield* RunInputRepo.use((service) =>
+            service.enqueue({
+              id: Schema.decodeUnknownSync(InputId)("old-retry-input"),
+              sessionId: testSessionId,
+              kind: "prompted",
+              body: "old input",
+              payload: {},
+              createdAt: 1000,
+            }),
+          );
+          yield* RunRepo.use((service) =>
+            service.update(testSessionId, {
+              state: "orphaned",
+              nextAttemptAt: Option.some(300000),
+            }),
+          );
           // A renewal changes updatedAt after scheduling and must not reset the cutoff.
           yield* TestClock.adjust(1000);
-          yield* RunRepo.claimLease(testSessionId, "foreign", 10);
-          yield* RunRepo.releaseLease(testSessionId, "foreign");
+          yield* RunRepo.use((service) =>
+            service.claimLease(testSessionId, "foreign", 10),
+          );
+          yield* RunRepo.use((service) =>
+            service.releaseLease(testSessionId, "foreign"),
+          );
           yield* authority.processSession(testSessionId);
           expect(workerSpawnInputs).toHaveLength(0);
-          yield* RunInputRepo.enqueue({
-            id: Schema.decodeUnknownSync(InputId)("fresh-retry-input"),
-            sessionId: testSessionId,
-            kind: "prompted",
-            body: "new input",
-            payload: {},
-            createdAt: 1500,
-          });
+          yield* RunInputRepo.use((service) =>
+            service.enqueue({
+              id: Schema.decodeUnknownSync(InputId)("fresh-retry-input"),
+              sessionId: testSessionId,
+              kind: "prompted",
+              body: "new input",
+              payload: {},
+              createdAt: 1500,
+            }),
+          );
           yield* authority.processSession(testSessionId);
           expect(workerSpawnInputs).toHaveLength(1);
           expect(
-            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+            Option.getOrThrow(
+              yield* RunRepo.use((service) => service.get(testSessionId)),
+            ).state,
           ).toBe("running");
         }),
       ),

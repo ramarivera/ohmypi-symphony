@@ -1,4 +1,6 @@
 import type * as LinearSdk from "@linear/sdk";
+import { TestClock } from "effect/testing";
+import * as fc from "fast-check";
 import { vi } from "vitest";
 import { suitePaths } from "./fixtures/paths.js";
 
@@ -173,7 +175,6 @@ import {
   Option,
   Redacted,
   Schema,
-  TestClock,
 } from "effect";
 import { beforeEach, describe, expect, it } from "vitest";
 import { LinearRateLimitError } from "../src/domain/errors.js";
@@ -240,7 +241,7 @@ const unusedRepoMethod = (..._args: ReadonlyArray<unknown>) => Effect.never;
 const gatewayDependencies = Layer.mergeAll(
   Layer.succeed(
     RunRepo,
-    RunRepo.make({
+    RunRepo.of({
       get: () => Effect.succeed(Option.some(run)),
       create: unusedRepoMethod,
       createIfNoActiveForIssue: unusedRepoMethod,
@@ -259,7 +260,7 @@ const gatewayDependencies = Layer.mergeAll(
   ),
   Layer.succeed(
     InstallationRepo,
-    InstallationRepo.make({
+    InstallationRepo.of({
       get: () => Effect.succeed(Option.some(installation)),
       put: unusedRepoMethod,
       revoke: unusedRepoMethod,
@@ -271,7 +272,7 @@ const gatewayDependencies = Layer.mergeAll(
   ),
   Layer.succeed(
     GatewayConfig,
-    GatewayConfig.make({
+    GatewayConfig.of({
       githubAppId: undefined,
       githubAppPrivateKey: undefined,
       linearClientId: "client-id",
@@ -300,7 +301,7 @@ const gatewayDependencies = Layer.mergeAll(
   ),
 );
 
-const gatewayLayer = LinearGateway.DefaultWithoutDependencies.pipe(
+const gatewayLayer = LinearGateway.layerWithoutDependencies.pipe(
   Layer.provide(gatewayDependencies),
 );
 const cacheTests = () => {
@@ -309,7 +310,7 @@ const cacheTests = () => {
       sdkState.state.startedStates.set("team-ttl", [
         { id: "state-1", name: "Started", position: 1 },
       ]);
-      const clock = yield* TestClock.testClock();
+      const clock = yield* TestClock.testClockWith(Effect.succeed);
       const gateway = yield* LinearGateway;
       yield* gateway.teamStartedStates({
         sessionId: String(sessionId),
@@ -482,24 +483,38 @@ describe("LinearGateway parity", () => {
     });
   });
 
-  effectIt.effect.prop(
+  effectIt.effect(
     "creates every generated thought activity and returns its SDK id",
-    { body: Schema.String },
-    ({ body }) =>
+    () =>
       Effect.gen(function* () {
-        sdkState.reset();
-        const gateway = yield* LinearGateway;
-        const activityId = yield* gateway.createActivity({
-          sessionId,
-          content: { type: "thought", body },
-        });
-        expect(activityId).toBe("activity-id");
-        expect(sdkState.state.activities.at(-1)?.content).toEqual({
-          type: "thought",
+        const cases = fc.record({ body: fc.string() });
+        const check = ({
           body,
-        });
-      }).pipe(Effect.provide(gatewayLayer)),
-    { fastCheck: { numRuns: 20 } },
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          Effect.gen(function* () {
+            sdkState.reset();
+            const gateway = yield* LinearGateway;
+            const activityId = yield* gateway.createActivity({
+              sessionId,
+              content: { type: "thought", body },
+            });
+            expect(activityId).toBe("activity-id");
+            expect(sdkState.state.activities.at(-1)?.content).toEqual({
+              type: "thought",
+              body,
+            });
+          }).pipe(Effect.provide(gatewayLayer));
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
   );
 
   it("forwards persisted plan and external URL fields verbatim", async () => {
@@ -618,7 +633,7 @@ describe("LinearGateway parity", () => {
             sessionId,
             content: { type: "thought", body: "one" },
           })
-          .pipe(Effect.fork);
+          .pipe(Effect.forkChild);
         yield* Effect.promise(() => sdkState.waitForActivity(1));
 
         const interrupted = yield* gateway
@@ -626,14 +641,17 @@ describe("LinearGateway parity", () => {
             sessionId,
             content: { type: "thought", body: "two" },
           })
-          .pipe(Effect.fork);
+          .pipe(Effect.forkChild);
         const third = yield* gateway
           .createActivity({
             sessionId,
             content: { type: "thought", body: "three" },
           })
-          .pipe(Effect.fork);
-        yield* Fiber.interruptFork(interrupted);
+          .pipe(Effect.forkChild);
+        yield* Fiber.interrupt(interrupted).pipe(
+          Effect.forkChild({ startImmediately: true }),
+          Effect.asVoid,
+        );
 
         expect(sdkState.state.activities).toHaveLength(1);
         sdkState.state.pending.shift()?.resolve({
@@ -676,9 +694,11 @@ describe("LinearGateway parity", () => {
     expect(attempts).toBe(2);
     expect(Exit.isFailure(exit)).toBe(true);
     if (Exit.isFailure(exit)) {
-      expect(exit.cause._tag).toBe("Fail");
-      if (exit.cause._tag === "Fail")
-        expect(exit.cause.error).toBeInstanceOf(LinearRateLimitError);
+      expect(exit.cause.reasons).toHaveLength(1);
+      const reason = exit.cause.reasons[0];
+      expect(reason?._tag).toBe("Fail");
+      if (reason?._tag === "Fail")
+        expect(reason.error).toBeInstanceOf(LinearRateLimitError);
     }
   });
 });

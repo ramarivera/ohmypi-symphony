@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect";
+import { Context, Effect, Layer, Option, Schema } from "effect";
 import {
   type DatabaseError,
   RowDecodeError,
@@ -62,7 +62,7 @@ const parseStringArray = (
   });
 
 const rowToInstallation = (
-  tokenCrypto: TokenCrypto,
+  tokenCrypto: TokenCrypto["Service"],
   row: InstallationRow,
 ): Effect.Effect<Installation, TokenCipherError | RowDecodeError, never> =>
   Effect.gen(function* () {
@@ -121,12 +121,10 @@ const rowToInstallation = (
     );
   });
 
-export class InstallationRepo extends Effect.Service<InstallationRepo>()(
+export class InstallationRepo extends Context.Service<InstallationRepo>()(
   "InstallationRepo",
   {
-    accessors: true,
-    dependencies: [TokenCrypto.Default],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       const tokenCrypto = yield* TokenCrypto;
 
@@ -400,4 +398,9 @@ export class InstallationRepo extends Effect.Service<InstallationRepo>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([TokenCrypto.layer]),
+  );
+}

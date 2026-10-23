@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect";
+import { Context, Effect, Layer, Option, Schema } from "effect";
 import type { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import {
   PromptTemplate,
@@ -35,11 +35,10 @@ const rowToPromptTemplate = (
     "PromptTemplate",
   );
 
-export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
+export class PromptTemplateRepo extends Context.Service<PromptTemplateRepo>()(
   "PromptTemplateRepo",
   {
-    accessors: true,
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       const cache = new Map<string, Option.Option<PromptTemplateRecord>>();
       const cacheKey = (organizationId: string, kind: PromptTemplateKind) =>
@@ -153,4 +152,7 @@ export class PromptTemplateRepo extends Effect.Service<PromptTemplateRepo>()(
       return { get, list, upsert, remove };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies;
+}

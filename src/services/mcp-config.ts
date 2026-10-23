@@ -1,6 +1,6 @@
 import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Effect, Option } from "effect";
+import { Data, Effect, Option } from "effect";
 import type { McpServerRecord } from "../domain/models.js";
 import {
   cleanupWorkspaceProcess,
@@ -8,6 +8,11 @@ import {
   needsWorkspaceIdentity,
   workspaceProcess,
 } from "./workspace-process.js";
+
+class McpConfigError extends Data.TaggedError("McpConfigError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
 
 const isTrackedMcpConfig = async (cwd: string): Promise<boolean> => {
   try {
@@ -69,7 +74,7 @@ export const removeMcpConfig = (
         try: () => removeMcpConfigFile(cwd),
         catch: (error) => String(error),
       }).pipe(
-        Effect.catchAll((error) =>
+        Effect.catch((error) =>
           Effect.logWarning("mcp.config.cleanup_failed").pipe(
             Effect.annotateLogs({ cwd, error }),
           ),
@@ -141,7 +146,7 @@ export const writeOmpMcpConfig = (
   servers: ReadonlyArray<McpServerRecord>,
   sessionId?: string,
   requireWrite = false,
-): Effect.Effect<void, Error> => {
+): Effect.Effect<void, McpConfigError> => {
   if (needsWorkspaceIdentity())
     return Effect.tryPromise({
       try: async () => {
@@ -152,7 +157,10 @@ export const writeOmpMcpConfig = (
         );
       },
       catch: (error) =>
-        error instanceof Error ? error : new Error(String(error)),
+        new McpConfigError({
+          message: error instanceof Error ? error.message : String(error),
+          cause: error,
+        }),
     });
   return writeOmpMcpConfigFile(
     cwd,
@@ -166,13 +174,15 @@ export const writeOmpMcpConfigFile = (
   cwd: string,
   config: ReturnType<typeof toOmpMcpConfig>,
   sessionId?: string,
-): Effect.Effect<void, Error> => {
+): Effect.Effect<void, McpConfigError> => {
   const contents = `${JSON.stringify({ mcpServers: config.mcpServers }, null, 2)}\n`;
   return Effect.gen(function* () {
     if (yield* Effect.promise(() => isTrackedMcpConfig(cwd))) {
       if (config.requireWrite)
         return yield* Effect.fail(
-          new Error("Gateway MCP proxy requires an untracked mcp.json"),
+          new McpConfigError({
+            message: "Gateway MCP proxy requires an untracked mcp.json",
+          }),
         );
       yield* Effect.logWarning("mcp.config.tracked_skip").pipe(
         Effect.annotateLogs({
@@ -194,7 +204,9 @@ export const writeOmpMcpConfigFile = (
       if (!gatewayShape) {
         if (config.requireWrite)
           return yield* Effect.fail(
-            new Error("Gateway MCP proxy cannot replace foreign mcp.json"),
+            new McpConfigError({
+              message: "Gateway MCP proxy cannot replace foreign mcp.json",
+            }),
           );
         yield* Effect.logWarning("mcp.config.foreign_skip").pipe(
           Effect.annotateLogs({
@@ -235,7 +247,10 @@ export const writeOmpMcpConfigFile = (
         }
       },
       catch: (error) =>
-        error instanceof Error ? error : new Error(String(error)),
+        new McpConfigError({
+          message: error instanceof Error ? error.message : String(error),
+          cause: error,
+        }),
     });
   });
 };

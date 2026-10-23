@@ -4,11 +4,10 @@ import { afterEach, describe, expect, it, test } from "@effect/vitest";
 import {
   ConfigProvider,
   Effect,
-  Either,
   Layer,
   Logger,
   Redacted,
-  Schema,
+  Result,
 } from "effect";
 import { GatewayConfig } from "../src/services/config.js";
 import { testPaths } from "./fixtures/paths.js";
@@ -27,12 +26,18 @@ const baseValues = new Map<string, string>([
 ]);
 
 const configLayer = (values: Map<string, string>) =>
-  GatewayConfig.Default.pipe(
-    Layer.provide(Layer.setConfigProvider(ConfigProvider.fromMap(values))),
+  GatewayConfig.layer.pipe(
+    Layer.provide(
+      ConfigProvider.layer(
+        ConfigProvider.fromUnknown(Object.fromEntries(values), {
+          preserveEmptyStrings: true,
+        }),
+      ),
+    ),
   );
 
 const configResult = (values: Map<string, string>) =>
-  Effect.either(
+  Effect.result(
     Effect.gen(function* () {
       return yield* GatewayConfig;
     }).pipe(Effect.provide(configLayer(values))),
@@ -173,8 +178,11 @@ describe("GatewayConfig", () => {
       Effect.gen(function* () {
         yield* GatewayConfig;
       }).pipe(
-        Effect.provide(configLayer(valuesWith([configured]))),
-        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+        Effect.provide(
+          configLayer(valuesWith([configured])).pipe(
+            Layer.provideMerge(Logger.layer([logger])),
+          ),
+        ),
       ),
     );
     expect(logs.join("\n")).toContain("GitHub App configuration is partial");
@@ -190,7 +198,7 @@ describe("GatewayConfig", () => {
         ]),
       ),
     );
-    expect(Either.isLeft(result)).toBe(true);
+    expect(Result.isFailure(result)).toBe(true);
   });
 
   test("applies all operational defaults", async () => {
@@ -221,7 +229,7 @@ describe("GatewayConfig", () => {
       const values = new Map(baseValues);
       values.delete(name);
       const result = await Effect.runPromise(configResult(values));
-      expect(Either.isLeft(result), name).toBe(true);
+      expect(Result.isFailure(result), name).toBe(true);
     }
   });
 
@@ -229,7 +237,7 @@ describe("GatewayConfig", () => {
     const result = await Effect.runPromise(
       configResult(valuesWith([["LINEAR_CLIENT_ID", ""]])),
     );
-    expect(Either.isLeft(result)).toBe(true);
+    expect(Result.isFailure(result)).toBe(true);
   });
   test("rejects a spaces-only repository suggestion confidence threshold", async () => {
     const result = await Effect.runPromise(
@@ -237,7 +245,7 @@ describe("GatewayConfig", () => {
         valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", "   "]]),
       ),
     );
-    expect(Either.isLeft(result)).toBe(true);
+    expect(Result.isFailure(result)).toBe(true);
   });
   test("rejects empty and whitespace-only confidence thresholds", async () => {
     for (const blank of ["", "   "]) {
@@ -246,7 +254,7 @@ describe("GatewayConfig", () => {
           valuesWith([["REPOSITORY_SUGGESTION_CONFIDENCE_THRESHOLD", blank]]),
         ),
       );
-      expect(Either.isLeft(result), JSON.stringify(blank)).toBe(true);
+      expect(Result.isFailure(result), JSON.stringify(blank)).toBe(true);
     }
   });
 
@@ -260,7 +268,7 @@ describe("GatewayConfig", () => {
         const result = await Effect.runPromise(
           configResult(valuesWith([[name, malformed]])),
         );
-        expect(Either.isLeft(result), `${name}=${malformed}`).toBe(true);
+        expect(Result.isFailure(result), `${name}=${malformed}`).toBe(true);
       }
     }
   });
@@ -288,7 +296,7 @@ describe("GatewayConfig", () => {
       const result = await Effect.runPromise(
         configResult(valuesWith([["PUBLIC_URL", value]])),
       );
-      expect(Either.isLeft(result), value).toBe(true);
+      expect(Result.isFailure(result), value).toBe(true);
     }
   });
 
@@ -301,9 +309,9 @@ describe("GatewayConfig", () => {
       const result = await Effect.runPromise(
         configResult(valuesWith([["PUBLIC_URL", value]])),
       );
-      expect(Either.isRight(result), value).toBe(true);
-      if (Either.isRight(result))
-        expect(result.right.publicUrl).toBeInstanceOf(URL);
+      expect(Result.isSuccess(result), value).toBe(true);
+      if (Result.isSuccess(result))
+        expect(result.success.publicUrl).toBeInstanceOf(URL);
     }
   });
 
@@ -338,73 +346,51 @@ describe("GatewayConfig", () => {
       const result = await Effect.runPromise(
         configResult(valuesWith([["LOG_LEVEL", value]])),
       );
-      expect(Either.isRight(result), value).toBe(true);
-      if (Either.isRight(result)) {
-        expect(result.right.logLevel).toBe(expected);
+      expect(Result.isSuccess(result), value).toBe(true);
+      if (Result.isSuccess(result)) {
+        expect(result.success.logLevel).toBe(expected);
       }
     }
   });
 
-  it.effect.prop(
-    "positive integer settings accept positive safe integers and reject boundaries",
-    {
-      field: Schema.Literal(
-        "PORT",
-        "LEASE_DURATION_MS",
-        "RECONCILER_INTERVAL_MS",
-        "WEBHOOK_REPLAY_WINDOW_MS",
-      ),
-      value: Schema.Literal(
-        "1",
-        "2",
-        "65535",
-        "0",
-        "-1",
-        "1.5",
-        "not-a-number",
-        "9007199254740992",
-      ),
-    },
-    ({ field, value }) =>
-      Effect.gen(function* () {
-        const result = yield* configResult(valuesWith([[field, value]]));
-        // Strict digit-only contract: "1.5" and other truncatable forms
-        // are rejected, not silently parsed.
-        const valid =
-          /^\d+$/u.test(value) &&
-          Number.isSafeInteger(Number(value)) &&
-          Number(value) > 0;
-        expect(Either.isRight(result)).toBe(valid);
-      }),
-    { fastCheck: { numRuns: 20 } },
-  );
+  for (const field of [
+    "PORT",
+    "LEASE_DURATION_MS",
+    "RECONCILER_INTERVAL_MS",
+    "WEBHOOK_REPLAY_WINDOW_MS",
+  ]) {
+    it.effect.each([
+      ["1", true],
+      ["2", true],
+      ["65535", true],
+      ["0", false],
+      ["-1", false],
+      ["1.5", false],
+      ["not-a-number", false],
+      ["9007199254740992", false],
+    ] as const)(
+      `${field} validates positive safe integer %s`,
+      ([value, valid]) =>
+        Effect.gen(function* () {
+          const result = yield* configResult(valuesWith([[field, value]]));
+          expect(Result.isSuccess(result)).toBe(valid);
+        }),
+    );
+  }
 
-  it.effect.prop(
-    "URL parsing accepts only valid secure or localhost URLs",
-    {
-      value: Schema.Literal(
-        "https://example.com",
-        "https://localhost",
-        "http://localhost:3000",
-        "ftp://localhost",
-        "http://example.com",
-        "file:///tmp/gateway",
-        "not-a-url",
-      ),
-    },
-    ({ value }) =>
-      Effect.gen(function* () {
-        const result = yield* configResult(valuesWith([["PUBLIC_URL", value]]));
-        let valid = false;
-        try {
-          const url = new URL(value);
-          valid = url.protocol === "https:" || url.hostname === "localhost";
-        } catch {
-          valid = false;
-        }
-        expect(Either.isRight(result)).toBe(valid);
-      }),
-    { fastCheck: { numRuns: 20 } },
+  it.effect.each([
+    ["https://example.com", true],
+    ["https://localhost", true],
+    ["http://localhost:3000", true],
+    ["ftp://localhost", true],
+    ["http://example.com", false],
+    ["file:///tmp/gateway", false],
+    ["not-a-url", false],
+  ] as const)("validates secure or localhost URL %s", ([value, valid]) =>
+    Effect.gen(function* () {
+      const result = yield* configResult(valuesWith([["PUBLIC_URL", value]]));
+      expect(Result.isSuccess(result)).toBe(valid);
+    }),
   );
 });
 
@@ -412,9 +398,9 @@ describe("Recovery bounds configuration", () => {
   it.effect("loads safe worker and operation bounds by default", () =>
     Effect.gen(function* () {
       const result = yield* configResult(valuesWith([]));
-      expect(Either.isRight(result)).toBe(true);
-      if (Either.isRight(result))
-        expect(result.right).toMatchObject({
+      expect(Result.isSuccess(result)).toBe(true);
+      if (Result.isSuccess(result))
+        expect(result.success).toMatchObject({
           rpcRequestTimeoutMs: 30_000,
           gitTimeoutMs: 120_000,
           nixTimeoutMs: 600_000,
@@ -431,18 +417,18 @@ describe("Recovery bounds configuration", () => {
   ] as const)("requires a positive integer for %s", (name) =>
     Effect.gen(function* () {
       expect(
-        Either.isLeft(yield* configResult(valuesWith([[name, "0"]]))),
+        Result.isFailure(yield* configResult(valuesWith([[name, "0"]]))),
       ).toBe(true);
       const result = yield* configResult(valuesWith([[name, "7"]]));
-      expect(Either.isRight(result)).toBe(true);
-      if (Either.isRight(result)) {
+      expect(Result.isSuccess(result)).toBe(true);
+      if (Result.isSuccess(result)) {
         const key = {
           RPC_REQUEST_TIMEOUT_MS: "rpcRequestTimeoutMs",
           GIT_TIMEOUT_MS: "gitTimeoutMs",
           NIX_TIMEOUT_MS: "nixTimeoutMs",
           MAX_CONCURRENT_WORKERS: "maxConcurrentWorkers",
         }[name];
-        expect(Reflect.get(result.right, key)).toBe(7);
+        expect(Reflect.get(result.success, key)).toBe(7);
       }
     }),
   );
@@ -456,10 +442,14 @@ describe("Finite operation deadlines", () => {
   ] as const)("bounds %s to the timer range", (name) =>
     Effect.gen(function* () {
       expect(
-        Either.isRight(yield* configResult(valuesWith([[name, "2147483647"]]))),
+        Result.isSuccess(
+          yield* configResult(valuesWith([[name, "2147483647"]])),
+        ),
       ).toBe(true);
       expect(
-        Either.isLeft(yield* configResult(valuesWith([[name, "2147483648"]]))),
+        Result.isFailure(
+          yield* configResult(valuesWith([[name, "2147483648"]])),
+        ),
       ).toBe(true);
     }),
   );

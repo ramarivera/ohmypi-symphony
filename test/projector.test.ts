@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { it } from "@effect/vitest";
 import { Clock, Effect, Fiber, Layer, Option } from "effect";
-import * as fc from "effect/FastCheck";
+import * as fc from "fast-check";
 import { describe, expect } from "vitest";
 import { LinearApiError } from "../src/domain/errors.js";
 import type { SessionId, SourceKey } from "../src/domain/ids.js";
@@ -54,7 +54,7 @@ let runCounter = 0;
 const unused = (..._args: ReadonlyArray<unknown>) =>
   Effect.die(new Error("not used in projector tests"));
 
-const mockLinear = LinearGateway.make({
+const mockLinear = LinearGateway.of({
   createActivity: (input) =>
     Effect.gen(function* () {
       mockState.activities.push(input);
@@ -99,15 +99,14 @@ const mockLinear = LinearGateway.make({
 
 const sqlite = SqliteClientLive(":memory:");
 const repoDeps = Layer.mergeAll(
-  sqlite,
-  RunEventRepo.Default,
-  RunRepo.Default,
-  RunInputRepo.Default,
-  ProjectionRepo.Default,
-).pipe(Layer.provide(sqlite));
+  RunEventRepo.layer,
+  RunRepo.layer,
+  RunInputRepo.layer,
+  ProjectionRepo.layer,
+).pipe(Layer.provideMerge(sqlite));
 const deps = Layer.mergeAll(repoDeps, Layer.succeed(LinearGateway, mockLinear));
 const ActivityProjectorLayer = Layer.mergeAll(
-  ActivityProjector.DefaultWithoutDependencies.pipe(Layer.provide(deps)),
+  ActivityProjector.layerWithoutDependencies.pipe(Layer.provide(deps)),
   deps,
 );
 
@@ -183,7 +182,7 @@ describe("ActivityProjector", () => {
             now: 0,
           });
 
-          const firstFiber = yield* Effect.fork(
+          const firstFiber = yield* Effect.forkChild(
             projector.thought("session", "same-source", "Accepted"),
           );
           yield* Effect.promise(() => started.promise);
@@ -552,204 +551,224 @@ describe("ActivityProjector", () => {
       }),
     );
 
-    it.effect.prop(
-      "enqueue is idempotent under duplicate sourceKey",
-      {
-        sourceKey: fc.uuid() as fc.Arbitrary<string>,
-        body: fc.string({ maxLength: 120 }) as fc.Arbitrary<string>,
-      },
-      ({ sourceKey, body }) =>
-        Effect.gen(function* () {
-          resetMock();
-          const projector = yield* ActivityProjector;
-          const runRepo = yield* RunRepo;
-          yield* runRepo.create({
-            sessionId: makeSessionId("session"),
-            organizationId: "org" as never,
-            issueId: Option.none(),
-            now: 0,
-          });
+    it.effect("enqueue is idempotent under duplicate sourceKey", () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sourceKey: fc.uuid(),
+          body: fc.string({ maxLength: 120 }),
+        });
+        const check = ({
+          sourceKey,
+          body,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          Effect.gen(function* () {
+            resetMock();
+            const projector = yield* ActivityProjector;
+            const runRepo = yield* RunRepo;
+            yield* runRepo.create({
+              sessionId: makeSessionId("session"),
+              organizationId: "org" as never,
+              issueId: Option.none(),
+              now: 0,
+            });
 
-          const runId = yield* Effect.sync(() => {
-            runCounter += 1;
-            return runCounter;
-          });
-          const uniqueSourceKey = `${runId}-${sourceKey}`;
-          const first = yield* projector.terminal(
-            "session",
-            uniqueSourceKey,
-            "response",
-            body,
-          );
-          const second = yield* projector.terminal(
-            "session",
-            uniqueSourceKey,
-            "response",
-            body,
-          );
+            const runId = yield* Effect.sync(() => {
+              runCounter += 1;
+              return runCounter;
+            });
+            const uniqueSourceKey = `${runId}-${sourceKey}`;
+            const first = yield* projector.terminal(
+              "session",
+              uniqueSourceKey,
+              "response",
+              body,
+            );
+            const second = yield* projector.terminal(
+              "session",
+              uniqueSourceKey,
+              "response",
+              body,
+            );
 
-          expect(first).toBe(true);
-          expect(second).toBe(false);
-        }),
+            expect(first).toBe(true);
+            expect(second).toBe(false);
+          });
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+          ),
+        );
+      }),
     );
   });
 
   describe("pure invariants", () => {
-    it.prop(
-      "redaction never leaks bearer token values",
-      {
-        token: fc.string({
-          unit: fc.constantFrom(
-            "A",
-            "B",
-            "C",
-            "1",
-            "2",
-            "-",
-            "_",
-            ".",
-            "~",
-            "+",
-            "/",
-            "=",
-          ),
-          minLength: 1,
-        }) as fc.Arbitrary<string>,
-      },
-      ({ token }) => {
-        const redacted = redactStringValues({
-          body: `Authorization: Bearer ${token}`,
-        }) as { body: string };
-        expect(redacted.body).toContain("Bearer redacted");
-        expect(redacted.body).not.toContain(`Bearer ${token}`);
-      },
-    );
+    it("redaction never leaks bearer token values", () =>
+      fc.assert(
+        fc.property(
+          fc.record({
+            token: fc.string({
+              unit: fc.constantFrom(
+                "A",
+                "B",
+                "C",
+                "1",
+                "2",
+                "-",
+                "_",
+                ".",
+                "~",
+                "+",
+                "/",
+                "=",
+              ),
+              minLength: 1,
+            }),
+          }),
+          ({ token }) => {
+            const redacted = redactStringValues({
+              body: `Authorization: Bearer ${token}`,
+            }) as { body: string };
+            expect(redacted.body).toContain("Bearer redacted");
+            expect(redacted.body).not.toContain(`Bearer ${token}`);
+          },
+        ),
+      ));
 
-    it.prop(
-      "redaction never leaks key-value token values",
-      {
-        kind: fc.constantFrom(
-          "token",
-          "key",
-          "secret",
-          "signature",
-          "password",
-        ) as fc.Arbitrary<
-          "token" | "key" | "secret" | "signature" | "password"
-        >,
-        value: fc
-          .string({ minLength: 1 })
-          .filter((s) => !/[,"'\s}\]]/.test(s)) as fc.Arbitrary<string>,
-      },
-      ({ kind, value }) => {
-        const redacted = redactStringValues({ body: `${kind}=${value}` }) as {
-          body: string;
-        };
-        expect(redacted.body).toBe(`${kind}=redacted`);
-      },
-    );
-    it.prop(
-      "redaction never leaks query token values",
-      {
-        kind: fc.constantFrom(
-          "token",
-          "key",
-          "secret",
-          "signature",
-          "password",
-        ) as fc.Arbitrary<
-          "token" | "key" | "secret" | "signature" | "password"
-        >,
-        value: fc
-          .string({ minLength: 1 })
-          .filter((s) => !/[&#\s"'<]/.test(s)) as fc.Arbitrary<string>,
-      },
-      ({ kind, value }) => {
-        const redacted = redactStringValues({ body: `?${kind}=${value}` }) as {
-          body: string;
-        };
-        expect(redacted.body).toBe(`?${kind}=redacted`);
-      },
-    );
-    it.prop(
-      "projection backoff is monotone non-decreasing and capped",
-      { attempts: fc.integer({ min: 1, max: 100 }) as fc.Arbitrary<number> },
-      ({ attempts }) => {
-        const base = 1_000;
-        const max = 5 * 60_000;
-        const values: number[] = [];
-        for (let i = 1; i <= attempts; i++) {
-          values.push(projectionBackoff(i, base, max));
-        }
-        for (let i = 1; i < values.length; i++) {
-          const value = values[i];
-          const previous = values[i - 1];
-          if (value !== undefined && previous !== undefined) {
-            expect(value).toBeGreaterThanOrEqual(previous);
-          }
-        }
-        for (const v of values) {
-          expect(v).toBeLessThanOrEqual(max);
-        }
-      },
-    );
+    it("redaction never leaks key-value token values", () =>
+      fc.assert(
+        fc.property(
+          fc.record({
+            kind: fc.constantFrom(
+              "token",
+              "key",
+              "secret",
+              "signature",
+              "password",
+            ),
+            value: fc
+              .string({ minLength: 1 })
+              .filter((s) => !/[,"'\s}\]]/.test(s)),
+          }),
+          ({ kind, value }) => {
+            const redacted = redactStringValues({
+              body: `${kind}=${value}`,
+            }) as {
+              body: string;
+            };
+            expect(redacted.body).toBe(`${kind}=redacted`);
+          },
+        ),
+      ));
+    it("redaction never leaks query token values", () =>
+      fc.assert(
+        fc.property(
+          fc.record({
+            kind: fc.constantFrom(
+              "token",
+              "key",
+              "secret",
+              "signature",
+              "password",
+            ),
+            value: fc
+              .string({ minLength: 1 })
+              .filter((s) => !/[&#\s"'<]/.test(s)),
+          }),
+          ({ kind, value }) => {
+            const redacted = redactStringValues({
+              body: `?${kind}=${value}`,
+            }) as {
+              body: string;
+            };
+            expect(redacted.body).toBe(`?${kind}=redacted`);
+          },
+        ),
+      ));
+    it("projection backoff is monotone non-decreasing and capped", () =>
+      fc.assert(
+        fc.property(
+          fc.record({ attempts: fc.integer({ min: 1, max: 100 }) }),
+          ({ attempts }) => {
+            const base = 1_000;
+            const max = 5 * 60_000;
+            const values: number[] = [];
+            for (let i = 1; i <= attempts; i++) {
+              values.push(projectionBackoff(i, base, max));
+            }
+            for (let i = 1; i < values.length; i++) {
+              const value = values[i];
+              const previous = values[i - 1];
+              if (value !== undefined && previous !== undefined) {
+                expect(value).toBeGreaterThanOrEqual(previous);
+              }
+            }
+            for (const v of values) {
+              expect(v).toBeLessThanOrEqual(max);
+            }
+          },
+        ),
+      ));
 
-    it.prop(
-      "rpc event activity mapping is total over known kinds",
-      {
-        kind: fc.constantFrom(
-          "agent_start",
-          "turn_start",
-          "tool_execution_start",
-          "tool_execution_end",
-          "message_end",
-          "agent_end",
-          "error",
-          "extension_ui_request",
-        ) as fc.Arbitrary<
-          | "agent_start"
-          | "turn_start"
-          | "tool_execution_start"
-          | "tool_execution_end"
-          | "message_end"
-          | "agent_end"
-          | "error"
-          | "extension_ui_request"
-        >,
-      },
-      ({ kind }) => {
-        const result = rpcEventActivityType({ type: kind });
-        expect(["thought", "action", "response", "error", "none"]).toContain(
-          result,
-        );
-        if (kind === "agent_start" || kind === "turn_start")
-          expect(result).toBe("thought");
-        if (kind === "tool_execution_start" || kind === "tool_execution_end")
-          expect(result).toBe("action");
-        if (kind === "agent_end") expect(result).toBe("response");
-        if (kind === "error") expect(result).toBe("error");
-        if (kind === "message_end" || kind === "extension_ui_request")
-          expect(result).toBe("none");
-      },
-    );
+    it("rpc event activity mapping is total over known kinds", () =>
+      fc.assert(
+        fc.property(
+          fc.record({
+            kind: fc.constantFrom(
+              "agent_start",
+              "turn_start",
+              "tool_execution_start",
+              "tool_execution_end",
+              "message_end",
+              "agent_end",
+              "error",
+              "extension_ui_request",
+            ),
+          }),
+          ({ kind }) => {
+            const result = rpcEventActivityType({ type: kind });
+            expect([
+              "thought",
+              "action",
+              "response",
+              "error",
+              "none",
+            ]).toContain(result);
+            if (kind === "agent_start" || kind === "turn_start")
+              expect(result).toBe("thought");
+            if (
+              kind === "tool_execution_start" ||
+              kind === "tool_execution_end"
+            )
+              expect(result).toBe("action");
+            if (kind === "agent_end") expect(result).toBe("response");
+            if (kind === "error") expect(result).toBe("error");
+            if (kind === "message_end" || kind === "extension_ui_request")
+              expect(result).toBe("none");
+          },
+        ),
+      ));
 
-    it.prop(
-      "rpc event activity mapping returns none for unknown kinds",
-      { kind: fc.string() as fc.Arbitrary<string> },
-      ({ kind }) => {
-        const known = new Set([
-          "agent_start",
-          "turn_start",
-          "tool_execution_start",
-          "tool_execution_end",
-          "message_end",
-          "agent_end",
-          "error",
-          "extension_ui_request",
-        ]);
-        if (known.has(kind)) return;
-        expect(rpcEventActivityType({ type: kind })).toBe("none");
-      },
-    );
+    it("rpc event activity mapping returns none for unknown kinds", () =>
+      fc.assert(
+        fc.property(fc.record({ kind: fc.string() }), ({ kind }) => {
+          const known = new Set([
+            "agent_start",
+            "turn_start",
+            "tool_execution_start",
+            "tool_execution_end",
+            "message_end",
+            "agent_end",
+            "error",
+            "extension_ui_request",
+          ]);
+          if (known.has(kind)) return;
+          expect(rpcEventActivityType({ type: kind })).toBe("none");
+        }),
+      ));
   });
 });

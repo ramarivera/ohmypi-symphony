@@ -21,10 +21,11 @@ import { brotliCompressSync, deflateSync, gzipSync } from "node:zlib";
 import {
   ConfigProvider,
   Effect,
-  Either,
   Fiber,
   Layer,
   Logger,
+  References,
+  Result,
   Schema,
 } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -152,12 +153,15 @@ const values = new Map([
 const configLayer = (
   overrides: ReadonlyArray<readonly [string, string]> = [],
 ) =>
-  Layer.setConfigProvider(
-    ConfigProvider.fromMap(new Map([...values, ...overrides])),
+  ConfigProvider.layer(
+    ConfigProvider.fromUnknown(
+      Object.fromEntries(new Map([...values, ...overrides])),
+      { preserveEmptyStrings: true },
+    ),
   );
 const cryptoLayer = (
   overrides: ReadonlyArray<readonly [string, string]> = [],
-) => TokenCrypto.Default.pipe(Layer.provide(configLayer(overrides)));
+) => TokenCrypto.layer.pipe(Layer.provide(configLayer(overrides)));
 const legacyToken = (plaintext: string): string => {
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", Buffer.from(key, "base64"), iv);
@@ -602,7 +606,7 @@ process.exit(0);`;
     const malformed = "[unterminated\nextraheader = old\n";
     await writeFile(path, malformed);
     const result = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         persistGitHubExtraHeader(
           dir,
           "test",
@@ -610,7 +614,7 @@ process.exit(0);`;
         ),
       ),
     );
-    expect(Either.isLeft(result)).toBe(true);
+    expect(Result.isFailure(result)).toBe(true);
     expect(await Bun.file(path).text()).toBe(malformed);
   });
 
@@ -622,7 +626,7 @@ process.exit(0);`;
     await mkdir(workspace);
     await symlink(outside, join(workspace, ".git"));
     const result = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         persistGitHubExtraHeader(
           workspace,
           "test",
@@ -630,10 +634,11 @@ process.exit(0);`;
         ),
       ),
     );
-    if (Either.isRight(result)) throw new Error("Expected persistence to fail");
-    expect(result.left.message).toBe("Could not persist GitHub credential");
-    expect(result.left.cause).toContain(".git");
-    expect(result.left.cause).not.toContain("secret");
+    if (Result.isSuccess(result))
+      throw new Error("Expected persistence to fail");
+    expect(result.failure.message).toBe("Could not persist GitHub credential");
+    expect(result.failure.cause).toContain(".git");
+    expect(result.failure.cause).not.toContain("secret");
   });
 
   it("doesn't expose gateway or model secrets to Git or its helpers", () => {
@@ -720,15 +725,16 @@ process.exit(0);`;
       message: unknown;
       annotations: Record<string, unknown>;
     }> = [];
-    const logger = Logger.make(({ message, annotations }) => {
-      logs.push({ message, annotations: Object.fromEntries(annotations) });
+    const logger = Logger.make(({ message, fiber }) => {
+      const annotations = fiber.getRef(References.CurrentLogAnnotations);
+      logs.push({ message, annotations: { ...annotations } });
     });
     await Effect.runPromise(
       Effect.gen(function* () {
         yield* unsetGitHubExtraHeader(missing, "cleanup-session");
         yield* removeMcpConfig(missing);
         yield* removeMcpAgentDb(missing);
-      }).pipe(Effect.provide(Logger.replace(Logger.defaultLogger, logger))),
+      }).pipe(Effect.provide(Logger.layer([logger]))),
     );
     expect(logs.map((entry) => entry.message)).toEqual([
       ["workspace.github_cleanup_failed"],
@@ -758,8 +764,9 @@ process.exit(0);`;
       message: unknown;
       annotations: Record<string, unknown>;
     }> = [];
-    const logger = Logger.make(({ message, annotations }) => {
-      logs.push({ message, annotations: Object.fromEntries(annotations) });
+    const logger = Logger.make(({ message, fiber }) => {
+      const annotations = fiber.getRef(References.CurrentLogAnnotations);
+      logs.push({ message, annotations: { ...annotations } });
     });
     for (const action of [
       "clear-git",
@@ -771,7 +778,7 @@ process.exit(0);`;
       );
       await Effect.runPromise(
         cleanupWorkspaceProcess(dir, action, "cleanup.failed").pipe(
-          Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+          Effect.provide(Logger.layer([logger])),
         ),
       );
     }
@@ -824,9 +831,9 @@ process.exit(0);`;
       fetch: fetchMock,
     });
     const denied = await Effect.runPromise(
-      Effect.either(app.getInstallationToken("alice", "repo", "org-b")),
+      Effect.result(app.getInstallationToken("alice", "repo", "org-b")),
     );
-    expect(Either.isLeft(denied) && denied.left.reason).toBe(
+    expect(Result.isFailure(denied) && denied.failure.reason).toBe(
       "tenant_forbidden",
     );
     expect(fetchMock).not.toHaveBeenCalled();
@@ -1115,28 +1122,30 @@ process.exit(0);`;
   it("fails closed in production and reads organization/owner policy", async () => {
     const load = (overrides: ReadonlyArray<readonly [string, string]>) =>
       Effect.runPromise(
-        Effect.either(
+        Effect.result(
           Effect.gen(function* () {
             return yield* GatewayConfig;
           }).pipe(
             Effect.provide(
-              GatewayConfig.Default.pipe(Layer.provide(configLayer(overrides))),
+              GatewayConfig.layer.pipe(Layer.provide(configLayer(overrides))),
             ),
           ),
         ),
       );
-    expect(Either.isLeft(await load([["NODE_ENV", "production"]]))).toBe(true);
+    expect(Result.isFailure(await load([["NODE_ENV", "production"]]))).toBe(
+      true,
+    );
     const admitted = await load([
       ["NODE_ENV", "production"],
       ["LINEAR_ALLOWED_ORGANIZATION_IDS", "org-a,org-b"],
       ["GITHUB_APP_ALLOWED_OWNERS_JSON", '{"org-a":["Alice"]}'],
     ]);
     expect(
-      Either.isRight(admitted) &&
-        admitted.right.allowedOrganizationIds?.has("org-b"),
+      Result.isSuccess(admitted) &&
+        admitted.success.allowedOrganizationIds?.has("org-b"),
     ).toBe(true);
     expect(
-      Either.isRight(admitted) && admitted.right.githubAppAllowedOwners,
+      Result.isSuccess(admitted) && admitted.success.githubAppAllowedOwners,
     ).toEqual({ "org-a": ["alice"] });
   });
 
@@ -1162,8 +1171,8 @@ process.exit(0);`;
           tokenContext("installation", "org-a", "org-a", "refresh_token"),
         ])
           expect(
-            Either.isLeft(
-              yield* Effect.either(cipher.decrypt(encrypted, wrong)),
+            Result.isFailure(
+              yield* Effect.result(cipher.decrypt(encrypted, wrong)),
             ),
           ).toBe(true);
         return encrypted;
@@ -1199,9 +1208,13 @@ process.exit(0);`;
     fileValues.delete("TOKEN_ENCRYPTION_KEY");
     fileValues.set("TOKEN_ENCRYPTION_KEY_FILE", keyFile);
     const sqlite = SqliteClientLive(":memory:");
-    const cipher = TokenCrypto.Default.pipe(
+    const cipher = TokenCrypto.layer.pipe(
       Layer.provide(
-        Layer.setConfigProvider(ConfigProvider.fromMap(fileValues)),
+        ConfigProvider.layer(
+          ConfigProvider.fromUnknown(Object.fromEntries(fileValues), {
+            preserveEmptyStrings: true,
+          }),
+        ),
       ),
     );
     await Effect.runPromise(
@@ -1359,9 +1372,9 @@ process.exit(0);`;
     });
     const header = `AUTHORIZATION: basic ${Buffer.from("x-access-token:synthetic-token").toString("base64")}`;
     const result = await Effect.runPromise(
-      Effect.either(persistGitHubExtraHeader(dir, "test", header)),
+      Effect.result(persistGitHubExtraHeader(dir, "test", header)),
     );
-    expect(Either.isLeft(result)).toBe(true);
+    expect(Result.isFailure(result)).toBe(true);
     expect(spawn).toHaveBeenCalledOnce();
     const [command, options] = spawn.mock.calls[0] ?? [];
     expect(JSON.stringify(command)).not.toContain(header);
@@ -1436,17 +1449,17 @@ process.exit(0);`;
     await Effect.runPromise(
       Effect.gen(function* () {
         yield* withRerunIssueGate(org, "success", Effect.void);
-        yield* Effect.either(
+        yield* Effect.result(
           withRerunIssueGate(org, "failure", Effect.fail("failed")),
         );
-        const holder = yield* Effect.fork(
+        const holder = yield* Effect.forkChild(
           withRerunIssueGate(org, "interrupt", Effect.never),
         );
-        yield* Effect.yieldNow();
-        const waiter = yield* Effect.fork(
+        yield* Effect.yieldNow;
+        const waiter = yield* Effect.forkChild(
           withRerunIssueGate(org, "interrupt", Effect.never),
         );
-        yield* Effect.yieldNow();
+        yield* Effect.yieldNow;
         expect(rerunIssueGateCount()).toBe(1);
         yield* Fiber.interrupt(waiter);
         expect(rerunIssueGateCount()).toBe(1);
@@ -1470,7 +1483,7 @@ it("upgrades v1 rows automatically when TokenCrypto starts with the gateway data
           `mcpenc:v1:${legacyToken("legacy")}`,
           1,
         );
-        const layer = TokenCrypto.Default.pipe(
+        const layer = TokenCrypto.layer.pipe(
           Layer.provide(
             Layer.mergeAll(Layer.succeed(SqliteClient, { db }), configLayer()),
           ),

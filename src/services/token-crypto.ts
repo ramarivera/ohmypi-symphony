@@ -1,4 +1,4 @@
-import { Effect, Option, Redacted } from "effect";
+import { Context, Effect, Layer, Option, Redacted } from "effect";
 import { TokenCipherError } from "../domain/errors.js";
 import { GatewayConfig } from "./config.js";
 import { SqliteClient } from "./store/sqlite-client.js";
@@ -58,10 +58,8 @@ const importKey = (
       }),
   });
 
-export class TokenCrypto extends Effect.Service<TokenCrypto>()("TokenCrypto", {
-  accessors: true,
-  dependencies: [GatewayConfig.Default],
-  effect: Effect.gen(function* () {
+export class TokenCrypto extends Context.Service<TokenCrypto>()("TokenCrypto", {
+  make: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const keyId = config.tokenEncryptionKeyId ?? 1;
     const raw = yield* decodeKey(Redacted.value(config.tokenEncryptionKey));
@@ -241,4 +239,9 @@ export class TokenCrypto extends Effect.Service<TokenCrypto>()("TokenCrypto", {
       });
     return { encrypt, decrypt };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([GatewayConfig.layer]),
+  );
+}

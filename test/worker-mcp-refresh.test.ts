@@ -8,15 +8,7 @@ import {
 } from "node:http";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import {
-  Clock,
-  ConfigProvider,
-  Effect,
-  Layer,
-  Option,
-  Runtime,
-  Schema,
-} from "effect";
+import { Clock, ConfigProvider, Effect, Layer, Option, Schema } from "effect";
 import { describe, expect, it, vi } from "vitest";
 import { McpServerId, OrganizationId } from "../src/domain/ids.js";
 import { McpServerRecord } from "../src/domain/models.js";
@@ -105,31 +97,42 @@ const withGateway = async (
     },
   });
   const url = `http://127.0.0.1:${upstream.port}/mcp`;
-  const provider = ConfigProvider.fromMap(
-    new Map([
-      ["LINEAR_CLIENT_ID", "client"],
-      ["LINEAR_CLIENT_SECRET", "secret"],
-      ["LINEAR_WEBHOOK_SECRET", "webhook"],
-      ["PUBLIC_URL", "http://localhost:3000"],
-      ["TOKEN_ENCRYPTION_KEY", Buffer.alloc(32, 7).toString("base64")],
-      ["MCP_OAUTH_ALLOW_LOOPBACK_HTTP", "true"],
-    ]),
+  const provider = ConfigProvider.fromUnknown(
+    Object.fromEntries(
+      new Map([
+        ["LINEAR_CLIENT_ID", "client"],
+        ["LINEAR_CLIENT_SECRET", "secret"],
+        ["LINEAR_WEBHOOK_SECRET", "webhook"],
+        ["PUBLIC_URL", "http://localhost:3000"],
+        ["TOKEN_ENCRYPTION_KEY", Buffer.alloc(32, 7).toString("base64")],
+        ["MCP_OAUTH_ALLOW_LOOPBACK_HTTP", "true"],
+      ]),
+    ),
+    { preserveEmptyStrings: true },
   );
-  const config = GatewayConfig.Default.pipe(
-    Layer.provide(Layer.setConfigProvider(provider)),
+  const config = GatewayConfig.layer.pipe(
+    Layer.provide(ConfigProvider.layer(provider)),
   );
   const sqlite = SqliteClientLive(":memory:");
-  const crypto = TokenCrypto.Default.pipe(Layer.provide(config));
-  const servers = McpServerRepo.Default.pipe(
+  const crypto = TokenCrypto.layer.pipe(Layer.provide(config));
+  const servers = McpServerRepo.layer.pipe(
     Layer.provide(Layer.mergeAll(sqlite, crypto)),
   );
-  const oauth = McpOAuth.Default.pipe(
+  const oauth = McpOAuth.layer.pipe(
     Layer.provide(Layer.mergeAll(config, sqlite, crypto, servers)),
   );
-  const clock = Object.assign(Clock.make(), {
+
+  const liveClock = Effect.runSync(Clock.Clock);
+  const clock = {
+    currentTimeNanosUnsafe: liveClock.currentTimeNanosUnsafe.bind(liveClock),
+    currentTimeNanos: liveClock.currentTimeNanos,
+    monotonicTimeNanosUnsafe:
+      liveClock.monotonicTimeNanosUnsafe.bind(liveClock),
+    monotonicTimeNanos: liveClock.monotonicTimeNanos,
+    sleep: liveClock.sleep.bind(liveClock),
     currentTimeMillis: Effect.sync(() => now),
-    unsafeCurrentTimeMillis: () => now,
-  });
+    currentTimeMillisUnsafe: () => now,
+  };
   try {
     await Effect.runPromise(
       Effect.scoped(
@@ -177,7 +180,9 @@ const withGateway = async (
             now,
           );
           const server = Option.getOrThrow(yield* repo.getMcpServer(org, id));
-          const runPromise = Runtime.runPromise(yield* Effect.runtime<never>());
+          const runPromise = Effect.runPromiseWith(
+            yield* Effect.context<never>(),
+          );
           const proxies: WorkerMcpProxy[] = [];
           yield* Effect.addFinalizer(() =>
             Effect.sync(() => {
@@ -231,7 +236,7 @@ const withGateway = async (
           );
         }).pipe(
           Effect.provide(Layer.mergeAll(sqlite, crypto, servers, oauth)),
-          Effect.withClock(clock),
+          Effect.provideService(Clock.Clock, clock),
         ),
       ),
     );
@@ -515,7 +520,7 @@ describe("worker MCP proxy transport boundary", () => {
           } else {
             stream.upstream.destroy();
             // Bun may translate a reset after headers to EOF at its server
-            // boundary. Either result must terminate the stream and its routes.
+            // boundary. Result result must terminate the stream and its routes.
             await stream.reader.read().then(
               (next) => expect(next.done).toBe(true),
               (error: unknown) => expect(error).toBeInstanceOf(Error),

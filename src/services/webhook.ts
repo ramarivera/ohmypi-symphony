@@ -1,5 +1,13 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { Cause, Effect, Option, Redacted, Schema } from "effect";
+import {
+  Cause,
+  Context,
+  Effect,
+  Layer,
+  Option,
+  Redacted,
+  Schema,
+} from "effect";
 import {
   type DatabaseError,
   type RowDecodeError,
@@ -277,13 +285,13 @@ const resolveRawTeamProjectIds = (
 
 const decodeOptionalBrand = <A>(
   value: string | null,
-  schema: Schema.Schema<A, string, never>,
+  schema: Schema.Codec<A, string, never>,
 ): Effect.Effect<Option.Option<A>, WebhookPayloadError> => {
   if (value === null) return Effect.succeed(Option.none());
-  return Schema.decodeUnknown(schema)(value).pipe(
+  return Schema.decodeUnknownEffect(schema)(value).pipe(
     Effect.map((v) => Option.some(v)),
     Effect.catchTag(
-      "ParseError",
+      "SchemaError",
       () =>
         new WebhookPayloadError({
           message: `Invalid identifier ${value}`,
@@ -317,7 +325,7 @@ const automationDelegatedPayload = (
 const validateAgentSessionIdentity = (
   event: AgentSessionEventType,
   config: { readonly linearClientId: string },
-  installationRepo: InstallationRepo,
+  installationRepo: InstallationRepo["Service"],
 ): Effect.Effect<
   void,
   WebhookIdentityError | DatabaseError | TokenCipherError | RowDecodeError,
@@ -342,11 +350,11 @@ const validateAgentSessionIdentity = (
       );
     }
 
-    const organizationId = yield* Schema.decodeUnknown(OrganizationId)(
+    const organizationId = yield* Schema.decodeUnknownEffect(OrganizationId)(
       event.organizationId,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookIdentityError({
             message: "Organization identity is not a valid identifier",
@@ -380,9 +388,9 @@ const handleAgentSessionEvent = (
   event: AgentSessionEventType,
   rawAgentSession: unknown,
   timestamp: number,
-  runRepo: RunRepo,
-  runInputRepo: RunInputRepo,
-  promptTemplateRepo: PromptTemplateRepo,
+  runRepo: RunRepo["Service"],
+  runInputRepo: RunInputRepo["Service"],
+  promptTemplateRepo: PromptTemplateRepo["Service"],
 ): Effect.Effect<
   void,
   WebhookPayloadError | WebhookIdentityError | DatabaseError | RowDecodeError,
@@ -396,11 +404,11 @@ const handleAgentSessionEvent = (
         : undefined;
     const { teamId, projectId } = resolveTeamAndProject(issue, rawIssue);
 
-    const sessionId = yield* Schema.decodeUnknown(SessionId)(
+    const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
       event.agentSession.id,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookPayloadError({
             message: `Invalid session id ${event.agentSession.id}`,
@@ -408,11 +416,11 @@ const handleAgentSessionEvent = (
           }),
       ),
     );
-    const organizationId = yield* Schema.decodeUnknown(OrganizationId)(
+    const organizationId = yield* Schema.decodeUnknownEffect(OrganizationId)(
       event.agentSession.organizationId,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookPayloadError({
             message: `Invalid organization id ${event.agentSession.organizationId}`,
@@ -446,11 +454,11 @@ const handleAgentSessionEvent = (
         event,
         Option.isSome(configured) ? configured.value.body : undefined,
       );
-      const id = yield* Schema.decodeUnknown(InputId)(
+      const id = yield* Schema.decodeUnknownEffect(InputId)(
         buildInputId(event, "created"),
       ).pipe(
         Effect.catchTag(
-          "ParseError",
+          "SchemaError",
           () =>
             new WebhookPayloadError({
               message: `Invalid input id ${buildInputId(event, "created")}`,
@@ -495,11 +503,11 @@ const handleAgentSessionEvent = (
       // by repository selection and UI-answer paths that expect the user's
       // literal text.
       const body = extractPromptBody(activity);
-      const id = yield* Schema.decodeUnknown(InputId)(
+      const id = yield* Schema.decodeUnknownEffect(InputId)(
         buildInputId(event, kind),
       ).pipe(
         Effect.catchTag(
-          "ParseError",
+          "SchemaError",
           () =>
             new WebhookPayloadError({
               message: `Invalid input id ${buildInputId(event, kind)}`,
@@ -523,11 +531,11 @@ const handleAgentSessionEvent = (
         Option.map(extractPromptBody),
         Option.getOrElse(() => ""),
       );
-      const id = yield* Schema.decodeUnknown(InputId)(
+      const id = yield* Schema.decodeUnknownEffect(InputId)(
         buildInputId(event, "stop"),
       ).pipe(
         Effect.catchTag(
-          "ParseError",
+          "SchemaError",
           () =>
             new WebhookPayloadError({
               message: `Invalid input id ${buildInputId(event, "stop")}`,
@@ -577,11 +585,11 @@ const validateOAuthAppPayload = (
         }),
       );
     }
-    const decoded = yield* Schema.decodeUnknown(OrganizationId)(
+    const decoded = yield* Schema.decodeUnknownEffect(OrganizationId)(
       organizationId,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookIdentityError({
             message: "Organization identity is not a valid identifier",
@@ -594,7 +602,7 @@ const validateOAuthAppPayload = (
 const handleOAuthAppRevoked = (
   action: string,
   organizationId: OrganizationId,
-  installationRepo: InstallationRepo,
+  installationRepo: InstallationRepo["Service"],
   timestamp: number,
 ): Effect.Effect<void, DatabaseError, never> =>
   Effect.gen(function* () {
@@ -658,11 +666,11 @@ const validatePermissionChangePayload = (
       );
     }
 
-    const decodedOrganizationId = yield* Schema.decodeUnknown(OrganizationId)(
-      organizationId,
-    ).pipe(
+    const decodedOrganizationId = yield* Schema.decodeUnknownEffect(
+      OrganizationId,
+    )(organizationId).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookIdentityError({
             message: "Organization identity is not a valid identifier",
@@ -670,11 +678,11 @@ const validatePermissionChangePayload = (
       ),
     );
 
-    const decodedAppUserId = yield* Schema.decodeUnknown(AppUserId)(
+    const decodedAppUserId = yield* Schema.decodeUnknownEffect(AppUserId)(
       appUserId,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookPayloadError({
             message: `Invalid app user id ${appUserId}`,
@@ -684,9 +692,9 @@ const validatePermissionChangePayload = (
     );
 
     const addedTeamIds = yield* Effect.forEach(added, (teamId) =>
-      Schema.decodeUnknown(TeamId)(teamId).pipe(
+      Schema.decodeUnknownEffect(TeamId)(teamId).pipe(
         Effect.catchTag(
-          "ParseError",
+          "SchemaError",
           () =>
             new WebhookPayloadError({
               message: `Invalid team id ${teamId}`,
@@ -697,9 +705,9 @@ const validatePermissionChangePayload = (
     );
 
     const removedTeamIds = yield* Effect.forEach(removed, (teamId) =>
-      Schema.decodeUnknown(TeamId)(teamId).pipe(
+      Schema.decodeUnknownEffect(TeamId)(teamId).pipe(
         Effect.catchTag(
-          "ParseError",
+          "SchemaError",
           () =>
             new WebhookPayloadError({
               message: `Invalid team id ${teamId}`,
@@ -726,7 +734,7 @@ const handlePermissionChange = (
   addedTeamIds: ReadonlyArray<TeamId>,
   removedTeamIds: ReadonlyArray<TeamId>,
   canAccessAllPublicTeams: boolean,
-  installationRepo: InstallationRepo,
+  installationRepo: InstallationRepo["Service"],
   timestamp: number,
 ): Effect.Effect<void, DatabaseError | RowDecodeError, never> =>
   Effect.gen(function* () {
@@ -749,7 +757,7 @@ const APP_USER_NOTIFICATION_STOP_ACTIONS: Record<string, true> = {
 const validateAppUserNotification = (
   parsed: Record<string, unknown>,
   config: { readonly linearClientId: string },
-  installationRepo: InstallationRepo,
+  installationRepo: InstallationRepo["Service"],
 ): Effect.Effect<
   {
     readonly payload: AppUserNotificationType;
@@ -764,11 +772,11 @@ const validateAppUserNotification = (
   | TokenCipherError
 > =>
   Effect.gen(function* () {
-    const payload = yield* Schema.decodeUnknown(AppUserNotification)(
+    const payload = yield* Schema.decodeUnknownEffect(AppUserNotification)(
       parsed,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         (error) =>
           new WebhookPayloadError({
             message: "AppUserNotification payload is invalid",
@@ -785,22 +793,22 @@ const validateAppUserNotification = (
       );
     }
 
-    const organizationId = yield* Schema.decodeUnknown(OrganizationId)(
+    const organizationId = yield* Schema.decodeUnknownEffect(OrganizationId)(
       payload.organizationId,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookIdentityError({
             message: "Organization identity is not a valid identifier",
           }),
       ),
     );
-    const appUserId = yield* Schema.decodeUnknown(AppUserId)(
+    const appUserId = yield* Schema.decodeUnknownEffect(AppUserId)(
       payload.appUserId,
     ).pipe(
       Effect.catchTag(
-        "ParseError",
+        "SchemaError",
         () =>
           new WebhookPayloadError({
             message: `Invalid app user id ${payload.appUserId}`,
@@ -834,9 +842,9 @@ const validateAppUserNotification = (
     let issueId = Option.none<IssueId>();
     if (rawIssueId !== null) {
       issueId = Option.some(
-        yield* Schema.decodeUnknown(IssueId)(rawIssueId).pipe(
+        yield* Schema.decodeUnknownEffect(IssueId)(rawIssueId).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             () =>
               new WebhookPayloadError({
                 message: `Invalid issue id ${rawIssueId}`,
@@ -870,8 +878,8 @@ const handleAppUserNotification = (
   payload: AppUserNotificationType,
   organizationId: OrganizationId,
   issueId: Option.Option<IssueId>,
-  runRepo: RunRepo,
-  runInputRepo: RunInputRepo,
+  runRepo: RunRepo["Service"],
+  runInputRepo: RunInputRepo["Service"],
   timestamp: number,
 ): Effect.Effect<
   void,
@@ -897,9 +905,11 @@ const handleAppUserNotification = (
     });
     const stopId = payload.notification.id || payload.webhookId;
     yield* Effect.forEach(runs, (run) =>
-      Schema.decodeUnknown(InputId)(`${run.sessionId}:stop:${stopId}`).pipe(
+      Schema.decodeUnknownEffect(InputId)(
+        `${run.sessionId}:stop:${stopId}`,
+      ).pipe(
         Effect.catchTag(
-          "ParseError",
+          "SchemaError",
           () =>
             new WebhookPayloadError({
               message: "Invalid AppUserNotification stop input id",
@@ -924,9 +934,9 @@ const handleAppUserNotification = (
 const decodeDeliveryId = (
   raw: string,
 ): Effect.Effect<DeliveryId, WebhookPayloadError> =>
-  Schema.decodeUnknown(DeliveryId)(raw).pipe(
+  Schema.decodeUnknownEffect(DeliveryId)(raw).pipe(
     Effect.catchTag(
-      "ParseError",
+      "SchemaError",
       () =>
         new WebhookPayloadError({
           message: "Invalid delivery id",
@@ -935,19 +945,10 @@ const decodeDeliveryId = (
     ),
   );
 
-export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
+export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
   "WebhookPipeline",
   {
-    accessors: true,
-    dependencies: [
-      GatewayConfig.Default,
-      InstallationRepo.Default,
-      RunRepo.Default,
-      RunInputRepo.Default,
-      DeliveryRepo.Default,
-      PromptTemplateRepo.Default,
-    ],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const config = yield* GatewayConfig;
       const installationRepo = yield* InstallationRepo;
       const runRepo = yield* RunRepo;
@@ -961,7 +962,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       ) =>
         deliveryRepo.mark(id, "failed", reason).pipe(
           Effect.tap(() => Effect.sync(() => failedCleanup.delete(id))),
-          Effect.catchAll((error) =>
+          Effect.catch((error) =>
             Effect.gen(function* () {
               failedCleanup.add(id);
               yield* Effect.logError("webhook.delivery_cleanup_failed").pipe(
@@ -1233,14 +1234,14 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
                 const rawAgentSession = isRecord(parsed.agentSession)
                   ? parsed.agentSession
                   : undefined;
-                const event = yield* Schema.decodeUnknown(AgentSessionEvent)(
-                  parsed,
-                ).pipe(
+                const event = yield* Schema.decodeUnknownEffect(
+                  AgentSessionEvent,
+                )(parsed).pipe(
                   Effect.catchTag(
-                    "ParseError",
+                    "SchemaError",
                     (error) =>
                       new WebhookPayloadError({
-                        message: `AgentSessionEvent payload is invalid: ${error}`,
+                        message: "AgentSessionEvent payload is invalid",
                         status: 400,
                         cause: String(error),
                       }),
@@ -1354,7 +1355,7 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
 
         return yield* process.pipe(
           Effect.onError((cause) => {
-            const failure = Cause.failureOption(cause);
+            const failure = Cause.findErrorOption(cause);
             const reason =
               Option.isSome(failure) &&
               (failure.value._tag === "@Gateway/WebhookPayloadError" ||
@@ -1403,6 +1404,18 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       return { handle };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([
+      GatewayConfig.layer,
+      InstallationRepo.layer,
+      RunRepo.layer,
+      RunInputRepo.layer,
+      DeliveryRepo.layer,
+      PromptTemplateRepo.layer,
+    ]),
+  );
+}
 
 export const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;

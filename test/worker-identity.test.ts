@@ -27,7 +27,7 @@ afterEach(async () => {
 const withIdentities = async (
   test: (
     repo: ReturnType<typeof makeWorkerIdentityRepo>,
-    db: SqliteClient["Type"]["db"],
+    db: SqliteClient["Service"]["db"],
     root: string,
   ) => Effect.Effect<void, unknown>,
 ) => {
@@ -81,10 +81,10 @@ describe("worker identities", () => {
     await withIdentities((repo) =>
       Effect.gen(function* () {
         yield* repo.acquire("a");
-        const result = yield* Effect.either(repo.acquire("b"));
-        expect(result._tag).toBe("Left");
-        if (result._tag !== "Left") throw new Error("Expected exhaustion");
-        expect(result.left.message).toContain("Worker uid range exhausted");
+        const result = yield* Effect.result(repo.acquire("b"));
+        expect(result._tag).toBe("Failure");
+        if (result._tag !== "Failure") throw new Error("Expected exhaustion");
+        expect(result.failure.message).toContain("Worker uid range exhausted");
         expect(yield* repo.acquire("a")).toBe("21001");
       }),
     );
@@ -99,10 +99,11 @@ describe("worker identities", () => {
         ).run();
         yield* repo.release("a", join(root, "workspaces"));
         expect(yield* repo.acquire("b")).toBe("21001");
-        const busy = yield* Effect.either(repo.acquire("a"));
-        expect(busy._tag).toBe("Left");
-        if (busy._tag !== "Left") throw new Error("Expected busy resume uid");
-        expect(busy.left.message).toContain("for resume is busy");
+        const busy = yield* Effect.result(repo.acquire("a"));
+        expect(busy._tag).toBe("Failure");
+        if (busy._tag !== "Failure")
+          throw new Error("Expected busy resume uid");
+        expect(busy.failure.message).toContain("for resume is busy");
         db.query(
           "UPDATE agent_run SET state='succeeded' WHERE session_id='b'",
         ).run();
@@ -123,13 +124,13 @@ describe("worker identities", () => {
         yield* repo.acquire("b");
         const other = new Database(join(root, "gateway.sqlite"));
         try {
-          const result = yield* Effect.either(
+          const result = yield* Effect.result(
             makeWorkerIdentityRepo(other).acquire(
               "a",
               join(root, "workspaces"),
             ),
           );
-          expect(result._tag).toBe("Left");
+          expect(result._tag).toBe("Failure");
           expect(
             db
               .query("SELECT session_id FROM worker_identity WHERE active=1")
@@ -196,8 +197,8 @@ describe("worker identities", () => {
     await withIdentities((repo) =>
       Effect.gen(function* () {
         expect(yield* repo.acquire("a")).toBe("1001");
-        const exhausted = yield* Effect.either(repo.acquire("b"));
-        expect(exhausted._tag).toBe("Left");
+        const exhausted = yield* Effect.result(repo.acquire("b"));
+        expect(exhausted._tag).toBe("Failure");
       }),
     );
   });
@@ -215,8 +216,8 @@ describe("worker identities", () => {
       Effect.gen(function* () {
         yield* repo.acquire("a");
         vi.stubEnv("WORKER_UID_BASE", "22000");
-        const result = yield* Effect.either(repo.acquire("a"));
-        expect(result._tag).toBe("Left");
+        const result = yield* Effect.result(repo.acquire("a"));
+        expect(result._tag).toBe("Failure");
       }),
     );
   });

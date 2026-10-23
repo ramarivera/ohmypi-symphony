@@ -4,7 +4,17 @@ import {
   randomBytes,
   timingSafeEqual,
 } from "node:crypto";
-import { Cause, Clock, Effect, Either, Option, Schema } from "effect";
+import {
+  Cause,
+  Clock,
+  Context,
+  Effect,
+  Layer,
+  Option,
+  Result,
+  Schema,
+  Semaphore,
+} from "effect";
 import { redact } from "../admin-ui/run-detail.js";
 import {
   type RunDetailModel,
@@ -82,7 +92,7 @@ const HTTP_TOKEN_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
 // before creating a session is the only way to avoid orphaned sessions.
 const rerunIssueGates = new Map<
   string,
-  { semaphore: Effect.Semaphore; users: number }
+  { semaphore: Semaphore.Semaphore; users: number }
 >();
 
 export const withRerunIssueGate = <A, E, R>(
@@ -94,7 +104,7 @@ export const withRerunIssueGate = <A, E, R>(
     Effect.sync(() => {
       const key = `${organizationId}:${issueId}`;
       const entry = rerunIssueGates.get(key) ?? {
-        semaphore: Effect.unsafeMakeSemaphore(1),
+        semaphore: Semaphore.makeUnsafe(1),
         users: 0,
       };
       entry.users += 1;
@@ -140,25 +150,25 @@ export interface ReconcilerShape {
 }
 export interface AdminDeps {
   readonly config: GatewayConfigShape;
-  readonly adminSessionRepo: AdminSessionRepo;
-  readonly executorInstanceRepo: ExecutorInstanceRepo;
+  readonly adminSessionRepo: AdminSessionRepo["Service"];
+  readonly executorInstanceRepo: ExecutorInstanceRepo["Service"];
   readonly executor: {
-    readonly listToolkits: Executor["listToolkits"];
+    readonly listToolkits: Executor["Service"]["listToolkits"];
   };
-  readonly installationRepo: InstallationRepo;
-  readonly runRepo: RunRepo;
-  readonly runEventRepo: RunEventRepo;
-  readonly runInputRepo: RunInputRepo;
+  readonly installationRepo: InstallationRepo["Service"];
+  readonly runRepo: RunRepo["Service"];
+  readonly runEventRepo: RunEventRepo["Service"];
+  readonly runInputRepo: RunInputRepo["Service"];
   readonly linearGateway: {
-    readonly createSessionOnIssue: LinearGateway["createSessionOnIssue"];
+    readonly createSessionOnIssue: LinearGateway["Service"]["createSessionOnIssue"];
   };
-  readonly workspaceRepo: WorkspaceRepo;
-  readonly promptTemplateRepo: PromptTemplateRepo;
-  readonly mcpServerRepo: McpServerRepo;
-  readonly mcpOAuth: McpOAuth;
+  readonly workspaceRepo: WorkspaceRepo["Service"];
+  readonly promptTemplateRepo: PromptTemplateRepo["Service"];
+  readonly mcpServerRepo: McpServerRepo["Service"];
+  readonly mcpOAuth: McpOAuth["Service"];
   readonly workspace: WorkspaceShape;
   readonly reconciler: ReconcilerShape;
-  readonly nixEnvironment: NixEnvironment;
+  readonly nixEnvironment: NixEnvironment["Service"];
 }
 
 interface RepositoryPayload {
@@ -176,7 +186,7 @@ class AdminError extends Schema.TaggedError<AdminError>()(
   "@Gateway/AdminError",
   {
     message: Schema.String,
-    status: Schema.Literal(400, 401, 403, 404, 409, 429, 500, 502),
+    status: Schema.Literals([400, 401, 403, 404, 409, 429, 500, 502]),
   },
 ) {}
 
@@ -270,40 +280,42 @@ function optionalString(value: unknown): string | null {
 function stringArray(
   value: unknown,
   field: string,
-): Either.Either<ReadonlyArray<string>, string> {
-  if (!Array.isArray(value)) return Either.left(`${field} must be an array`);
+): Result.Result<ReadonlyArray<string>, string> {
+  if (!Array.isArray(value)) return Result.fail(`${field} must be an array`);
   if (value.some((item) => typeof item !== "string"))
-    return Either.left(`${field} must contain only strings`);
-  return Either.right(
+    return Result.fail(`${field} must contain only strings`);
+  return Result.succeed(
     value.map((item) => String(item).trim().toLowerCase()).filter(Boolean),
   );
 }
 function preservingStringArray(
   value: unknown,
   field: string,
-): Either.Either<ReadonlyArray<string>, string> {
-  if (!Array.isArray(value)) return Either.left(`${field} must be an array`);
+): Result.Result<ReadonlyArray<string>, string> {
+  if (!Array.isArray(value)) return Result.fail(`${field} must be an array`);
   if (value.some((item) => typeof item !== "string")) {
-    return Either.left(`${field} must contain only strings`);
+    return Result.fail(`${field} must contain only strings`);
   }
-  return Either.right(value.map((item) => String(item).trim()).filter(Boolean));
+  return Result.succeed(
+    value.map((item) => String(item).trim()).filter(Boolean),
+  );
 }
 
 function optionalStringArray(
   value: unknown,
   field: string,
-): Either.Either<ReadonlyArray<string>, string> {
-  if (value === undefined || value === null) return Either.right([]);
+): Result.Result<ReadonlyArray<string>, string> {
+  if (value === undefined || value === null) return Result.succeed([]);
   return stringArray(value, field);
 }
 
 function optionalNixPackageArray(
   value: unknown,
-): Either.Either<ReadonlyArray<NixPackageName>, string> {
-  if (value === undefined || value === null) return Either.right([]);
-  if (!Array.isArray(value)) return Either.left("nixPackages must be an array");
+): Result.Result<ReadonlyArray<NixPackageName>, string> {
+  if (value === undefined || value === null) return Result.succeed([]);
+  if (!Array.isArray(value)) return Result.fail("nixPackages must be an array");
   if (value.some((item) => typeof item !== "string")) {
-    return Either.left("nixPackages must contain only strings");
+    return Result.fail("nixPackages must contain only strings");
   }
   const values = value.map((item) => item.trim()).filter(Boolean);
   if (
@@ -311,9 +323,9 @@ function optionalNixPackageArray(
       (item) => !/^[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*$/u.test(item),
     )
   ) {
-    return Either.left("Invalid Nix package name");
+    return Result.fail("Invalid Nix package name");
   }
-  return Either.right(normalizeNixPackages(values));
+  return Result.succeed(normalizeNixPackages(values));
 }
 
 function optionalBoolean(value: unknown): boolean | undefined {
@@ -323,33 +335,33 @@ function optionalBoolean(value: unknown): boolean | undefined {
 
 function repositoryPayload(
   body: Record<string, unknown>,
-): Either.Either<RepositoryPayload, string> {
+): Result.Result<RepositoryPayload, string> {
   const id = optionalString(body.id);
   const url = optionalString(body.url);
   const ref = optionalString(body.ref);
-  if (id === null) return Either.left("id is required");
-  if (url === null) return Either.left("url is required");
+  if (id === null) return Result.fail("id is required");
+  if (url === null) return Result.fail("url is required");
   if (!isHttpsGitHubRepositoryUrl(url))
-    return Either.left("url must be https://github.com/<owner>/<repo>");
-  if (ref === null) return Either.left("ref is required");
+    return Result.fail("url must be https://github.com/<owner>/<repo>");
+  if (ref === null) return Result.fail("ref is required");
   if (ref.startsWith("-") || /[\r\n\0]/u.test(ref))
-    return Either.left("Invalid repository ref");
+    return Result.fail("Invalid repository ref");
   const teamIds = optionalStringArray(body.teamIds, "teamIds");
-  if (Either.isLeft(teamIds)) return Either.left(teamIds.left);
+  if (Result.isFailure(teamIds)) return Result.fail(teamIds.failure);
   const projectIds = optionalStringArray(body.projectIds, "projectIds");
-  if (Either.isLeft(projectIds)) return Either.left(projectIds.left);
+  if (Result.isFailure(projectIds)) return Result.fail(projectIds.failure);
   const labels = optionalStringArray(body.labels, "labels");
-  if (Either.isLeft(labels)) return Either.left(labels.left);
+  if (Result.isFailure(labels)) return Result.fail(labels.failure);
   const nixPackages = optionalNixPackageArray(body.nixPackages);
-  if (Either.isLeft(nixPackages)) return Either.left(nixPackages.left);
-  return Either.right({
+  if (Result.isFailure(nixPackages)) return Result.fail(nixPackages.failure);
+  return Result.succeed({
     id,
     url,
     ref,
-    teamIds: teamIds.right,
-    projectIds: projectIds.right,
-    labels: labels.right,
-    nixPackages: nixPackages.right,
+    teamIds: teamIds.success,
+    projectIds: projectIds.success,
+    labels: labels.success,
+    nixPackages: nixPackages.success,
     isDefault: optionalBoolean(body.isDefault),
   });
 }
@@ -388,77 +400,77 @@ interface McpServerPayload {
 
 function mcpServerPayload(
   body: Record<string, unknown>,
-): Either.Either<McpServerPayload, string> {
+): Result.Result<McpServerPayload, string> {
   const id = optionalString(body.id);
   const name = optionalString(body.name);
-  if (id === null) return Either.left("id is required");
-  if (name === null) return Either.left("name is required");
+  if (id === null) return Result.fail("id is required");
+  if (name === null) return Result.fail("name is required");
   const rawTransport = body.transport;
   if (
     rawTransport !== "stdio" &&
     rawTransport !== "http" &&
     rawTransport !== "sse"
   ) {
-    return Either.left("transport must be stdio, http, or sse");
+    return Result.fail("transport must be stdio, http, or sse");
   }
   const command = body.command === null ? null : optionalString(body.command);
   const url = body.url === null ? null : optionalString(body.url);
   if (rawTransport === "stdio" && command === null) {
-    return Either.left("stdio transport requires a command");
+    return Result.fail("stdio transport requires a command");
   }
   if (rawTransport !== "stdio") {
     if (url === null) {
-      return Either.left(`${rawTransport} transport requires a valid URL`);
+      return Result.fail(`${rawTransport} transport requires a valid URL`);
     }
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        return Either.left(
+        return Result.fail(
           `${rawTransport} transport requires a valid http(s) URL`,
         );
       }
     } catch {
-      return Either.left(
+      return Result.fail(
         `${rawTransport} transport requires a valid http(s) URL`,
       );
     }
   }
   const argsResult = preservingStringArray(body.args, "args");
-  if (Either.isLeft(argsResult)) return Either.left(argsResult.left);
-  const args = argsResult.right;
+  if (Result.isFailure(argsResult)) return Result.fail(argsResult.failure);
+  const args = argsResult.success;
   let repositoryId: string | null;
   if (body.repositoryId === null || body.repositoryId === undefined) {
     repositoryId = null;
   } else if (typeof body.repositoryId !== "string") {
-    return Either.left("repositoryId must be a string or null");
+    return Result.fail("repositoryId must be a string or null");
   } else {
     repositoryId = optionalString(body.repositoryId);
   }
   const envValue = body.env;
   const env: Record<string, string> = {};
   if (envValue !== undefined && envValue !== null) {
-    if (!record(envValue)) return Either.left("env must be an object");
+    if (!record(envValue)) return Result.fail("env must be an object");
     for (const [key, value] of Object.entries(envValue)) {
       if (typeof value !== "string")
-        return Either.left(`env.${key} must be a string`);
+        return Result.fail(`env.${key} must be a string`);
       env[key] = value;
     }
   }
   const headersValue = body.headers;
   const headers: Record<string, string> = {};
   if (headersValue !== undefined && headersValue !== null) {
-    if (!record(headersValue)) return Either.left("headers must be an object");
+    if (!record(headersValue)) return Result.fail("headers must be an object");
     const invalidHeaderNames = Object.keys(headersValue).filter(
       (key) => !HTTP_TOKEN_RE.test(key),
     );
     if (invalidHeaderNames.length > 0) {
-      return Either.left(
+      return Result.fail(
         `Invalid MCP header name: ${invalidHeaderNames.join(", ")}`,
       );
     }
     for (const [key, value] of Object.entries(headersValue)) {
       if (typeof value !== "string")
-        return Either.left(`headers.${key} must be a string`);
+        return Result.fail(`headers.${key} must be a string`);
       headers[key] = value;
     }
   }
@@ -482,19 +494,19 @@ function mcpServerPayload(
     rawAuthMethod !== "" &&
     oauthTokenEndpointAuthMethod === null
   ) {
-    return Either.left(
+    return Result.fail(
       "oauthTokenEndpointAuthMethod must be none, client_secret_basic, or client_secret_post",
     );
   }
   if (oauthClientSecret !== null && oauthClientId === null) {
-    return Either.left(
+    return Result.fail(
       "oauthClientId is required when oauthClientSecret is set",
     );
   }
   if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
-    return Either.left("enabled must be a boolean");
+    return Result.fail("enabled must be a boolean");
   }
-  return Either.right({
+  return Result.succeed({
     id,
     name,
     transport: rawTransport,
@@ -847,8 +859,12 @@ function parseJsonBody(request: Request) {
 function mapCauseToResponse(
   cause: Cause.Cause<unknown>,
 ): Option.Option<Response> {
-  const typed = Array.from(Cause.failures(cause));
-  const defects = Array.from(Cause.defects(cause));
+  const typed = cause.reasons
+    .filter(Cause.isFailReason)
+    .map((reason) => reason.error);
+  const defects = cause.reasons
+    .filter(Cause.isDieReason)
+    .map((reason) => reason.defect);
   const all = [...typed, ...defects];
 
   for (const error of all) {
@@ -950,9 +966,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
 
       if (url.pathname !== "/") {
         const authenticated = yield* requireSession(request).pipe(
-          Effect.either,
+          Effect.result,
         );
-        if (Either.isLeft(authenticated)) {
+        if (Result.isFailure(authenticated)) {
           if (
             request.method === "GET" &&
             !url.pathname.endsWith(".json") &&
@@ -998,11 +1014,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const rawSessionId = decodeURIComponent(
           isJsonPath ? encodedRunId.slice(0, -".json".length) : encodedRunId,
         );
-        const sessionId = yield* Schema.decodeUnknown(SessionId)(
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
           rawSessionId,
         ).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({ message: "Invalid run id", status: 400 }),
               ),
@@ -1024,7 +1040,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           rawToken === null
             ? Option.none()
             : yield* deps.adminSessionRepo.get(tokenHash(rawToken), now).pipe(
-                Effect.catchAll((error) =>
+                Effect.catch((error) =>
                   Effect.logWarning("admin.session_lookup_failed").pipe(
                     Effect.annotateLogs({
                       sessionId,
@@ -1061,11 +1077,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
       );
       if (rerunMatch !== null && request.method === "POST") {
         const rawSessionId = decodeURIComponent(rerunMatch[1] ?? "");
-        const sessionId = yield* Schema.decodeUnknown(SessionId)(
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
           rawSessionId,
         ).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({ message: "Invalid run id", status: 400 }),
               ),
@@ -1150,11 +1166,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
                   });
                 }),
               );
-            const newRunSessionId = yield* Schema.decodeUnknown(SessionId)(
-              newSessionId,
-            ).pipe(
+            const newRunSessionId = yield* Schema.decodeUnknownEffect(
+              SessionId,
+            )(newSessionId).pipe(
               Effect.catchTags({
-                ParseError: () =>
+                SchemaError: () =>
                   Effect.fail(
                     new AdminError({
                       message: "Invalid session id from Linear",
@@ -1177,11 +1193,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
               );
             }
             const rerunCreatedAt = yield* Clock.currentTimeMillis;
-            const inputId = yield* Schema.decodeUnknown(InputId)(
+            const inputId = yield* Schema.decodeUnknownEffect(InputId)(
               `${newSessionId}:created`,
             ).pipe(
               Effect.catchTags({
-                ParseError: () =>
+                SchemaError: () =>
                   Effect.fail(
                     new AdminError({
                       message: "Invalid input id",
@@ -1301,11 +1317,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
           return Option.some(text("Prompt templates unavailable", 500));
         }
         const payload = yield* parseJsonBody(request);
-        const kind = yield* Schema.decodeUnknown(
-          Schema.Literal("created", "prompted", "contract"),
+        const kind = yield* Schema.decodeUnknownEffect(
+          Schema.Literals(["created", "prompted", "contract"]),
         )(payload.kind).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             () =>
               new AdminError({
                 message: "Invalid prompt template kind",
@@ -1467,9 +1483,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
           return Option.some(text("Executor is not configured", 404));
         const name = `${EXECUTOR_ATTACHMENT_PREFIX}${encodeURIComponent(slug)}:${optionalString(body.name) ?? slug}`;
         const rawId = optionalString(body.id) ?? `executor-${slug}`;
-        const id = yield* Schema.decodeUnknown(McpServerId)(rawId).pipe(
+        const id = yield* Schema.decodeUnknownEffect(McpServerId)(rawId).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({
                   message: "Invalid MCP server id",
@@ -1486,9 +1502,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
               text("repositoryId must be a string or null", 400),
             );
           repositoryId = Option.some(
-            yield* Schema.decodeUnknown(WorkspaceId)(value).pipe(
+            yield* Schema.decodeUnknownEffect(WorkspaceId)(value).pipe(
               Effect.catchTags({
-                ParseError: () =>
+                SchemaError: () =>
                   Effect.fail(
                     new AdminError({
                       message: "Invalid repository id",
@@ -1564,16 +1580,18 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const session = yield* requireMutation(request);
         const body = yield* parseJsonBody(request);
         const payloadEither = mcpServerPayload(body);
-        if (Either.isLeft(payloadEither))
-          return Option.some(text(payloadEither.left, 400));
-        const payload = payloadEither.right;
+        if (Result.isFailure(payloadEither))
+          return Option.some(text(payloadEither.failure, 400));
+        const payload = payloadEither.success;
         const repositoryId =
           payload.repositoryId === null
             ? Option.none<WorkspaceId>()
-            : yield* Schema.decodeUnknown(WorkspaceId)(payload.repositoryId)
+            : yield* Schema.decodeUnknownEffect(WorkspaceId)(
+                payload.repositoryId,
+              )
                 .pipe(
                   Effect.catchTags({
-                    ParseError: () =>
+                    SchemaError: () =>
                       Effect.fail(
                         new AdminError({
                           message: "Invalid repository id",
@@ -1583,9 +1601,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
                   }),
                 )
                 .pipe(Effect.map(Option.some));
-        const id = yield* Schema.decodeUnknown(McpServerId)(payload.id).pipe(
+        const id = yield* Schema.decodeUnknownEffect(McpServerId)(
+          payload.id,
+        ).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({
                   message: "Invalid MCP server id",
@@ -1640,11 +1660,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const session = yield* requireMutation(request);
         const rawId = mcpOauthConnect[1];
         if (rawId === undefined) return Option.some(text("Not found", 404));
-        const id = yield* Schema.decodeUnknown(McpServerId)(
+        const id = yield* Schema.decodeUnknownEffect(McpServerId)(
           decodeURIComponent(rawId),
         ).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({
                   message: "Invalid MCP server id",
@@ -1702,11 +1722,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const session = yield* requireMutation(request);
         const rawId = mcpOauthDisconnect[1];
         if (rawId === undefined) return Option.some(text("Not found", 404));
-        const id = yield* Schema.decodeUnknown(McpServerId)(
+        const id = yield* Schema.decodeUnknownEffect(McpServerId)(
           decodeURIComponent(rawId),
         ).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({
                   message: "Invalid MCP server id",
@@ -1722,9 +1742,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const rawId = decodeURIComponent(
           url.pathname.slice("/api/admin/mcp-servers/".length),
         );
-        const id = yield* Schema.decodeUnknown(McpServerId)(rawId).pipe(
+        const id = yield* Schema.decodeUnknownEffect(McpServerId)(rawId).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({
                   message: "Invalid MCP server id",
@@ -1762,9 +1782,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
           const session = yield* requireMutation(request);
           const body = yield* parseJsonBody(request);
           const payloadEither = mcpServerPayload(body);
-          if (Either.isLeft(payloadEither))
-            return Option.some(text(payloadEither.left, 400));
-          const payload = payloadEither.right;
+          if (Result.isFailure(payloadEither))
+            return Option.some(text(payloadEither.failure, 400));
+          const payload = payloadEither.success;
           if (payload.id !== id)
             return Option.some(
               text("MCP server id in body does not match path", 400),
@@ -1778,10 +1798,12 @@ export const createAdminHandle = (deps: AdminDeps) =>
           const repositoryId =
             payload.repositoryId === null
               ? Option.none<WorkspaceId>()
-              : yield* Schema.decodeUnknown(WorkspaceId)(payload.repositoryId)
+              : yield* Schema.decodeUnknownEffect(WorkspaceId)(
+                  payload.repositoryId,
+                )
                   .pipe(
                     Effect.catchTags({
-                      ParseError: () =>
+                      SchemaError: () =>
                         Effect.fail(
                           new AdminError({
                             message: "Invalid repository id",
@@ -1939,15 +1961,15 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const session = yield* requireMutation(request);
         const body = yield* parseJsonBody(request);
         const payloadEither = repositoryPayload(body);
-        if (Either.isLeft(payloadEither)) {
-          return Option.some(text(payloadEither.left, 400));
+        if (Result.isFailure(payloadEither)) {
+          return Option.some(text(payloadEither.failure, 400));
         }
-        const payload = payloadEither.right;
-        const repositoryId = yield* Schema.decodeUnknown(WorkspaceId)(
+        const payload = payloadEither.success;
+        const repositoryId = yield* Schema.decodeUnknownEffect(WorkspaceId)(
           payload.id,
         ).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({
                   message: "Invalid repository id",
@@ -1956,21 +1978,21 @@ export const createAdminHandle = (deps: AdminDeps) =>
               ),
           }),
         );
-        const teamIds = yield* Schema.decodeUnknown(Schema.Array(TeamId))(
+        const teamIds = yield* Schema.decodeUnknownEffect(Schema.Array(TeamId))(
           payload.teamIds,
         ).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({ message: "Invalid team ids", status: 400 }),
               ),
           }),
         );
-        const projectIds = yield* Schema.decodeUnknown(Schema.Array(ProjectId))(
-          payload.projectIds,
-        ).pipe(
+        const projectIds = yield* Schema.decodeUnknownEffect(
+          Schema.Array(ProjectId),
+        )(payload.projectIds).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({ message: "Invalid project ids", status: 400 }),
               ),
@@ -1997,9 +2019,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const rawId = decodeURIComponent(
           url.pathname.slice("/api/admin/repositories/".length),
         );
-        const id = yield* Schema.decodeUnknown(WorkspaceId)(rawId).pipe(
+        const id = yield* Schema.decodeUnknownEffect(WorkspaceId)(rawId).pipe(
           Effect.catchTags({
-            ParseError: () =>
+            SchemaError: () =>
               Effect.fail(
                 new AdminError({
                   message: "Invalid repository id",
@@ -2013,30 +2035,30 @@ export const createAdminHandle = (deps: AdminDeps) =>
           const session = yield* requireMutation(request);
           const body = yield* parseJsonBody(request);
           const payloadEither = repositoryPayload(body);
-          if (Either.isLeft(payloadEither)) {
-            return Option.some(text(payloadEither.left, 400));
+          if (Result.isFailure(payloadEither)) {
+            return Option.some(text(payloadEither.failure, 400));
           }
-          const payload = payloadEither.right;
+          const payload = payloadEither.success;
           if (payload.id !== id) {
             return Option.some(
               text("Repository id in body does not match path", 400),
             );
           }
-          const teamIds = yield* Schema.decodeUnknown(Schema.Array(TeamId))(
-            payload.teamIds,
-          ).pipe(
+          const teamIds = yield* Schema.decodeUnknownEffect(
+            Schema.Array(TeamId),
+          )(payload.teamIds).pipe(
             Effect.catchTags({
-              ParseError: () =>
+              SchemaError: () =>
                 Effect.fail(
                   new AdminError({ message: "Invalid team ids", status: 400 }),
                 ),
             }),
           );
-          const projectIds = yield* Schema.decodeUnknown(
+          const projectIds = yield* Schema.decodeUnknownEffect(
             Schema.Array(ProjectId),
           )(payload.projectIds).pipe(
             Effect.catchTags({
-              ParseError: () =>
+              SchemaError: () =>
                 Effect.fail(
                   new AdminError({
                     message: "Invalid project ids",
@@ -2084,23 +2106,23 @@ export const createAdminHandle = (deps: AdminDeps) =>
           body.issueLabels,
           "issueLabels",
         );
-        if (Either.isLeft(issueLabels)) {
-          return Option.some(text(issueLabels.left, 400));
+        if (Result.isFailure(issueLabels)) {
+          return Option.some(text(issueLabels.failure, 400));
         }
         const projectLabels = optionalStringArray(
           body.projectLabels,
           "projectLabels",
         );
-        if (Either.isLeft(projectLabels)) {
-          return Option.some(text(projectLabels.left, 400));
+        if (Result.isFailure(projectLabels)) {
+          return Option.some(text(projectLabels.failure, 400));
         }
         const resolution = yield* deps.workspace.resolve({
           organizationId: session.organizationId,
           teamId: optionalString(body.teamId),
           projectId: optionalString(body.projectId),
           repositoryId: optionalString(body.repositoryId),
-          issueLabels: issueLabels.right,
-          projectLabels: projectLabels.right,
+          issueLabels: issueLabels.success,
+          projectLabels: projectLabels.success,
         });
         return Option.some(
           json({
@@ -2133,9 +2155,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
     },
     (effect) =>
       effect.pipe(
-        Effect.catchAllCause((cause) =>
-          Effect.succeed(mapCauseToResponse(cause)),
-        ),
+        Effect.catchCause((cause) => Effect.succeed(mapCauseToResponse(cause))),
       ),
   );
 
@@ -2161,27 +2181,8 @@ export const createAdminSession = (
     return { token, csrf, expiresAt };
   });
 
-export class Admin extends Effect.Service<Admin>()("Admin", {
-  accessors: true,
-  dependencies: [
-    GatewayConfig.Default,
-    AdminSessionRepo.Default,
-    InstallationRepo.Default,
-    ExecutorInstanceRepo.Default,
-    Executor.Default,
-    RunRepo.Default,
-    RunEventRepo.Default,
-    RunInputRepo.Default,
-    LinearGateway.Default,
-    WorkspaceRepo.Default,
-    PromptTemplateRepo.Default,
-    McpServerRepo.Default,
-    McpOAuth.Default,
-    Workspace.Default,
-    Reconciler.Default,
-    NixEnvironment.Default,
-  ],
-  effect: Effect.gen(function* () {
+export class Admin extends Context.Service<Admin>()("Admin", {
+  make: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const adminSessionRepo = yield* AdminSessionRepo;
     const executorInstanceRepo = yield* ExecutorInstanceRepo;
@@ -2218,4 +2219,26 @@ export class Admin extends Effect.Service<Admin>()("Admin", {
     });
     return { handle };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([
+      GatewayConfig.layer,
+      AdminSessionRepo.layer,
+      InstallationRepo.layer,
+      ExecutorInstanceRepo.layer,
+      Executor.layer,
+      RunRepo.layer,
+      RunEventRepo.layer,
+      RunInputRepo.layer,
+      LinearGateway.layer,
+      WorkspaceRepo.layer,
+      PromptTemplateRepo.layer,
+      McpServerRepo.layer,
+      McpOAuth.layer,
+      Workspace.layer,
+      Reconciler.layer,
+      NixEnvironment.layer,
+    ]),
+  );
+}

@@ -1,8 +1,9 @@
-import { Effect, Option, Redacted, Schema } from "effect";
+import { Cause, Effect, Logger, Option, Redacted, Schema } from "effect";
 import { describe, expect, it } from "vitest";
 import {
   DatabaseError,
   LinearRateLimitError,
+  RowDecodeError,
   WorkspaceError,
 } from "../src/domain/errors.js";
 import {
@@ -36,6 +37,7 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "../src/services/store/repositories.js";
+import { decodeRow } from "../src/services/store/sqlite-client.js";
 import { suitePaths } from "./fixtures/paths.js";
 
 const suitePath = suitePaths();
@@ -81,7 +83,7 @@ const config: GatewayConfigShape = {
 
 const deps: AdminDeps = {
   config,
-  adminSessionRepo: AdminSessionRepo.make({
+  adminSessionRepo: AdminSessionRepo.of({
     get: () =>
       Effect.succeed(
         Option.some({
@@ -92,7 +94,7 @@ const deps: AdminDeps = {
     create: unreachable,
     deleteAdminSession: unreachable,
   }),
-  installationRepo: InstallationRepo.make({
+  installationRepo: InstallationRepo.of({
     put: unreachable,
     get: unreachable,
     revoke: unreachable,
@@ -101,7 +103,7 @@ const deps: AdminDeps = {
     createOAuthState: unreachable,
     consumeOAuthState: unreachable,
   }),
-  runRepo: RunRepo.make({
+  runRepo: RunRepo.of({
     get: unreachable,
     create: unreachable,
     createIfNoActiveForIssue: unreachable,
@@ -117,7 +119,7 @@ const deps: AdminDeps = {
     releaseLease: unreachable,
     recoverInterruptedRuns: unreachable,
   }),
-  runEventRepo: RunEventRepo.make({
+  runEventRepo: RunEventRepo.of({
     upsert: unreachable,
     list: unreachable,
     getBySourceKey: unreachable,
@@ -149,7 +151,7 @@ const deps: AdminDeps = {
   executor: {
     listToolkits: unreachable,
   } as unknown as AdminDeps["executor"],
-  runInputRepo: RunInputRepo.make({
+  runInputRepo: RunInputRepo.of({
     enqueue: unreachable,
     applyStop: unreachable,
     pending: unreachable,
@@ -160,7 +162,7 @@ const deps: AdminDeps = {
   linearGateway: {
     createSessionOnIssue: unreachable,
   },
-  workspaceRepo: WorkspaceRepo.make({
+  workspaceRepo: WorkspaceRepo.of({
     setWorkspace: unreachable,
     createRepository: unreachable,
     getRepository: unreachable,
@@ -190,7 +192,7 @@ const deps: AdminDeps = {
         lastError: Option.none(),
       }),
   },
-  nixEnvironment: NixEnvironment.make({
+  nixEnvironment: NixEnvironment.of({
     enforceBudget: () =>
       Effect.succeed({ removed: 0, sizeBytes: 0, withinBudget: true }),
     prepare: unreachable,
@@ -293,7 +295,7 @@ describe("service Admin request validation", () => {
     });
     const updateHandle = createAdminHandle({
       ...deps,
-      workspaceRepo: WorkspaceRepo.make({
+      workspaceRepo: WorkspaceRepo.of({
         setWorkspace: unreachable,
         createRepository: unreachable,
         getRepository: unreachable,
@@ -366,7 +368,7 @@ describe("service Admin request validation", () => {
     const pruned: Array<string> = [];
     const cacheHandle = createAdminHandle({
       ...deps,
-      nixEnvironment: NixEnvironment.make({
+      nixEnvironment: NixEnvironment.of({
         enforceBudget: () =>
           Effect.succeed({ removed: 0, sizeBytes: 0, withinBudget: true }),
         prepare: unreachable,
@@ -497,7 +499,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     };
     const noIssueHandle = createAdminHandle({
       ...deps,
-      runRepo: RunRepo.make({
+      runRepo: RunRepo.of({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(noIssue)),
       }),
@@ -518,7 +520,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     let createSessionCalls = 0;
     const activeHandle = createAdminHandle({
       ...deps,
-      runRepo: RunRepo.make({
+      runRepo: RunRepo.of({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
         hasActiveForIssue: () => Effect.succeed(true),
@@ -554,7 +556,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     };
     const nonterminalHandle = createAdminHandle({
       ...deps,
-      runRepo: RunRepo.make({
+      runRepo: RunRepo.of({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(nonterminalRun)),
       }),
@@ -587,7 +589,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     };
     const foreignHandle = createAdminHandle({
       ...deps,
-      runRepo: RunRepo.make({
+      runRepo: RunRepo.of({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(foreignRun)),
       }),
@@ -622,7 +624,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     const newSessionId = "55555555-5555-4555-8555-555555555555";
     const rerunHandle = createAdminHandle({
       ...deps,
-      runRepo: RunRepo.make({
+      runRepo: RunRepo.of({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
         hasActiveForIssue: () => Effect.succeed(false),
@@ -634,7 +636,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
           return Effect.succeed("created");
         },
       }),
-      runInputRepo: RunInputRepo.make({
+      runInputRepo: RunInputRepo.of({
         ...deps.runInputRepo,
         enqueue: (input) => {
           created.createdInputId = input.id;
@@ -724,7 +726,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
     const newSessionId = "55555555-5555-4555-8555-555555555555";
     const rerunHandle = createAdminHandle({
       ...deps,
-      runRepo: RunRepo.make({
+      runRepo: RunRepo.of({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
         hasActiveForIssue: () => Effect.succeed(active),
@@ -734,7 +736,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
           return Effect.succeed("created");
         },
       }),
-      runInputRepo: RunInputRepo.make({
+      runInputRepo: RunInputRepo.of({
         ...deps.runInputRepo,
         enqueue: () => Effect.succeed(true),
       }),
@@ -780,7 +782,7 @@ describe("POST /api/admin/runs/:id/rerun", () => {
   it("maps Linear rate limits to 429 with retry delay", async () => {
     const rateLimitHandle = createAdminHandle({
       ...deps,
-      runRepo: RunRepo.make({
+      runRepo: RunRepo.of({
         ...deps.runRepo,
         get: () => Effect.succeed(Option.some(terminalRun)),
         hasActiveForIssue: () => Effect.succeed(false),
@@ -825,7 +827,7 @@ describe("MCP admin endpoints", () => {
       createdAt: 1,
       updatedAt: 1,
     });
-    const mcpServerRepo = McpServerRepo.make({
+    const mcpServerRepo = McpServerRepo.of({
       createMcpServer: unreachable,
       getMcpServer: () => Effect.succeed(Option.some(server)),
       listMcpServers: () => Effect.succeed([server]),
@@ -834,11 +836,11 @@ describe("MCP admin endpoints", () => {
     });
     const mcpHandle = createAdminHandle({
       ...deps,
-      installationRepo: InstallationRepo.make({
+      installationRepo: InstallationRepo.of({
         ...deps.installationRepo,
         get: () => Effect.succeed(Option.none()),
       }),
-      workspaceRepo: WorkspaceRepo.make({
+      workspaceRepo: WorkspaceRepo.of({
         ...deps.workspaceRepo,
         listRepositories: () => Effect.succeed([]),
       }),
@@ -918,7 +920,7 @@ describe("MCP admin endpoints", () => {
       updatedAt: 1,
     });
     let received: Record<string, unknown> | undefined;
-    const mcpServerRepo = McpServerRepo.make({
+    const mcpServerRepo = McpServerRepo.of({
       listMcpServers: () => Effect.succeed([server]),
       createMcpServer: unreachable,
       getMcpServer: () => Effect.succeed(Option.some(server)),
@@ -968,7 +970,7 @@ describe("MCP admin endpoints", () => {
   });
   it("rejects non-string repository ids before persistence", async () => {
     let called = false;
-    const mcpServerRepo = McpServerRepo.make({
+    const mcpServerRepo = McpServerRepo.of({
       ...deps.mcpServerRepo,
       createMcpServer: (..._args: ReadonlyArray<unknown>) => {
         called = true;
@@ -1061,7 +1063,7 @@ describe("MCP admin endpoints", () => {
     });
     let received: Record<string, unknown> | undefined;
     let disconnected = false;
-    const mcpServerRepo = McpServerRepo.make({
+    const mcpServerRepo = McpServerRepo.of({
       ...deps.mcpServerRepo,
       getMcpServer: () => Effect.succeed(Option.some(server)),
       updateMcpServer: (_org, _id, input) => {
@@ -1337,7 +1339,7 @@ describe("Executor admin endpoints", () => {
       },
       remove: () => Effect.succeed(true),
     } as unknown as AdminDeps["executorInstanceRepo"];
-    const mcpServerRepo = McpServerRepo.make({
+    const mcpServerRepo = McpServerRepo.of({
       listMcpServers: () => Effect.succeed([attached]),
       createMcpServer: unreachable,
       getMcpServer: () => Effect.succeed(Option.some(attached)),
@@ -1386,7 +1388,7 @@ describe("Executor admin endpoints", () => {
       updatedAt: 1,
     });
     let enabled: boolean | undefined;
-    const mcpServerRepo = McpServerRepo.make({
+    const mcpServerRepo = McpServerRepo.of({
       listMcpServers: () => Effect.succeed([attached]),
       createMcpServer: unreachable,
       getMcpServer: () => Effect.succeed(Option.some(attached)),
@@ -1447,4 +1449,82 @@ it("denies shared Nix cache inspection and pruning to tenant admins", async () =
     );
     expect(Option.getOrThrow(response).status).toBe(403);
   }
+});
+
+describe("v4 cause and schema boundaries", () => {
+  const permutations = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+  ];
+  it.each(permutations)(
+    "preserves typed failure precedence for cause order %s,%s,%s",
+    async (...order) => {
+      const reasons = [
+        Cause.makeFailReason(
+          new RowDecodeError({ message: "typed row", entity: "run" }),
+        ),
+        Cause.makeDieReason(
+          new RowDecodeError({ message: "defect row", entity: "run" }),
+        ),
+        Cause.makeInterruptReason(0),
+      ];
+      const cause = Cause.fromReasons(
+        order.map((index) => {
+          const reason = reasons[index];
+          if (reason === undefined) throw new Error("Missing cause fixture");
+          return reason;
+        }),
+      );
+      const local = createAdminHandle({
+        ...deps,
+        runRepo: { ...deps.runRepo, get: () => Effect.failCause(cause) },
+      });
+      const response = Option.getOrThrow(
+        await Effect.runPromise(
+          local(
+            new Request("http://localhost:3000/runs/session.json", {
+              headers: { cookie: `omp_gateway_admin=${token}` },
+            }),
+          ),
+        ),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.text()).toBe("typed row");
+    },
+  );
+
+  it("keeps malformed row input out of public errors and logs", async () => {
+    const secret = "malformed-row-private-token";
+    const logs: unknown[] = [];
+    const logger = Logger.make((entry) => {
+      logs.push({ message: entry.message, cause: entry.cause });
+    });
+    const local = createAdminHandle({
+      ...deps,
+      runRepo: {
+        ...deps.runRepo,
+        get: () =>
+          decodeRow(
+            Schema.Struct({ accessToken: Schema.Number }),
+            { accessToken: secret },
+            "run",
+          ).pipe(Effect.as(Option.none())),
+      },
+    });
+    const result = await Effect.runPromise(
+      local(
+        new Request("http://localhost:3000/runs/session.json", {
+          headers: { cookie: `omp_gateway_admin=${token}` },
+        }),
+      ).pipe(Effect.provide(Logger.layer([logger]))),
+    );
+    const response = Option.getOrThrow(result);
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("Stored data is invalid");
+    expect(JSON.stringify(logs)).not.toContain(secret);
+  });
 });

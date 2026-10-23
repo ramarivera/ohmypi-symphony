@@ -15,10 +15,9 @@ import {
 } from "../src/services/store/sqlite-client.js";
 
 const cacheKey = "a".repeat(64);
-const storeLayer = Layer.mergeAll(
-  NixCacheRepo.Default,
-  WorkspaceRepo.Default,
-).pipe(Layer.provideMerge(SqliteClientLive(":memory:")));
+const storeLayer = Layer.mergeAll(NixCacheRepo.layer, WorkspaceRepo.layer).pipe(
+  Layer.provideMerge(SqliteClientLive(":memory:")),
+);
 
 const withStore = <A, E>(
   effect: Effect.Effect<A, E, NixCacheRepo | WorkspaceRepo | SqliteClient>,
@@ -39,9 +38,9 @@ const entry = Schema.decodeUnknownSync(NixCacheEntry)({
 describe("Nix package domain", () => {
   it("accepts conservative attribute paths and rejects unsafe names", () => {
     expect(
-      Schema.decodeUnknownEither(NixPackageName)("python3Packages.requests")
+      Schema.decodeUnknownResult(NixPackageName)("python3Packages.requests")
         ._tag,
-    ).toBe("Right");
+    ).toBe("Success");
     for (const value of [
       "",
       "../nix",
@@ -52,8 +51,8 @@ describe("Nix package domain", () => {
       ".hidden",
       "trailing.",
     ]) {
-      expect(Schema.decodeUnknownEither(NixPackageName)(value)._tag).toBe(
-        "Left",
+      expect(Schema.decodeUnknownResult(NixPackageName)(value)._tag).toBe(
+        "Failure",
       );
     }
   });

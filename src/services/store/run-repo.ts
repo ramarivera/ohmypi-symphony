@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import { DatabaseError, type RowDecodeError } from "../../domain/errors.js";
 import type {
   IssueId,
@@ -86,10 +86,8 @@ const getNullable = <A>(
 const optionToSql = <A>(value: Option.Option<A>): A | null =>
   Option.match(value, { onNone: () => null, onSome: (v) => v });
 
-export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
-  accessors: true,
-  dependencies: [RunEventRepo.Default],
-  effect: Effect.gen(function* () {
+export class RunRepo extends Context.Service<RunRepo>()("RunRepo", {
+  make: Effect.gen(function* () {
     const { db } = yield* SqliteClient;
     const runEventRepo = yield* RunEventRepo;
     const get = Effect.fn("RunRepo.get")(function* (
@@ -626,4 +624,9 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       recoverInterruptedRuns,
     };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([RunEventRepo.layer]),
+  );
+}

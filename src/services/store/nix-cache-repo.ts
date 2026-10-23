@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect";
+import { Context, Effect, Layer, Option, Schema } from "effect";
 import { type DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import { NixCacheEntry } from "../../domain/models.js";
 import {
@@ -73,11 +73,10 @@ const rowToNixCacheEntry = (
     );
   });
 
-export class NixCacheRepo extends Effect.Service<NixCacheRepo>()(
+export class NixCacheRepo extends Context.Service<NixCacheRepo>()(
   "NixCacheRepo",
   {
-    accessors: true,
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
       const get = Effect.fn("NixCacheRepo.get")(function* (
@@ -173,4 +172,7 @@ export class NixCacheRepo extends Effect.Service<NixCacheRepo>()(
       return { get, upsert, list, remove };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies;
+}

@@ -1,4 +1,4 @@
-import { Option, Schema } from "effect";
+import { Effect, Option, Schema } from "effect";
 import {
   AppUserId,
   DeliveryId,
@@ -13,7 +13,7 @@ import {
   WorkspaceId,
 } from "./ids.js";
 
-export const RunState = Schema.Literal(
+export const RunState = Schema.Literals([
   "queued",
   "starting",
   "running",
@@ -23,7 +23,7 @@ export const RunState = Schema.Literal(
   "failed",
   "canceled",
   "orphaned",
-);
+]);
 export type RunState = Schema.Schema.Type<typeof RunState>;
 
 export const TERMINAL_RUN_STATES: ReadonlyArray<RunState> = [
@@ -31,9 +31,9 @@ export const TERMINAL_RUN_STATES: ReadonlyArray<RunState> = [
   "failed",
   "canceled",
 ];
-export const DesiredRunState = Schema.Literal("running", "canceled");
+export const DesiredRunState = Schema.Literals(["running", "canceled"]);
 export type DesiredRunState = Schema.Schema.Type<typeof DesiredRunState>;
-export const InputKind = Schema.Literal("created", "prompted", "stop");
+export const InputKind = Schema.Literals(["created", "prompted", "stop"]);
 export type InputKind = Schema.Schema.Type<typeof InputKind>;
 export const APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION = "issueStatusChanged";
 
@@ -47,15 +47,15 @@ export const isDeferredNotificationStopPayload = (
     record.action === APP_USER_NOTIFICATION_DEFERRED_STOP_ACTION
   );
 };
-export const ActivityType = Schema.Literal(
+export const ActivityType = Schema.Literals([
   "thought",
   "action",
   "elicitation",
   "response",
   "error",
-);
+]);
 export type ActivityType = Schema.Schema.Type<typeof ActivityType>;
-export const LogLevel = Schema.Literal(
+export const LogLevel = Schema.Literals([
   "trace",
   "debug",
   "info",
@@ -63,7 +63,7 @@ export const LogLevel = Schema.Literal(
   "error",
   "fatal",
   "silent",
-);
+]);
 export type LogLevel = Schema.Schema.Type<typeof LogLevel>;
 
 const NullableString = Schema.OptionFromNullOr(Schema.String);
@@ -74,28 +74,33 @@ const NullableNumber = Schema.OptionFromNullOr(Schema.Number);
  * as argv values, never interpolated into a shell command.
  */
 export const NixPackageName = Schema.String.pipe(
-  Schema.pattern(/^[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*$/u),
+  Schema.check(Schema.isPattern(/^[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9_+-]+)*$/u)),
   Schema.brand("@Gateway/NixPackageName"),
 );
 export type NixPackageName = Schema.Schema.Type<typeof NixPackageName>;
 
 export const NixCacheEntry = Schema.Struct({
-  cacheKey: Schema.String.pipe(Schema.pattern(/^[a-f0-9]{64}$/u)),
+  cacheKey: Schema.String.pipe(
+    Schema.check(Schema.isPattern(/^[a-f0-9]{64}$/u)),
+  ),
   nixpkgsFlakeRef: Schema.String,
   packages: Schema.Array(NixPackageName),
   storePaths: Schema.Array(Schema.String),
   pathEntries: Schema.Array(Schema.String),
-  sizeBytes: Schema.Number.pipe(Schema.int(), Schema.nonNegative()),
+  sizeBytes: Schema.Number.pipe(
+    Schema.check(Schema.isInt()),
+    Schema.check(Schema.isGreaterThanOrEqualTo(0)),
+  ),
   createdAt: Schema.Number,
   updatedAt: Schema.Number,
 });
 export type NixCacheEntry = Schema.Schema.Type<typeof NixCacheEntry>;
 
-export const PromptTemplateKind = Schema.Literal(
+export const PromptTemplateKind = Schema.Literals([
   "created",
   "prompted",
   "contract",
-);
+]);
 export type PromptTemplateKind = Schema.Schema.Type<typeof PromptTemplateKind>;
 
 export const PromptTemplate = Schema.Struct({
@@ -127,18 +132,18 @@ export type RepositoryDefinition = Schema.Schema.Type<
   typeof RepositoryDefinition
 >;
 
-export const RepositoryRecord = Schema.extend(
-  RepositoryDefinition,
-  Schema.Struct({
+export const RepositoryRecord = Schema.Struct({
+  ...RepositoryDefinition.fields,
+  ...Schema.Struct({
     organizationId: OrganizationId,
     labels: Schema.Array(Schema.String),
     isDefault: Schema.Boolean,
     createdAt: Schema.Number,
     updatedAt: Schema.Number,
-  }),
-);
+  }).fields,
+});
 export type RepositoryRecord = Schema.Schema.Type<typeof RepositoryRecord>;
-export const McpServerTransport = Schema.Literal("stdio", "http", "sse");
+export const McpServerTransport = Schema.Literals(["stdio", "http", "sse"]);
 export type McpServerTransport = Schema.Schema.Type<typeof McpServerTransport>;
 
 export const McpOAuthClientConfig = Schema.Struct({
@@ -146,7 +151,7 @@ export const McpOAuthClientConfig = Schema.Struct({
   clientSecret: Schema.optional(Schema.String),
   scope: Schema.optional(Schema.String),
   tokenEndpointAuthMethod: Schema.optional(
-    Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+    Schema.Literals(["none", "client_secret_basic", "client_secret_post"]),
   ),
 });
 export type McpOAuthClientConfig = Schema.Schema.Type<
@@ -160,10 +165,9 @@ export const McpServerRecord = Schema.Struct({
   command: Schema.OptionFromNullOr(Schema.String),
   args: Schema.Array(Schema.String),
   url: Schema.OptionFromNullOr(Schema.String),
-  env: Schema.Record({ key: Schema.String, value: Schema.String }),
-  headers: Schema.optionalWith(
-    Schema.Record({ key: Schema.String, value: Schema.String }),
-    { default: () => ({}) },
+  env: Schema.Record(Schema.String, Schema.String),
+  headers: Schema.Record(Schema.String, Schema.String).pipe(
+    Schema.withDecodingDefaultType(Effect.sync(() => ({}))),
   ),
   oauthClient: Schema.optional(Schema.NullOr(McpOAuthClientConfig)),
   repositoryId: Schema.OptionFromNullOr(WorkspaceId),
@@ -214,7 +218,7 @@ export const WebhookDelivery = Schema.Struct({
   organizationId: OrganizationId,
   payloadHash: Schema.String,
   receivedAt: Schema.Number,
-  status: Schema.Literal("pending", "processed", "failed"),
+  status: Schema.Literals(["pending", "processed", "failed"]),
   error: NullableString,
 });
 export type WebhookDelivery = Schema.Schema.Type<typeof WebhookDelivery>;
@@ -229,17 +233,17 @@ export const RunInput = Schema.Struct({
 });
 export type RunInput = Schema.Schema.Type<typeof RunInput>;
 
-const RunEventStatus = Schema.Literal(
+const RunEventStatus = Schema.Literals([
   "observed",
   "pending",
   "completed",
   "failed",
-);
+]);
 export const RunEvent = Schema.Struct({
   sourceKey: SourceKey,
   sessionId: SessionId,
   kind: Schema.String,
-  level: Schema.Literal("debug", "info", "warn", "result", "error"),
+  level: Schema.Literals(["debug", "info", "warn", "result", "error"]),
   status: Schema.OptionFromNullOr(RunEventStatus),
   text: NullableString,
   payload: Schema.Unknown,
@@ -261,96 +265,97 @@ export const ProjectionJob = Schema.Struct({
 });
 export type ProjectionJob = Schema.Schema.Type<typeof ProjectionJob>;
 
-export const AgentSessionComment = Schema.Struct(
-  {
-    id: Schema.optionalWith(Schema.String, { default: () => "" }),
+export const AgentSessionComment = Schema.StructWithRest(
+  Schema.Struct({
+    id: Schema.String.pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => "")),
+    ),
     body: Schema.String,
-  },
-  { key: Schema.String, value: Schema.Unknown },
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
 );
 export type AgentSessionComment = Schema.Schema.Type<
   typeof AgentSessionComment
 >;
-export const AgentSessionIssue = Schema.Struct(
-  {
+export const AgentSessionIssue = Schema.StructWithRest(
+  Schema.Struct({
     id: Schema.String,
     title: Schema.String,
-    description: Schema.optionalWith(Schema.NullOr(Schema.String), {
-      default: () => null,
-    }),
-    identifier: Schema.optionalWith(Schema.NullOr(Schema.String), {
-      default: () => null,
-    }),
-    url: Schema.optionalWith(Schema.NullOr(Schema.String), {
-      default: () => null,
-    }),
-    teamId: Schema.optionalWith(Schema.NullOr(Schema.String), {
-      default: () => null,
-    }),
-    projectId: Schema.optionalWith(Schema.NullOr(Schema.String), {
-      default: () => null,
-    }),
-  },
-  { key: Schema.String, value: Schema.Unknown },
+    description: Schema.NullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => null)),
+    ),
+    identifier: Schema.NullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => null)),
+    ),
+    url: Schema.NullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => null)),
+    ),
+    teamId: Schema.NullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => null)),
+    ),
+    projectId: Schema.NullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => null)),
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
 );
 export type AgentSessionIssue = Schema.Schema.Type<typeof AgentSessionIssue>;
-export const AgentSessionActivity = Schema.Struct(
-  {
+export const AgentSessionActivity = Schema.StructWithRest(
+  Schema.Struct({
     id: Schema.String,
     agentSessionId: Schema.String,
     content: Schema.Unknown,
-    signal: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-  },
-  { key: Schema.String, value: Schema.Unknown },
+    signal: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
 );
 export type AgentSessionActivity = Schema.Schema.Type<
   typeof AgentSessionActivity
 >;
 
 // Linear's embedded webhook AgentSession payload has no `type` field.
-export const AgentSessionWebhookPayload = Schema.Struct(
-  {
+export const AgentSessionWebhookPayload = Schema.StructWithRest(
+  Schema.Struct({
     id: Schema.String,
     appUserId: Schema.String,
     organizationId: Schema.String,
     status: Schema.String,
     createdAt: Schema.String,
     updatedAt: Schema.String,
-    issueId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    commentId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    sourceCommentId: Schema.optionalWith(
-      Schema.OptionFromNullOr(Schema.String),
-      { default: () => Option.none() },
+    issueId: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
     ),
-    summary: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    url: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    archivedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    startedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    endedAt: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    comment: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionComment), {
-      default: () => Option.none(),
-    }),
-    issue: Schema.optionalWith(Schema.OptionFromNullOr(AgentSessionIssue), {
-      default: () => Option.none(),
-    }),
-  },
-  { key: Schema.String, value: Schema.Unknown },
+    commentId: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    sourceCommentId: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    summary: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    url: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    archivedAt: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    startedAt: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    endedAt: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    comment: Schema.OptionFromNullOr(AgentSessionComment).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+    issue: Schema.OptionFromNullOr(AgentSessionIssue).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
 );
 export type AgentSessionWebhookPayload = Schema.Schema.Type<
   typeof AgentSessionWebhookPayload
@@ -364,25 +369,22 @@ export const AgentSessionEvent = Schema.Struct({
   oauthClientId: Schema.String,
   webhookId: Schema.String,
   webhookTimestamp: Schema.Number,
-  createdAt: Schema.optionalWith(Schema.String, {
-    default: () => "1970-01-01T00:00:00.000Z",
-  }),
-  promptContext: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-    default: () => Option.none(),
-  }),
-  guidance: Schema.optionalWith(
-    Schema.OptionFromNullOr(
-      Schema.Array(Schema.Struct({ body: Schema.String })),
+  createdAt: Schema.String.pipe(
+    Schema.withDecodingDefaultType(
+      Effect.sync(() => "1970-01-01T00:00:00.000Z"),
     ),
-    { default: () => Option.none() },
   ),
-  previousComments: Schema.optionalWith(
-    Schema.OptionFromNullOr(Schema.Array(AgentSessionComment)),
-    { default: () => Option.none() },
+  promptContext: Schema.OptionFromNullOr(Schema.String).pipe(
+    Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
   ),
-  agentActivity: Schema.optionalWith(
-    Schema.OptionFromNullOr(AgentSessionActivity),
-    { default: () => Option.none() },
+  guidance: Schema.OptionFromNullOr(
+    Schema.Array(Schema.Struct({ body: Schema.String })),
+  ).pipe(Schema.withDecodingDefaultType(Effect.sync(() => Option.none()))),
+  previousComments: Schema.OptionFromNullOr(
+    Schema.Array(AgentSessionComment),
+  ).pipe(Schema.withDecodingDefaultType(Effect.sync(() => Option.none()))),
+  agentActivity: Schema.OptionFromNullOr(AgentSessionActivity).pipe(
+    Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
   ),
   agentSession: AgentSessionWebhookPayload,
 });
@@ -394,8 +396,8 @@ export type AgentSessionEvent = Schema.Schema.Type<typeof AgentSessionEvent>;
  * are present on every generated variant, while issue details are optional for
  * generic notifications.
  */
-export const AppUserNotificationIssue = Schema.Struct(
-  {
+export const AppUserNotificationIssue = Schema.StructWithRest(
+  Schema.Struct({
     id: Schema.String,
     identifier: Schema.String,
     team: Schema.Struct({
@@ -406,32 +408,31 @@ export const AppUserNotificationIssue = Schema.Struct(
     teamId: Schema.String,
     title: Schema.String,
     url: Schema.String,
-    description: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-  },
-  { key: Schema.String, value: Schema.Unknown },
+    description: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
 );
 export type AppUserNotificationIssue = Schema.Schema.Type<
   typeof AppUserNotificationIssue
 >;
 
-export const AppUserNotificationDetails = Schema.Struct(
-  {
+export const AppUserNotificationDetails = Schema.StructWithRest(
+  Schema.Struct({
     id: Schema.String,
     type: Schema.String,
     userId: Schema.String,
     createdAt: Schema.String,
     updatedAt: Schema.String,
-    issueId: Schema.optionalWith(Schema.OptionFromNullOr(Schema.String), {
-      default: () => Option.none(),
-    }),
-    issue: Schema.optionalWith(
-      Schema.OptionFromNullOr(AppUserNotificationIssue),
-      { default: () => Option.none() },
+    issueId: Schema.OptionFromNullOr(Schema.String).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
     ),
-  },
-  { key: Schema.String, value: Schema.Unknown },
+    issue: Schema.OptionFromNullOr(AppUserNotificationIssue).pipe(
+      Schema.withDecodingDefaultType(Effect.sync(() => Option.none())),
+    ),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
 );
 export type AppUserNotificationDetails = Schema.Schema.Type<
   typeof AppUserNotificationDetails
