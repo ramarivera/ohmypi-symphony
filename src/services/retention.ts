@@ -155,7 +155,7 @@ export const makeRetention = (input: {
                 continue;
               }
               if (input.removeWorkspace === undefined)
-                removeWorkerWorkspaceSync(path);
+                removeWorkerWorkspaceSync(path, root);
               else input.removeWorkspace(path);
             } catch (error) {
               if (

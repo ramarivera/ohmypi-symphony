@@ -1,11 +1,10 @@
 import { Database } from "bun:sqlite";
 import { createCipheriv, randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import {
-  type FileHandle,
   link,
   mkdir,
   mkdtemp,
-  open,
   readdir,
   realpath,
   rm,
@@ -71,6 +70,7 @@ import {
 import {
   cleanupWorkspaceProcess,
   gitEnvironment,
+  removeWorkerWorkspaceSync,
   workspaceProcess,
 } from "../src/services/workspace-process.js";
 
@@ -83,6 +83,10 @@ const dnsLookup = vi.hoisted(() =>
   >(async () => [{ address: "93.184.216.34", family: 4 }]),
 );
 vi.mock("node:dns/promises", () => ({ lookup: dnsLookup }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, fchownSync: vi.fn(actual.fchownSync) };
+});
 const dirs: string[] = [];
 // Scratch storage is mandated by the global AGENTS.md; /tmp can be shared tmpfs.
 // Override the base for CI while keeping fixture paths canonical.
@@ -214,15 +218,16 @@ describe("security boundaries", () => {
     const before = await stat(outside);
     // A native unprivileged test can't chown the parent directory to a foreign
     // uid. Stub that syscall while retaining the real inode ownership/nlink.
-    const handle = await open(workspace, "r");
-    const prototype = Object.getPrototypeOf(handle) as FileHandle;
-    await handle.close();
-    const chown = vi.spyOn(prototype, "chown").mockResolvedValue(undefined);
+    const chown = vi.spyOn(fs, "fchownSync").mockReturnValue(undefined);
     const foreignUid = (process.getuid?.() ?? 1000) + 1;
     await expect(
       prepareWorkerWorkspace(workspace, String(foreignUid)),
     ).rejects.toThrow("Multiply-linked");
-    expect(chown).toHaveBeenCalledExactlyOnceWith(foreignUid, foreignUid);
+    expect(chown).toHaveBeenCalledExactlyOnceWith(
+      expect.any(Number),
+      foreignUid,
+      foreignUid,
+    );
     expect((await stat(outside)).uid).toBe(before.uid);
     expect(await Bun.file(outside).text()).toBe("gateway");
   });
@@ -236,18 +241,31 @@ describe("security boundaries", () => {
       join(workspace, ".omp-home", "cache"),
       join(workspace, "dependency"),
     );
-    const handle = await open(workspace, "r");
-    const prototype = Object.getPrototypeOf(handle) as FileHandle;
-    await handle.close();
-    vi.spyOn(prototype, "chown").mockRejectedValue(
-      new Error("Unexpected ownership change"),
-    );
+    vi.spyOn(fs, "fchownSync").mockImplementation(() => {
+      throw new Error("Unexpected ownership change");
+    });
     for (let attempt = 0; attempt < 2; attempt++)
       await prepareWorkerWorkspace(workspace, String(process.getuid?.()));
     expect(await Bun.file(join(workspace, "dependency")).text()).toBe(
       "tool-state",
     );
     expect((await stat(join(workspace, "dependency"))).nlink).toBe(2);
+  });
+
+  it("rejects retention paths outside the root and symlinked workspace paths before migration", async () => {
+    const root = await temporary();
+    const outside = await temporary();
+    const alias = join(root, "linked");
+    await symlink(outside, alias);
+    vi.stubEnv("WORKER_UID", String((process.getuid?.() ?? 1000) + 1));
+    const chown = vi.spyOn(fs, "fchownSync");
+    const spawn = vi.spyOn(Bun, "spawnSync");
+    for (const path of [root, outside, alias])
+      expect(() => removeWorkerWorkspaceSync(path, root)).toThrow(
+        "inside the workspace root",
+      );
+    expect(chown).not.toHaveBeenCalled();
+    expect(spawn).not.toHaveBeenCalled();
   });
 
   it("runs the materializer entry point and excludes writable tool state", async () => {

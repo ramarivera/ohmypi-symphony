@@ -1,11 +1,13 @@
-import { constants } from "node:fs";
 import {
-  type FileHandle,
-  lstat,
-  open,
-  readdir,
-  realpath,
-} from "node:fs/promises";
+  closeSync,
+  constants,
+  fchownSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readdirSync,
+  realpathSync,
+} from "node:fs";
 import { join } from "node:path";
 
 // No prefixes such as AWS_*, GITHUB_*, PI_*, or *_FILE. New gateway secrets
@@ -71,19 +73,19 @@ export const workerIdentityCommand = (
 };
 
 /** Give only the worker workspace to its uid. Never follow repository symlinks. */
-export const prepareWorkerWorkspace = async (
+export const prepareWorkerWorkspaceSync = (
   cwd: string,
   uid: string | undefined,
-): Promise<void> => {
+): void => {
   if (uid === undefined || uid === "") return;
   if (!/^[1-9][0-9]*$/u.test(uid)) throw new Error("Invalid worker uid");
-  const root = await realpath(cwd);
-  if (root !== cwd || (await lstat(cwd)).isSymbolicLink())
+  const root = realpathSync(cwd);
+  if (root !== cwd || lstatSync(cwd).isSymbolicLink())
     throw new Error("Worker workspace must be canonical");
-  const visit = async (path: string): Promise<void> => {
-    let handle: FileHandle;
+  const visit = (path: string): void => {
+    let fd: number;
     try {
-      handle = await open(
+      fd = openSync(
         path,
         constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
       );
@@ -93,24 +95,29 @@ export const prepareWorkerWorkspace = async (
       throw error;
     }
     try {
-      const stat = await handle.stat();
+      const stat = fstatSync(fd);
       if (!stat.isDirectory() && !stat.isFile())
         throw new Error("Unsupported workspace file type");
       const owned = stat.uid === Number(uid) && stat.gid === Number(uid);
       if (stat.isFile() && stat.nlink !== 1 && !owned)
         throw new Error("Multiply-linked workspace files are forbidden");
-      if (!owned) await handle.chown(Number(uid), Number(uid));
+      if (!owned) fchownSync(fd, Number(uid), Number(uid));
       if (stat.isDirectory()) {
-        const fdPath = `/proc/self/fd/${handle.fd}`;
-        for (const name of await readdir(fdPath))
-          await visit(join(fdPath, name));
+        const fdPath = `/proc/self/fd/${fd}`;
+        for (const name of readdirSync(fdPath)) visit(join(fdPath, name));
       }
     } finally {
-      await handle.close();
+      closeSync(fd);
     }
   };
-  await visit(root);
+  visit(root);
 };
+
+// Keep the preparation API while sharing retention's synchronous ownership walk.
+export const prepareWorkerWorkspace = async (
+  cwd: string,
+  uid: string | undefined,
+): Promise<void> => prepareWorkerWorkspaceSync(cwd, uid);
 
 /** Workers never receive renewal material or access tokens lasting over an hour. */
 export const workerMcpCredential = (

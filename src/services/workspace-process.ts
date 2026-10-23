@@ -1,7 +1,11 @@
-import { rmdirSync, rmSync } from "node:fs";
+import { realpathSync, rmdirSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Effect } from "effect";
-import { workerIdentityCommand } from "./worker-security.js";
+import { isWithin } from "../util/paths.js";
+import {
+  prepareWorkerWorkspaceSync,
+  workerIdentityCommand,
+} from "./worker-security.js";
 
 /** Git is allowed transport settings, never gateway or model credentials. */
 export const gitEnvironment = (
@@ -72,11 +76,20 @@ export const workspaceProcess = async (
 };
 
 /** Keep retention's SQLite reopen fence synchronous while dropping tree writes to the worker. */
-export const removeWorkerWorkspaceSync = (cwd: string): void => {
+export const removeWorkerWorkspaceSync = (
+  cwd: string,
+  workspaceRoot: string,
+): void => {
+  const root = realpathSync(workspaceRoot);
+  if (cwd === root || !isWithin(root, cwd) || realpathSync(cwd) !== cwd)
+    throw new Error("Retention workspace must be inside the workspace root");
   if (!needsWorkspaceIdentity()) {
     rmSync(cwd, { recursive: true, force: true });
     return;
   }
+  // Terminal workspaces from older images never pass through resume preparation.
+  // Migrate them before delegation, without yielding retention's reopen fence.
+  prepareWorkerWorkspaceSync(cwd, process.env.WORKER_UID);
   const child = Bun.spawnSync(
     workerIdentityCommand(
       [process.execPath, workspaceWorkerScript, "remove-workspace-contents"],
