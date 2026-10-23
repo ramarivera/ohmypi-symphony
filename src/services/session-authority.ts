@@ -11,6 +11,7 @@ import {
   Option,
   Queue,
   Ref,
+  Runtime,
   Schedule,
 } from "effect";
 import {
@@ -70,10 +71,10 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
+import { startWorkerMcpProxy } from "./worker-mcp-proxy.js";
 import {
   prepareWorkerWorkspace,
   workerEnvironment,
-  workerMcpCredential,
 } from "./worker-security.js";
 import {
   makeWorkspace,
@@ -353,6 +354,19 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
     ],
     scoped: Effect.gen(function* () {
       const scope = yield* Effect.scope;
+      const runtime = yield* Effect.runtime<never>();
+      const runPromise = Runtime.runPromise(runtime);
+      const mcpProxies = new Map<SessionId, () => void>();
+      const stopMcpProxy = (sessionId: SessionId) => {
+        mcpProxies.get(sessionId)?.();
+        mcpProxies.delete(sessionId);
+      };
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          for (const stop of mcpProxies.values()) stop();
+          mcpProxies.clear();
+        }),
+      );
       const runRepo = yield* RunRepo;
       const runInputRepo = yield* RunInputRepo;
       const promptTemplateRepo = yield* PromptTemplateRepo;
@@ -1063,6 +1077,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
       const dropWorker = (sessionId: SessionId) =>
         Effect.gen(function* () {
+          stopMcpProxy(sessionId);
           const state = (yield* Ref.get(workersRef)).get(sessionId);
           if (state !== undefined) {
             yield* state.unsubscribe();
@@ -1760,7 +1775,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         yield* worker.setHostTools(definitions);
       });
 
-      const startWorker = Effect.fn("SessionAuthority.startWorker")(function* (
+      const openWorker = Effect.fn("SessionAuthority.startWorker")(function* (
         run: AgentRun,
         cwd: string,
         refreshWorkspaceCredentials = false,
@@ -1874,46 +1889,72 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           allMcpServers,
           Option.isSome(run.repositoryId) ? run.repositoryId.value : null,
         );
-        const mintedMcp = yield* Effect.forEach(
+        const oauthServers = yield* Effect.filter(
           effectiveMcpServers,
           (server) =>
-            Effect.gen(function* () {
-              if (Option.isNone(server.url) || server.transport === "stdio") {
-                return { server, credential: null };
-              }
-              const token = yield* mcpOAuth.mintCredential(
-                run.organizationId,
-                server.id,
-              );
-              const credential = yield* Effect.try({
-                try: () =>
-                  Option.isNone(token)
-                    ? null
-                    : workerMcpCredential(token.value),
-                catch: () =>
-                  new RpcSpawnError({
-                    message:
-                      "MCP access token must expire within one hour; gateway renewal credentials cannot be sent to workers",
-                  }),
-              });
-              return {
-                server,
-                credential,
-              };
-            }),
-          { concurrency: "unbounded" },
+            server.transport === "stdio" || Option.isNone(server.url)
+              ? Effect.succeed(false)
+              : mcpOAuth
+                  .getCredentialDetails(run.organizationId, server.id)
+                  .pipe(Effect.map(Option.isSome)),
         );
-        const credentials = mintedMcp.flatMap((entry) =>
-          entry.credential !== null && Option.isSome(entry.server.url)
-            ? [
-                {
-                  serverUrl: entry.server.url.value,
-                  accessToken: entry.credential.accessToken,
-                  expiresAt: entry.credential.expiresAt,
-                },
-              ]
-            : [],
-        );
+        let configServers = effectiveMcpServers;
+        if (oauthServers.length > 0) {
+          const proxy = yield* Effect.try({
+            try: () =>
+              startWorkerMcpProxy({
+                servers: oauthServers,
+                allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp ?? false,
+                accessToken: (server, rejectedAccessToken) =>
+                  runPromise(
+                    mcpOAuth
+                      .mintCredential(run.organizationId, server.id, {
+                        ...(rejectedAccessToken === undefined
+                          ? {}
+                          : { rejectedAccessToken }),
+                        serverUrl: Option.getOrThrow(server.url),
+                      })
+                      .pipe(
+                        Effect.flatMap((token) =>
+                          Option.isSome(token)
+                            ? Effect.succeed(token.value.accessToken)
+                            : Effect.fail(
+                                new Error("MCP credential disconnected"),
+                              ),
+                        ),
+                      ),
+                  ),
+                refreshFailed: (server) =>
+                  runPromise(
+                    Effect.gen(function* () {
+                      const now = yield* Clock.currentTimeMillis;
+                      yield* runEventRepo.upsert({
+                        sourceKey:
+                          `mcp-refresh:${run.sessionId}:${server.id}` as SourceKey,
+                        sessionId: run.sessionId,
+                        kind: "mcp_refresh_failed",
+                        level: "error",
+                        text: `MCP credential renewal failed for ${server.name}. Reconnect this server in the gateway and retry the tool call.`,
+                        payload: { serverId: server.id },
+                        status: "observed",
+                        now,
+                      });
+                    }),
+                  ),
+              }),
+            catch: () =>
+              new RpcSpawnError({
+                message: "Could not start worker MCP proxy",
+              }),
+          });
+          mcpProxies.set(run.sessionId, proxy.stop);
+          const byId = new Map(
+            proxy.servers.map((server) => [server.id, server]),
+          );
+          configServers = effectiveMcpServers.map(
+            (server) => byId.get(server.id) ?? server,
+          );
+        }
         yield* Effect.tryPromise({
           try: () => prepareWorkerWorkspace(cwd, process.env.WORKER_UID),
           catch: () =>
@@ -1930,7 +1971,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               }),
           });
         const agentDir = yield* Effect.tryPromise({
-          try: () => materializeMcpAgentDb(cwd, credentials),
+          try: () => materializeMcpAgentDb(cwd, []),
           catch: (error) =>
             new RpcSpawnError({
               message: `MCP credential materialization failed: ${String(error)}`,
@@ -1947,18 +1988,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             ),
           ),
         );
-        const configServers = mintedMcp.map((entry) => {
-          if (entry.credential === null) return entry.server;
-          return {
-            ...entry.server,
-            headers: Object.fromEntries(
-              Object.entries(entry.server.headers).filter(
-                ([name]) => name.toLowerCase() !== "authorization",
-              ),
-            ),
-          };
-        });
-        yield* writeOmpMcpConfig(cwd, configServers, run.sessionId).pipe(
+        yield* writeOmpMcpConfig(
+          cwd,
+          configServers,
+          run.sessionId,
+          oauthServers.length > 0,
+        ).pipe(
           Effect.mapError(
             (error) =>
               new RpcSpawnError({
@@ -2064,6 +2099,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
         return worker;
       });
+
+      const startWorker = (...args: Parameters<typeof openWorker>) =>
+        openWorker(...args).pipe(
+          Effect.onError(() =>
+            Effect.sync(() => stopMcpProxy(args[0].sessionId)),
+          ),
+        );
 
       const processSession = Effect.fn("SessionAuthority.processSession")(
         function* (

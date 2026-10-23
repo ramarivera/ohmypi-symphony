@@ -111,7 +111,11 @@ export const resolveEffectiveMcpServers = (
   return effective.filter((server) => server.enabled);
 };
 
-export const toOmpMcpConfig = (servers: ReadonlyArray<McpServerRecord>) => ({
+export const toOmpMcpConfig = (
+  servers: ReadonlyArray<McpServerRecord>,
+  requireWrite = false,
+) => ({
+  ...(requireWrite ? { requireWrite: true } : {}),
   mcpServers: Object.fromEntries(
     servers.map((server) => {
       const headers = server.headers ?? {};
@@ -136,16 +140,25 @@ export const writeOmpMcpConfig = (
   cwd: string,
   servers: ReadonlyArray<McpServerRecord>,
   sessionId?: string,
+  requireWrite = false,
 ): Effect.Effect<void, Error> => {
   if (needsWorkspaceIdentity())
     return Effect.tryPromise({
       try: async () => {
-        await workspaceProcess(cwd, "mcp-config", toOmpMcpConfig(servers));
+        await workspaceProcess(
+          cwd,
+          "mcp-config",
+          toOmpMcpConfig(servers, requireWrite),
+        );
       },
       catch: (error) =>
         error instanceof Error ? error : new Error(String(error)),
     });
-  return writeOmpMcpConfigFile(cwd, toOmpMcpConfig(servers), sessionId);
+  return writeOmpMcpConfigFile(
+    cwd,
+    toOmpMcpConfig(servers, requireWrite),
+    sessionId,
+  );
 };
 
 /** Accept only the already-projected worker config across the uid boundary. */
@@ -154,9 +167,13 @@ export const writeOmpMcpConfigFile = (
   config: ReturnType<typeof toOmpMcpConfig>,
   sessionId?: string,
 ): Effect.Effect<void, Error> => {
-  const contents = `${JSON.stringify(config, null, 2)}\n`;
+  const contents = `${JSON.stringify({ mcpServers: config.mcpServers }, null, 2)}\n`;
   return Effect.gen(function* () {
     if (yield* Effect.promise(() => isTrackedMcpConfig(cwd))) {
+      if (config.requireWrite)
+        return yield* Effect.fail(
+          new Error("Gateway MCP proxy requires an untracked mcp.json"),
+        );
       yield* Effect.logWarning("mcp.config.tracked_skip").pipe(
         Effect.annotateLogs({
           event: "mcp.config.tracked_skip",
@@ -175,6 +192,10 @@ export const writeOmpMcpConfigFile = (
         }
       });
       if (!gatewayShape) {
+        if (config.requireWrite)
+          return yield* Effect.fail(
+            new Error("Gateway MCP proxy cannot replace foreign mcp.json"),
+          );
         yield* Effect.logWarning("mcp.config.foreign_skip").pipe(
           Effect.annotateLogs({
             event: "mcp.config.foreign_skip",
