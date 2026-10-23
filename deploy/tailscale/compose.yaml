@@ -1,0 +1,111 @@
+name: symphony-tailnet
+
+services:
+  tailscale:
+    # Stable multi-platform index verified 2026-10-23; see docs/tailscale.md.
+    image: tailscale/tailscale:v1.104.2@sha256:b11583ad2e93e4671128538c88cf11f460444a5d7e449311dd1933a400ab849d
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      # Native file: support, not an inline key or an unsupported TS_AUTHKEY_FILE.
+      TS_AUTHKEY: file:/run/secrets/ts_authkey
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${TS_HOSTNAME:-symphony}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      # Keep Docker DNS for sidecar bootstrap. Gateway DNS is configured below.
+      TS_ACCEPT_DNS: "false"
+      TS_EXTRA_ARGS: --advertise-tags=tag:symphony
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    secrets:
+      - ts_authkey
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:9002/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  gateway:
+    build:
+      context: ../..
+    image: ohmypi-symphony:tailscale
+    restart: unless-stopped
+    # This base's TokenCrypto still reads TOKEN_ENCRYPTION_KEY directly. Load it
+    # inside the container; Compose/inspect only see the file path and command.
+    command:
+      - sh
+      - -ec
+      - 'export TOKEN_ENCRYPTION_KEY="$$(cat /run/secrets/token_encryption_key)"; exec bun dist/index.js'
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_healthy
+        restart: true
+    security_opt:
+      - no-new-privileges:true
+    # Preserve the Dockerfile's non-root USER. No network capabilities are needed.
+    cap_drop:
+      - ALL
+    environment:
+      PUBLIC_URL: ${PUBLIC_URL:-https://symphony.YOUR-TAILNET.ts.net}
+      PORT: "3000"
+      LINEAR_CLIENT_ID_FILE: /run/secrets/linear_client_id
+      LINEAR_CLIENT_SECRET_FILE: /run/secrets/linear_client_secret
+      LINEAR_WEBHOOK_SECRET_FILE: /run/secrets/linear_webhook_secret
+      TOKEN_ENCRYPTION_KEY_FILE: /run/secrets/token_encryption_key
+      DATABASE_PATH: /app/data/gateway.sqlite
+      WORKSPACE_ROOT: /app/workspaces
+      NIX_ROOTS_DIR: /app/nix-roots
+    secrets:
+      - linear_client_id
+      - linear_client_secret
+      - linear_webhook_secret
+      - token_encryption_key
+    volumes:
+      # network_mode shares routes/interfaces, not a mount namespace. Bind the
+      # resolver explicitly instead of assuming tailscaled rewrites this file.
+      - ./resolv.conf:/etc/resolv.conf:ro
+      - gateway-data:/app/data
+      - gateway-workspaces:/app/workspaces
+      - gateway-logs:/app/logs
+      - gateway-nix:/nix
+      - gateway-nix-roots:/app/nix-roots
+    healthcheck:
+      test: [CMD, bun, -e, "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+# These files must exist on the Docker host. Only paths enter Compose config.
+secrets:
+  ts_authkey:
+    file: ${TS_AUTHKEY_FILE:-./secrets/ts_authkey}
+  linear_client_id:
+    file: ${LINEAR_CLIENT_ID_FILE:-./secrets/linear_client_id}
+  linear_client_secret:
+    file: ${LINEAR_CLIENT_SECRET_FILE:-./secrets/linear_client_secret}
+  linear_webhook_secret:
+    file: ${LINEAR_WEBHOOK_SECRET_FILE:-./secrets/linear_webhook_secret}
+  token_encryption_key:
+    file: ${TOKEN_ENCRYPTION_KEY_FILE:-./secrets/token_encryption_key}
+
+volumes:
+  tailscale-state:
+  gateway-data:
+  gateway-workspaces:
+  gateway-logs:
+  gateway-nix:
+  gateway-nix-roots:
