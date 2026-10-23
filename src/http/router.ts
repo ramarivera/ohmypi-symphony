@@ -1,10 +1,7 @@
-import {
-  HttpRouter,
-  HttpServerRequest,
-  HttpServerResponse,
-} from "@effect/platform";
 import { BunHttpServerRequest } from "@effect/platform-bun";
 import { Clock, Effect, Option } from "effect";
+import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { OAuthStateError } from "../domain/errors.js";
 import {
   Admin,
   createAdminSession,
@@ -26,7 +23,7 @@ const SECURITY_HEADERS: Record<string, string> = {
 };
 
 export const health = Effect.gen(function* () {
-  const status = yield* Reconciler.status();
+  const status = yield* Reconciler.use((service) => service.status());
   const now = yield* Clock.currentTimeMillis;
   const config = yield* Effect.serviceOption(GatewayConfig);
   const maxAgeMs = Math.max(
@@ -61,11 +58,11 @@ export const health = Effect.gen(function* () {
 
 export const webhook = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
-  const response = yield* WebhookPipeline.handle(
-    BunHttpServerRequest.toRequest(request),
+  const response = yield* WebhookPipeline.use((service) =>
+    service.handle(BunHttpServerRequest.toBunServerRequest(request)),
   );
   if (response.ok) {
-    yield* Reconciler.trigger();
+    yield* Reconciler.use((service) => service.trigger());
   }
   return HttpServerResponse.fromWeb(response);
 });
@@ -82,7 +79,7 @@ export const oauthStart = Effect.gen(function* () {
     new URL(request.url, "http://localhost").searchParams.get("returnTo"),
   );
   const config = yield* GatewayConfig;
-  const { url } = yield* OAuth.startAuthorization();
+  const { url } = yield* OAuth.use((service) => service.startAuthorization());
   return HttpServerResponse.redirect(url, {
     status: 302,
     headers: {
@@ -95,8 +92,8 @@ export const oauthStart = Effect.gen(function* () {
 export const oauthCallback = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
   const callback = Effect.gen(function* () {
-    const installation = yield* OAuth.completeAuthorization(
-      new URL(request.url, "http://localhost"),
+    const installation = yield* OAuth.use((service) =>
+      service.completeAuthorization(new URL(request.url, "http://localhost")),
     );
     yield* Effect.logInfo("oauth.completed").pipe(
       Effect.annotateLogs({
@@ -112,7 +109,7 @@ export const oauthCallback = Effect.gen(function* () {
       installation.organizationId,
       now,
     );
-    const returnCookie = BunHttpServerRequest.toRequest(request)
+    const returnCookie = BunHttpServerRequest.toBunServerRequest(request)
       .headers.get("cookie")
       ?.match(/(?:^|;\s*)omp_gateway_return=([^;]*)/u)?.[1];
     const returnTo = safeReturnTo(
@@ -145,20 +142,24 @@ export const mcpOauthCallback = Effect.gen(function* () {
   const adminUrl = new URL(config.publicUrl.toString());
   adminUrl.pathname = `${adminUrl.pathname.replace(/\/$/u, "")}/admin`;
   adminUrl.search = "";
-  const cookie = BunHttpServerRequest.toRequest(request).headers.get("cookie");
+  const cookie =
+    BunHttpServerRequest.toBunServerRequest(request).headers.get("cookie");
   const rawToken = cookie?.match(/(?:^|;\s*)omp_gateway_admin=([^;]*)/u)?.[1];
   if (rawToken === undefined) {
-    return yield* Effect.fail(new Error("Unauthorized MCP OAuth callback"));
+    return yield* Effect.fail(
+      new OAuthStateError({ message: "Unauthorized MCP OAuth callback" }),
+    );
   }
   const adminSessionHash = tokenHash(decodeURIComponent(rawToken));
   const now = yield* Clock.currentTimeMillis;
   const session = yield* adminSessionRepo.get(adminSessionHash, now);
   if (Option.isNone(session)) {
-    return yield* Effect.fail(new Error("Unauthorized MCP OAuth callback"));
+    return yield* Effect.fail(
+      new OAuthStateError({ message: "Unauthorized MCP OAuth callback" }),
+    );
   }
-  return yield* McpOAuth.completeMcpAuthorization(
-    callback,
-    adminSessionHash,
+  return yield* McpOAuth.use((service) =>
+    service.completeMcpAuthorization(callback, adminSessionHash),
   ).pipe(
     Effect.as(
       HttpServerResponse.redirect(`${adminUrl.pathname}?mcp=connected`, {
@@ -166,7 +167,7 @@ export const mcpOauthCallback = Effect.gen(function* () {
         headers: SECURITY_HEADERS,
       }),
     ),
-    Effect.catchAll((error) =>
+    Effect.catch((error) =>
       Effect.logError("mcp.oauth_callback_failed").pipe(
         Effect.annotateLogs({ error: String(error) }),
         Effect.as(
@@ -182,7 +183,9 @@ export const mcpOauthCallback = Effect.gen(function* () {
 
 const admin = Effect.gen(function* () {
   const request = yield* HttpServerRequest.HttpServerRequest;
-  const response = yield* Admin.handle(BunHttpServerRequest.toRequest(request));
+  const response = yield* Admin.use((service) =>
+    service.handle(BunHttpServerRequest.toBunServerRequest(request)),
+  );
   return response._tag === "Some"
     ? HttpServerResponse.fromWeb(response.value)
     : HttpServerResponse.text("Not found", { status: 404 });
@@ -216,8 +219,19 @@ export const authenticateRoutes = <E, R>(
   Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const path = new URL(request.url, "http://localhost").pathname;
+    // v4 also matches the parent of a wildcard route. v3 registered only
+    // GET /admin, and never registered the bare /api/admin path.
+    const parentPath = path.replace(/\/$/u, "");
+    if (
+      parentPath === "/api/admin" ||
+      (parentPath === "/admin" &&
+        request.method !== "GET" &&
+        request.method !== "HEAD")
+    ) {
+      return HttpServerResponse.empty({ status: 404 });
+    }
     if (publicRoute(request.method, path)) return yield* app;
-    const raw = BunHttpServerRequest.toRequest(request)
+    const raw = BunHttpServerRequest.toBunServerRequest(request)
       .headers.get("cookie")
       ?.match(/(?:^|;\s*)omp_gateway_admin=([^;]*)/u)?.[1];
     const repo = yield* AdminSessionRepo;
@@ -247,19 +261,27 @@ export const authenticateRoutes = <E, R>(
     return yield* app;
   });
 
-export const router = HttpRouter.empty.pipe(
-  HttpRouter.get("/health", health),
-  HttpRouter.all("/webhooks/linear", webhook),
-  HttpRouter.get("/oauth/start", oauthStart),
-  HttpRouter.get("/oauth/callback", oauthCallback),
-  HttpRouter.get("/oauth/mcp/callback", mcpOauthCallback),
-  HttpRouter.get("/", admin),
-  HttpRouter.get("/admin", admin),
-  HttpRouter.get("/runs/:id", admin),
-  HttpRouter.get("/runs/:id.json", admin),
-  HttpRouter.all("/admin/*", admin),
-  HttpRouter.all("/api/admin/*", admin),
-  HttpRouter.use(authenticateRoutes),
-);
+export const routes = [
+  HttpRouter.route("GET", "/health", authenticateRoutes(health)),
+  HttpRouter.route("*", "/webhooks/linear", authenticateRoutes(webhook)),
+  HttpRouter.route("GET", "/oauth/start", authenticateRoutes(oauthStart)),
+  HttpRouter.route("GET", "/oauth/callback", authenticateRoutes(oauthCallback)),
+  HttpRouter.route(
+    "GET",
+    "/oauth/mcp/callback",
+    authenticateRoutes(mcpOauthCallback),
+  ),
+  HttpRouter.route("GET", "/", authenticateRoutes(admin)),
+  HttpRouter.route("GET", "/admin", authenticateRoutes(admin)),
+  HttpRouter.route("GET", "/runs/:id", authenticateRoutes(admin)),
+  HttpRouter.route("GET", "/runs/:id.json", authenticateRoutes(admin)),
+  HttpRouter.route("*", "/admin/*", authenticateRoutes(admin)),
+  HttpRouter.route("*", "/api/admin/*", authenticateRoutes(admin)),
+] as const;
 
-export const httpApp = HttpRouter.toHttpApp(router);
+// v4 expands /admin/* to /admin too. Both use the admin handler; retain
+// the original inventory above and enforce its method boundary in middleware.
+export const RouterLive = HttpRouter.addAll(
+  routes.filter((route) => route.path !== "/admin"),
+);
+export const httpApp = HttpRouter.toHttpEffect(RouterLive);
