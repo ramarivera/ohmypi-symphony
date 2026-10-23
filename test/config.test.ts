@@ -454,3 +454,132 @@ describe("Finite operation deadlines", () => {
     }),
   );
 });
+
+describe("Worker model routing", () => {
+  it.effect("leaves routing and the default model unset by default", () =>
+    Effect.gen(function* () {
+      const result = yield* configResult(baseValues);
+      if (!Result.isSuccess(result)) throw new Error("expected success");
+      expect(result.success.cliproxyApiBaseUrl).toBeUndefined();
+      expect(result.success.cliproxyApiKey).toBeUndefined();
+      expect(result.success.workerDefaultModel).toBeUndefined();
+      expect(result.success.workerProfileDir).toBeUndefined();
+      expect(result.success.workerExtensionPaths).toEqual([]);
+      expect(result.success.workerClaudeExecutable).toBe("claude-cliproxy");
+    }),
+  );
+
+  test("reads the CLIProxyAPI key from a secret file and defaults to Codex", async () => {
+    const directory = await mkdtemp(
+      join(testPath("temporary"), "gateway-secrets-"),
+    );
+    temporaryDirectories.push(directory);
+    const keyFile = join(directory, "cliproxyapi-key");
+    await writeFile(keyFile, "symphony-client-key\n", { mode: 0o600 });
+    const result = await Effect.runPromise(
+      configResult(
+        valuesWith([
+          ["CLIPROXYAPI_BASE_URL", "http://cliproxyapi:8317/"],
+          ["CLIPROXYAPI_API_KEY_FILE", keyFile],
+          ["WORKER_PROFILE_DIR", "/app/worker-profile"],
+          [
+            "WORKER_EXTENSION_PATHS",
+            "/opt/omp-extensions/a.ts, /opt/omp-extensions/b.ts",
+          ],
+        ]),
+      ),
+    );
+    if (!Result.isSuccess(result)) throw new Error("expected success");
+    const config = result.success;
+    expect(config.cliproxyApiBaseUrl).toBe("http://cliproxyapi:8317");
+    expect(config.cliproxyApiKey && Redacted.value(config.cliproxyApiKey)).toBe(
+      "symphony-client-key",
+    );
+    expect(String(config.cliproxyApiKey)).not.toContain("symphony-client-key");
+    expect(config.workerDefaultModel).toBe("cliproxyapi/gpt-6-sol");
+    expect(config.workerProfileDir).toBe("/app/worker-profile");
+    expect(config.workerExtensionPaths).toEqual([
+      "/opt/omp-extensions/a.ts",
+      "/opt/omp-extensions/b.ts",
+    ]);
+  });
+
+  it.effect.each([
+    ["without a profile", undefined, undefined],
+    ["with a blank profile", "  ", undefined],
+    ["with a profile", "/app/worker-profile", "cliproxyapi/gpt-6-sol"],
+  ] as const)(
+    "uses the implicit CLIProxyAPI model only with a profile: %s",
+    ([, profile, model]) =>
+      Effect.gen(function* () {
+        const values = valuesWith([
+          ["CLIPROXYAPI_BASE_URL", "http://cliproxyapi:8317"],
+          ["CLIPROXYAPI_API_KEY", "key"],
+        ]);
+        if (profile !== undefined) values.set("WORKER_PROFILE_DIR", profile);
+        const result = yield* configResult(values);
+        if (!Result.isSuccess(result)) throw new Error("expected success");
+        expect(result.success.workerDefaultModel).toBe(model);
+      }),
+  );
+
+  it.effect("accepts an explicit default model with a thinking level", () =>
+    Effect.gen(function* () {
+      const result = yield* configResult(
+        valuesWith([
+          ["CLIPROXYAPI_BASE_URL", "https://cliproxyapi.example.test/root"],
+          ["CLIPROXYAPI_API_KEY", "key"],
+          ["WORKER_DEFAULT_MODEL", "pi-claude-cli/claude-opus-5-5:high"],
+        ]),
+      );
+      if (!Result.isSuccess(result)) throw new Error("expected success");
+      expect(result.success.cliproxyApiBaseUrl).toBe(
+        "https://cliproxyapi.example.test/root",
+      );
+      expect(result.success.workerDefaultModel).toBe(
+        "pi-claude-cli/claude-opus-5-5:high",
+      );
+    }),
+  );
+
+  it.effect.each([
+    [
+      "base URL without a key",
+      [["CLIPROXYAPI_BASE_URL", "http://cliproxyapi:8317"]],
+    ],
+    ["key without a base URL", [["CLIPROXYAPI_API_KEY", "key"]]],
+    [
+      "embedded URL credentials",
+      [
+        ["CLIPROXYAPI_BASE_URL", "http://user:pass@cliproxyapi:8317"],
+        ["CLIPROXYAPI_API_KEY", "key"],
+      ],
+    ],
+    [
+      "a query string",
+      [
+        ["CLIPROXYAPI_BASE_URL", "http://cliproxyapi:8317?key=x"],
+        ["CLIPROXYAPI_API_KEY", "key"],
+      ],
+    ],
+    [
+      "a non-HTTP URL",
+      [
+        ["CLIPROXYAPI_BASE_URL", "file:///etc/passwd"],
+        ["CLIPROXYAPI_API_KEY", "key"],
+      ],
+    ],
+    ["a model without a provider", [["WORKER_DEFAULT_MODEL", "gpt-6-sol"]]],
+    ["a relative profile path", [["WORKER_PROFILE_DIR", "worker-profile"]]],
+    [
+      "a relative extension path",
+      [["WORKER_EXTENSION_PATHS", "/opt/a.ts,ext/b.ts"]],
+    ],
+  ] as const)("rejects %s", ([, overrides]) =>
+    Effect.gen(function* () {
+      expect(Result.isFailure(yield* configResult(valuesWith(overrides)))).toBe(
+        true,
+      );
+    }),
+  );
+});

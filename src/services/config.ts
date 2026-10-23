@@ -1,4 +1,4 @@
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import {
   Config,
   ConfigProvider,
@@ -9,6 +9,7 @@ import {
   Redacted,
 } from "effect";
 import type { LogLevel } from "../domain/models.js";
+import { modelProvider } from "./worker-profile.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
 
@@ -57,6 +58,18 @@ export interface GatewayConfigShape {
   readonly reconcilerCatchupMinAgeMs: number;
   readonly webhookReplayWindowMs: number;
   readonly repositorySuggestionConfidenceThreshold: number;
+  /** Read-only, credential-free omp profile copied into each worker agent dir. */
+  readonly workerProfileDir?: string | undefined;
+  readonly workerProfileMaxBytes?: number;
+  readonly workerProfileMaxEntries?: number;
+  /** CLIProxyAPI origin; the only model endpoint workers are configured for. */
+  readonly cliproxyApiBaseUrl?: string | undefined;
+  /** Dedicated Symphony client key, passed only into worker environments. */
+  readonly cliproxyApiKey?: Redacted.Redacted<string> | undefined;
+  readonly workerDefaultModel?: string | undefined;
+  /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
+  readonly workerExtensionPaths?: ReadonlyArray<string>;
+  readonly workerClaudeExecutable?: string;
 }
 
 const positiveInteger = (name: string, fallback: number) =>
@@ -179,6 +192,27 @@ const logFileSize = Config.String("LOG_FILE_SIZE").pipe(
 
 const logFileLimit = positiveInteger("LOG_FILE_LIMIT", 14);
 
+const invalid = (message: string) =>
+  new Config.ConfigError(new ConfigProvider.SourceError({ message }));
+
+const absolutePath = (name: string, value: string) =>
+  isAbsolute(value) && resolve(value) === value
+    ? Effect.succeed(value)
+    : Effect.fail(invalid(`${name} must be a normalized absolute path`));
+
+const workerExtensionPaths = Config.String("WORKER_EXTENSION_PATHS").pipe(
+  Config.withDefault(""),
+  Config.mapEffect((value) =>
+    Effect.forEach(
+      value
+        .split(",")
+        .map((path) => path.trim())
+        .filter(Boolean),
+      (path) => absolutePath("WORKER_EXTENSION_PATHS", path),
+    ),
+  ),
+);
+
 const nixpkgsFlakeRef = Config.String("NIXPKGS_FLAKE_REF").pipe(
   Config.withDefault(
     "github:NixOS/nixpkgs/ac62194c3917d5f474c1a844b6fd6da2db95077d",
@@ -265,6 +299,19 @@ const GatewayConfigValues = Config.all({
     Config.map(resolve),
   ),
   nixGcMaxBytes: positiveInteger("NIX_GC_MAX_BYTES", 10 * 1024 * 1024 * 1024),
+  workerProfileMaxBytes: positiveInteger(
+    "WORKER_PROFILE_MAX_BYTES",
+    64 * 1024 * 1024,
+  ),
+  workerProfileMaxEntries: positiveInteger(
+    "WORKER_PROFILE_MAX_ENTRIES",
+    10_000,
+  ),
+  workerExtensionPaths,
+  workerClaudeExecutable: Config.String("WORKER_CLAUDE_EXECUTABLE").pipe(
+    Config.withDefault("claude-cliproxy"),
+    Config.map((value) => value.trim() || "claude-cliproxy"),
+  ),
 });
 
 const requiredValue = Effect.fn("GatewayConfig.requiredValue")(function* (
@@ -328,6 +375,86 @@ const optionalValue = Effect.fn("GatewayConfig.optionalValue")(function* (
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
 });
+
+/** Codex through CLIProxyAPI's OpenAI-compatible endpoint, declared by the profile. */
+export const DEFAULT_CLIPROXYAPI_WORKER_MODEL = "cliproxyapi/gpt-6-sol";
+
+const workerModelRouting = Effect.fn("GatewayConfig.workerModelRouting")(
+  function* (): Effect.fn.Return<
+    Pick<
+      GatewayConfigShape,
+      | "workerProfileDir"
+      | "cliproxyApiBaseUrl"
+      | "cliproxyApiKey"
+      | "workerDefaultModel"
+    >,
+    Config.ConfigError
+  > {
+    const profile = yield* Config.option(Config.String("WORKER_PROFILE_DIR"));
+    const profileDir = Option.isSome(profile)
+      ? profile.value.trim() || undefined
+      : undefined;
+    const workerProfileDir =
+      profileDir === undefined
+        ? undefined
+        : yield* absolutePath("WORKER_PROFILE_DIR", profileDir);
+    const rawBase = yield* Config.option(Config.String("CLIPROXYAPI_BASE_URL"));
+    const base = Option.isSome(rawBase)
+      ? rawBase.value.trim() || undefined
+      : undefined;
+    const key = yield* optionalValue("CLIPROXYAPI_API_KEY");
+    if ((base === undefined) !== (key === undefined))
+      return yield* Effect.fail(
+        invalid(
+          "CLIPROXYAPI_BASE_URL and CLIPROXYAPI_API_KEY (or _FILE) must be set together",
+        ),
+      );
+    let cliproxyApiBaseUrl: string | undefined;
+    if (base !== undefined) {
+      const url = URL.canParse(base) ? new URL(base) : undefined;
+      if (
+        url === undefined ||
+        (url.protocol !== "https:" && url.protocol !== "http:") ||
+        url.username !== "" ||
+        url.password !== "" ||
+        url.search !== "" ||
+        url.hash !== ""
+      )
+        return yield* Effect.fail(
+          invalid(
+            "CLIPROXYAPI_BASE_URL must be an http(s) URL without credentials, query, or fragment",
+          ),
+        );
+      cliproxyApiBaseUrl = `${url.origin}${url.pathname.replace(/\/+$/u, "")}`;
+    }
+    const rawModel = yield* Config.option(
+      Config.String("WORKER_DEFAULT_MODEL"),
+    );
+    const configuredModel = Option.isSome(rawModel)
+      ? rawModel.value.trim() || undefined
+      : undefined;
+    const workerDefaultModel =
+      configuredModel ??
+      (workerProfileDir === undefined || cliproxyApiBaseUrl === undefined
+        ? undefined
+        : DEFAULT_CLIPROXYAPI_WORKER_MODEL);
+    if (
+      workerDefaultModel !== undefined &&
+      modelProvider(workerDefaultModel) === undefined
+    )
+      return yield* Effect.fail(
+        invalid(
+          "WORKER_DEFAULT_MODEL must be provider/model with an optional :thinking suffix",
+        ),
+      );
+    return {
+      workerProfileDir,
+      cliproxyApiBaseUrl,
+      cliproxyApiKey: key === undefined ? undefined : Redacted.make(key),
+      workerDefaultModel,
+    };
+  },
+);
 
 export class GatewayConfig extends Context.Service<GatewayConfig>()(
   "GatewayConfig",
@@ -453,8 +580,10 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
           ),
         );
       }
+      const routing = yield* workerModelRouting();
       return {
         ...values,
+        ...routing,
         allowedOrganizationIds,
         gatewayAdminOrganizationIds,
         githubAppAllowedOwners,

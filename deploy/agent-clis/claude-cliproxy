@@ -1,0 +1,19 @@
+#!/bin/sh
+# Claude Code routed through CLIProxyAPI, for pi-claude-cli in gateway workers.
+# The gateway gives workers CLIPROXYAPI_BASE_URL and CLIPROXYAPI_API_KEY and
+# runs pi-claude-cli in claude-login mode, which refuses inherited ANTHROPIC_*
+# values. So omp never holds an Anthropic endpoint or credential; only this
+# Claude Code child does. Same variables as the T3 sidecar's claude-cliproxy
+# provider instance and toolbox's claudex wrapper.
+set -eu
+: "${CLIPROXYAPI_BASE_URL:?claude-cliproxy needs CLIPROXYAPI_BASE_URL}"
+: "${CLIPROXYAPI_API_KEY:?claude-cliproxy needs CLIPROXYAPI_API_KEY}"
+# Claude Code prefers ANTHROPIC_API_KEY over ANTHROPIC_AUTH_TOKEN; drop every
+# other auth source so nothing bypasses the proxy.
+unset ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_API_KEY_HELPER \
+  CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+export ANTHROPIC_BASE_URL="${CLIPROXYAPI_BASE_URL%/}"
+export ANTHROPIC_AUTH_TOKEN="$CLIPROXYAPI_API_KEY"
+unset CLIPROXYAPI_API_KEY
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1
+exec /opt/claude/bin/claude "$@"

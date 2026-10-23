@@ -358,14 +358,24 @@ process.exit(0);`;
     expect(options?.env).not.toHaveProperty("BUN_OPTIONS");
   });
 
-  it("excludes unlisted secrets, secret files, database paths, and runtime injection variables from worker env", () => {
+  it("excludes unlisted secrets, direct model-provider keys, secret files, database paths, and runtime injection variables from worker env", () => {
     const result = workerEnvironment({
       PATH: "/bin",
       HOME: "/worker",
       LANG: "C",
       TERM: "xterm",
       NIX_SSL_CERT_FILE: "/cert.pem",
-      OPENAI_API_KEY: "worker-model-key",
+      OPENAI_API_KEY: "direct-provider-key",
+      OPENAI_BASE_URL: "https://api.openai.com/v1",
+      ANTHROPIC_API_KEY: "direct-provider-key",
+      ANTHROPIC_AUTH_TOKEN: "direct-provider-key",
+      ANTHROPIC_BASE_URL: "https://api.anthropic.com",
+      GOOGLE_API_KEY: "direct-provider-key",
+      GEMINI_API_KEY: "direct-provider-key",
+      OPENROUTER_API_KEY: "direct-provider-key",
+      CLIPROXYAPI_API_KEY: "gateway-process-copy",
+      CLIPROXYAPI_API_KEY_FILE: "/run/secrets/CLIPROXYAPI_API_KEY",
+      PI_CLAUDE_AUTH: "api-key",
       PI_CODING_AGENT_DIR: "/workspace/.omp",
       GITHUB_APP_PRIVATE_KEY: "secret",
       GITHUB_APP_PRIVATE_KEY_FILE: "/run/secrets/key",
@@ -385,7 +395,6 @@ process.exit(0);`;
         "HOME",
         "LANG",
         "NIX_SSL_CERT_FILE",
-        "OPENAI_API_KEY",
         "PATH",
         "PI_CODING_AGENT_DIR",
         "TERM",

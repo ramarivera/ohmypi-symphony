@@ -1,0 +1,8 @@
+{
+  "name": "ohmypi-symphony-worker-extensions",
+  "private": true,
+  "description": "omp extensions installed read-only into the gateway image for every worker. Pinned with bun.lock; see docs/worker-profile.md.",
+  "dependencies": {
+    "@ramarivera/pi-claude-cli": "0.5.1"
+  }
+}

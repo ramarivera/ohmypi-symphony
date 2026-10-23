@@ -11,6 +11,7 @@ import {
   Layer,
   Option,
   Queue,
+  Redacted,
   Ref,
   Schedule,
   Semaphore,
@@ -75,6 +76,12 @@ import {
 } from "./store/repositories.js";
 import { WorkerIdentityRepo } from "./store/worker-identity-repo.js";
 import { startWorkerMcpProxy } from "./worker-mcp-proxy.js";
+import {
+  seedWorkerProfileFiles,
+  validateWorkerProfile,
+  workerModelArguments,
+  workerModelEnvironment,
+} from "./worker-profile.js";
 import {
   prepareWorkerWorkspace,
   sessionWorkerEnvironment,
@@ -1815,6 +1822,21 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           );
         }
         command.push("--extension", deviationExtensionPath);
+        for (const extensionPath of config.workerExtensionPaths ?? []) {
+          if (!existsSync(extensionPath))
+            return yield* Effect.fail(
+              new RpcSpawnError({
+                message: `Worker extension is missing: ${extensionPath}`,
+              }),
+            );
+          command.push("--extension", extensionPath);
+        }
+        command.push(
+          ...workerModelArguments(
+            config.workerDefaultModel,
+            Option.isSome(run.ompSessionFile),
+          ),
+        );
 
         const workerUid = yield* workerIdentities.acquire(
           run.sessionId,
@@ -1980,6 +2002,40 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 message: "Could not prepare worker tool directories",
               }),
           });
+        const profileDir = config.workerProfileDir;
+        if (profileDir !== undefined)
+          yield* Effect.tryPromise({
+            try: async () => {
+              // Validate on every start: the mount can change without a restart.
+              const manifest = await validateWorkerProfile(profileDir, {
+                cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
+                defaultModel: config.workerDefaultModel,
+                maxBytes: config.workerProfileMaxBytes ?? 64 * 1024 * 1024,
+                maxEntries: config.workerProfileMaxEntries ?? 10_000,
+                requireWorldReadable: workerUid !== undefined,
+              });
+              return workerUid
+                ? workspaceProcess(cwd, "seed-profile", {
+                    source: profileDir,
+                    manifest,
+                  })
+                : seedWorkerProfileFiles(cwd, profileDir, manifest);
+            },
+            catch: (error) =>
+              new RpcSpawnError({
+                message: `Worker profile seeding failed: ${error instanceof Error ? error.message : String(error)}`,
+              }),
+          }).pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning("worker.profile.seed_failed").pipe(
+                Effect.annotateLogs({
+                  event: "worker.profile.seed_failed",
+                  sessionId: run.sessionId,
+                  error: error.message,
+                }),
+              ),
+            ),
+          );
         const agentDir = yield* Effect.tryPromise({
           try: () => materializeMcpAgentDb(cwd, []),
           catch: (error) =>
@@ -2029,6 +2085,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           ...(workerUid === undefined ? {} : { workerUid }),
           cwd,
           env: { ...environment, PI_CODING_AGENT_DIR: agentDir },
+          injectedEnv: workerModelEnvironment({
+            cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
+            cliproxyApiKey:
+              config.cliproxyApiKey === undefined
+                ? undefined
+                : Redacted.value(config.cliproxyApiKey),
+            claudeExecutable:
+              config.workerClaudeExecutable ?? "claude-cliproxy",
+          }),
           sessionId: run.sessionId,
           requestTimeoutMs: config.rpcRequestTimeoutMs ?? 30_000,
         });

@@ -10,6 +10,10 @@ import {
   materializeMcpAgentDb,
   removeMcpAgentDbFile,
 } from "./services/mcp-oauth.js";
+import {
+  seedWorkerProfileFiles,
+  type WorkerProfileManifest,
+} from "./services/worker-profile.js";
 import { workerMcpCredential } from "./services/worker-security.js";
 import { cleanupWorkerSharedDirectoriesSync } from "./services/worker-shared-cleanup.js";
 import {
@@ -47,6 +51,16 @@ switch (action) {
       ),
     );
     break;
+  case "seed-profile": {
+    // The gateway validated this manifest; the copy re-checks every file
+    // without following links and can only write this worker's own tree.
+    const { source, manifest } = input as {
+      readonly source: string;
+      readonly manifest: WorkerProfileManifest;
+    };
+    process.stdout.write(await seedWorkerProfileFiles(cwd, source, manifest));
+    break;
+  }
   case "remove-agent-db":
     await removeMcpAgentDbFile(cwd);
     break;

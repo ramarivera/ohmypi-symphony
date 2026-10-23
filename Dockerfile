@@ -1,4 +1,7 @@
-ARG OMP_VERSION=17.1.8
+# omp 18.8.6 is the release pi-claude-cli 0.5.1 targets and was verified on.
+ARG OMP_VERSION=18.8.6
+# Shared with the T3 sidecar; within pi-claude-cli 0.5.1's supported range.
+ARG CLAUDE_VERSION=2.1.304
 
 FROM oven/bun:1.3.14 AS omp
 ARG OMP_VERSION
@@ -7,8 +10,8 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 RUN case "$TARGETARCH" in \
-      amd64) asset="omp-linux-x64"; checksum="7ee37fa2acdc461fe286f767e75393a7bac2500ff6383b863714121f73d610e4" ;; \
-      arm64) asset="omp-linux-arm64"; checksum="c2d79e2e4d665b54bbdcf7a174a892b0346ce1b63a4ad5f8bfe95c5ec828bb66" ;; \
+      amd64) asset="omp-linux-x64"; checksum="877acdc48384b80fe4c083b1e610433d28922dd9fccde9ea430aaace8765b19b" ;; \
+      arm64) asset="omp-linux-arm64"; checksum="a6bf1405877a739965586fcf973136f72078d2e6dc288905fab08588469c13cf" ;; \
       *) echo "Unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
   && curl --fail --location --retry 3 \
@@ -16,6 +19,23 @@ RUN case "$TARGETARCH" in \
     --output /usr/local/bin/omp \
   && echo "${checksum}  /usr/local/bin/omp" | sha256sum --check --strict \
   && chmod 0755 /usr/local/bin/omp
+
+# Claude Code for pi-claude-cli, via the installer shared with deploy/t3.
+FROM oven/bun:1.3.14 AS agent-clis
+ARG CLAUDE_VERSION
+ARG TARGETARCH
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/*
+COPY deploy/agent-clis/install-agent-clis.sh /usr/local/bin/install-agent-clis
+RUN TARGETARCH="$TARGETARCH" install-agent-clis "claude=${CLAUDE_VERSION}"
+
+# Worker omp extensions, pinned by bun.lock. The Agent SDK's optional bundled
+# Claude binaries are skipped: workers use the CLI driver and /opt/claude.
+FROM oven/bun:1.3.14 AS worker-extensions
+WORKDIR /opt/omp-extensions
+COPY deploy/worker-extensions/package.json deploy/worker-extensions/bun.lock ./
+RUN bun install --frozen-lockfile --production --omit=optional --ignore-scripts
 
 FROM oven/bun:1.3.14 AS build
 WORKDIR /app
@@ -48,6 +68,14 @@ RUN apt-get update \
   && apt-get purge -y --auto-remove curl xz-utils \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=omp /usr/local/bin/omp /usr/local/bin/omp
+COPY --from=agent-clis /opt/claude /opt/claude
+COPY --from=worker-extensions /opt/omp-extensions /opt/omp-extensions
+COPY deploy/agent-clis/claude-cliproxy /usr/local/bin/claude-cliproxy
+RUN ln -s /opt/claude/bin/claude /usr/local/bin/claude \
+  && chown -Rh root:root /opt/claude /opt/omp-extensions /usr/local/bin/claude-cliproxy \
+  && chmod -R go-w /opt/claude /opt/omp-extensions \
+  && chmod 0755 /usr/local/bin/claude-cliproxy \
+  && install -d -m 0755 -o root -g root /app/worker-profile
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json /app/bun.lock* ./
 RUN bun install --production --frozen-lockfile
@@ -63,6 +91,11 @@ RUN chmod 0755 /usr/local/bin/gateway-entrypoint
 # Entrypoint defaults to a 64-slot range, or one slot for legacy WORKER_UID.
 ENV HOME=/root
 ENV WORKSPACE_ROOT=/app/workspaces
+# Every worker loads pi-claude-cli; Claude models route through claude-cliproxy.
+# Mount a curated profile at /app/worker-profile and set WORKER_PROFILE_DIR.
+ENV WORKER_EXTENSION_PATHS=/opt/omp-extensions/node_modules/@ramarivera/pi-claude-cli/entrypoints/omp.ts
+ENV WORKER_CLAUDE_EXECUTABLE=/usr/local/bin/claude-cliproxy
+ENV DISABLE_AUTOUPDATER=1
 USER root
 ENTRYPOINT ["/usr/local/bin/gateway-entrypoint"]
 EXPOSE 3000
