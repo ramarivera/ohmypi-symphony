@@ -1,5 +1,15 @@
 import { AgentActivitySignal, LinearClient } from "@linear/sdk";
-import { Clock, Deferred, Effect, Option, Redacted, Ref, Schema } from "effect";
+import {
+  Clock,
+  Context,
+  Deferred,
+  Effect,
+  Layer,
+  Option,
+  Redacted,
+  Ref,
+  Schema,
+} from "effect";
 import {
   type DatabaseError,
   InstallationRevokedError,
@@ -49,16 +59,10 @@ const STARTED_STATES_CACHE_TTL_MS = 60 * 60 * 1000;
 const STARTED_STATES_CACHE_MAX_TEAMS = 100;
 const LIST_SESSION_ACTIVITIES_MAX_PAGES = 10;
 
-export class LinearGateway extends Effect.Service<LinearGateway>()(
+export class LinearGateway extends Context.Service<LinearGateway>()(
   "LinearGateway",
   {
-    accessors: true,
-    dependencies: [
-      InstallationRepo.Default,
-      RunRepo.Default,
-      GatewayConfig.Default,
-    ],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const installationRepo = yield* InstallationRepo;
       const runRepo = yield* RunRepo;
       const config = yield* GatewayConfig;
@@ -352,11 +356,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         InstallationRevokedError | TokenRefreshError
       > {
         const now = yield* Clock.currentTimeMillis;
-        const orgId = yield* Schema.decodeUnknown(OrganizationId)(
+        const orgId = yield* Schema.decodeUnknownEffect(OrganizationId)(
           organizationId,
         ).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new TokenRefreshError({
                 organizationId,
@@ -427,24 +431,22 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           retriesRemaining: number,
         ): Effect.Effect<A, LinearApiError | LinearRateLimitError> =>
           effect.pipe(
-            Effect.catchSome((error) => {
+            Effect.catch((error) => {
               if (
                 error._tag !== "@Gateway/LinearRateLimitError" ||
                 retriesRemaining === 0
               ) {
-                return Option.none();
+                return Effect.fail(error);
               }
-              return Option.some(
-                Effect.gen(function* () {
-                  yield* Effect.logDebug("linear.api.rateLimited").pipe(
-                    Effect.annotateLogs({
-                      retryAfterMs: error.retryAfterMs,
-                    }),
-                  );
-                  yield* Effect.sleep(error.retryAfterMs ?? 1_000);
-                  return yield* run(retriesRemaining - 1);
-                }),
-              );
+              return Effect.gen(function* () {
+                yield* Effect.logDebug("linear.api.rateLimited").pipe(
+                  Effect.annotateLogs({
+                    retryAfterMs: error.retryAfterMs,
+                  }),
+                );
+                yield* Effect.sleep(error.retryAfterMs ?? 1_000);
+                return yield* run(retriesRemaining - 1);
+              });
             }),
           );
         return run(1);
@@ -493,11 +495,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           | LinearRateLimitError
           | TokenRefreshError
         > {
-          const sessionId = yield* Schema.decodeUnknown(SessionId)(
+          const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
             input.sessionId,
           ).pipe(
             Effect.catchTag(
-              "ParseError",
+              "SchemaError",
               (error) =>
                 new LinearApiError({
                   operation: "createActivity",
@@ -627,11 +629,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         | LinearRateLimitError
         | TokenRefreshError
       > {
-        const sessionId = yield* Schema.decodeUnknown(SessionId)(
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
           input.sessionId,
         ).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new LinearApiError({
                 operation: "listSessionActivities",
@@ -798,11 +800,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           | LinearRateLimitError
           | TokenRefreshError
         > {
-          const sessionId = yield* Schema.decodeUnknown(SessionId)(
+          const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
             input.sessionId,
           ).pipe(
             Effect.catchTag(
-              "ParseError",
+              "SchemaError",
               (error) =>
                 new LinearApiError({
                   operation: "updateSession",
@@ -895,11 +897,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           | LinearRateLimitError
           | TokenRefreshError
         > {
-          const sessionId = yield* Schema.decodeUnknown(SessionId)(
+          const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
             input.sessionId,
           ).pipe(
             Effect.catchTag(
-              "ParseError",
+              "SchemaError",
               (error) =>
                 new LinearApiError({
                   operation: "teamStartedStates",
@@ -1025,11 +1027,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         | LinearRateLimitError
         | TokenRefreshError
       > {
-        const sessionId = yield* Schema.decodeUnknown(SessionId)(
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
           input.sessionId,
         ).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new LinearApiError({
                 operation: "repositorySuggestions",
@@ -1124,11 +1126,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         | LinearRateLimitError
         | TokenRefreshError
       > {
-        const sessionId = yield* Schema.decodeUnknown(SessionId)(
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
           input.sessionId,
         ).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new LinearApiError({
                 operation: "getIssue",
@@ -1221,11 +1223,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           | LinearRateLimitError
           | TokenRefreshError
         > {
-          const sessionId = yield* Schema.decodeUnknown(SessionId)(
+          const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
             input.sessionId,
           ).pipe(
             Effect.catchTag(
-              "ParseError",
+              "SchemaError",
               (error) =>
                 new LinearApiError({
                   operation: "updateIssue",
@@ -1319,11 +1321,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         | LinearRateLimitError
         | TokenRefreshError
       > {
-        const sessionId = yield* Schema.decodeUnknown(SessionId)(
+        const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
           input.sessionId,
         ).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new LinearApiError({
                 operation: "addSessionExternalUrls",
@@ -1395,11 +1397,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
           | LinearRateLimitError
           | TokenRefreshError
         > {
-          const sessionId = yield* Schema.decodeUnknown(SessionId)(
+          const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
             input.sessionId,
           ).pipe(
             Effect.catchTag(
-              "ParseError",
+              "SchemaError",
               (error) =>
                 new LinearApiError({
                   operation: "createIssueComment",
@@ -1502,11 +1504,11 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
         | LinearRateLimitError
         | TokenRefreshError
       > {
-        const issueId = yield* Schema.decodeUnknown(IssueId)(
+        const issueId = yield* Schema.decodeUnknownEffect(IssueId)(
           input.issueId,
         ).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new LinearApiError({
                 operation: "createSessionOnIssue",
@@ -1572,4 +1574,9 @@ export class LinearGateway extends Effect.Service<LinearGateway>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([InstallationRepo.layer, RunRepo.layer, GatewayConfig.layer]),
+  );
+}

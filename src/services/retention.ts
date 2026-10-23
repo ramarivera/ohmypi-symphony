@@ -1,6 +1,13 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { Config, ConfigError, Effect, Either, Schedule } from "effect";
+import {
+  Config,
+  ConfigProvider,
+  Context,
+  Effect,
+  Layer,
+  Schedule,
+} from "effect";
 import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
 import { NixEnvironment } from "./nix-environment.js";
@@ -13,16 +20,17 @@ import {
 import { removeWorkerWorkspaceSync } from "./workspace-process.js";
 
 const positiveInteger = (name: string, fallback: number) =>
-  Config.string(name).pipe(
+  Config.String(name).pipe(
     Config.withDefault(String(fallback)),
-    Config.mapOrFail((value) => {
+    Config.mapEffect((value) => {
       const parsed = /^\d+$/.test(value.trim()) ? Number(value) : Number.NaN;
       return Number.isSafeInteger(parsed) && parsed > 0
-        ? Either.right(parsed)
-        : Either.left(
-            ConfigError.InvalidData(
-              [name],
-              `${name} must be a positive integer`,
+        ? Effect.succeed(parsed)
+        : Effect.fail(
+            new Config.ConfigError(
+              new ConfigProvider.SourceError({
+                message: `${name} must be a positive integer`,
+              }),
             ),
           );
     }),
@@ -38,7 +46,7 @@ export const retentionConfig = Config.all({
   authGraceMs: positiveInteger("RETENTION_AUTH_GRACE_MS", day),
   nixStoreMaxBytes: positiveInteger("NIX_STORE_MAX_BYTES", 20 * 1024 ** 3),
 });
-export type RetentionPolicy = Config.Config.Success<typeof retentionConfig>;
+export type RetentionPolicy = Config.Success<typeof retentionConfig>;
 
 export const MAX_WORKSPACES_PER_SWEEP = 25;
 
@@ -309,9 +317,8 @@ export const makeRetention = (input: {
   return { sweep };
 };
 
-export class Retention extends Effect.Service<Retention>()("Retention", {
-  dependencies: [GatewayConfig.Default, NixEnvironment.Default],
-  effect: Effect.gen(function* () {
+export class Retention extends Context.Service<Retention>()("Retention", {
+  make: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const policy = yield* Config.unwrap(retentionConfig);
     const { db } = yield* SqliteClient;
@@ -328,23 +335,28 @@ export class Retention extends Effect.Service<Retention>()("Retention", {
         Effect.annotateLogs({ event: "retention.swept", ...result }),
       );
     }).pipe(
-      Effect.catchAllCause((cause) =>
+      Effect.catchCause((cause) =>
         Effect.logError("Retention sweep failed", cause),
       ),
     );
     const budgetTick = nix
       .enforceBudget(policy.nixStoreMaxBytes)
       .pipe(
-        Effect.catchAllCause((cause) =>
+        Effect.catchCause((cause) =>
           Effect.logError("Nix store budget enforcement failed", cause),
         ),
       );
     return {
       sweep,
       run: Effect.repeat(
-        Effect.zipRight(sweepTick, budgetTick),
+        Effect.andThen(sweepTick, budgetTick),
         Schedule.spaced(policy.intervalMs),
       ),
     };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([GatewayConfig.layer, NixEnvironment.layer]),
+  );
+}

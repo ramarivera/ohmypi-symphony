@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { Effect, Redacted, Schema } from "effect";
+import { Context, Effect, Layer, Redacted, Schema } from "effect";
 import {
   type DatabaseError,
   LinearApiError,
@@ -37,14 +37,17 @@ const hashState = (rawState: string): string =>
 const normalizeRedirectPath = (path: string): string =>
   path.replace(/^\/+/u, "");
 
-const buildRedirectUri = (config: GatewayConfig, path: string): string => {
+const buildRedirectUri = (
+  config: GatewayConfig["Service"],
+  path: string,
+): string => {
   const base = new URL(config.publicUrl.toString().replace(/\/?$/u, "/"));
   const normalized = normalizeRedirectPath(path);
   return new URL(normalized, base).toString();
 };
 
 const exchangeAuthorizationCode = (
-  config: GatewayConfig,
+  config: GatewayConfig["Service"],
   code: string,
   redirectUri: string,
 ): Effect.Effect<TokenResponse, LinearApiError> =>
@@ -104,9 +107,9 @@ const buildInstallation = (
   now: number,
 ): Effect.Effect<InstallationType, LinearApiError> => {
   const record = buildInstallationRecord(token, organizationId, appUserId, now);
-  return Schema.decodeUnknown(Installation)(record).pipe(
+  return Schema.decodeUnknownEffect(Installation)(record).pipe(
     Effect.catchTag(
-      "ParseError",
+      "SchemaError",
       (error) =>
         new LinearApiError({
           message: `Invalid installation record: ${error}`,
@@ -116,10 +119,8 @@ const buildInstallation = (
   );
 };
 
-export class OAuth extends Effect.Service<OAuth>()("OAuth", {
-  accessors: true,
-  dependencies: [GatewayConfig.Default, InstallationRepo.Default],
-  effect: Effect.gen(function* () {
+export class OAuth extends Context.Service<OAuth>()("OAuth", {
+  make: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const installationRepo = yield* InstallationRepo;
 
@@ -243,4 +244,9 @@ export class OAuth extends Effect.Service<OAuth>()("OAuth", {
 
     return { startAuthorization, completeAuthorization };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([GatewayConfig.layer, InstallationRepo.layer]),
+  );
+}

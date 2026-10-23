@@ -13,7 +13,7 @@ import {
 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { Clock, Effect, Option } from "effect";
+import { Clock, Context, Effect, Layer, Option, Semaphore } from "effect";
 import {
   type DatabaseError,
   type RowDecodeError,
@@ -379,7 +379,7 @@ export const persistGitHubExtraHeader = (
       ),
     });
   return removeGitHubExtraHeaders(target, sessionId).pipe(
-    Effect.zipRight(
+    Effect.andThen(
       Effect.tryPromise({
         try: async () => {
           if (!isGatewayGitHubExtraHeader(header))
@@ -497,14 +497,16 @@ export const runGitOutput = (
         reason: "git_failed",
       }),
   }).pipe(
-    Effect.timeoutFail({
+    Effect.timeoutOrElse({
       duration: timeoutMs,
-      onTimeout: () =>
-        new WorkspaceError({
-          message: `git ${gitSubcommand(args)} timed out after ${timeoutMs}ms`,
-          sessionId,
-          reason: "git_failed",
-        }),
+      orElse: () =>
+        Effect.fail(
+          new WorkspaceError({
+            message: `git ${gitSubcommand(args)} timed out after ${timeoutMs}ms`,
+            sessionId,
+            reason: "git_failed",
+          }),
+        ),
     }),
   );
 
@@ -521,7 +523,7 @@ export const unsetGitHubExtraHeader = (
       { sessionId },
     );
   return removeGitHubExtraHeaders(target, sessionId, timeoutMs).pipe(
-    Effect.catchAll((error) =>
+    Effect.catch((error) =>
       Effect.logWarning("workspace.github_cleanup_failed").pipe(
         Effect.annotateLogs({ sessionId, error: error.message }),
       ),
@@ -728,7 +730,7 @@ export const makeWorkspace = (input: {
       .slice(0, 16);
     // Ownership lives in the name, so even a crash between mkdir and the first
     // write leaves enough information for recovery. Never infer death from age.
-    const stagingRecoveryGate = yield* Effect.makeSemaphore(1);
+    const stagingRecoveryGate = yield* Semaphore.make(1);
     let stagingRecovered = false;
     let stagingRetryAt = 0;
     const recoverStaging = (workerUid: string | undefined) =>
@@ -795,7 +797,7 @@ export const makeWorkspace = (input: {
                 stagingRecovered = true;
               }),
             ),
-            Effect.catchAll((error) =>
+            Effect.catch((error) =>
               Effect.gen(function* () {
                 stagingRetryAt = (yield* Clock.currentTimeMillis) + 30_000;
                 yield* Effect.logWarning(
@@ -1079,7 +1081,7 @@ export const makeWorkspace = (input: {
                   sessionId,
                 ),
               }).pipe(
-                Effect.catchAll((error) =>
+                Effect.catch((error) =>
                   Effect.logWarning("workspace.staging_cleanup_failed").pipe(
                     Effect.annotateLogs({ sessionId, error: error.message }),
                   ),
@@ -1192,14 +1194,8 @@ export const makeWorkspace = (input: {
       clearGitHubExtraHeader,
     };
   });
-export class Workspace extends Effect.Service<Workspace>()("Workspace", {
-  accessors: true,
-  dependencies: [
-    GatewayConfig.Default,
-    WorkspaceRepo.Default,
-    GitHubApp.Default,
-  ],
-  effect: Effect.gen(function* () {
+export class Workspace extends Context.Service<Workspace>()("Workspace", {
+  make: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const repo = yield* WorkspaceRepo;
     const githubApp =
@@ -1214,4 +1210,9 @@ export class Workspace extends Effect.Service<Workspace>()("Workspace", {
       githubApp,
     });
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([GatewayConfig.layer, WorkspaceRepo.layer, GitHubApp.layer]),
+  );
+}

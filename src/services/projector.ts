@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { Clock, Effect, Option, ParseResult, Ref, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Ref, Schema } from "effect";
 import {
   type DatabaseError,
   type InstallationRevokedError,
@@ -52,16 +52,10 @@ export const rpcEventActivityType = (event: {
   }
 };
 
-export class ActivityProjector extends Effect.Service<ActivityProjector>()(
+export class ActivityProjector extends Context.Service<ActivityProjector>()(
   "ActivityProjector",
   {
-    accessors: true,
-    dependencies: [
-      ProjectionRepo.Default,
-      RunRepo.Default,
-      LinearGateway.Default,
-    ],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const projectionRepo = yield* ProjectionRepo;
       const runRepo = yield* RunRepo;
       const linear = yield* LinearGateway;
@@ -86,12 +80,12 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         Effect.sync(() => JSON.stringify(value));
 
       const decodeSourceKey = (value: string) =>
-        Schema.decodeUnknown(SourceKey)(value).pipe(
+        Schema.decodeUnknownEffect(SourceKey)(value).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new RowDecodeError({
-                message: ParseResult.TreeFormatter.formatErrorSync(error),
+                message: "Stored data is invalid",
                 entity: "SourceKey",
                 cause: String(error),
               }),
@@ -99,12 +93,12 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         );
 
       const decodeSessionId = (value: string) =>
-        Schema.decodeUnknown(SessionId)(value).pipe(
+        Schema.decodeUnknownEffect(SessionId)(value).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new RowDecodeError({
-                message: ParseResult.TreeFormatter.formatErrorSync(error),
+                message: "Stored data is invalid",
                 entity: "SessionId",
                 cause: String(error),
               }),
@@ -112,12 +106,12 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
         );
 
       const decodeActivityId = (value: string) =>
-        Schema.decodeUnknown(ActivityId)(value).pipe(
+        Schema.decodeUnknownEffect(ActivityId)(value).pipe(
           Effect.catchTag(
-            "ParseError",
+            "SchemaError",
             (error) =>
               new RowDecodeError({
-                message: ParseResult.TreeFormatter.formatErrorSync(error),
+                message: "Stored data is invalid",
                 entity: "ActivityId",
                 cause: String(error),
               }),
@@ -319,15 +313,15 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
                     error instanceof Error ? error.message : String(error),
                 }),
             });
-            const sessionId = yield* Schema.decodeUnknown(SessionId)(
+            const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
               request.sessionId,
             ).pipe(
               Effect.catchTag(
-                "ParseError",
-                (error) =>
+                "SchemaError",
+                (_error) =>
                   new LinearApiError({
                     operation: "createIssueComment",
-                    message: ParseResult.TreeFormatter.formatErrorSync(error),
+                    message: "Stored data is invalid",
                   }),
               ),
             );
@@ -369,15 +363,15 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
               yield* projectionRepo.complete(sourceKey, owner, Option.none());
               return true;
             }
-            const sessionId = yield* Schema.decodeUnknown(SessionId)(
+            const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
               update.sessionId,
             ).pipe(
               Effect.catchTag(
-                "ParseError",
-                (error) =>
+                "SchemaError",
+                (_error) =>
                   new LinearApiError({
                     operation: "updateSession",
-                    message: ParseResult.TreeFormatter.formatErrorSync(error),
+                    message: "Stored data is invalid",
                   }),
               ),
             );
@@ -393,15 +387,15 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
                     error instanceof Error ? error.message : String(error),
                 }),
             });
-            const sessionId = yield* Schema.decodeUnknown(SessionId)(
+            const sessionId = yield* Schema.decodeUnknownEffect(SessionId)(
               request.sessionId,
             ).pipe(
               Effect.catchTag(
-                "ParseError",
-                (error) =>
+                "SchemaError",
+                (_error) =>
                   new LinearApiError({
                     operation: "createActivity",
-                    message: ParseResult.TreeFormatter.formatErrorSync(error),
+                    message: "Stored data is invalid",
                   }),
               ),
             );
@@ -757,7 +751,7 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
               if (event.willContinue === true) return;
               const draft = yield* Ref.get(assistantDraft);
               const body = Option.match(
-                Option.fromNullable(draft.get(sessionId)),
+                Option.fromNullishOr(draft.get(sessionId)),
                 {
                   onNone: () => "OhMyPi run completed.",
                   onSome: (value) => value,
@@ -801,4 +795,9 @@ export class ActivityProjector extends Effect.Service<ActivityProjector>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([ProjectionRepo.layer, RunRepo.layer, LinearGateway.layer]),
+  );
+}

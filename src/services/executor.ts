@@ -1,17 +1,17 @@
-import { Effect, Schema } from "effect";
+import { Context, Effect, Layer, Schema } from "effect";
 import type { OrganizationId } from "../domain/ids.js";
 import { ExecutorInstanceRepo } from "./store/executor-instance-repo.js";
 
 export class ExecutorRequestError extends Schema.TaggedError<ExecutorRequestError>()(
   "@Gateway/ExecutorRequestError",
   {
-    reason: Schema.Literal(
+    reason: Schema.Literals([
       "not_configured",
       "invalid_endpoint",
       "timeout",
       "http",
       "invalid_response",
-    ),
+    ]),
     message: Schema.String,
   },
 ) {}
@@ -37,10 +37,8 @@ export const executorUrlForPath = (base: string, path: string): string => {
 const endpointFor = (base: string): string =>
   executorUrlForPath(base, "api/toolkits");
 
-export class Executor extends Effect.Service<Executor>()("Executor", {
-  accessors: true,
-  dependencies: [ExecutorInstanceRepo.Default],
-  effect: Effect.gen(function* () {
+export class Executor extends Context.Service<Executor>()("Executor", {
+  make: Effect.gen(function* () {
     const instances = yield* ExecutorInstanceRepo;
 
     const listToolkits = Effect.fn("Executor.listToolkits")(function* (
@@ -119,7 +117,7 @@ export class Executor extends Effect.Service<Executor>()("Executor", {
               message: String(error),
             }),
         });
-        return yield* Schema.decodeUnknown(ToolkitResponse)(body).pipe(
+        return yield* Schema.decodeUnknownEffect(ToolkitResponse)(body).pipe(
           Effect.map((decoded) => decoded.toolkits),
           Effect.mapError(
             (error) =>
@@ -134,4 +132,9 @@ export class Executor extends Effect.Service<Executor>()("Executor", {
     });
     return { listToolkits };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([ExecutorInstanceRepo.layer]),
+  );
+}

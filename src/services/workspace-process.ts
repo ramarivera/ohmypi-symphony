@@ -210,7 +210,7 @@ export const cleanupWorkspaceProcess = (
     catch: (error) => (error instanceof Error ? error.message : String(error)),
   }).pipe(
     Effect.asVoid,
-    Effect.catchAll((error) =>
+    Effect.catch((error) =>
       Effect.logWarning(event).pipe(
         Effect.annotateLogs({ ...annotations, cwd, action, error }),
       ),

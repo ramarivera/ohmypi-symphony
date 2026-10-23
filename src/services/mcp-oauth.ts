@@ -4,7 +4,16 @@ import type { Stats } from "node:fs";
 import { chmod, lstat, mkdir, rm, unlink, writeFile } from "node:fs/promises";
 import { isIP } from "node:net";
 import { isAbsolute, join, resolve as resolvePath } from "node:path";
-import { Clock, Deferred, Effect, Option, Ref, Schema } from "effect";
+import {
+  Clock,
+  Context,
+  Deferred,
+  Effect,
+  Layer,
+  Option,
+  Ref,
+  Schema,
+} from "effect";
 import {
   DatabaseError,
   McpOAuthError,
@@ -87,7 +96,7 @@ const McpOAuthClientMetadataSchema = Schema.Struct({
   clientId: Schema.String,
   clientSecret: Schema.optional(Schema.String),
   tokenEndpointAuthMethod: Schema.optional(
-    Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+    Schema.Literals(["none", "client_secret_basic", "client_secret_post"]),
   ),
   authorizationEndpoint: Schema.String,
   tokenEndpoint: Schema.String,
@@ -108,13 +117,15 @@ const RegistrationResponse = Schema.Struct({
   client_id: Schema.String,
   client_secret: Schema.optional(Schema.String),
   token_endpoint_auth_method: Schema.optional(
-    Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+    Schema.Literals(["none", "client_secret_basic", "client_secret_post"]),
   ),
 });
 const TokenResponse = Schema.Struct({
   access_token: Schema.String,
   refresh_token: Schema.optional(Schema.String),
-  expires_in: Schema.optional(Schema.Number.pipe(Schema.nonNegative())),
+  expires_in: Schema.optional(
+    Schema.Number.pipe(Schema.check(Schema.isGreaterThanOrEqualTo(0))),
+  ),
   token_type: Schema.optional(Schema.String),
   scope: Schema.optional(Schema.String),
 });
@@ -215,7 +226,7 @@ const fetchWithTimeout = (
 ): Promise<Response> => safeOAuthFetch(input, init, policy, fetchImpl);
 
 const decodeJsonResponse = <A, I, R>(
-  schema: Schema.Schema<A, I, R>,
+  schema: Schema.Codec<A, I, R>,
   response: Response,
   operation: string,
 ): Effect.Effect<A, DatabaseError, R> =>
@@ -226,9 +237,9 @@ const decodeJsonResponse = <A, I, R>(
         message: `${operation} response JSON failed: ${String(error)}`,
       }),
   }).pipe(
-    Effect.flatMap((body) => Schema.decodeUnknown(schema)(body)),
+    Effect.flatMap((body) => Schema.decodeUnknownEffect(schema)(body)),
     Effect.catchTag(
-      "ParseError",
+      "SchemaError",
       (error) =>
         new DatabaseError({
           message: `${operation} response schema failed: ${String(error)}`,
@@ -237,7 +248,7 @@ const decodeJsonResponse = <A, I, R>(
   );
 
 const decodeStoredJson = <A, I, R>(
-  schema: Schema.Schema<A, I, R>,
+  schema: Schema.Codec<A, I, R>,
   value: string,
   operation: string,
 ): Effect.Effect<A, DatabaseError, R> =>
@@ -249,9 +260,9 @@ const decodeStoredJson = <A, I, R>(
         message: `${operation} JSON failed: ${String(error)}`,
       }),
   }).pipe(
-    Effect.flatMap((body) => Schema.decodeUnknown(schema)(body)),
+    Effect.flatMap((body) => Schema.decodeUnknownEffect(schema)(body)),
     Effect.catchTag(
-      "ParseError",
+      "SchemaError",
       (error) =>
         new DatabaseError({
           message: `${operation} schema failed: ${String(error)}`,
@@ -683,7 +694,7 @@ const refreshAccessToken = (
 const encrypted = (value: string): string =>
   `${MCP_OAUTH_ENCRYPTED_PREFIX}${value}`;
 const decryptValue = (
-  crypto: TokenCrypto,
+  crypto: TokenCrypto["Service"],
   value: string,
   context: string,
 ): Effect.Effect<string, TokenCipherError> =>
@@ -691,14 +702,8 @@ const decryptValue = (
     ? crypto.decrypt(value.slice(MCP_OAUTH_ENCRYPTED_PREFIX.length), context)
     : Effect.succeed(value);
 
-export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
-  accessors: true,
-  dependencies: [
-    GatewayConfig.Default,
-    McpServerRepo.Default,
-    TokenCrypto.Default,
-  ],
-  effect: Effect.gen(function* () {
+export class McpOAuth extends Context.Service<McpOAuth>()("McpOAuth", {
+  make: Effect.gen(function* () {
     const config = yield* GatewayConfig;
     const mcpServerRepo = yield* McpServerRepo;
     const tokenCrypto = yield* TokenCrypto;
@@ -1460,7 +1465,16 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       listStatuses,
     };
   }),
-}) {}
+}) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([
+      GatewayConfig.layer,
+      McpServerRepo.layer,
+      TokenCrypto.layer,
+    ]),
+  );
+}
 const lstatIfExists = async (path: string): Promise<Stats | undefined> => {
   try {
     return await lstat(path);
@@ -1624,7 +1638,7 @@ export const removeMcpAgentDb = (
         try: () => removeMcpAgentDbFile(workspace),
         catch: (error) => String(error),
       }).pipe(
-        Effect.catchAll((error) =>
+        Effect.catch((error) =>
           Effect.logWarning("mcp.agent_db.cleanup_failed").pipe(
             Effect.annotateLogs({ cwd: workspace, error }),
           ),
