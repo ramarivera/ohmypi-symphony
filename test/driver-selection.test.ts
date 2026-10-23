@@ -1,11 +1,14 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Layer, Option, Schema } from "effect";
+import { Effect, Layer, Option, Result, Schema } from "effect";
 import { OrganizationId, SessionId, WorkspaceId } from "../src/domain/ids.js";
 import { selectDriver } from "../src/drivers/selection.js";
 import { RunEventRepo } from "../src/services/store/run-event-repo.js";
 import { RunRepo } from "../src/services/store/run-repo.js";
-import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
+import {
+  SqliteClient,
+  SqliteClientLive,
+} from "../src/services/store/sqlite-client.js";
 import { WorkspaceRepo } from "../src/services/store/workspace-repo.js";
 
 import { testPaths } from "./fixtures/paths.js";
@@ -17,7 +20,7 @@ const sessionId = Schema.decodeUnknownSync(SessionId)("session-1");
 const layer = Layer.mergeAll(
   WorkspaceRepo.layer,
   RunRepo.layer.pipe(Layer.provide(RunEventRepo.layer)),
-).pipe(Layer.provide(SqliteClientLive(":memory:")));
+).pipe(Layer.provideMerge(SqliteClientLive(":memory:")));
 
 describe("repository driver selection", () => {
   it.live(
@@ -97,6 +100,42 @@ describe("repository driver selection", () => {
           Option.getOrThrow(yield* repo.getRepository(organizationId, id))
             .defaultDriver,
         ).toBe("t3");
+      }).pipe(Effect.provide(layer)),
+  );
+  it.effect(
+    "retains JSON and schema causes for corrupt driver session rows",
+    () =>
+      Effect.gen(function* () {
+        const repo = yield* WorkspaceRepo;
+        const { db } = yield* SqliteClient;
+        yield* (yield* RunRepo).create({
+          sessionId,
+          organizationId,
+          issueId: Option.none(),
+        });
+        for (const ref of [
+          "{broken",
+          JSON.stringify({ driver: "t3", nativeId: 123, locator: {} }),
+        ]) {
+          yield* Effect.sync(() =>
+            db
+              .query(
+                "INSERT INTO driver_session(session_id,ref_json) VALUES (?,?) ON CONFLICT(session_id) DO UPDATE SET ref_json=excluded.ref_json",
+              )
+              .run(sessionId, ref),
+          );
+          const result = yield* repo
+            .getDriverSession(sessionId)
+            .pipe(Effect.result);
+          expect(Result.isFailure(result)).toBe(true);
+          if (Result.isFailure(result)) {
+            expect(result.failure._tag).toBe("@Gateway/RowDecodeError");
+            expect(result.failure).toHaveProperty("entity", "driver_session");
+            expect(result.failure).toHaveProperty("cause");
+            if (result.failure._tag === "@Gateway/RowDecodeError")
+              expect(result.failure.cause).toBeTruthy();
+          }
+        }
       }).pipe(Effect.provide(layer)),
   );
   it.effect(

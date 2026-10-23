@@ -107,6 +107,10 @@ export class FakeT3Server {
       .filter((payload) => payload.type === type);
   }
 
+  activeSocketCount(): number {
+    return this.sockets.size;
+  }
+
   closeAllSockets(): void {
     for (const ws of this.sockets) ws.close(1012, "restart");
   }

@@ -100,6 +100,9 @@ const planStatus = (status: string): PlanStep["status"] => {
       return "inProgress";
     case "completed":
       return "completed";
+    case "cancelled":
+    case "canceled":
+      return "canceled";
     default:
       return "pending";
   }

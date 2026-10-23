@@ -27,7 +27,8 @@ changing labels doesn't migrate an existing conversation between runtimes.
 `T3_TOKEN` or `T3_TOKEN_FILE`; the file is reread on connection. A shared
 daemon can't reach mode-0700 per-uid workspaces, so remote mode fails closed
 when `WORKER_UID_BASE` isolation is active, before any project or thread is
-created. Launch mode rejects `T3_BASE_URL` and `T3_TOKEN*` so a shared daemon
+created. Remote mode also rejects repositories with Nix packages and workspaces
+with retained Git credentials or config includes, before contacting T3. Launch mode rejects `T3_BASE_URL` and `T3_TOKEN*` so a shared daemon
 can't be configured by accident.
 
 Both modes take `T3_PROVIDER_INSTANCE` and `T3_MODEL`. Launch mode accepts only
@@ -76,7 +77,7 @@ one-time pairing code on startup (12 characters from a 32-symbol alphabet, about
 token or pairing code from its diagnostics.
 
 Stopping the session (run end, cancellation, failure, gateway shutdown)
-closes the T3 session and then terminates the daemon's process group: SIGTERM,
+detaches the T3 connection without interrupting a remote turn, then terminates the daemon's process group: SIGTERM,
 then SIGKILL after 5 s. Releasing a terminal session's uid kills any remaining
 process with that uid, as for OMP. A gateway restart starts a new daemon on the
 persisted state; the driver reattaches the thread and interrupts its old turn.
@@ -96,13 +97,18 @@ The T3 worker contract tells the agent to push a branch, open the PR through the
 GitHub REST API with that credential, and include the PR URL in its final
 response, which the authority links to the Linear session. The GitHub App
 installation needs Contents and Pull requests write access on the repository.
-Remote mode removes the gateway's Git credential instead and uses a contract
-without push instructions.
+Both modes refuse retained non-gateway Git credentials and config includes
+before opening T3. Launch mode checks as the session uid and allows only the
+gateway's GitHub extraheader. Remote mode first removes that header and uses
+a contract without push instructions.
 
 `T3_RUNTIME_MODE` defaults to `auto`. The authority answers any approval that
 still escalates with `accept` once, inside the session's cancellation mutation
 gate. Questions become Linear elicitations and replies return to the originating
-request. A five-minute lack of progress, a held queue, or exhausted reconnects
+request. Multi-question and multi-select forms include their question IDs and
+options; reply with a JSON object keyed by ID, with arrays for multi-select
+answers. Invalid forms are rejected without sending fabricated answers.
+A five-minute lack of progress, a held queue, or exhausted reconnects
 interrupts the turn and enters the authority's existing bounded retry policy.
 The watchdog pauses for pending user questions. Gateway recovery reattaches the
 persisted thread, interrupts any old turn, and sends a continuation attempt.

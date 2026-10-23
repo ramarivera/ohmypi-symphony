@@ -1,7 +1,16 @@
 /** Keeps the authority's host-tool/cancellation machinery while all turn
  * execution and event consumption go through AgentDriver. */
 import { randomUUID } from "node:crypto";
-import { Clock, Effect, Exit, Fiber, Option, Scope, Stream } from "effect";
+import {
+  Clock,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Schema,
+  Scope,
+  Stream,
+} from "effect";
 import { RpcProtocolError } from "../domain/errors.js";
 import type { RpcEvent, RpcWorkerHandle } from "../services/rpc-worker.js";
 import type {
@@ -30,11 +39,12 @@ export const openDriverWorker = (
     const scope = yield* Scope.fork(parentScope, "sequential");
     const session = yield* driver.open(input).pipe(
       Scope.provide(scope),
-      Effect.tapError(() => Scope.close(scope, Exit.void)),
+      Effect.onError(() => Scope.close(scope, Exit.void)),
       Effect.mapError(protocolError),
     );
     let lastProgressAt = yield* Clock.currentTimeMillis;
     let awaitingOutcome = false;
+    let ownedTurnId: string | undefined;
     const listeners = new Set<(event: RpcEvent) => void>();
     const questions = new Map<string, ReadonlyArray<UserQuestion>>();
     const emit = (event: RpcEvent) => {
@@ -53,17 +63,21 @@ export const openDriverWorker = (
             awaitingOutcome = true;
           }),
         ),
-        Effect.tap((handle) =>
-          session.ref.driver !== "t3"
+        Effect.tap((handle) => {
+          ownedTurnId = handle.turnId;
+          return session.ref.driver !== "t3"
             ? Effect.void
             : Effect.forkIn(
                 handle.outcome.pipe(
                   Effect.tap((outcome) =>
                     Effect.gen(function* () {
-                      const snapshot = yield* session.snapshot;
+                      const snapshot = yield* session.snapshot.pipe(
+                        Effect.option,
+                      );
                       if (
                         outcome.status === "completed" &&
-                        snapshot.turns.some(
+                        Option.isSome(snapshot) &&
+                        snapshot.value.turns.some(
                           (turn) =>
                             turn.turnId !== outcome.turnId &&
                             [
@@ -96,8 +110,8 @@ export const openDriverWorker = (
                   ),
                 ),
                 scope,
-              ).pipe(Effect.asVoid),
-        ),
+              ).pipe(Effect.asVoid);
+        }),
       );
     if (session.ref.driver === "t3")
       yield* Effect.forkIn(
@@ -110,7 +124,10 @@ export const openDriverWorker = (
                 stallTimeoutMs
             ) {
               awaitingOutcome = false;
-              yield* session.interrupt().pipe(Effect.catch(() => Effect.void));
+              if (ownedTurnId !== undefined)
+                yield* session
+                  .interrupt(ownedTurnId)
+                  .pipe(Effect.catch(() => Effect.void));
               emit({
                 type: "error",
                 message: `T3 stalled for ${stallTimeoutMs}ms`,
@@ -135,8 +152,6 @@ export const openDriverWorker = (
       stop: () =>
         Effect.gen(function* () {
           listeners.clear();
-          if (session.ref.driver === "t3")
-            yield* session.interrupt().pipe(Effect.catch(() => Effect.void));
           yield* Scope.close(scope, Exit.void);
         }),
       prompt: (text, id) =>
@@ -158,24 +173,56 @@ export const openDriverWorker = (
         legacy?.respondToUi ??
         ((requestId, response) => {
           const form = questions.get(requestId) ?? [];
-          return session
-            .respond(
-              requestId,
-              "cancelled" in response
-                ? { _tag: "Dismiss" }
-                : {
-                    _tag: "Answer",
-                    answers: Object.fromEntries(
-                      form.map((question) => [
-                        question.id,
-                        "value" in response
-                          ? response.value
-                          : String(response.confirmed),
-                      ]),
-                    ),
-                  },
+          return Effect.gen(function* () {
+            if ("cancelled" in response) {
+              yield* session.respond(requestId, { _tag: "Dismiss" });
+              return;
+            }
+            const value =
+              "value" in response ? response.value : String(response.confirmed);
+            const structured =
+              form.length > 1 || form.some((question) => question.multiSelect);
+            const answers = structured
+              ? yield* Effect.try({
+                  try: () =>
+                    Schema.decodeUnknownSync(
+                      Schema.Record(
+                        Schema.String,
+                        Schema.Union([
+                          Schema.String,
+                          Schema.Array(Schema.String),
+                        ]),
+                      ),
+                    )(JSON.parse(value)),
+                  catch: () =>
+                    new RpcProtocolError({
+                      method: "driver",
+                      message:
+                        "Reply with a JSON object keyed by question id; multi-select answers must be arrays.",
+                    }),
+                })
+              : Object.fromEntries(
+                  form.map((question) => [question.id, value]),
+                );
+            if (
+              Object.keys(answers).length !== form.length ||
+              form.some((question) => {
+                const answer = answers[question.id];
+                return (
+                  !Object.hasOwn(answers, question.id) ||
+                  (question.multiSelect
+                    ? !Array.isArray(answer)
+                    : typeof answer !== "string")
+                );
+              })
             )
-            .pipe(Effect.asVoid, Effect.mapError(protocolError));
+              return yield* new RpcProtocolError({
+                method: "driver",
+                message:
+                  "Answer every question id once, using arrays only for multi-select questions.",
+              });
+            yield* session.respond(requestId, { _tag: "Answer", answers });
+          }).pipe(Effect.asVoid, Effect.mapError(protocolError));
         }),
       onEvent: (listener) =>
         Effect.gen(function* () {

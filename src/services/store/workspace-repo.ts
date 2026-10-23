@@ -22,6 +22,12 @@ import {
   tryDb,
 } from "./sqlite-client.js";
 
+const DriverSessionRef = Schema.Struct({
+  driver: Schema.Literals(["omp", "t3"]),
+  nativeId: Schema.String,
+  locator: Schema.Record(Schema.String, Schema.String),
+});
+
 const RepositoryRow = Schema.Struct({
   organization_id: Schema.String,
   id: Schema.String,
@@ -560,22 +566,17 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
             "WorkspaceRepo.getDriverSession",
           );
           if (row === null) return Option.none<SessionRef>();
+          const parsed = yield* Effect.try({
+            try: () => JSON.parse(row.ref_json) as unknown,
+            catch: (error) =>
+              new RowDecodeError({
+                message: "Invalid JSON in driver session",
+                entity: "driver_session",
+                cause: error instanceof Error ? error.message : String(error),
+              }),
+          });
           return Option.some(
-            yield* Effect.try({
-              try: () =>
-                Schema.decodeUnknownSync(
-                  Schema.Struct({
-                    driver: Schema.Literals(["omp", "t3"]),
-                    nativeId: Schema.String,
-                    locator: Schema.Record(Schema.String, Schema.String),
-                  }),
-                )(JSON.parse(row.ref_json)),
-              catch: () =>
-                new RowDecodeError({
-                  message: "Invalid driver session",
-                  entity: "driver_session",
-                }),
-            }),
+            yield* decodeRow(DriverSessionRef, parsed, "driver_session"),
           );
         });
       const setDriverSession = (sessionId: SessionId, ref: SessionRef) =>

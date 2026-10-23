@@ -43,6 +43,27 @@ const snapshot = (
 });
 
 describe("T3EventMapper", () => {
+  it.each(["cancelled", "canceled"])(
+    "maps %s todo steps to Linear canceled",
+    (status) => {
+      const mapper = new T3EventMapper("thread-1");
+      expect(
+        mapper.apply(
+          event(
+            1,
+            "turn-item.updated",
+            item({
+              id: "plan",
+              type: "todo_list",
+              steps: [{ id: "step", text: "Abandoned", status }],
+            }),
+          ),
+        ),
+      ).toMatchObject([
+        { _tag: "Plan", steps: [{ content: "Abandoned", status: "canceled" }] },
+      ]);
+    },
+  );
   it("drops replayed sequences and advances past unknown events", () => {
     const mapper = new T3EventMapper("thread-1");
     expect(mapper.apply(event(1, "run.created", run("starting")))).toHaveLength(

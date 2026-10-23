@@ -3355,6 +3355,155 @@ const t3Server = Effect.acquireRelease(
 
 describe("AgentDriver authority integration", () => {
   it.live(
+    "stops both drivers when persisting their session fails before registration",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        for (const driver of ["omp", "t3"] as const) {
+          yield* withAuthority(
+            (db) =>
+              Effect.gen(function* () {
+                yield* seedDriverRun(driver);
+                yield* Effect.sync(() =>
+                  db.exec(
+                    "CREATE TRIGGER fail_driver_session BEFORE INSERT ON driver_session BEGIN SELECT RAISE(ABORT, 'persistence failed'); END",
+                  ),
+                );
+                const authority = yield* SessionAuthority;
+                const result = yield* authority
+                  .processSession(testSessionId)
+                  .pipe(Effect.result);
+                expect(Result.isFailure(result)).toBe(true);
+                expect(yield* authority.activeWorkerCount()).toBe(0);
+                if (driver === "omp")
+                  expect(orderEvents).toContain("worker-stopped");
+                else {
+                  yield* Effect.sync(() => server.activeSocketCount()).pipe(
+                    Effect.repeat({
+                      while: (count) => count > 0,
+                      schedule: Schedule.spaced(5),
+                    }),
+                    Effect.timeout(1000),
+                  );
+                  expect(server.activeSocketCount()).toBe(0);
+                }
+              }),
+            {
+              withLinearGateway: true,
+              config: [
+                ["T3_BASE_URL", server.baseUrl.toString()],
+                ["T3_TOKEN", server.token],
+                ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+                ["T3_MODEL", "gpt-6-sol"],
+              ],
+            },
+          );
+        }
+      }),
+  );
+  it.live(
+    "rejects remote T3 repository Nix packages instead of omitting them",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              yield* (yield* WorkspaceRepo).updateRepository(
+                testOrganizationId,
+                Schema.decodeUnknownSync(WorkspaceId)("driver-repo"),
+                {
+                  nixPackages: [
+                    Schema.decodeUnknownSync(NixPackageName)("nodejs"),
+                  ],
+                },
+              );
+              const result = yield* (yield* SessionAuthority)
+                .processSession(testSessionId)
+                .pipe(Effect.result);
+              expect(Result.isFailure(result)).toBe(true);
+              if (Result.isFailure(result))
+                expect(result.failure.message).toContain(
+                  "Remote T3 cannot receive repository Nix packages",
+                );
+              expect(server.projectMutations).toEqual([]);
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "denies retained non-gateway Git credentials before remote T3 opens the workspace",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        for (const config of [
+          '[http "https://github.com/"]\nextraheader = AUTHORIZATION: bearer retained-secret\n',
+          "[credential]\nhelper = store\n",
+          '[remote "origin"]\nurl = https://user:retained-secret@github.com/org/repo\n',
+          "[include]\npath = /secret/config\n",
+        ])
+          yield* withT3Authority(
+            () =>
+              Effect.gen(function* () {
+                const { configPath } = yield* seedDriverRun("t3");
+                yield* Effect.promise(() => writeFile(configPath, config));
+                const result = yield* (yield* SessionAuthority)
+                  .processSession(testSessionId)
+                  .pipe(Effect.result);
+                expect(Result.isFailure(result)).toBe(true);
+                if (Result.isFailure(result)) {
+                  expect(result.failure.message).toContain(
+                    "T3 refused non-gateway workspace Git credentials",
+                  );
+                  expect(result.failure.message).not.toContain(
+                    "retained-secret",
+                  );
+                }
+                expect(server.projectMutations).toEqual([]);
+              }),
+            server,
+          );
+      }),
+  );
+  it.live(
+    "denies non-gateway Git credentials before the private daemon starts",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const { configPath } = yield* seedDriverRun("t3");
+            yield* Effect.promise(() =>
+              writeFile(
+                configPath,
+                '[http "https://github.com/"]\nextraheader = AUTHORIZATION: bearer retained-secret\n',
+              ),
+            );
+            const result = yield* (yield* SessionAuthority)
+              .processSession(testSessionId)
+              .pipe(Effect.result);
+            expect(Result.isFailure(result)).toBe(true);
+            if (Result.isFailure(result))
+              expect(result.failure.message).toBe(
+                "T3 refused non-gateway workspace Git credentials or config includes",
+              );
+            expect(workerSpawnInputs).toHaveLength(0);
+          }),
+        {
+          withLinearGateway: true,
+          config: [
+            ["T3_MODE", "launch"],
+            ["T3_CLI_PATH", "/must-not-execute-t3"],
+            ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+            ["T3_MODEL", "gpt-6-sol"],
+            ["CLIPROXYAPI_BASE_URL", "https://cliproxyapi.example.test"],
+            ["CLIPROXYAPI_API_KEY", "proxy-client-key"],
+          ],
+        },
+      ),
+  );
+  it.live(
     "runs T3 with the same projection/terminal lifecycle and persists its native ref",
     () =>
       Effect.gen(function* () {
@@ -3580,7 +3729,26 @@ describe("AgentDriver authority integration", () => {
           () =>
             Effect.gen(function* () {
               const { cwd, configPath } = yield* seedDriverRun("t3");
+              nixPathEntries = ["/nix/store/repository-toolchain/bin"];
+              yield* (yield* WorkspaceRepo).updateRepository(
+                testOrganizationId,
+                Schema.decodeUnknownSync(WorkspaceId)("driver-repo"),
+                {
+                  nixPackages: [
+                    Schema.decodeUnknownSync(NixPackageName)("nodejs"),
+                  ],
+                },
+              );
               yield* (yield* SessionAuthority).processSession(testSessionId);
+              expect(nixPreparedRepositories).toContain("driver-repo");
+              const launchEnv = JSON.parse(
+                yield* Effect.promise(() =>
+                  readFile(`${cwd}/.omp-home/t3/serve-env.json`, "utf8"),
+                ),
+              ) as { path: string };
+              expect(launchEnv.path.split(":")[0]).toBe(
+                "/nix/store/repository-toolchain/bin",
+              );
               const ref = Option.getOrThrow(
                 yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
               );

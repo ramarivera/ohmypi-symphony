@@ -25,6 +25,7 @@ import {
 import { workerMcpCredential } from "./services/worker-security.js";
 import { cleanupWorkerSharedDirectoriesSync } from "./services/worker-shared-cleanup.js";
 import {
+  assertT3GitCredentials,
   persistGitHubExtraHeader,
   removeGitHubExtraHeaders,
 } from "./services/workspace.js";
@@ -78,6 +79,11 @@ switch (action) {
   case "persist-git":
     if (typeof input !== "string") throw new Error("Expected Git credential");
     await Effect.runPromise(persistGitHubExtraHeader(cwd, "worker", input));
+    break;
+  case "check-t3-git":
+    await Effect.runPromise(
+      assertT3GitCredentials(cwd, "worker", 120_000, input === true),
+    );
     break;
   case "clear-git":
     await Effect.runPromise(removeGitHubExtraHeaders(cwd, "worker"));

@@ -37,6 +37,7 @@ writeFileSync(
   JSON.stringify({
     keys: envKeys,
     home: process.env.HOME,
+    path: process.env.PATH,
     t3Home: process.env.T3CODE_HOME,
     cwd: process.cwd(),
     workspace: args.at(-1),

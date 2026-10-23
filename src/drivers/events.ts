@@ -51,7 +51,11 @@ export const agentEventToRpc = (event: AgentEvent): RpcEvent => {
         type: "extension_ui_request",
         id: event.requestId,
         method: "input",
-        title: event.prompt,
+        title:
+          event.questions.length > 1 ||
+          event.questions.some((question) => question.multiSelect)
+            ? `${event.prompt}\n\nReply with a JSON object keyed by question id. Use string arrays for multi-select answers.\n${JSON.stringify(event.questions)}`
+            : event.prompt,
         options: event.options.map((option) => option.label),
       };
     case "RequestResolved":

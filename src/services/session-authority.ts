@@ -108,6 +108,7 @@ import {
   workerEnvironment,
 } from "./worker-security.js";
 import {
+  assertT3GitCredentials,
   makeWorkspace,
   parseRepositorySuggestionCandidate,
   type RepositoryResolution,
@@ -2101,8 +2102,21 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 message:
                   "A shared T3 daemon cannot serve isolated worker workspaces; set T3_MODE=launch",
               });
+            if (
+              Option.isSome(repository) &&
+              repository.value.nixPackages.length > 0
+            )
+              return yield* new RpcSpawnError({
+                message:
+                  "Remote T3 cannot receive repository Nix packages; set T3_MODE=launch",
+              });
             // Clone credentials can already be present on a newly materialized workspace.
             yield* removeGitHubExtraHeaders(
+              cwd,
+              run.sessionId,
+              config.gitTimeoutMs ?? 120_000,
+            );
+            yield* assertT3GitCredentials(
               cwd,
               run.sessionId,
               config.gitTimeoutMs ?? 120_000,
@@ -2141,6 +2155,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               catch: () =>
                 new RpcSpawnError({
                   message: "Could not prepare worker tool directories",
+                }),
+            });
+            // Inspect as the session uid before any T3 process can read the tree.
+            yield* Effect.tryPromise({
+              try: () => workspaceProcess(cwd, "check-t3-git", true),
+              catch: () =>
+                new RpcSpawnError({
+                  message:
+                    "T3 refused non-gateway workspace Git credentials or config includes",
                 }),
             });
             // A daemon or provider left by an earlier attempt would own the
@@ -2202,13 +2225,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             workspace: { _tag: "Directory", path: cwd },
             ...(Option.isSome(saved) ? { resume: { ref: saved.value } } : {}),
           }).pipe(Effect.provideService(Scope.Scope, scope));
-          yield* workspaceRepo.setDriverSession(
-            run.sessionId,
-            worker.driverSession.ref,
-          );
-          // A gateway restart must not leave two turns operating in a workspace.
-          if (Option.isSome(saved)) yield* worker.abort();
-          yield* attachWorker(run, worker);
+          yield* Effect.gen(function* () {
+            yield* workspaceRepo.setDriverSession(
+              run.sessionId,
+              worker.driverSession.ref,
+            );
+            // A gateway restart must not leave two turns operating in a workspace.
+            if (Option.isSome(saved)) yield* worker.abort();
+            yield* attachWorker(run, worker);
+          }).pipe(Effect.onError(() => worker.stop()));
           return worker;
         }
         const command: string[] = [config.ompCliPath];
@@ -2464,12 +2489,17 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             workspace: { _tag: "Directory", path: cwd },
           },
           worker,
-        ).pipe(Effect.provideService(Scope.Scope, scope));
-        yield* workspaceRepo.setDriverSession(
-          run.sessionId,
-          adapted.driverSession.ref,
+        ).pipe(
+          Effect.provideService(Scope.Scope, scope),
+          Effect.onError(() => worker.stop()),
         );
-        yield* attachWorker(run, adapted);
+        yield* Effect.gen(function* () {
+          yield* workspaceRepo.setDriverSession(
+            run.sessionId,
+            adapted.driverSession.ref,
+          );
+          yield* attachWorker(run, adapted);
+        }).pipe(Effect.onError(() => adapted.stop()));
         return adapted;
       });
 
