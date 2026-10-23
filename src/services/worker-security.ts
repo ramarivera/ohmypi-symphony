@@ -49,13 +49,18 @@ const WORKER_ENV = new Set([
 ]);
 export const workerEnvironment = (
   input: Record<string, string | undefined>,
-): Record<string, string> =>
-  Object.fromEntries(
+  workerUid?: string,
+): Record<string, string> => ({
+  ...Object.fromEntries(
     Object.entries(input).filter(
       (entry): entry is [string, string] =>
         WORKER_ENV.has(entry[0]) && entry[1] !== undefined,
     ),
-  );
+  ),
+  // The single-user store is prepared by the gateway. Workers must not take
+  // its write lock, mutate its database, or connect to a privileged daemon.
+  ...(workerUid ? { NIX_REMOTE: "local?read-only=true" } : {}),
+});
 
 export const workerIdentityCommand = (
   command: ReadonlyArray<string>,

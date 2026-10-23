@@ -398,6 +398,26 @@ process.exit(0);`;
     expect(() => workerIdentityCommand(["omp"], "0")).toThrow();
   });
 
+  it("uses a read-only local Nix store for isolated workers without changing native workers", () => {
+    const inherited = {
+      PATH: "/opt/nix/bin:/bin",
+      HOME: "/workspace/.omp-home",
+      NIX_REMOTE: "daemon",
+      TOKEN_ENCRYPTION_KEY: "gateway-only",
+    };
+    expect(workerEnvironment(inherited, "1001")).toEqual({
+      PATH: inherited.PATH,
+      HOME: inherited.HOME,
+      NIX_REMOTE: "local?read-only=true",
+    });
+    expect(workerEnvironment(inherited).NIX_REMOTE).toBe("daemon");
+    expect(workerEnvironment(inherited, "").NIX_REMOTE).toBe("daemon");
+    expect(workerEnvironment({ PATH: "/bin" })).not.toHaveProperty(
+      "NIX_REMOTE",
+    );
+    expect(inherited.NIX_REMOTE).toBe("daemon");
+  });
+
   it("doesn't follow workspace symlinks when assigning worker ownership", async () => {
     const dir = await temporary();
     const workspace = join(dir, "workspace");

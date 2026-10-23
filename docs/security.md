@@ -95,6 +95,29 @@ workspaces; this change doesn't provide per-run or per-tenant filesystem/network
 isolation. Model-provider API keys explicitly allowed for omp remain visible to
 the worker; gateway-only keys and arbitrary environment variables don't.
 
+## Nix in Docker
+
+The gateway has `HOME=/root`. Nix 2.30.3 is installed with `--no-daemon`;
+`/etc/nix/nix.conf` enables `nix-command flakes read-only-local-store`, disables
+the Nix sandbox,
+and sets `build-users-group =` to empty for this single-user installation.
+The empty group makes builds run as the Nix caller. The gateway's
+`NixEnvironment` uses `nativeRunner` without a uid transition, so environment
+preparation runs as root. Only use a trusted, pinned `NIXPKGS_FLAKE_REF`.
+Don't expose a root Nix daemon to workers or run repository-supplied builders
+as the gateway.
+
+`/opt/nix/bin` is on PATH for both identities. Its image-owned profile link
+points directly into `/nix/store`, outside bun's private home and outside the
+persisted volume's profile directory. This also works with existing Nix
+volumes. Workers retain their workspace HOME and load the system configuration.
+Their environment selects `NIX_REMOTE=local?read-only=true`, so Nix never
+takes the shared database write lock. They can evaluate cached flakes and
+use packages already prepared by the gateway; they can't add packages to
+the shared single-user store. No store ownership
+migration or extra capability is required. Never recursively chown `/nix/store`
+or follow GC-root symlinks to change ownership.
+
 ## MCP OAuth
 
 Discovery and token requests resolve DNS, reject non-public addresses, and pin the
