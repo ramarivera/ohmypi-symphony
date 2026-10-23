@@ -5,6 +5,11 @@ import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { SqliteClient, tryDb } from "./store/sqlite-client.js";
+import {
+  sealWorkerUidWorkspacesSync,
+  stopWorkerUidProcessesSync,
+  workerUidRange,
+} from "./worker-security.js";
 import { removeWorkerWorkspaceSync } from "./workspace-process.js";
 
 const positiveInteger = (name: string, fallback: number) =>
@@ -142,6 +147,25 @@ export const makeRetention = (input: {
               skippedWorkspaces++;
               continue;
             }
+            const identity = db
+              .query<{ uid: number }, [string]>(
+                "SELECT uid FROM worker_identity WHERE session_id=?",
+              )
+              .get(row.session_id);
+            const uid = identity?.uid ?? workerUidRange(process.env)?.base;
+            // A released uid may be serving another session. Never reopen an
+            // old workspace to that worker, even briefly during deletion.
+            if (
+              uid !== undefined &&
+              db
+                .query(
+                  "SELECT 1 FROM worker_identity WHERE uid=? AND active=1 AND session_id<>?",
+                )
+                .get(uid, row.session_id) !== null
+            ) {
+              skippedWorkspaces++;
+              continue;
+            }
             try {
               const stat = lstatSync(path);
               if (
@@ -154,8 +178,13 @@ export const makeRetention = (input: {
                 skippedWorkspaces++;
                 continue;
               }
+              if (uid !== undefined) stopWorkerUidProcessesSync(uid);
               if (input.removeWorkspace === undefined)
-                removeWorkerWorkspaceSync(path, root);
+                removeWorkerWorkspaceSync(
+                  path,
+                  root,
+                  uid === undefined ? undefined : String(uid),
+                );
               else input.removeWorkspace(path);
             } catch (error) {
               if (
@@ -169,6 +198,11 @@ export const makeRetention = (input: {
                 continue;
               }
             }
+            if (identity !== null && root !== undefined)
+              sealWorkerUidWorkspacesSync(root, identity.uid);
+            db.query(
+              "UPDATE worker_identity SET active=0 WHERE session_id=?",
+            ).run(row.session_id);
             db.query("DELETE FROM workspace WHERE session_id=?").run(
               row.session_id,
             );
@@ -176,6 +210,24 @@ export const makeRetention = (input: {
               "UPDATE agent_run SET workspace_path=NULL, omp_session_file=NULL WHERE session_id=?",
             ).run(row.session_id);
             workspaces++;
+          }
+          // A crash can leave an allocation after terminal state was committed,
+          // including a failed clone with no published workspace path.
+          const retired = db
+            .query<{ session_id: string; uid: number }, [number]>(
+              `SELECT i.session_id, i.uid FROM worker_identity i JOIN agent_run r ON r.session_id=i.session_id
+             WHERE i.active=1 AND r.state IN ('succeeded','failed','canceled')
+             AND (r.lease_expires_at IS NULL OR r.lease_expires_at<=?)`,
+            )
+            .all(now);
+          for (const identity of retired) {
+            // Without the configured root, fail closed until a later sweep.
+            if (root === undefined) continue;
+            stopWorkerUidProcessesSync(identity.uid);
+            sealWorkerUidWorkspacesSync(root, identity.uid);
+            db.query(
+              "UPDATE worker_identity SET active=0 WHERE session_id=?",
+            ).run(identity.session_id);
           }
           return { workspaces, skippedWorkspaces };
         })

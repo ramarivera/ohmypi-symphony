@@ -38,10 +38,11 @@ terminal cleanup remove only generated values and retain user-installed headers.
 ## Docker worker identity
 
 The Docker entrypoint runs the gateway as root and locks `/app/data` and
-`/app/logs` to mode 0700. Workers run as uid/gid 1001 through `setpriv`, with no
+`/app/logs` to mode 0700. Workers get distinct numeric uid/gid pairs from
+`WORKER_UID_BASE` through `WORKER_UID_BASE + WORKER_UID_COUNT - 1` via `setpriv`, with no
 supplementary groups, capabilities, or privilege escalation. Their HOME and
 TMPDIR point to excluded `.omp-home/` and `.omp-tmp/` directories. The gateway
-assigns workspace files to that uid without following symlinks and rejects
+assigns each workspace root mode 0700 and its files to the session uid without following symlinks and rejects
 multiply-linked regular files that require an ownership change. Already-owned
 hardlinks remain valid across retries and resumes. MCP materialization, cleanup,
 and Git credential updates execute as the worker uid, including on resume, so
@@ -109,13 +110,59 @@ provision them root-owned with mode 0400 before upgrading, including readonly mo
 Don't share gateway state or key volumes with workers or mount the Docker socket
 into the container.
 
-Native launches without `WORKER_UID` retain same-uid workers. The environment
+Docker defaults to a dedicated range of 64 identities starting at 1001. Override
+it with `WORKER_UID_BASE` and `WORKER_UID_COUNT`. `WORKER_UID` alone is deprecated
+and migrates to a range of size one. An explicit base wins over the legacy value;
+a base without a count defaults to 64. Don't overlap gateway/system accounts or
+other processes with this range. Root is forbidden. No passwd/group entries or
+new capabilities are required for the numeric identities.
+
+The `worker_identity` SQLite table associates each session with its uid and has a
+unique index on active uids. Allocation uses an immediate transaction, so separate
+gateway connections can't allocate the same active uid. Recovery and resume reuse
+the persisted uid. A terminal session releases its slot after worker teardown.
+Before release, the gateway kills remaining processes with that uid, including
+escaped process groups, and seals all its retained workspace and clone roots to
+root-owned mode 0700. That happens before another session can acquire the slot.
+A resumed terminal session requires its original uid; if that slot is occupied,
+startup fails with an explicit busy error and follows the normal retry policy.
+Exhaustion likewise fails clearly instead of sharing an identity. Size the range
+for expected concurrency and resume demand. Retention reclaims terminal allocations
+left by a crash once their authority lease has expired, including failed clones.
+
+Stop the previous gateway container and all its workers before upgrading or
+changing the range. Don't run old and new binaries against the same workspaces.
+The entrypoint seals existing workspace roots before the gateway allocates any
+uid, so legacy unresumed workspaces can't be exposed to the first new worker.
+Legacy sessions get a mapping when next started; their no-follow ownership walk
+migrates files to the allocated uid. Retention looks up the persisted uid and
+migrates legacy workspaces without a mapping to the range base. It skips a
+workspace if another active session holds that uid, rather than briefly exposing
+old files during deletion. Failed cleanup keeps records for a later sweep.
+Retained roots and abandoned clone roots stay inaccessible after slot reuse.
+
+Each session has its own `.omp-home`, `.omp-tmp`, XDG config/data/cache directories,
+and Bun install/transpiler caches. omp's writable agent configuration and MCP
+SQLite database are also inside that session's private workspace. Existing
+`/home/bun/.omp` configuration is not a shared worker HOME. Provider API keys
+explicitly allowed for omp remain visible to that worker. Gateway-only keys and
+arbitrary environment variables don't.
+
+Shared `/nix`, `/app/nix-profile`, `/app/node_modules`, `/app/dist`,
+and Nix GC roots belong to root and have no group/other write permissions. Only
+the gateway builds/prunes the shared Nix cache; workers can read and execute its
+outputs. `/app/nix-profile` points directly into the immutable store, so workers
+can execute Nix while `/home/bun` remains private to the gateway. The single-user Nix config sets an empty `build-users-group` for the root
+gateway instead of requiring nonexistent `nixbld` accounts. No shared writable cache or supplementary shared group is granted.
+Startup repairs legacy shared-volume ownership. The workspace parent belongs to
+root with mode 0755 so a session can't rename another session's root. Workers
+can't modify executable files that another session loads from these shared paths.
+
+Native launches without either uid setting retain same-uid workers. The
 allowlist and mode-0600 SQLite files still apply, but same-uid workers can read the
-gateway's process environment and files. Use the Docker deployment for the uid
-boundary. Workers currently share one uid and can access other workers'
-workspaces; this change doesn't provide per-run or per-tenant filesystem/network
-isolation. Model-provider API keys explicitly allowed for omp remain visible to
-the worker; gateway-only keys and arbitrary environment variables don't.
+gateway's process environment and files. Use Docker for this boundary. Per-session
+uids isolate discretionary filesystem access; workers still share the container's
+network, kernel and global process visibility. This isn't a network sandbox.
 
 ## Nix in Docker
 
@@ -232,3 +279,33 @@ Security tests use canonical fixtures under
 scratch-storage policy and avoid a quota-limited shared `/tmp`. CI can override
 the fixture parent with `SECURITY_TEST_TMPDIR`; per-case directories are removed
 after each test.
+
+## Two-session Docker isolation probe
+
+Build the candidate image, then run a disposable container with the entrypoint and
+only the existing capability set. Use a dedicated test range and fresh workspaces:
+
+```sh
+docker build -t symphony-uid-isolation:probe .
+docker run --rm --cap-drop=ALL --cap-add=CHOWN --cap-add=DAC_OVERRIDE \
+  --cap-add=KILL --cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP \
+  -e WORKER_UID_BASE=21001 -e WORKER_UID_COUNT=2 \
+  symphony-uid-isolation:probe bun /path/to/mounted/probe.ts
+```
+
+The mounted probe must use `SqliteClientLive`, `makeWorkerIdentityRepo`, workspace
+preparation/helpers and `RpcWorker.spawn` with the allocated `workerUid`. Start
+two real `omp --mode rpc` workers concurrently. As each identity, assert own
+workspace writes succeed and the other workspace, `.git/config` and
+`.omp-gateway/agent.db` reads/writes fail. Verify gateway database, secret and
+`/proc/1/environ` reads fail; shared Nix/profile/tool writes fail; CapEff and CapBnd
+are zero and NoNewPrivs is one. Verify 0700 root ownership, persisted recovery,
+exhaustion, release/recycle with the old workspace still denied, busy resume,
+same-uid resume after release, escaped-process termination, retention skipping
+busy identities and legacy cleanup. Create a uid-1001 legacy workspace before
+entrypoint startup and verify it is sealed before allocation.
+
+Save the script, image digest, build log and JSON receipt under
+`~/dev/agentic-scratchpads/ohmypi-symphony/uid-isolation/`. Use dummy credentials
+only. Unit tests cover allocation and filesystem syscall contracts; the real
+Docker probe establishes the uid access boundary without running a model turn.

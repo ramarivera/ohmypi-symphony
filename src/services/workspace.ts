@@ -32,7 +32,9 @@ import { detachedProcessGroup, signalProcessTree } from "./process.js";
 import { WorkspaceRepo } from "./store/repositories.js";
 import {
   prepareWorkerWorkspace,
+  sealWorkerWorkspaceSync,
   workerIdentityCommand,
+  workerUidRange,
 } from "./worker-security.js";
 import {
   cleanupWorkspaceProcess,
@@ -40,6 +42,7 @@ import {
   needsWorkspaceIdentity,
   removeWorkerWorkspace,
   workspaceProcess,
+  workspaceWorkerUid,
 } from "./workspace-process.js";
 
 export { isWithin } from "../util/paths.js";
@@ -366,7 +369,7 @@ export const persistGitHubExtraHeader = (
   if (needsWorkspaceIdentity())
     return Effect.tryPromise({
       try: async () => {
-        await prepareWorkerWorkspace(target, process.env.WORKER_UID);
+        await prepareWorkerWorkspace(target, workspaceWorkerUid(target));
         await workspaceProcess(target, "persist-git", header);
       },
       catch: workspaceFailure(
@@ -452,7 +455,7 @@ export const runGitOutput = (
       const process = Bun.spawn(
         cwd === undefined
           ? command
-          : workerIdentityCommand(command, globalThis.process.env.WORKER_UID),
+          : workerIdentityCommand(command, workspaceWorkerUid(cwd)),
         {
           env: {
             ...gitEnvironment(globalThis.process.env),
@@ -728,81 +731,86 @@ export const makeWorkspace = (input: {
     const stagingRecoveryGate = yield* Effect.makeSemaphore(1);
     let stagingRecovered = false;
     let stagingRetryAt = 0;
-    const recoverStaging = stagingRecoveryGate.withPermits(1)(
-      Effect.gen(function* () {
-        if (
-          stagingRecovered ||
-          (yield* Clock.currentTimeMillis) < stagingRetryAt
-        )
-          return;
-        yield* ensureRoot(input.workspaceRoot, "startup").pipe(
-          Effect.flatMap((root) =>
-            Effect.tryPromise({
-              try: async () => {
-                const entries = await opendir(root);
-                let scanned = 0;
-                let removed = 0;
-                for await (const entry of entries) {
-                  if (++scanned > 10_000 || removed >= 100) break;
-                  const owner =
-                    /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
-                      entry.name,
-                    );
-                  if (
-                    owner === null ||
-                    owner[1] !== hostKey ||
-                    !entry.isDirectory()
-                  )
-                    continue;
-                  const pid = Number(owner[2]);
-                  if (!Number.isSafeInteger(pid)) continue;
-                  try {
-                    process.kill(pid, 0);
-                    continue;
-                  } catch (error) {
+    const recoverStaging = (workerUid: string | undefined) =>
+      stagingRecoveryGate.withPermits(1)(
+        Effect.gen(function* () {
+          if (
+            stagingRecovered ||
+            (yield* Clock.currentTimeMillis) < stagingRetryAt
+          )
+            return;
+          yield* ensureRoot(input.workspaceRoot, "startup").pipe(
+            Effect.flatMap((root) =>
+              Effect.tryPromise({
+                try: async () => {
+                  const entries = await opendir(root);
+                  let scanned = 0;
+                  let removed = 0;
+                  for await (const entry of entries) {
+                    if (++scanned > 10_000 || removed >= 100) break;
+                    const owner =
+                      /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
+                        entry.name,
+                      );
                     if (
-                      !(
-                        error instanceof Error &&
-                        "code" in error &&
-                        error.code === "ESRCH"
-                      )
+                      owner === null ||
+                      owner[1] !== hostKey ||
+                      !entry.isDirectory()
                     )
                       continue;
+                    const pid = Number(owner[2]);
+                    if (!Number.isSafeInteger(pid)) continue;
+                    try {
+                      process.kill(pid, 0);
+                      continue;
+                    } catch (error) {
+                      if (
+                        !(
+                          error instanceof Error &&
+                          "code" in error &&
+                          error.code === "ESRCH"
+                        )
+                      )
+                        continue;
+                    }
+                    // Dead owners cannot publish these random, per-clone names.
+                    // Forced removal is idempotent when multiple gateways clean up.
+                    await removeWorkerWorkspace(
+                      join(root, entry.name),
+                      root,
+                      workerUid,
+                    );
+                    removed++;
                   }
-                  // Dead owners cannot publish these random, per-clone names.
-                  // Forced removal is idempotent when multiple gateways clean up.
-                  await removeWorkerWorkspace(join(root, entry.name), root);
-                  removed++;
-                }
-              },
-              catch: workspaceFailure(
-                "recover abandoned clones",
-                "git_failed",
-                "startup",
-              ),
-            }),
-          ),
-          Effect.tap(() =>
-            Effect.sync(() => {
-              stagingRecovered = true;
-            }),
-          ),
-          Effect.catchAll((error) =>
-            Effect.gen(function* () {
-              stagingRetryAt = (yield* Clock.currentTimeMillis) + 30_000;
-              yield* Effect.logWarning(
-                "workspace.staging_recovery_failed",
-              ).pipe(
-                Effect.annotateLogs({
-                  event: "workspace.staging_recovery_failed",
-                  error: String(error),
-                }),
-              );
-            }),
-          ),
-        );
-      }),
-    );
+                },
+                catch: workspaceFailure(
+                  "recover abandoned clones",
+                  "git_failed",
+                  "startup",
+                ),
+              }),
+            ),
+            Effect.tap(() =>
+              Effect.sync(() => {
+                stagingRecovered = true;
+              }),
+            ),
+            Effect.catchAll((error) =>
+              Effect.gen(function* () {
+                stagingRetryAt = (yield* Clock.currentTimeMillis) + 30_000;
+                yield* Effect.logWarning(
+                  "workspace.staging_recovery_failed",
+                ).pipe(
+                  Effect.annotateLogs({
+                    event: "workspace.staging_recovery_failed",
+                    error: String(error),
+                  }),
+                );
+              }),
+            ),
+          );
+        }),
+      );
     const git = (
       args: ReadonlyArray<string>,
       cwd: string | undefined,
@@ -889,7 +897,16 @@ export const makeWorkspace = (input: {
     const materialize = Effect.fn("Workspace.materialize")(function* (
       sessionId: string,
       repository: RepositoryRecord,
+      workerUid?: string,
     ): Effect.fn.Return<string, WorkspaceError> {
+      if (workerUidRange(process.env) !== undefined && workerUid === undefined)
+        return yield* Effect.fail(
+          new WorkspaceError({
+            message: "Missing per-session worker uid",
+            sessionId,
+            reason: "git_failed",
+          }),
+        );
       yield* Effect.annotateCurrentSpan({
         "workspace.session_id": sessionId,
         "workspace.repository_id": repository.id,
@@ -908,7 +925,7 @@ export const makeWorkspace = (input: {
           }),
         );
       }
-      yield* recoverStaging;
+      yield* recoverStaging(workerUid);
       const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
       const target = join(canonicalRoot, safeSessionKey(sessionId));
 
@@ -964,6 +981,14 @@ export const makeWorkspace = (input: {
             );
           }
           yield* validateMarker(markerPath, repository, sessionId);
+          yield* Effect.tryPromise({
+            try: () => prepareWorkerWorkspace(canonicalTarget, workerUid),
+            catch: workspaceFailure(
+              "Could not assign workspace ownership",
+              "git_failed",
+              sessionId,
+            ),
+          });
           yield* refreshGitHubExtraHeader(
             sessionId,
             repository,
@@ -984,14 +1009,17 @@ export const makeWorkspace = (input: {
         // A missing marker can also mean an agent removed an untracked file.
         // Preserve user work even when the old checkout cannot be reused.
         yield* Effect.tryPromise({
-          try: () =>
-            rename(
+          try: () => {
+            if (needsWorkspaceIdentity())
+              sealWorkerWorkspaceSync(canonicalTarget);
+            return rename(
               canonicalTarget,
               join(
                 canonicalRoot,
                 `.stale-${safeSessionKey(sessionId)}-${crypto.randomUUID()}`,
               ),
-            ),
+            );
+          },
           catch: workspaceFailure(
             "preserve marker-less workspace",
             "git_failed",
@@ -1043,7 +1071,8 @@ export const makeWorkspace = (input: {
             }),
             (path) =>
               Effect.tryPromise({
-                try: () => removeWorkerWorkspace(path, canonicalRoot),
+                try: () =>
+                  removeWorkerWorkspace(path, canonicalRoot, workerUid),
                 catch: workspaceFailure(
                   "remove clone staging",
                   "git_failed",
@@ -1072,10 +1101,9 @@ export const makeWorkspace = (input: {
             input.gitTimeoutMs,
             githubExtraHeader,
           );
-          if (process.env.WORKER_UID)
+          if (workerUid)
             yield* Effect.tryPromise({
-              try: () =>
-                prepareWorkerWorkspace(staging, process.env.WORKER_UID),
+              try: () => prepareWorkerWorkspace(staging, workerUid),
               catch: workspaceFailure(
                 "Could not assign workspace ownership",
                 "git_failed",

@@ -1,4 +1,4 @@
-import { realpathSync, rmdirSync, rmSync } from "node:fs";
+import { lstatSync, realpathSync, rmdirSync, rmSync } from "node:fs";
 import { lstat, realpath, rm, rmdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,6 +8,7 @@ import {
   prepareWorkerWorkspace,
   prepareWorkerWorkspaceSync,
   workerIdentityCommand,
+  workerUidRange,
 } from "./worker-security.js";
 
 /** Git is allowed transport settings, never gateway or model credentials. */
@@ -36,9 +37,28 @@ export const gitEnvironment = (
   };
 };
 
-export const needsWorkspaceIdentity = (): boolean =>
-  !!process.env.WORKER_UID &&
-  process.getuid?.() !== Number(process.env.WORKER_UID);
+export const needsWorkspaceIdentity = (): boolean => {
+  const range = workerUidRange(process.env);
+  return (
+    range !== undefined &&
+    (process.env.WORKER_UID_BASE !== undefined ||
+      process.getuid?.() !== range.base)
+  );
+};
+
+/** The root inode is gateway-published; workers cannot chown it to another uid. */
+export const workspaceWorkerUid = (cwd: string): string | undefined => {
+  const range = workerUidRange(process.env);
+  if (range === undefined) return undefined;
+  const uid = lstatSync(cwd).uid;
+  if (uid >= range.base && uid < range.base + range.count) return String(uid);
+  // One-slot deployments also support legacy ownership migration.
+  if (!process.env.WORKER_UID_BASE && process.env.WORKER_UID)
+    return String(range.base);
+  throw new Error(
+    "Workspace has no allocated worker uid; prepare it before worker operations",
+  );
+};
 
 const workspaceWorkerScript = fileURLToPath(
   new URL(
@@ -51,7 +71,11 @@ const workspaceWorkerScript = fileURLToPath(
 
 // Only gateway-installed code and dependencies may initialize the helper. The
 // workspace is data, never Bun's cwd/config/module-resolution root.
-const workspaceWorkerCommand = (cwd: string, action: string): string[] =>
+const workspaceWorkerCommand = (
+  cwd: string,
+  action: string,
+  uid = workspaceWorkerUid(cwd),
+): string[] =>
   workerIdentityCommand(
     [
       process.execPath,
@@ -62,7 +86,7 @@ const workspaceWorkerCommand = (cwd: string, action: string): string[] =>
       action,
       cwd,
     ],
-    process.env.WORKER_UID,
+    uid,
   );
 
 /** All writes into worker-controlled trees run without gateway privileges. */
@@ -93,6 +117,7 @@ export const workspaceProcess = async (
 export const removeWorkerWorkspace = async (
   cwd: string,
   workspaceRoot: string,
+  workerUid?: string,
 ): Promise<void> => {
   const root = await realpath(workspaceRoot);
   const node = await lstat(cwd).catch((error: unknown) => {
@@ -113,7 +138,7 @@ export const removeWorkerWorkspace = async (
     await rm(cwd, { recursive: true, force: true });
     return;
   }
-  await prepareWorkerWorkspace(cwd, process.env.WORKER_UID);
+  await prepareWorkerWorkspace(cwd, workerUid ?? workspaceWorkerUid(cwd));
   await workspaceProcess(cwd, "remove-workspace-contents", null);
   await rmdir(cwd);
 };
@@ -122,6 +147,7 @@ export const removeWorkerWorkspace = async (
 export const removeWorkerWorkspaceSync = (
   cwd: string,
   workspaceRoot: string,
+  workerUid?: string,
 ): void => {
   const root = realpathSync(workspaceRoot);
   if (cwd === root || !isWithin(root, cwd) || realpathSync(cwd) !== cwd)
@@ -132,9 +158,10 @@ export const removeWorkerWorkspaceSync = (
   }
   // Terminal workspaces from older images never pass through resume preparation.
   // Migrate them before delegation, without yielding retention's reopen fence.
-  prepareWorkerWorkspaceSync(cwd, process.env.WORKER_UID);
+  const uid = workerUid ?? workspaceWorkerUid(cwd);
+  prepareWorkerWorkspaceSync(cwd, uid);
   const child = Bun.spawnSync(
-    workspaceWorkerCommand(cwd, "remove-workspace-contents"),
+    workspaceWorkerCommand(cwd, "remove-workspace-contents", uid),
     {
       cwd: dirname(workspaceWorkerScript),
       // This allowlist excludes BUN_*, NODE_OPTIONS and loader variables.
