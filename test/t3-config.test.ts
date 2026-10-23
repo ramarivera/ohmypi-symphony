@@ -1,8 +1,11 @@
 import { writeFile } from "node:fs/promises";
 import { describe, expect, it } from "@effect/vitest";
 import { ConfigProvider, Effect, Layer, Redacted, Result } from "effect";
-import { t3DriverOptionsFromConfig } from "../src/drivers/t3/driver.js";
-import { GatewayConfig } from "../src/services/config.js";
+import {
+  remoteT3Endpoint,
+  t3DriverOptionsFromConfig,
+} from "../src/drivers/t3/driver.js";
+import { GatewayConfig, type T3DriverConfig } from "../src/services/config.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const pathFor = testPaths();
@@ -24,6 +27,20 @@ const t3Values: ReadonlyArray<readonly [string, string]> = [
   ["T3_PROJECT_ID", "project-1"],
   ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
   ["T3_MODEL", "gpt-6-sol"],
+];
+
+const remoteOptions = (config: T3DriverConfig) => {
+  if (config.connection._tag !== "Remote")
+    throw new Error("expected a remote T3 connection");
+  return t3DriverOptionsFromConfig(config, remoteT3Endpoint(config.connection));
+};
+
+const launchValues: ReadonlyArray<readonly [string, string]> = [
+  ["T3_MODE", "launch"],
+  ["T3_PROVIDER_INSTANCE", "claude-cliproxy"],
+  ["T3_MODEL", "claude-opus-5-5"],
+  ["CLIPROXYAPI_BASE_URL", "https://cliproxyapi.example.test/"],
+  ["CLIPROXYAPI_API_KEY", "proxy-client-key"],
 ];
 
 const load = (values: ReadonlyArray<readonly [string, string]>) =>
@@ -70,12 +87,14 @@ describe("T3 driver config", () => {
         interactionMode: "default",
         idNamespace: "symphony",
       });
-      expect(t3?.baseUrl.toString()).toBe("http://t3:3773/");
-      expect(t3?.token._tag).toBe("Inline");
-      if (t3?.token._tag === "Inline") {
-        expect(Redacted.isRedacted(t3.token.token)).toBe(true);
-        expect(String(t3.token.token)).not.toContain("t3-bearer");
-        expect(Redacted.value(t3.token.token)).toBe("t3-bearer");
+      const connection = t3?.connection;
+      if (connection?._tag !== "Remote") throw new Error("expected remote");
+      expect(connection.baseUrl.toString()).toBe("http://t3:3773/");
+      expect(connection.token._tag).toBe("Inline");
+      if (connection.token._tag === "Inline") {
+        expect(Redacted.isRedacted(connection.token.token)).toBe(true);
+        expect(String(connection.token.token)).not.toContain("t3-bearer");
+        expect(Redacted.value(connection.token.token)).toBe("t3-bearer");
       }
     }),
   );
@@ -91,7 +110,7 @@ describe("T3 driver config", () => {
       if (Result.isFailure(result)) throw result.failure;
       const t3 = result.success.t3Driver;
       if (t3 === undefined) throw new Error("expected T3 config");
-      const options = t3DriverOptionsFromConfig(t3);
+      const options = remoteOptions(t3);
       expect(options.modelSelection).toEqual({
         instanceId: "codex-cliproxy",
         model: "gpt-6-sol",
@@ -115,12 +134,15 @@ describe("T3 driver config", () => {
       ]);
       if (Result.isFailure(result)) throw result.failure;
       const t3 = result.success.t3Driver;
-      expect(t3?.token).toEqual({ _tag: "File", path });
       if (t3 === undefined) throw new Error("expected T3 config");
-      const token = yield* t3DriverOptionsFromConfig(t3).token;
+      expect(t3.connection).toMatchObject({
+        _tag: "Remote",
+        token: { _tag: "File", path },
+      });
+      const token = yield* remoteOptions(t3).token;
       expect(Redacted.value(token)).toBe("file-token");
       yield* Effect.promise(() => writeFile(path, "rotated-token\n"));
-      const rotated = yield* t3DriverOptionsFromConfig(t3).token;
+      const rotated = yield* remoteOptions(t3).token;
       expect(Redacted.value(rotated)).toBe("rotated-token");
     }),
   );
@@ -149,6 +171,57 @@ describe("T3 driver config", () => {
         [["T3_BASE_URL", "ftp://t3"], ...t3Values.slice(1)],
         [["T3_BASE_URL", "https://user:secret@t3"], ...t3Values.slice(1)],
         [["T3_BASE_URL", "https://t3/?token=secret"], ...t3Values.slice(1)],
+      ];
+      for (const values of cases) {
+        const result = yield* load(values);
+        expect(Result.isFailure(result)).toBe(true);
+      }
+    }),
+  );
+
+  it.effect("launch mode needs no shared endpoint or bearer", () =>
+    Effect.gen(function* () {
+      const result = yield* load(launchValues);
+      if (Result.isFailure(result)) throw result.failure;
+      expect(result.success.t3Driver).toMatchObject({
+        providerInstanceId: "claude-cliproxy",
+        runtimeMode: "auto",
+        connection: {
+          _tag: "Launch",
+          cliPath: "t3",
+          portBase: 47100,
+          portCount: 64,
+          launchTimeoutMs: 60_000,
+          codexExecutable: "codex",
+          claudeExecutable: "claude-cliproxy",
+          codexModel: "gpt-6-sol",
+        },
+      });
+      const sized = yield* load([
+        ...launchValues,
+        ["WORKER_UID_COUNT", "8"],
+        ["T3_PORT_BASE", "40000"],
+      ]);
+      if (Result.isFailure(sized)) throw sized.failure;
+      expect(sized.success.t3Driver?.connection).toMatchObject({
+        portBase: 40000,
+        portCount: 8,
+      });
+    }),
+  );
+
+  it.effect("launch mode rejects settings that would share a daemon", () =>
+    Effect.gen(function* () {
+      const cases: ReadonlyArray<ReadonlyArray<readonly [string, string]>> = [
+        [...launchValues, ["T3_BASE_URL", "http://t3:3773"]],
+        [...launchValues, ["T3_TOKEN", "shared-bearer"]],
+        [...launchValues, ["T3_PROVIDER_INSTANCE", "codex"]],
+        launchValues.filter(([key]) => !key.startsWith("CLIPROXYAPI_")),
+        [...launchValues, ["T3_MODE", "sidecar"]],
+        [...launchValues, ["T3_PORT_BASE", "80"]],
+        [...launchValues, ["T3_PORT_BASE", "65530"], ["T3_PORT_COUNT", "10"]],
+        [...launchValues, ["T3_CLI_PATH", "t3; rm -rf /"]],
+        [["T3_MODE", "remote"], ...launchValues.slice(1)],
       ];
       for (const values of cases) {
         const result = yield* load(values);

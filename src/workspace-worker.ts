@@ -1,7 +1,15 @@
 import { readdirSync, rmSync } from "node:fs";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  rename,
+  writeFile,
+} from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { Effect } from "effect";
+import type { T3LaunchSettings } from "./drivers/t3/launcher.js";
+import { t3SessionPaths } from "./drivers/t3/paths.js";
 import {
   removeMcpConfigFile,
   writeOmpMcpConfigFile,
@@ -102,6 +110,26 @@ switch (action) {
     );
     if (missing.length > 0)
       await appendFile(excludePath, `\n${missing.join("\n")}\n`);
+    break;
+  }
+  case "t3-config": {
+    // Paths come from the workspace, never the payload. Rewritten every launch.
+    const { settings, codexConfig } = input as T3LaunchSettings;
+    if (typeof codexConfig !== "string" || typeof settings !== "object")
+      throw new Error("Expected T3 settings");
+    const paths = t3SessionPaths(cwd);
+    const userdata = join(paths.t3Home, "userdata");
+    for (const dir of [userdata, paths.codexHome, paths.claudeHome])
+      await mkdir(dir, { recursive: true, mode: 0o700 });
+    const replace = async (path: string, content: string) => {
+      await writeFile(`${path}.tmp`, content, { mode: 0o600 });
+      await rename(`${path}.tmp`, path);
+    };
+    await replace(
+      join(userdata, "settings.json"),
+      `${JSON.stringify(settings, null, 2)}\n`,
+    );
+    await replace(join(paths.codexHome, "config.toml"), codexConfig);
     break;
   }
   default:

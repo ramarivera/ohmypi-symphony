@@ -29,9 +29,35 @@ export type T3TokenSource =
   /** Re-read on every connect so a rotated token file is picked up. */
   | { readonly _tag: "File"; readonly path: string };
 
+/** Settings for the gateway-owned per-session `t3 serve` launcher. */
+export interface T3LaunchConfig {
+  readonly _tag: "Launch";
+  readonly cliPath: string;
+  /** First loopback port; a session's port is portBase + its slot. */
+  readonly portBase: number;
+  readonly portCount: number;
+  readonly launchTimeoutMs: number;
+  readonly codexExecutable: string;
+  readonly claudeExecutable: string;
+  readonly codexModel: string;
+  readonly codexReasoningEffort: string;
+  readonly textGenerationModel: string;
+}
+
+/**
+ * Remote: one externally managed daemon shared by every T3 session. Launch:
+ * the gateway starts a private daemon per session under its worker uid.
+ */
+export type T3Connection =
+  | {
+      readonly _tag: "Remote";
+      readonly baseUrl: URL;
+      readonly token: T3TokenSource;
+    }
+  | T3LaunchConfig;
+
 export interface T3DriverConfig {
-  readonly baseUrl: URL;
-  readonly token: T3TokenSource;
+  readonly connection: T3Connection;
   readonly projectId?: string;
   readonly providerInstanceId: string;
   readonly model: string;
@@ -93,7 +119,7 @@ export interface GatewayConfigShape {
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
   readonly workerExtensionPaths?: ReadonlyArray<string>;
   readonly workerClaudeExecutable?: string;
-  /** Present only when T3_BASE_URL is set. */
+  /** Present only when T3_MODE or T3_BASE_URL is set. */
   readonly t3Driver?: T3DriverConfig;
 }
 
@@ -519,13 +545,17 @@ const t3ModelOptions = (
   return Result.succeed(options);
 };
 
-const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
-  function* (): Effect.fn.Return<
-    T3DriverConfig | undefined,
-    Config.ConfigError
-  > {
-    const baseUrlValue = yield* optionalValue("T3_BASE_URL");
-    if (baseUrlValue === undefined) return undefined;
+const configFailure = (message: string) =>
+  Effect.fail(
+    new Config.ConfigError(new ConfigProvider.SourceError({ message })),
+  );
+
+const t3RemoteConnection = Effect.fn("GatewayConfig.t3RemoteConnection")(
+  function* (
+    baseUrlValue: string | undefined,
+  ): Effect.fn.Return<T3Connection, Config.ConfigError> {
+    if (baseUrlValue === undefined)
+      return yield* configFailure("T3_MODE=remote requires T3_BASE_URL");
     const baseUrl = yield* Effect.try({
       try: () => new URL(baseUrlValue),
       catch: () =>
@@ -541,28 +571,117 @@ const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
       baseUrl.password !== "" ||
       baseUrl.search !== "" ||
       baseUrl.hash !== ""
-    ) {
-      return yield* Effect.fail(
-        new Config.ConfigError(
-          new ConfigProvider.SourceError({
-            message:
-              "T3_BASE_URL must use http(s) without credentials, query, or fragment",
-          }),
-        ),
+    )
+      return yield* configFailure(
+        "T3_BASE_URL must use http(s) without credentials, query, or fragment",
       );
-    }
     const tokenFile = yield* Config.option(Config.String("T3_TOKEN_FILE"));
     const directToken = yield* Config.option(Config.String("T3_TOKEN"));
     const hasDirectToken =
       Option.isSome(directToken) && directToken.value.trim().length > 0;
     // requiredValue validates that the file (or variable) yields a token now.
     const token = yield* requiredValue("T3_TOKEN");
-    const tokenSource: T3TokenSource =
-      !hasDirectToken &&
-      Option.isSome(tokenFile) &&
-      tokenFile.value.trim().length > 0
-        ? { _tag: "File", path: tokenFile.value.trim() }
-        : { _tag: "Inline", token: Redacted.make(token) };
+    return {
+      _tag: "Remote",
+      baseUrl,
+      token:
+        !hasDirectToken &&
+        Option.isSome(tokenFile) &&
+        tokenFile.value.trim().length > 0
+          ? { _tag: "File", path: tokenFile.value.trim() }
+          : { _tag: "Inline", token: Redacted.make(token) },
+    };
+  },
+);
+
+const T3_SIMPLE_VALUE = /^[A-Za-z0-9._/-]{1,200}$/u;
+
+/** The only provider instances a launched daemon defines; both use CLIProxyAPI. */
+export const T3_LAUNCH_INSTANCES: ReadonlySet<string> = new Set([
+  "codex-cliproxy",
+  "claude-cliproxy",
+]);
+
+const t3LaunchConnection = Effect.fn("GatewayConfig.t3LaunchConnection")(
+  function* (
+    baseUrlValue: string | undefined,
+  ): Effect.fn.Return<T3Connection, Config.ConfigError> {
+    // A shared daemon endpoint or bearer would bypass per-session isolation.
+    if (
+      baseUrlValue !== undefined ||
+      (yield* optionalValue("T3_TOKEN")) !== undefined
+    )
+      return yield* configFailure(
+        "T3_MODE=launch starts a daemon per session; unset T3_BASE_URL, T3_TOKEN and T3_TOKEN_FILE",
+      );
+    const portBase = Number((yield* optionalValue("T3_PORT_BASE")) ?? "47100");
+    const portCount = Number(
+      (yield* optionalValue("T3_PORT_COUNT")) ??
+        (yield* optionalValue("WORKER_UID_COUNT")) ??
+        "64",
+    );
+    if (
+      !Number.isSafeInteger(portBase) ||
+      !Number.isSafeInteger(portCount) ||
+      portBase < 1024 ||
+      portCount < 1 ||
+      portBase + portCount - 1 > 65535
+    )
+      return yield* configFailure(
+        "T3_PORT_BASE and T3_PORT_COUNT must describe unprivileged TCP ports",
+      );
+    const launchTimeoutMs = Number(
+      (yield* optionalValue("T3_LAUNCH_TIMEOUT_MS")) ?? "60000",
+    );
+    if (!Number.isSafeInteger(launchTimeoutMs) || launchTimeoutMs <= 0)
+      return yield* configFailure(
+        "T3_LAUNCH_TIMEOUT_MS must be a positive integer",
+      );
+    const value = (name: string, fallback: string) =>
+      optionalValue(name).pipe(
+        Effect.map((raw) => raw ?? fallback),
+        Effect.filterOrElse(
+          (raw) => T3_SIMPLE_VALUE.test(raw),
+          () => configFailure(`${name} must be a plain path or identifier`),
+        ),
+      );
+    return {
+      _tag: "Launch",
+      cliPath: yield* value("T3_CLI_PATH", "t3"),
+      portBase,
+      portCount,
+      launchTimeoutMs,
+      codexExecutable: yield* value("T3_CODEX_EXECUTABLE", "codex"),
+      claudeExecutable: yield* value(
+        "T3_CLAUDE_EXECUTABLE",
+        (yield* optionalValue("WORKER_CLAUDE_EXECUTABLE")) ?? "claude-cliproxy",
+      ),
+      codexModel: yield* value("T3_CODEX_MODEL", "gpt-6-sol"),
+      codexReasoningEffort: yield* value("T3_CODEX_REASONING_EFFORT", "high"),
+      textGenerationModel: yield* value(
+        "T3_TEXT_GENERATION_MODEL",
+        "gpt-6-luna",
+      ),
+    };
+  },
+);
+
+const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
+  function* (): Effect.fn.Return<
+    T3DriverConfig | undefined,
+    Config.ConfigError
+  > {
+    const modeValue = yield* optionalValue("T3_MODE");
+    const baseUrlValue = yield* optionalValue("T3_BASE_URL");
+    if (modeValue === undefined && baseUrlValue === undefined) return undefined;
+    const mode = modeValue ?? "remote";
+    if (mode !== "launch" && mode !== "remote") {
+      return yield* configFailure("T3_MODE must be launch or remote");
+    }
+    const connection: T3Connection =
+      mode === "launch"
+        ? yield* t3LaunchConnection(baseUrlValue)
+        : yield* t3RemoteConnection(baseUrlValue);
     const runtimeModeValue =
       (yield* optionalValue("T3_RUNTIME_MODE")) ?? "auto";
     if (!isRuntimeMode(runtimeModeValue)) {
@@ -602,8 +721,7 @@ const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
       return yield* Effect.fail(modelOptions.failure);
     const projectId = yield* optionalValue("T3_PROJECT_ID");
     return {
-      baseUrl,
-      token: tokenSource,
+      connection,
       ...(projectId === undefined ? {} : { projectId }),
       providerInstanceId: yield* requiredValue("T3_PROVIDER_INSTANCE"),
       model: yield* requiredValue("T3_MODEL"),
@@ -741,6 +859,17 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
       }
       const routing = yield* workerModelRouting();
       const t3Driver = yield* t3DriverConfig();
+      if (t3Driver?.connection._tag === "Launch") {
+        // Launched daemons only get the proxy client key, like OMP workers.
+        if (routing.cliproxyApiBaseUrl === undefined)
+          return yield* configFailure(
+            "T3_MODE=launch requires CLIPROXYAPI_BASE_URL and CLIPROXYAPI_API_KEY",
+          );
+        if (!T3_LAUNCH_INSTANCES.has(t3Driver.providerInstanceId))
+          return yield* configFailure(
+            `T3_MODE=launch supports T3_PROVIDER_INSTANCE ${[...T3_LAUNCH_INSTANCES].join(" or ")}`,
+          );
+      }
       return {
         ...values,
         ...routing,

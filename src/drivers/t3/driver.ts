@@ -27,7 +27,7 @@ import {
   SubscriptionRef,
   type Take,
 } from "effect";
-import type { T3DriverConfig } from "../../services/config.js";
+import type { T3Connection, T3DriverConfig } from "../../services/config.js";
 import {
   type AgentDriver,
   type AgentEvent,
@@ -88,11 +88,25 @@ export interface T3DriverOptions {
   readonly connectTimeoutMs?: number;
 }
 
+/** Where one T3 daemon listens and how to get its bearer before each connect. */
+export interface T3Endpoint {
+  readonly baseUrl: URL;
+  readonly token: Effect.Effect<Redacted.Redacted<string>, T3RpcError>;
+}
+
+export const remoteT3Endpoint = (
+  connection: Extract<T3Connection, { readonly _tag: "Remote" }>,
+): T3Endpoint => ({
+  baseUrl: connection.baseUrl,
+  token: tokenFromSource(connection.token),
+});
+
 export const t3DriverOptionsFromConfig = (
   config: T3DriverConfig,
+  endpoint: T3Endpoint,
 ): T3DriverOptions => ({
-  baseUrl: config.baseUrl,
-  token: tokenFromSource(config.token),
+  baseUrl: endpoint.baseUrl,
+  token: endpoint.token,
   ...(config.projectId === undefined ? {} : { projectId: config.projectId }),
   modelSelection: {
     instanceId: config.providerInstanceId,

@@ -1,7 +1,11 @@
 # omp 18.8.6 is the release pi-claude-cli 0.5.1 targets and was verified on.
 ARG OMP_VERSION=18.8.6
-# Shared with the T3 sidecar; within pi-claude-cli 0.5.1's supported range.
+# Within pi-claude-cli 0.5.1's supported range; also the T3 Claude provider.
 ARG CLAUDE_VERSION=2.1.304
+# T3 Code for the per-session launcher (T3_MODE=launch), plus the Codex build
+# T3 0.1.2 pins for managed installs (apps/server/src/provider/CodexInstallation.ts).
+ARG T3_VERSION=0.1.2
+ARG CODEX_VERSION=0.156.1
 
 FROM oven/bun:1.3.14 AS omp
 ARG OMP_VERSION
@@ -20,15 +24,17 @@ RUN case "$TARGETARCH" in \
   && echo "${checksum}  /usr/local/bin/omp" | sha256sum --check --strict \
   && chmod 0755 /usr/local/bin/omp
 
-# Claude Code for pi-claude-cli, via the installer shared with deploy/t3.
+# Claude Code for pi-claude-cli; T3 and Codex for launched T3 daemons.
 FROM oven/bun:1.3.14 AS agent-clis
 ARG CLAUDE_VERSION
+ARG T3_VERSION
+ARG CODEX_VERSION
 ARG TARGETARCH
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates curl \
   && rm -rf /var/lib/apt/lists/*
 COPY deploy/agent-clis/install-agent-clis.sh /usr/local/bin/install-agent-clis
-RUN TARGETARCH="$TARGETARCH" install-agent-clis "claude=${CLAUDE_VERSION}"
+RUN TARGETARCH="$TARGETARCH" install-agent-clis "claude=${CLAUDE_VERSION}" "codex=${CODEX_VERSION}" "t3=${T3_VERSION}"
 
 # Worker omp extensions, pinned by bun.lock. The Agent SDK's optional bundled
 # Claude binaries are skipped: workers use the CLI driver and /opt/claude.
@@ -55,7 +61,7 @@ ENV NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 # Share config and binaries without traversing bun's private HOME. Leave store
 # ownership to the installer; the gateway prepares packages as root.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates curl git openssh-client xz-utils util-linux \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl git libatomic1 openssh-client ripgrep xz-utils util-linux \
   && install -d -m 0755 -o bun -g bun /nix /app/data /app/logs /app/nix-roots /app/workspaces /home/bun/.omp/natives \
   && curl --fail --location --retry 3 --output /tmp/nix-install https://releases.nixos.org/nix/nix-2.30.3/install \
   && echo "8ff029ac2a49134441dc14c9168abb04506710834d7390039a8c1800dd998cd9  /tmp/nix-install" | sha256sum --check --strict \
@@ -69,11 +75,15 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=omp /usr/local/bin/omp /usr/local/bin/omp
 COPY --from=agent-clis /opt/claude /opt/claude
+COPY --from=agent-clis /opt/codex /opt/codex
+COPY --from=agent-clis /opt/t3 /opt/t3
 COPY --from=worker-extensions /opt/omp-extensions /opt/omp-extensions
 COPY deploy/agent-clis/claude-cliproxy /usr/local/bin/claude-cliproxy
 RUN ln -s /opt/claude/bin/claude /usr/local/bin/claude \
-  && chown -Rh root:root /opt/claude /opt/omp-extensions /usr/local/bin/claude-cliproxy \
-  && chmod -R go-w /opt/claude /opt/omp-extensions \
+  && ln -s /opt/codex/bin/codex /usr/local/bin/codex \
+  && ln -s /opt/t3/t3 /usr/local/bin/t3 \
+  && chown -Rh root:root /opt/claude /opt/codex /opt/t3 /opt/omp-extensions /usr/local/bin/claude-cliproxy \
+  && chmod -R go-w /opt/claude /opt/codex /opt/t3 /opt/omp-extensions \
   && chmod 0755 /usr/local/bin/claude-cliproxy \
   && install -d -m 0755 -o root -g root /app/worker-profile
 COPY --from=build /app/dist ./dist

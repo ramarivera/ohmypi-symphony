@@ -3,8 +3,8 @@
 # The gateway gives workers CLIPROXYAPI_BASE_URL and CLIPROXYAPI_API_KEY and
 # runs pi-claude-cli in claude-login mode, which refuses inherited ANTHROPIC_*
 # values. So omp never holds an Anthropic endpoint or credential; only this
-# Claude Code child does. Same variables as the T3 sidecar's claude-cliproxy
-# provider instance and toolbox's claudex wrapper.
+# Claude Code child does. Launched T3 daemons use this wrapper as their
+# claude-cliproxy provider binary. Same variables as toolbox's claudex wrapper.
 set -eu
 : "${CLIPROXYAPI_BASE_URL:?claude-cliproxy needs CLIPROXYAPI_BASE_URL}"
 : "${CLIPROXYAPI_API_KEY:?claude-cliproxy needs CLIPROXYAPI_API_KEY}"

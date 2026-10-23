@@ -1,5 +1,6 @@
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@effect/vitest";
 import {
   Clock,
@@ -3543,7 +3544,7 @@ describe("AgentDriver authority integration", () => {
               expect(Result.isFailure(result)).toBe(true);
               if (Result.isFailure(result))
                 expect(result.failure.message).toContain(
-                  "per-session uid launcher",
+                  "shared T3 daemon cannot serve isolated worker workspaces",
                 );
               expect(server.threads.size).toBe(0);
               expect(server.projectMutations).toHaveLength(0);
@@ -3557,6 +3558,133 @@ describe("AgentDriver authority integration", () => {
           "10001",
         );
       }),
+  );
+  it.live(
+    "launches a private T3 daemon per session with the OMP Git credential path",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        const cli = testPath("bin/t3-proxy.sh");
+        const fakeCli = fileURLToPath(
+          new URL("./fixtures/fake-t3-cli.ts", import.meta.url),
+        );
+        yield* Effect.promise(() =>
+          writeFile(
+            cli,
+            `#!/bin/sh\nexec ${process.execPath} ${fakeCli} proxy ${server.baseUrl.port} ${server.token} "$@"\n`,
+            { mode: 0o755 },
+          ),
+        );
+        const portBase = 20_000 + ((process.pid * 11) % 20_000);
+        yield* withAuthority(
+          () =>
+            Effect.gen(function* () {
+              const { cwd, configPath } = yield* seedDriverRun("t3");
+              yield* (yield* SessionAuthority).processSession(testSessionId);
+              const ref = Option.getOrThrow(
+                yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+              );
+              expect(ref.driver).toBe("t3");
+              expect(ref.locator.origin).toBe(`http://127.0.0.1:${portBase}`);
+              expect(workerSpawnInputs).toHaveLength(0);
+              expect([...server.projects.values()][0]?.workspaceRoot).toBe(cwd);
+              // Same repo-scoped, re-minted credential OMP workers get. It
+              // stays in the session's Git config and never crosses the API.
+              const minted = Buffer.from("x-access-token:ghs_launch").toString(
+                "base64",
+              );
+              expect(
+                yield* Effect.promise(() => readFile(configPath, "utf8")),
+              ).toContain(`AUTHORIZATION: basic ${minted}`);
+              expect(JSON.stringify(server.requests)).not.toContain(minted);
+              expect(JSON.stringify(server.requests)).not.toContain(
+                "ghs_launch",
+              );
+              const prompt = JSON.stringify(
+                server.commandsOf("message.dispatch")[0],
+              );
+              expect(prompt).toContain("GitHub REST API");
+              expect(prompt).not.toContain("rromp_report_deviation");
+              const t3Home = join(cwd, ".omp-home", "t3");
+              const serveEnv = JSON.parse(
+                yield* Effect.promise(() =>
+                  readFile(join(t3Home, "serve-env.json"), "utf8"),
+                ),
+              );
+              expect(serveEnv.home).toBe(join(cwd, ".omp-home"));
+              expect(serveEnv.keys).toContain("CLIPROXYAPI_API_KEY");
+              expect(serveEnv.keys).not.toContain("LINEAR_CLIENT_SECRET");
+              const settings = yield* Effect.promise(() =>
+                readFile(join(t3Home, "userdata", "settings.json"), "utf8"),
+              );
+              expect(settings).toContain("codex-cliproxy");
+              expect(settings).not.toContain("proxy-client-key");
+              const provider = Number(
+                yield* Effect.promise(() =>
+                  readFile(join(t3Home, "provider.pid"), "utf8"),
+                ),
+              );
+              server.updateRun(ref.nativeId, "run-1", { status: "running" });
+              server.upsertItem(ref.nativeId, {
+                id: "message-1",
+                type: "assistant_message",
+                runId: "run-1",
+                status: "completed",
+                ordinal: 1,
+                messageId: "assistant-1",
+                text: "Opened https://github.com/org/repo/pull/7",
+                streaming: false,
+              });
+              server.updateRun(ref.nativeId, "run-1", { status: "completed" });
+              yield* awaitState("succeeded");
+              expect(toolExternalUrlCalls).toContainEqual({
+                sessionId: testSessionId,
+                urls: [
+                  {
+                    label: "Pull request",
+                    url: "https://github.com/org/repo/pull/7",
+                  },
+                ],
+              });
+              // Run end stops the daemon and its provider children.
+              const stopped = yield* Effect.sync(() => {
+                try {
+                  process.kill(provider, 0);
+                  return false;
+                } catch {
+                  return true;
+                }
+              }).pipe(
+                Effect.repeat({
+                  until: (done) => done,
+                  schedule: Schedule.spaced(25),
+                }),
+                Effect.timeoutOrElse({
+                  duration: 5_000,
+                  orElse: () => Effect.succeed(false),
+                }),
+              );
+              expect(stopped).toBe(true);
+            }),
+          {
+            withLinearGateway: true,
+            githubApp: {
+              getInstallationToken: () => Effect.succeed("ghs_launch"),
+            },
+            config: [
+              ["T3_MODE", "launch"],
+              ["T3_CLI_PATH", cli],
+              ["T3_PORT_BASE", String(portBase)],
+              ["T3_PORT_COUNT", "4"],
+              ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+              ["T3_MODEL", "gpt-6-sol"],
+              ["CLIPROXYAPI_BASE_URL", "https://cliproxyapi.example.test"],
+              ["CLIPROXYAPI_API_KEY", "proxy-client-key"],
+            ],
+          },
+        );
+      }),
+    20_000,
   );
   it.live(
     "reuses the T3 thread after restart while a new attempt ignores old terminal events",
