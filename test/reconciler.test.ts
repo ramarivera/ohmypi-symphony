@@ -166,6 +166,7 @@ describe("Reconciler", () => {
             yield* reconciler.awaitTrigger();
             const duplicate = yield* Effect.forkChild(
               reconciler.awaitTrigger(),
+              { startImmediately: true },
             );
             expect(
               Option.isNone(

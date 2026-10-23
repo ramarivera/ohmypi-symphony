@@ -291,13 +291,14 @@ export const makeGitHubApp = (input: {
         return token;
       });
       return yield* mint.pipe(
-        // onExit (not tap/tapError): interruption must also release waiters.
-        Effect.onExit((exit) => Deferred.done(deferred, exit)),
+        // Clear ownership before notifying waiters, which may retry inline.
         Effect.ensuring(
           Effect.sync(() => {
             if (inFlight.get(key) === deferred) inFlight.delete(key);
           }),
         ),
+        // onExit (not tap/tapError): interruption must also release waiters.
+        Effect.onExit((exit) => Deferred.done(deferred, exit)),
       );
     },
   );

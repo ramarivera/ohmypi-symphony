@@ -184,6 +184,60 @@ describe("GitHubApp", () => {
     expect(requests).toBe(2);
   });
 
+  it("mints a fresh token when a waiting caller retries immediately after failure", async () => {
+    const started = Deferred.makeUnsafe<void>();
+    const firstResponse = Promise.withResolvers<Response>();
+    let lookups = 0;
+    let mints = 0;
+    let retries = 0;
+    const service = makeGitHubApp({
+      allowedOwners: { "org-test": ["octo-org"] },
+      appId: "12345",
+      privateKey: privateKeyPem,
+      fetch: async (url) => {
+        if (String(url).includes("/repos/")) {
+          lookups += 1;
+          return Response.json({ id: 42 });
+        }
+        mints += 1;
+        if (mints === 1) {
+          Deferred.doneUnsafe(started, Effect.void);
+          return firstResponse.promise;
+        }
+        return Response.json({ token: "retried-token" }, { status: 201 });
+      },
+    });
+    const token = () =>
+      service.getInstallationToken("octo-org", "repo", "org-test");
+    const program = Effect.gen(function* () {
+      const winner = yield* Effect.forkChild(Effect.result(token()), {
+        startImmediately: true,
+      });
+      yield* Deferred.await(started);
+      const waiter = yield* Effect.forkChild(
+        token().pipe(
+          Effect.catchTag("@Gateway/GitHubAppError", (error) => {
+            expect(error.status).toBe(503);
+            retries += 1;
+            return token();
+          }),
+        ),
+        { startImmediately: true },
+      );
+      expect(waiter.pollUnsafe()).toBeUndefined();
+      expect(lookups).toBe(1);
+      expect(mints).toBe(1);
+      firstResponse.resolve(Response.json({}, { status: 503 }));
+      expect(yield* Fiber.join(waiter)).toBe("retried-token");
+      const failed = yield* Fiber.join(winner);
+      expect(Result.isFailure(failed)).toBe(true);
+      expect(retries).toBe(1);
+      expect(lookups).toBe(2);
+      expect(mints).toBe(2);
+    });
+    await Effect.runPromise(Effect.timeout(program, "5 seconds"));
+  });
+
   it("returns a typed failure without exposing disabled credentials", async () => {
     const result = await Effect.runPromise(
       Effect.result(

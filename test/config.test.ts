@@ -9,7 +9,6 @@ import {
   Redacted,
   Result,
 } from "effect";
-import * as fc from "fast-check";
 import { GatewayConfig } from "../src/services/config.js";
 import { testPaths } from "./fixtures/paths.js";
 
@@ -354,100 +353,43 @@ describe("GatewayConfig", () => {
     }
   });
 
-  it.effect(
-    "positive integer settings accept positive safe integers and reject boundaries",
-    () =>
-      Effect.gen(function* () {
-        const cases = fc.record({
-          field: fc.constantFrom(
-            ...[
-              "PORT",
-              "LEASE_DURATION_MS",
-              "RECONCILER_INTERVAL_MS",
-              "WEBHOOK_REPLAY_WINDOW_MS",
-            ],
-          ),
-          value: fc.constantFrom(
-            ...[
-              "1",
-              "2",
-              "65535",
-              "0",
-              "-1",
-              "1.5",
-              "not-a-number",
-              "9007199254740992",
-            ],
-          ),
-        });
-        const check = ({
-          field,
-          value,
-        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
-          Effect.gen(function* () {
-            const result = yield* configResult(valuesWith([[field, value]]));
-            // Strict digit-only contract: "1.5" and other truncatable forms
-            // are rejected, not silently parsed.
-            const valid =
-              /^\d+$/u.test(value) &&
-              Number.isSafeInteger(Number(value)) &&
-              Number(value) > 0;
-            expect(Result.isSuccess(result)).toBe(valid);
-          });
-        const context =
-          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
-        yield* Effect.promise(() =>
-          fc.assert(
-            fc.asyncProperty(cases, (sample) =>
-              Effect.runPromiseWith(context)(check(sample)),
-            ),
-            { numRuns: 20 },
-          ),
-        );
-      }),
-  );
-
-  it.effect("URL parsing accepts only valid secure or localhost URLs", () =>
-    Effect.gen(function* () {
-      const cases = fc.record({
-        value: fc.constantFrom(
-          ...[
-            "https://example.com",
-            "https://localhost",
-            "http://localhost:3000",
-            "ftp://localhost",
-            "http://example.com",
-            "file:///tmp/gateway",
-            "not-a-url",
-          ],
-        ),
-      });
-      const check = ({
-        value,
-      }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+  for (const field of [
+    "PORT",
+    "LEASE_DURATION_MS",
+    "RECONCILER_INTERVAL_MS",
+    "WEBHOOK_REPLAY_WINDOW_MS",
+  ]) {
+    it.effect.each([
+      ["1", true],
+      ["2", true],
+      ["65535", true],
+      ["0", false],
+      ["-1", false],
+      ["1.5", false],
+      ["not-a-number", false],
+      ["9007199254740992", false],
+    ] as const)(
+      `${field} validates positive safe integer %s`,
+      ([value, valid]) =>
         Effect.gen(function* () {
-          const result = yield* configResult(
-            valuesWith([["PUBLIC_URL", value]]),
-          );
-          let valid = false;
-          try {
-            const url = new URL(value);
-            valid = url.protocol === "https:" || url.hostname === "localhost";
-          } catch {
-            valid = false;
-          }
+          const result = yield* configResult(valuesWith([[field, value]]));
           expect(Result.isSuccess(result)).toBe(valid);
-        });
-      const context =
-        yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
-      yield* Effect.promise(() =>
-        fc.assert(
-          fc.asyncProperty(cases, (sample) =>
-            Effect.runPromiseWith(context)(check(sample)),
-          ),
-          { numRuns: 20 },
-        ),
-      );
+        }),
+    );
+  }
+
+  it.effect.each([
+    ["https://example.com", true],
+    ["https://localhost", true],
+    ["http://localhost:3000", true],
+    ["ftp://localhost", true],
+    ["http://example.com", false],
+    ["file:///tmp/gateway", false],
+    ["not-a-url", false],
+  ] as const)("validates secure or localhost URL %s", ([value, valid]) =>
+    Effect.gen(function* () {
+      const result = yield* configResult(valuesWith([["PUBLIC_URL", value]]));
+      expect(Result.isSuccess(result)).toBe(valid);
     }),
   );
 });
