@@ -1,6 +1,16 @@
 import { Database } from "bun:sqlite";
 import { createCipheriv, randomBytes } from "node:crypto";
-import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { ConfigProvider, Effect, Either, Fiber, Layer, Schema } from "effect";
@@ -38,7 +48,14 @@ import {
   workerIdentityCommand,
   workerMcpCredential,
 } from "../src/services/worker-security.js";
-import { isHttpsGitHubRepositoryUrl } from "../src/services/workspace.js";
+import {
+  isHttpsGitHubRepositoryUrl,
+  persistGitHubExtraHeader,
+} from "../src/services/workspace.js";
+import {
+  gitEnvironment,
+  workspaceProcess,
+} from "../src/services/workspace-process.js";
 
 const dnsLookup = vi.hoisted(() =>
   vi.fn<
@@ -50,13 +67,14 @@ const dnsLookup = vi.hoisted(() =>
 );
 vi.mock("node:dns/promises", () => ({ lookup: dnsLookup }));
 const dirs: string[] = [];
+// Scratch storage is mandated by the global AGENTS.md; /tmp can be shared tmpfs.
+// Override the base for CI while keeping fixture paths canonical.
 const temporary = async () => {
-  const parent = join(
-    homedir(),
-    "dev/agentic-scratchpads/ohmypi-symphony/security/tests",
-  );
+  const parent =
+    process.env.SECURITY_TEST_TMPDIR ??
+    join(homedir(), "dev/agentic-scratchpads/ohmypi-symphony/security/tests");
   await mkdir(parent, { recursive: true });
-  const dir = await mkdtemp(join(parent, "case-"));
+  const dir = await realpath(await mkdtemp(join(parent, "case-")));
   dirs.push(dir);
   return dir;
 };
@@ -151,6 +169,106 @@ describe("security boundaries", () => {
     await prepareWorkerWorkspace(workspace, String(process.getuid?.()));
     expect((await stat(outside)).uid).toBe(before.uid);
     expect((await stat(outside)).mode).toBe(before.mode);
+  });
+
+  it("rejects hardlinks before assigning worker ownership", async () => {
+    const dir = await temporary();
+    const workspace = join(dir, "workspace");
+    await mkdir(workspace);
+    const outside = join(dir, "outside");
+    await writeFile(outside, "gateway", { mode: 0o400 });
+    await link(outside, join(workspace, "linked"));
+    const before = await stat(outside);
+    await expect(
+      prepareWorkerWorkspace(workspace, String(process.getuid?.())),
+    ).rejects.toThrow("Multiply-linked");
+    expect((await stat(outside)).uid).toBe(before.uid);
+    expect(await Bun.file(outside).text()).toBe("gateway");
+  });
+
+  it("runs the materializer entry point and excludes writable tool state", async () => {
+    const dir = await temporary();
+    const initialized = Bun.spawn(["git", "init", dir], {
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    expect(await initialized.exited).toBe(0);
+    await workspaceProcess(dir, "tool-directories", null);
+    await writeFile(join(dir, ".omp-home", "private"), "secret");
+    await writeFile(join(dir, ".omp-tmp", "temporary"), "temp");
+    const status = Bun.spawn(["git", "status", "--porcelain"], {
+      cwd: dir,
+      stdout: "pipe",
+    });
+    expect(await new Response(status.stdout).text()).toBe("");
+    expect(await status.exited).toBe(0);
+    const agentDir = await workspaceProcess(dir, "agent-db", []);
+    expect(agentDir).toBe(join(dir, ".omp-gateway"));
+    await workspaceProcess(dir, "remove-agent-db", null);
+    expect(await Bun.file(join(agentDir, "agent.db")).exists()).toBe(false);
+  });
+
+  it("refuses to append credentials when the previous config cannot be parsed", async () => {
+    const dir = await temporary();
+    await mkdir(join(dir, ".git"));
+    const path = join(dir, ".git", "config");
+    const malformed = "[unterminated\nextraheader = old\n";
+    await writeFile(path, malformed);
+    const result = await Effect.runPromise(
+      Effect.either(
+        persistGitHubExtraHeader(
+          dir,
+          "test",
+          `AUTHORIZATION: basic ${Buffer.from("x-access-token:secret").toString("base64")}`,
+        ),
+      ),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+    expect(await Bun.file(path).text()).toBe(malformed);
+  });
+
+  it("retains a useful credential persistence failure cause without exposing tokens", async () => {
+    const dir = await temporary();
+    const outside = join(dir, "outside");
+    await mkdir(outside);
+    const workspace = join(dir, "workspace");
+    await mkdir(workspace);
+    await symlink(outside, join(workspace, ".git"));
+    const result = await Effect.runPromise(
+      Effect.either(
+        persistGitHubExtraHeader(
+          workspace,
+          "test",
+          `AUTHORIZATION: basic ${Buffer.from("x-access-token:secret").toString("base64")}`,
+        ),
+      ),
+    );
+    if (Either.isRight(result)) throw new Error("Expected persistence to fail");
+    expect(result.left.message).toBe("Could not persist GitHub credential");
+    expect(result.left.cause).toContain(".git");
+    expect(result.left.cause).not.toContain("secret");
+  });
+
+  it("doesn't expose gateway or model secrets to Git or its helpers", () => {
+    const environment = gitEnvironment({
+      PATH: "/bin",
+      HOME: "/home/git",
+      GIT_CONFIG_GLOBAL: "/gitconfig",
+      LINEAR_CLIENT_SECRET: "secret",
+      TOKEN_ENCRYPTION_KEY_FILE: "/key",
+      OPENAI_API_KEY: "model-secret",
+      GITHUB_APP_PRIVATE_KEY: "private",
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_VALUE_0: "stale",
+      NODE_OPTIONS: "--import=evil",
+    });
+    expect(environment).toEqual({
+      PATH: "/bin",
+      HOME: "/home/git",
+      GIT_CONFIG_GLOBAL: "/gitconfig",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_TERMINAL_PROMPT: "0",
+    });
   });
 
   it.each([
@@ -336,6 +454,35 @@ describe("security boundaries", () => {
       expect(await response.text()).toBe("pinned-connection");
     } finally {
       await server.stop(true);
+    }
+  });
+
+  it("rejects invalid upstream statuses without an uncaught callback exception", async () => {
+    const server = createServer((socket) => {
+      socket.once("data", () =>
+        socket.end(
+          "HTTP/1.1 600 Invalid\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        ),
+      );
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, "127.0.0.1", resolve),
+    );
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Missing fixture address");
+    try {
+      await expect(
+        safeOAuthFetch(
+          `http://127.0.0.1:${address.port}`,
+          {},
+          { allowLoopbackHttp: true },
+        ),
+      ).rejects.toThrow("Invalid OAuth HTTP response status");
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
     }
   });
 

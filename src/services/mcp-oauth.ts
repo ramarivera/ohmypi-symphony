@@ -27,6 +27,11 @@ import {
 import { TokenCrypto } from "./token-crypto.js";
 import { tokenContext } from "./token-migration.js";
 
+import {
+  needsWorkspaceIdentity,
+  workspaceProcess,
+} from "./workspace-process.js";
+
 export const MCP_OAUTH_PROVIDER_PREFIX = "mcp_oauth:profile:default:";
 export const MCP_OAUTH_ENCRYPTED_PREFIX = "mcpenc:v1:";
 export const MCP_OAUTH_CALLBACK_PATH = "/oauth/mcp/callback";
@@ -1425,6 +1430,8 @@ export const materializeMcpAgentDb = async (
     readonly clientSecret?: string | undefined;
   }>,
 ): Promise<string> => {
+  if (needsWorkspaceIdentity())
+    return workspaceProcess(workspace, "agent-db", credentials);
   const providers = new Set<string>();
   for (const credential of credentials) {
     const provider = mcpProviderForServerUrl(credential.serverUrl);
@@ -1529,6 +1536,12 @@ export const removeMcpAgentDb = (
   workspace: string,
 ): Effect.Effect<void, never, never> =>
   Effect.promise(async () => {
+    if (needsWorkspaceIdentity()) {
+      await workspaceProcess(workspace, "remove-agent-db", null).catch(
+        () => undefined,
+      );
+      return;
+    }
     try {
       await unlink(join(workspace, ".omp-gateway", "agent.db"));
     } catch {}

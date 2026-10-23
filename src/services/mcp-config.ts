@@ -2,6 +2,11 @@ import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Option } from "effect";
 import type { McpServerRecord } from "../domain/models.js";
+import {
+  gitEnvironment,
+  needsWorkspaceIdentity,
+  workspaceProcess,
+} from "./workspace-process.js";
 
 const isTrackedMcpConfig = async (cwd: string): Promise<boolean> => {
   try {
@@ -9,6 +14,7 @@ const isTrackedMcpConfig = async (cwd: string): Promise<boolean> => {
       ["git", "ls-files", "--error-unmatch", "mcp.json"],
       {
         cwd,
+        env: gitEnvironment(globalThis.process.env),
         stdout: "ignore",
         stderr: "ignore",
       },
@@ -44,6 +50,12 @@ export const removeMcpConfig = (
   cwd: string,
 ): Effect.Effect<void, never, never> =>
   Effect.promise(async () => {
+    if (needsWorkspaceIdentity()) {
+      await workspaceProcess(cwd, "remove-mcp-config", null).catch(
+        () => undefined,
+      );
+      return;
+    }
     if (await isTrackedMcpConfig(cwd)) return;
     try {
       await unlink(join(cwd, "mcp.json"));
@@ -114,6 +126,14 @@ export const writeOmpMcpConfig = (
   servers: ReadonlyArray<McpServerRecord>,
   sessionId?: string,
 ): Effect.Effect<void, Error> => {
+  if (needsWorkspaceIdentity())
+    return Effect.tryPromise({
+      try: async () => {
+        await workspaceProcess(cwd, "mcp-config", servers);
+      },
+      catch: (error) =>
+        error instanceof Error ? error : new Error(String(error)),
+    });
   const contents = `${JSON.stringify(toOmpMcpConfig(servers), null, 2)}\n`;
   return Effect.gen(function* () {
     if (yield* Effect.promise(() => isTrackedMcpConfig(cwd))) {

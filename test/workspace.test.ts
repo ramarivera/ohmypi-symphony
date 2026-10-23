@@ -502,6 +502,16 @@ describe("Workspace", () => {
         ],
         target,
       );
+      yield* runGit(
+        [
+          "config",
+          "--local",
+          "--add",
+          "http.https://github.com/.extraheader",
+          "X-User: retained",
+        ],
+        target,
+      );
       yield* fixtureIo("workspace marker creation", () =>
         writeFile(
           join(target, MARKER_FILE),
@@ -524,10 +534,15 @@ describe("Workspace", () => {
         },
       });
       yield* workspace.materialize(id, record);
-      expect(tokenCalls).toBe(1);
+      yield* workspace.materialize(id, record);
+      expect(tokenCalls).toBe(2);
       expect(
-        yield* readGitConfig("http.https://github.com/.extraheader", target),
-      ).toBe(buildGitHubExtraHeader("fresh-token"));
+        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
+      ).toEqual(["X-User: retained", buildGitHubExtraHeader("fresh-token")]);
+      yield* workspace.clearGitHubExtraHeader(id, target);
+      expect(
+        yield* readGitConfigAll("http.https://github.com/.extraheader", target),
+      ).toEqual(["X-User: retained"]);
     }),
   );
 
@@ -689,7 +704,7 @@ describe("Workspace", () => {
             "http.https://github.com/.extraheader",
             target,
           ),
-        ).toEqual([gatewayHeader, foreignHeader]);
+        ).toEqual([foreignHeader]);
       }),
   );
 

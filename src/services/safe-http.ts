@@ -69,23 +69,33 @@ const pinnedRequest = (
           callback(null, address, family),
       },
       (res) => {
-        const responseHeaders = new Headers();
-        for (const [key, value] of Object.entries(res.headers)) {
-          if (value !== undefined)
-            responseHeaders.set(
-              key,
-              Array.isArray(value) ? value.join(", ") : value,
-            );
+        try {
+          const status = res.statusCode ?? 502;
+          if (status < 200 || status > 599)
+            throw new Error("Invalid OAuth HTTP response status");
+          const responseHeaders = new Headers();
+          for (const [key, value] of Object.entries(res.headers)) {
+            if (value !== undefined)
+              responseHeaders.set(
+                key,
+                Array.isArray(value) ? value.join(", ") : value,
+              );
+          }
+          resolve(
+            new Response(
+              [204, 205, 304].includes(status)
+                ? null
+                : (Readable.toWeb(
+                    res,
+                  ) as unknown as ReadableStream<Uint8Array>),
+              { status, headers: responseHeaders },
+            ),
+          );
+          if ([204, 205, 304].includes(status)) res.resume();
+        } catch (error) {
+          res.destroy();
+          reject(error);
         }
-        const status = res.statusCode ?? 502;
-        resolve(
-          new Response(
-            [204, 205, 304].includes(status)
-              ? null
-              : (Readable.toWeb(res) as unknown as ReadableStream<Uint8Array>),
-            { status, headers: responseHeaders },
-          ),
-        );
       },
     );
     req.on("error", reject);

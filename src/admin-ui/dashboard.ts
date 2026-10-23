@@ -195,7 +195,7 @@ export const ADMIN_BODY = `
       </div>
     </section>
 
-    <section class="panel" aria-labelledby="nix-cache-heading">
+    <section id="nix-cache-panel" class="panel" aria-labelledby="nix-cache-heading" hidden>
       <div class="panel-header">
         <h2 id="nix-cache-heading">Nix package cache</h2>
       </div>
@@ -815,6 +815,8 @@ export const ADMIN_SCRIPT = `
   }
 
   async function loadNixCache() {
+    if (!document.documentElement.hasAttribute("data-gateway-admin")) return;
+    el("nix-cache-panel").hidden = false;
     setAriaBusy("nix-cache-list", true);
     var result = await fetchJSON(NIX_CACHE_URL, { method: "GET" });
     if (result && result.redirecting) return;

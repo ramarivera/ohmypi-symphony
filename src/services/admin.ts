@@ -981,7 +981,15 @@ export const createAdminHandle = (deps: AdminDeps) =>
         if (Option.isNone(session)) {
           return Option.some(redirect("/"));
         }
-        return Option.some(html(renderAdminPage()));
+        return Option.some(
+          html(
+            renderAdminPage(
+              deps.config.gatewayAdminOrganizationIds?.has(
+                session.value.organizationId,
+              ) === true,
+            ),
+          ),
+        );
       }
 
       if (url.pathname.startsWith("/runs/") && request.method === "GET") {

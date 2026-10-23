@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Clock, Duration, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
@@ -69,6 +70,7 @@ import {
   parseRepositorySuggestionCandidate,
   type RepositoryResolution,
 } from "./workspace.js";
+import { workspaceProcess } from "./workspace-process.js";
 
 interface InputContext {
   readonly organizationId: string | null;
@@ -1683,8 +1685,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
         const environment = workerEnvironment(process.env);
         if (process.env.WORKER_UID) {
-          environment.HOME = cwd;
-          environment.TMPDIR = cwd;
+          environment.HOME = join(cwd, ".omp-home");
+          environment.TMPDIR = join(cwd, ".omp-tmp");
         }
         if (Option.isSome(run.repositoryId)) {
           const repository = yield* workspaceRepo.getRepository(
@@ -1806,6 +1808,21 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               ]
             : [],
         );
+        yield* Effect.tryPromise({
+          try: () => prepareWorkerWorkspace(cwd, process.env.WORKER_UID),
+          catch: () =>
+            new RpcSpawnError({
+              message: "Could not prepare isolated worker workspace",
+            }),
+        });
+        if (process.env.WORKER_UID)
+          yield* Effect.tryPromise({
+            try: () => workspaceProcess(cwd, "tool-directories", null),
+            catch: () =>
+              new RpcSpawnError({
+                message: "Could not prepare worker tool directories",
+              }),
+          });
         const agentDir = yield* Effect.tryPromise({
           try: () => materializeMcpAgentDb(cwd, credentials),
           catch: (error) =>
@@ -1856,13 +1873,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           ),
         );
 
-        yield* Effect.tryPromise({
-          try: () => prepareWorkerWorkspace(cwd, process.env.WORKER_UID),
-          catch: () =>
-            new RpcSpawnError({
-              message: "Could not prepare isolated worker workspace",
-            }),
-        });
         const worker = yield* rpc.spawn({
           command,
           cwd,

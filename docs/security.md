@@ -28,18 +28,35 @@ Repository URLs must be canonical `https://github.com/owner/repo` URLs, optional
 ending in `.git`. Convert existing SSH/local/non-GitHub repository records before
 running them. GitHub tokens use Git environment configuration during clone, and
 mode-0600 local Git configuration for worker access, never command arguments.
+The worker can read that repository-scoped installation token, which GitHub
+expires after one hour. This is intentional for authenticated worker Git
+operations. It is not the GitHub App private key or an organization-wide token.
+Hiding a token from code that can invoke authenticated Git requires a separate
+Git broker, which this design doesn't provide. Gateway header refresh and
+terminal cleanup remove only generated values and retain user-installed headers.
 
 ## Docker worker identity
 
 The Docker entrypoint runs the gateway as root and locks `/app/data` and
 `/app/logs` to mode 0700. Workers run as uid/gid 1001 through `setpriv`, with no
 supplementary groups, capabilities, or privilege escalation. Their HOME and
-TMPDIR point to their workspace. The gateway assigns workspace files to that uid
-without following symlinks. `/app/workspaces` must be a separate writable volume,
+TMPDIR point to excluded `.omp-home/` and `.omp-tmp/` directories. The gateway
+assigns workspace files to that uid without following symlinks and rejects
+multiply-linked regular files. MCP materialization, cleanup, and Git credential
+updates execute as the worker uid, including on resume, so worker-planted paths
+never cause privileged gateway writes. Git subprocesses receive a transport
+environment allowlist, without gateway or model-provider credentials.
+`/app/workspaces` must be a separate writable volume,
 outside `/app/data`; the image sets `WORKSPACE_ROOT=/app/workspaces`.
 
 Remove deployment overrides that force the gateway to run as `bun`. Keep the
-capabilities required to switch uid/gid and drop the worker capability set.
+entrypoint capability bounding policy. It drops all capabilities except CHOWN,
+DAC_OVERRIDE, SETUID, SETGID and SETPCAP. DAC_OVERRIDE is needed to traverse
+worker-owned mode-0700 directories during the ownership walk, and SETPCAP is
+needed for the worker's empty capability bounding set. Each worker has no
+capabilities. A deployment may also apply `--cap-drop=ALL` with these five
+`--cap-add` values; omitting DAC_OVERRIDE or SETPCAP breaks workspace preparation
+or worker startup.
 Mount all gateway secret files root-owned with mode **0400**, including Docker
 secrets. Startup rejects insecure `_FILE` mounts. Existing data/log volume roots
 are secured by the entrypoint before the gateway starts. Don't share gateway
@@ -86,3 +103,9 @@ to the current key and row-specific AAD. Version-1 decryption remains supported
 for compatibility. Keep old keys until every database/backup that needs them has
 been upgraded. Old binaries can't read version-2 rows; rolling back requires the
 pre-upgrade database backup. No Effect version change is included.
+
+Security tests use canonical fixtures under
+`~/dev/agentic-scratchpads/ohmypi-symphony/security/tests` to honor the global
+scratch-storage policy and avoid a quota-limited shared `/tmp`. CI can override
+the fixture parent with `SECURITY_TEST_TMPDIR`; per-case directories are removed
+after each test.

@@ -67,12 +67,13 @@ export const oauthStart = Effect.gen(function* () {
   const returnTo = safeReturnTo(
     new URL(request.url, "http://localhost").searchParams.get("returnTo"),
   );
+  const config = yield* GatewayConfig;
   const { url } = yield* OAuth.startAuthorization();
   return HttpServerResponse.redirect(url, {
     status: 302,
     headers: {
       ...SECURITY_HEADERS,
-      "set-cookie": `omp_gateway_return=${encodeURIComponent(returnTo)}; HttpOnly; SameSite=Lax; Path=/oauth; Max-Age=600${url.protocol === "https:" ? "; Secure" : ""}`,
+      "set-cookie": `omp_gateway_return=${encodeURIComponent(returnTo)}; HttpOnly; SameSite=Lax; Path=/oauth; Max-Age=600${config.publicUrl.protocol === "https:" ? "; Secure" : ""}`,
     },
   });
 });
@@ -181,7 +182,13 @@ export const safeDecode = (value: string): string => {
   }
 };
 export const safeReturnTo = (value: string | null): string =>
-  value !== null && /^\/(?!\/)/u.test(value) && !/[\\\r\n]/u.test(value)
+  value !== null &&
+  /^\/(?!\/)/u.test(value) &&
+  !value.includes("\\") &&
+  [...value].every(
+    (character) =>
+      character.charCodeAt(0) > 32 && character.charCodeAt(0) !== 127,
+  )
     ? value
     : "/admin";
 export const publicRoute = (method: string, path: string): boolean =>
