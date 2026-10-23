@@ -26,6 +26,7 @@ import {
 } from "./store/sqlite-client.js";
 import { TokenCrypto } from "./token-crypto.js";
 import { tokenContext } from "./token-migration.js";
+import { workerMcpCredential } from "./worker-security.js";
 
 import {
   cleanupWorkspaceProcess,
@@ -1432,7 +1433,14 @@ export const materializeMcpAgentDb = async (
   }>,
 ): Promise<string> => {
   if (needsWorkspaceIdentity())
-    return workspaceProcess(workspace, "agent-db", credentials);
+    return workspaceProcess(
+      workspace,
+      "agent-db",
+      credentials.map((credential) => ({
+        serverUrl: credential.serverUrl,
+        ...workerMcpCredential(credential),
+      })),
+    );
   const providers = new Set<string>();
   for (const credential of credentials) {
     const provider = mcpProviderForServerUrl(credential.serverUrl);

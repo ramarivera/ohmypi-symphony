@@ -102,6 +102,31 @@ const temporary = async () => {
   dirs.push(dir);
   return dir;
 };
+const withWorkspaceIpc = async (
+  kind: "FIFO" | "socket",
+  use: (workspace: string, path: string) => Promise<void>,
+) => {
+  const workspace = await temporary();
+  const path = join(workspace, "ipc");
+  const server = createServer();
+  if (kind === "FIFO") {
+    const result = Bun.spawnSync(["mkfifo", path]);
+    expect(result.exitCode).toBe(0);
+  } else {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(path, resolve);
+    });
+  }
+  try {
+    await use(workspace, path);
+  } finally {
+    if (server.listening)
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+  }
+};
 afterEach(async () => {
   await Promise.all(
     dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
@@ -277,6 +302,55 @@ describe("security boundaries", () => {
     );
     expect((await stat(join(workspace, "dependency"))).nlink).toBe(2);
   });
+
+  it.each(["FIFO", "socket"] as const)(
+    "accepts a worker-owned %s in both ownership walks without chown",
+    async (kind) => {
+      await withWorkspaceIpc(kind, async (workspace, path) => {
+        const handle = await open(workspace, "r");
+        const prototype = Object.getPrototypeOf(handle) as FileHandle;
+        await handle.close();
+        const chown = vi.spyOn(prototype, "chown");
+        const chownSync = vi.spyOn(fs, "fchownSync");
+        const uid = String(process.getuid?.());
+        await prepareWorkerWorkspace(workspace, uid);
+        prepareWorkerWorkspaceSync(workspace, uid);
+        expect(chown).not.toHaveBeenCalled();
+        expect(chownSync).not.toHaveBeenCalled();
+        const node = await stat(path);
+        expect(kind === "FIFO" ? node.isFIFO() : node.isSocket()).toBe(true);
+        expect(node.uid).toBe(process.getuid?.());
+      });
+    },
+  );
+
+  it.each(["FIFO", "socket"] as const)(
+    "rejects a foreign-owned %s in both ownership walks without chowning it",
+    async (kind) => {
+      await withWorkspaceIpc(kind, async (workspace, path) => {
+        const handle = await open(workspace, "r");
+        const prototype = Object.getPrototypeOf(handle) as FileHandle;
+        await handle.close();
+        // Keep the real foreign inode metadata; only fake migrating the parent.
+        const chown = vi.spyOn(prototype, "chown").mockResolvedValue(undefined);
+        const chownSync = vi.spyOn(fs, "fchownSync").mockReturnValue(undefined);
+        const uid = (process.getuid?.() ?? 1000) + 1;
+        await expect(
+          prepareWorkerWorkspace(workspace, String(uid)),
+        ).rejects.toThrow("Foreign-owned workspace FIFO or socket");
+        expect(() =>
+          prepareWorkerWorkspaceSync(workspace, String(uid)),
+        ).toThrow("Foreign-owned workspace FIFO or socket");
+        expect(chown).toHaveBeenCalledExactlyOnceWith(uid, uid);
+        expect(chownSync).toHaveBeenCalledExactlyOnceWith(
+          expect.any(Number),
+          uid,
+          uid,
+        );
+        expect((await stat(path)).uid).toBe(process.getuid?.());
+      });
+    },
+  );
 
   it("rejects retention paths outside the root and symlinked workspace paths before migration", async () => {
     const root = await temporary();
@@ -902,6 +976,67 @@ describe("security boundaries", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("strips all renewal material before serializing the agent-db worker payload", async () => {
+    const dir = await temporary();
+    vi.stubEnv("WORKER_UID", String((process.getuid?.() ?? 1000) + 1));
+    const spawn = vi.spyOn(Bun, "spawn").mockImplementation(() => {
+      throw new Error("Worker payload intercepted");
+    });
+    const credential = {
+      serverUrl: "https://mcp.example",
+      accessToken: "access",
+      expiresAt: Date.now() + 600_000,
+      refreshToken: "refresh-secret",
+      tokenEndpoint: "https://issuer.example/token",
+      clientId: "client",
+      clientSecret: "client-secret",
+    };
+    await expect(materializeMcpAgentDb(dir, [credential])).rejects.toThrow(
+      "Worker payload intercepted",
+    );
+    expect(spawn).toHaveBeenCalledOnce();
+    const options = spawn.mock.calls[0]?.[1];
+    if (!(options?.stdin instanceof Response))
+      throw new Error("Missing serialized worker input");
+    expect(await options.stdin.json()).toEqual([
+      {
+        serverUrl: credential.serverUrl,
+        accessToken: credential.accessToken,
+        expiresAt: credential.expiresAt,
+      },
+    ]);
+  });
+
+  it("defensively filters credentials received by the real workspace worker", async () => {
+    const dir = await temporary();
+    vi.stubEnv("WORKER_UID", "");
+    const credential = {
+      serverUrl: "https://mcp.example",
+      accessToken: "access",
+      expiresAt: Date.now() + 600_000,
+      refreshToken: "refresh-secret",
+      tokenEndpoint: "https://issuer.example/token",
+      clientId: "client",
+      clientSecret: "client-secret",
+    };
+    const agent = await workspaceProcess(dir, "agent-db", [credential]);
+    const db = new Database(join(agent, "agent.db"));
+    try {
+      const rows = db
+        .query<{ data: string }, []>("SELECT data FROM auth_credentials")
+        .all();
+      expect(rows.map((row) => JSON.parse(row.data))).toEqual([
+        { access: credential.accessToken, expires: credential.expiresAt },
+      ]);
+    } finally {
+      db.close();
+    }
+    // Bypass the gateway and prove the worker enforces workerMcpCredential too.
+    await expect(
+      workspaceProcess(dir, "agent-db", [{ ...credential, expiresAt: 0 }]),
+    ).rejects.toThrow("MCP worker access token must expire within one hour");
   });
 
   it("evicts rerun gates after success, failure, and interruption", async () => {

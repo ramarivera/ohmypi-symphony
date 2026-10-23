@@ -10,6 +10,7 @@ import {
   materializeMcpAgentDb,
   removeMcpAgentDbFile,
 } from "./services/mcp-oauth.js";
+import { workerMcpCredential } from "./services/worker-security.js";
 import {
   persistGitHubExtraHeader,
   removeGitHubExtraHeaders,
@@ -21,7 +22,15 @@ const input: unknown = await Bun.stdin.json();
 switch (action) {
   case "agent-db": {
     const credentials = input as Parameters<typeof materializeMcpAgentDb>[1];
-    process.stdout.write(await materializeMcpAgentDb(cwd, credentials));
+    process.stdout.write(
+      await materializeMcpAgentDb(
+        cwd,
+        credentials.map((credential) => ({
+          serverUrl: credential.serverUrl,
+          ...workerMcpCredential(credential),
+        })),
+      ),
+    );
     break;
   }
   case "mcp-config":

@@ -92,8 +92,21 @@ const validWorkerUid = (uid: string | undefined): number | undefined => {
 const isSymlinkLoop = (error: unknown): boolean =>
   error instanceof Error && "code" in error && error.code === "ELOOP";
 
+const isNoDevice = (error: unknown): boolean =>
+  error instanceof Error && "code" in error && error.code === "ENXIO";
+
+const isWorkspaceIpc = (stat: Stats): boolean =>
+  stat.isFIFO() || stat.isSocket();
+
 /** Whether this node must be chowned; throws for files the worker must never own. */
 const needsChown = (stat: Stats, uid: number): boolean => {
+  // IPC nodes need no group migration. Never transfer a foreign IPC endpoint,
+  // even for retention: all callers keep the same fail-closed ownership policy.
+  if (isWorkspaceIpc(stat)) {
+    if (stat.uid !== uid)
+      throw new Error("Foreign-owned workspace FIFO or socket");
+    return false;
+  }
   if (!stat.isDirectory() && !stat.isFile())
     throw new Error("Unsupported workspace file type");
   const owned = stat.uid === uid && stat.gid === uid;
@@ -118,6 +131,13 @@ export const prepareWorkerWorkspace = async (
       handle = await open(path, NO_FOLLOW_FLAGS);
     } catch (error) {
       if (isSymlinkLoop(error)) return;
+      if (isNoDevice(error)) {
+        const stat = await lstat(path);
+        if (isWorkspaceIpc(stat)) {
+          needsChown(stat, uid);
+          return;
+        }
+      }
       throw error;
     }
     try {
@@ -154,6 +174,13 @@ export const prepareWorkerWorkspaceSync = (
       fd = openSync(path, NO_FOLLOW_FLAGS);
     } catch (error) {
       if (isSymlinkLoop(error)) return;
+      if (isNoDevice(error)) {
+        const stat = lstatSync(path);
+        if (isWorkspaceIpc(stat)) {
+          needsChown(stat, uid);
+          return;
+        }
+      }
       throw error;
     }
     try {
