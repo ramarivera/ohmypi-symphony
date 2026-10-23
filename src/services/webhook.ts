@@ -51,7 +51,6 @@ import {
   redactStringValues,
 } from "./linear-helpers.js";
 import { substitutePromptTemplate } from "./prompt-templates.js";
-import { deliveryReplayHash } from "./store/delivery-repo.js";
 import {
   DeliveryRepo,
   InstallationRepo,
@@ -917,30 +916,33 @@ const handleAppUserNotification = (
       issueId: issueId.value,
     });
     const stopId = payload.notification.id || payload.webhookId;
-    yield* Effect.forEach(runs, (run) =>
-      Schema.decodeUnknownEffect(InputId)(
-        `${run.sessionId}:stop:${stopId}`,
-      ).pipe(
-        Effect.catchTag(
-          "SchemaError",
-          () =>
-            new WebhookPayloadError({
-              message: "Invalid AppUserNotification stop input id",
-              status: 400,
+    // The signed event time bounds both delayed ingress and startup replay.
+    yield* Effect.forEach(
+      runs.filter((run) => run.createdAt <= timestamp),
+      (run) =>
+        Schema.decodeUnknownEffect(InputId)(
+          `${run.sessionId}:stop:${stopId}`,
+        ).pipe(
+          Effect.catchTag(
+            "SchemaError",
+            () =>
+              new WebhookPayloadError({
+                message: "Invalid AppUserNotification stop input id",
+                status: 400,
+              }),
+          ),
+          Effect.flatMap((id) =>
+            runInputRepo.enqueue({
+              id,
+              sessionId: run.sessionId,
+              kind: "stop",
+              body: `Stopped by Linear notification ${payload.action}.`,
+              payload: persistedPayload,
+              createdAt: timestamp,
             }),
+          ),
+          Effect.asVoid,
         ),
-        Effect.flatMap((id) =>
-          runInputRepo.enqueue({
-            id,
-            sessionId: run.sessionId,
-            kind: "stop",
-            body: `Stopped by Linear notification ${payload.action}.`,
-            payload: persistedPayload,
-            createdAt: timestamp,
-          }),
-        ),
-        Effect.asVoid,
-      ),
     );
   });
 
@@ -1124,20 +1126,16 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
         const pending = yield* deliveryRepo.pendingIds();
         for (const row of pending) {
           const token = randomUUID();
+          let acquired = false;
           const replay = Effect.gen(function* () {
             const id = yield* decodeDeliveryId(row.delivery_id);
             const claimed = yield* deliveryRepo.claimReplay(id, token);
             if (Option.isNone(claimed)) return;
+            acquired = true;
             const stored = claimed.value;
             if (
               stored.payload_version !== 1 ||
-              stored.replay_hash !==
-                deliveryReplayHash(
-                  stored.organization_id,
-                  stored.payload_hash,
-                  stored.payload_json,
-                  stored.payload_version,
-                )
+              !deliveryRepo.verifyReplay(stored)
             ) {
               return yield* Effect.fail(
                 new WebhookPayloadError({
@@ -1195,14 +1193,23 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
                       Effect.option,
                     );
                     if (Option.isSome(id)) {
-                      yield* markClaimFailed(
-                        id.value,
-                        token,
-                        "Stored webhook replay failed",
-                      );
+                      // Recovery must fail startup if storage cannot make an
+                      // abandoned delivery retryable. Request cleanup can defer.
+                      yield* acquired
+                        ? deliveryRepo.mark(
+                            id.value,
+                            "failed",
+                            "Stored webhook replay failed",
+                            token,
+                          )
+                        : deliveryRepo.failReplayClaim(
+                            id.value,
+                            row.claim_token,
+                          );
                     }
                   }),
             ),
+            Effect.ensuring(deliveryRepo.releaseClaim(row.delivery_id, token)),
           );
         }
       });
@@ -1509,6 +1516,13 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
           });
 
         return yield* process.pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              deliveryId === undefined
+                ? Effect.void
+                : deliveryRepo.releaseClaim(deliveryId, claimToken),
+            ),
+          ),
           Effect.onError((cause) => {
             const failure = Cause.findErrorOption(cause);
             const reason =
