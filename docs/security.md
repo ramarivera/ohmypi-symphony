@@ -99,11 +99,8 @@ Workspace ownership is migrated separately by preparation and retention under
 ownership migration: gateway log append/rotation and Nix root creation/removal
 don't chmod legacy files and retain access through DAC_OVERRIDE. Nix roots contain
 result symlinks into `/nix`; their targets must never be recursively chowned by
-this migration. The `/nix` store retains its Nix-managed ownership. The root
-gateway also needs a root-readable single-user Nix configuration: the legacy
-uid-1000 HOME at `/home/bun` causes Nix to fall back to `/root` and miss its
-experimental-feature settings. This separate deployment issue is tracked in
-`sym-2sm.18`.
+this migration. The `/nix` store retains its Nix-managed ownership. The gateway
+and worker Nix configuration is described below.
 
 Gateway auth/key mounts and Docker secrets outside `/app/data` aren't modified;
 provision them root-owned with mode 0400 before upgrading, including readonly mounts.
@@ -122,8 +119,7 @@ the worker; gateway-only keys and arbitrary environment variables don't.
 
 The gateway has `HOME=/root`. Nix 2.30.3 is installed with `--no-daemon`;
 `/etc/nix/nix.conf` enables `nix-command flakes read-only-local-store`, disables
-the Nix sandbox,
-and sets `build-users-group =` to empty for this single-user installation.
+the Nix sandbox, and sets `build-users-group =` to empty for this single-user installation.
 The empty group makes builds run as the Nix caller. The gateway's
 `NixEnvironment` uses `nativeRunner` without a uid transition, so environment
 preparation runs as root. Only use a trusted, pinned `NIXPKGS_FLAKE_REF`.
@@ -137,8 +133,8 @@ volumes. Workers retain their workspace HOME and load the system configuration.
 Their environment selects `NIX_REMOTE=local?read-only=true`, so Nix never
 takes the shared database write lock. They can evaluate cached flakes and
 use packages already prepared by the gateway; they can't add packages to
-the shared single-user store. No store ownership
-migration or extra capability is required. Never recursively chown `/nix/store`
+the shared single-user store. No store ownership migration or extra capability
+is required. Never recursively chown `/nix/store`
 or follow GC-root symlinks to change ownership.
 
 ## MCP OAuth
