@@ -10,11 +10,12 @@
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "build": "bun build src/index.ts src/extensions/report-deviation.ts src/workspace-worker.ts --target=bun --outdir=dist",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && bun run effect:check",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "test": "bunx --bun vitest run",
-    "check": "bun run typecheck && bun run lint && bun run test && bun run build"
+    "test": "bun run effect:check && bunx --bun vitest run",
+    "check": "bun run typecheck && bun run lint && bun run test && bun run build",
+    "effect:check": "effect-tsgo diagnostics --project tsconfig.json --format text --severity error,warning --strict"
   },
   "dependencies": {
     "@effect/platform-bun": "4.0.6",
