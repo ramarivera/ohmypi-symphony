@@ -11,6 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import {
+  Clock,
   Duration,
   Effect,
   Exit,
@@ -557,6 +558,7 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
         failure: null,
       });
       const received = yield* Ref.make(0);
+      const lastActivityAt = yield* Ref.make(0);
 
       const subscribeOnce = Effect.gen(function* () {
         const conn = yield* connection;
@@ -582,6 +584,8 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
             ),
             Stream.runForEach((item) =>
               Effect.gen(function* () {
+                // Streaming deltas may map to no projected event but still prove liveness.
+                yield* Ref.set(lastActivityAt, yield* Clock.currentTimeMillis);
                 yield* Ref.update(received, (count) => count + 1);
                 for (const event of mapper.apply(item)) {
                   yield* Queue.offer(queue, [event]);
@@ -861,6 +865,7 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
         },
         capabilities: T3_CAPABILITIES,
         events: Stream.fromQueue(queue).pipe(Stream.flattenTake),
+        lastActivityAt: Ref.get(lastActivityAt),
         sendTurn,
         interrupt,
         respond,

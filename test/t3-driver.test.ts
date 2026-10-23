@@ -19,7 +19,9 @@ import {
   makeT3Driver,
   type T3DriverOptions,
 } from "../src/drivers/t3/driver.js";
-import { connectT3 } from "../src/drivers/t3/rpc-client.js";
+import { connectT3, httpJson } from "../src/drivers/t3/rpc-client.js";
+import { openDriverWorker } from "../src/drivers/worker-adapter.js";
+import type { RpcEvent } from "../src/services/rpc-worker.js";
 import { FakeT3Server } from "./fixtures/fake-t3.js";
 
 const withServer = Effect.acquireRelease(
@@ -116,6 +118,52 @@ const runningRun = (server: FakeT3Server, runId = "run-1") =>
   server.updateRun(THREAD_ID, runId, { status: "running" });
 
 describe("T3 driver auth and protocol", () => {
+  it.live(
+    "times out and aborts HTTP requests whose JSON body stalls after headers",
+    () =>
+      Effect.gen(function* () {
+        let bodyStarted = false;
+        let aborted = false;
+        const server = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            Bun.serve({
+              port: 0,
+              hostname: "127.0.0.1",
+              fetch: () =>
+                new Response(
+                  new ReadableStream<Uint8Array>({
+                    start(controller) {
+                      bodyStarted = true;
+                      controller.enqueue(
+                        new TextEncoder().encode('{"partial":'),
+                      );
+                    },
+                    cancel() {
+                      aborted = true;
+                    },
+                  }),
+                  { headers: { "content-type": "application/json" } },
+                ),
+            }),
+          ),
+          (server) => Effect.promise(() => server.stop(true)),
+        );
+        const error = yield* httpJson(
+          "environment",
+          new URL(`http://127.0.0.1:${server.port}/stalled-body`),
+          { method: "GET" },
+          200,
+        ).pipe(Effect.timeout("2 seconds"), Effect.flip);
+        expect(bodyStarted).toBe(true);
+        expect(error).toMatchObject({
+          reason: "timeout",
+          method: "environment",
+          sent: true,
+        });
+        yield* waitUntil(() => aborted, "HTTP body cancellation");
+      }),
+  );
+
   it.live("probes the descriptor and exchanges the bearer for a ticket", () =>
     Effect.gen(function* () {
       const server = yield* withServer;
@@ -220,6 +268,85 @@ describe("T3 driver launch", () => {
 });
 
 describe("T3 driver turns and events", () => {
+  it.live(
+    "keeps a run alive on suppressed streaming updates, then interrupts on silence",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* withServer;
+        const worker = yield* openDriverWorker(
+          driverFor(server),
+          openInput,
+          undefined,
+          1_000,
+        );
+        const events: RpcEvent[] = [];
+        yield* worker.onEvent((event) => events.push(event));
+        yield* waitUntil(() => subscribeCount(server) === 1, "subscription");
+        yield* worker.prompt("long command and reasoning", "streaming-input");
+        runningRun(server);
+        server.upsertItem(THREAD_ID, {
+          id: "long-command",
+          runId: "run-1",
+          type: "command_execution",
+          status: "running",
+          ordinal: 1,
+          input: "long-command",
+          output: "starting",
+        });
+        yield* waitUntil(
+          () => events.some((event) => event.type === "tool_execution_start"),
+          "initial tool event",
+        );
+        const projectedCount = events.length;
+        for (let index = 0; index < 25; index++) {
+          yield* Effect.sleep(100);
+          const acksBefore = server.clientFrames.filter(
+            (frame) => frame._tag === "Ack",
+          ).length;
+          for (const type of [
+            "command_execution",
+            "reasoning",
+            "assistant_message",
+          ]) {
+            server.upsertItem(THREAD_ID, {
+              id: type === "command_execution" ? "long-command" : type,
+              runId: "run-1",
+              type,
+              status: "running",
+              ordinal: 1,
+              input: "long-command",
+              output: `progress ${index}`,
+              text: `streaming ${index}`,
+              messageId: "assistant-message",
+              streaming: true,
+            });
+          }
+          yield* waitUntil(
+            () =>
+              server.clientFrames.filter((frame) => frame._tag === "Ack")
+                .length >=
+              acksBefore + 3,
+            "streaming acknowledgements",
+          );
+          expect(server.commandsOf("run.interrupt")).toHaveLength(0);
+          expect(events).toHaveLength(projectedCount);
+        }
+        yield* waitUntil(
+          () =>
+            events.some(
+              (event) =>
+                event.type === "error" &&
+                event.message === "T3 stalled for 1000ms",
+            ),
+          "silent run watchdog",
+        );
+        expect(server.commandsOf("run.interrupt")).toHaveLength(1);
+        expect(server.commandsOf("run.interrupt")[0]).toMatchObject({
+          runId: "run-1",
+        });
+      }),
+  );
+
   it.live("maps a full run onto normalized events and an outcome", () =>
     Effect.gen(function* () {
       const server = yield* withServer;

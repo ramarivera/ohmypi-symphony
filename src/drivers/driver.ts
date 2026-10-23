@@ -288,6 +288,8 @@ export interface AgentSession {
    * Single consumer: events are buffered until read.
    */
   readonly events: Stream.Stream<AgentEvent, DriverError>;
+  /** Latest driver stream activity in epoch milliseconds, before event deduplication. */
+  readonly lastActivityAt?: Effect.Effect<number>;
   readonly sendTurn: (
     input: TurnInput,
   ) => Effect.Effect<TurnHandle, DriverError>;

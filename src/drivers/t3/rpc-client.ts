@@ -106,57 +106,64 @@ export const httpJson = (
   init: RequestInit,
   timeoutMs: number,
 ): Effect.Effect<unknown, T3RpcError> =>
-  Effect.gen(function* () {
-    const response = yield* Effect.tryPromise({
-      try: (signal) => fetch(url, { ...init, redirect: "manual", signal }),
-      catch: (error) =>
-        new T3RpcError({
+  Effect.tryPromise({
+    // Keep the abort signal alive through body consumption, not just headers.
+    try: async (signal): Promise<unknown> => {
+      const response = await fetch(url, {
+        ...init,
+        redirect: "manual",
+        signal,
+      });
+      if (response.status === 401 || response.status === 403) {
+        throw new T3RpcError({
+          reason: "auth",
+          method,
+          sent: true,
+          message: `T3 ${url.pathname} rejected the credential (HTTP ${response.status})`,
+        });
+      }
+      if (!response.ok) {
+        throw new T3RpcError({
           reason: "unavailable",
           method,
-          sent: false,
-          message: `T3 ${url.pathname} unreachable: ${errorText(error)}`,
-        }),
-    }).pipe(
-      Effect.timeoutOrElse({
-        duration: Duration.millis(timeoutMs),
-        orElse: () =>
-          Effect.fail(
-            new T3RpcError({
-              reason: "timeout",
-              method,
-              sent: true,
-              message: `T3 ${url.pathname} timed out after ${timeoutMs}ms`,
-            }),
-          ),
-      }),
-    );
-    if (response.status === 401 || response.status === 403) {
-      return yield* new T3RpcError({
-        reason: "auth",
-        method,
-        sent: true,
-        message: `T3 ${url.pathname} rejected the credential (HTTP ${response.status})`,
-      });
-    }
-    if (!response.ok) {
-      return yield* new T3RpcError({
-        reason: "unavailable",
-        method,
-        sent: true,
-        message: `T3 ${url.pathname} answered HTTP ${response.status}`,
-      });
-    }
-    return yield* Effect.tryPromise({
-      try: (): Promise<unknown> => response.json(),
-      catch: () =>
-        new T3RpcError({
+          sent: true,
+          message: `T3 ${url.pathname} answered HTTP ${response.status}`,
+        });
+      }
+      try {
+        return await response.json();
+      } catch {
+        throw new T3RpcError({
           reason: "protocol",
           method,
           sent: true,
           message: `T3 ${url.pathname} returned invalid JSON`,
-        }),
-    });
-  });
+        });
+      }
+    },
+    catch: (error) =>
+      error instanceof T3RpcError
+        ? error
+        : new T3RpcError({
+            reason: "unavailable",
+            method,
+            sent: false,
+            message: `T3 ${url.pathname} unreachable: ${errorText(error)}`,
+          }),
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: Duration.millis(timeoutMs),
+      orElse: () =>
+        Effect.fail(
+          new T3RpcError({
+            reason: "timeout",
+            method,
+            sent: true,
+            message: `T3 ${url.pathname} timed out after ${timeoutMs}ms`,
+          }),
+        ),
+    }),
+  );
 
 const decodeOrProtocol =
   <A, I>(schema: Schema.Codec<A, I>, method: string, what: string) =>

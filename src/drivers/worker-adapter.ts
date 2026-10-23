@@ -118,9 +118,12 @@ export const openDriverWorker = (
         Effect.forever(
           Effect.gen(function* () {
             yield* Effect.sleep(Math.min(1_000, stallTimeoutMs));
+            const lastActivityAt = yield* session.lastActivityAt ??
+              Effect.succeed(lastProgressAt);
             if (
               awaitingOutcome &&
-              (yield* Clock.currentTimeMillis) - lastProgressAt >=
+              (yield* Clock.currentTimeMillis) -
+                Math.max(lastProgressAt, lastActivityAt) >=
                 stallTimeoutMs
             ) {
               awaitingOutcome = false;
