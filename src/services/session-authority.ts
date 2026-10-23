@@ -170,6 +170,7 @@ const linearWorkerPromptWithTemplate = (
   kind: "created" | "prompted" | "stop",
   body: string,
   defaultContract = LINEAR_WORKER_CONTRACT,
+  allowOrganizationContract = true,
 ): Effect.Effect<string, DatabaseError | RowDecodeError> => {
   if (kind === "prompted") {
     return repo.get(organizationId, "prompted").pipe(
@@ -182,6 +183,8 @@ const linearWorkerPromptWithTemplate = (
       ),
     );
   }
+  if (!allowOrganizationContract)
+    return Effect.succeed(linearWorkerPrompt(kind, body, defaultContract));
   return kind !== "created"
     ? Effect.succeed(linearWorkerPrompt(kind, body))
     : repo
@@ -2055,13 +2058,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             .getIssue({ sessionId: run.sessionId, issueId: run.issueId.value })
             .pipe(
               Effect.map((issue) => issue.labels),
-              Effect.mapError(
-                () =>
-                  new RpcSpawnError({
-                    message:
-                      "Could not read Linear labels for driver selection",
-                  }),
-              ),
+              Effect.catch(() => Effect.succeed(labels)),
             );
         }
         const repository = Option.isSome(run.repositoryId)
@@ -2862,6 +2859,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     retryInput.kind,
                     retryInput.body,
                     workerContractFor(worker, config.t3Driver?.connection._tag),
+                    worker.driverSession?.ref.driver !== "t3",
                   );
                   const agentInvoked = yield* worker.prompt(
                     retryPrompt,
@@ -3035,6 +3033,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     input.kind,
                     input.body,
                     workerContractFor(worker, config.t3Driver?.connection._tag),
+                    worker.driverSession?.ref.driver !== "t3",
                   ),
                   input.id,
                 );

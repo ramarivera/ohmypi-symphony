@@ -3278,7 +3278,10 @@ describe("Recovery review regressions", () => {
   );
 });
 
-const seedDriverRun = (defaultDriver: "omp" | "t3") =>
+const seedDriverRun = (
+  defaultDriver: "omp" | "t3",
+  labels: ReadonlyArray<string> = [],
+) =>
   Effect.gen(function* () {
     const installations = yield* InstallationRepo;
     const repositories = yield* WorkspaceRepo;
@@ -3315,7 +3318,7 @@ const seedDriverRun = (defaultDriver: "omp" | "t3") =>
       sessionId: testSessionId,
       kind: "created",
       body: "Fix the test and open a PR",
-      payload: {},
+      payload: { agentSession: { issue: { labels } } },
     });
     return { cwd, configPath };
   });
@@ -3343,6 +3346,7 @@ const withT3Authority = <A, E>(
     ...(workerUid === undefined ? {} : { workerUid }),
     config: [
       ["T3_BASE_URL", server.baseUrl.toString()],
+      ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
       ["T3_TOKEN", server.token],
       ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
       ["T3_MODEL", "gpt-6-sol"],
@@ -3392,6 +3396,7 @@ describe("AgentDriver authority integration", () => {
               withLinearGateway: true,
               config: [
                 ["T3_BASE_URL", server.baseUrl.toString()],
+                ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
                 ["T3_TOKEN", server.token],
                 ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
                 ["T3_MODEL", "gpt-6-sol"],
@@ -3514,6 +3519,12 @@ describe("AgentDriver authority integration", () => {
               const authority = yield* SessionAuthority;
               const repositories = yield* WorkspaceRepo;
               const { cwd, configPath } = yield* seedDriverRun("t3");
+              yield* (yield* PromptTemplateRepo).upsert({
+                organizationId: testOrganizationId,
+                kind: "contract",
+                body: "Org OMP contract: use linear_get_issue, linear_create_comment, linear_add_external_url and rromp_report_deviation, then push.",
+                updatedAt: 0,
+              });
               yield* authority.processSession(testSessionId);
               const ref = Option.getOrThrow(
                 yield* repositories.getDriverSession(testSessionId),
@@ -3526,6 +3537,12 @@ describe("AgentDriver authority integration", () => {
                 yield* Effect.promise(() => readFile(configPath, "utf8")),
               ).not.toContain("AUTHORIZATION");
               const command = server.commandsOf("message.dispatch")[0];
+              const prompt = JSON.stringify(command);
+              expect(prompt).toContain("No Git or GitHub credential");
+              expect(prompt).toContain("don't try to push");
+              expect(prompt).not.toContain("Org OMP contract");
+              expect(prompt).not.toContain("rromp_report_deviation");
+              expect(prompt).not.toContain("linear_get_issue");
               expect(command?.messageId).toBe(
                 `symphony:${ref.nativeId}:message:driver-input`,
               );
@@ -3656,6 +3673,59 @@ describe("AgentDriver authority integration", () => {
       }),
   );
   it.live(
+    "falls back to webhook driver labels when Linear is unavailable",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        for (const t3Configured of [false, true]) {
+          for (const webhookOverride of [false, true]) {
+            yield* withAuthority(
+              () =>
+                Effect.gen(function* () {
+                  yield* seedDriverRun(
+                    webhookOverride ? "t3" : "omp",
+                    webhookOverride ? ["driver:omp"] : [],
+                  );
+                  linearIssueLookupFails = true;
+                  yield* (yield* PromptTemplateRepo).upsert({
+                    organizationId: testOrganizationId,
+                    kind: "contract",
+                    body: "Stored OMP contract",
+                    updatedAt: 0,
+                  });
+                  yield* (yield* SessionAuthority).processSession(
+                    testSessionId,
+                  );
+                  expect(workerSpawnInputs).toHaveLength(1);
+                  expect(workerPrompts[0]).toContain("Stored OMP contract");
+                  expect(server.threads.size).toBe(0);
+                  expect(
+                    Option.getOrThrow(
+                      yield* (yield* WorkspaceRepo).getDriverSession(
+                        testSessionId,
+                      ),
+                    ).driver,
+                  ).toBe("omp");
+                }),
+              {
+                withLinearGateway: true,
+                config: t3Configured
+                  ? [
+                      ["T3_BASE_URL", server.baseUrl.toString()],
+                      ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
+                      ["T3_TOKEN", server.token],
+                      ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+                      ["T3_MODEL", "gpt-6-sol"],
+                    ]
+                  : [],
+              },
+            );
+          }
+        }
+      }),
+  );
+
+  it.live(
     "reads Linear's current driver label over the stored repository default",
     () =>
       Effect.gen(function* () {
@@ -3729,6 +3799,12 @@ describe("AgentDriver authority integration", () => {
           () =>
             Effect.gen(function* () {
               const { cwd, configPath } = yield* seedDriverRun("t3");
+              yield* (yield* PromptTemplateRepo).upsert({
+                organizationId: testOrganizationId,
+                kind: "contract",
+                body: "Org OMP contract: use linear_get_issue, linear_create_comment, linear_add_external_url and rromp_report_deviation, then push.",
+                updatedAt: 0,
+              });
               nixPathEntries = ["/nix/store/repository-toolchain/bin"];
               yield* (yield* WorkspaceRepo).updateRepository(
                 testOrganizationId,
@@ -3772,6 +3848,8 @@ describe("AgentDriver authority integration", () => {
                 server.commandsOf("message.dispatch")[0],
               );
               expect(prompt).toContain("GitHub REST API");
+              expect(prompt).not.toContain("Org OMP contract");
+              expect(prompt).not.toContain("linear_get_issue");
               expect(prompt).not.toContain("rromp_report_deviation");
               const t3Home = join(cwd, ".omp-home", "t3");
               const serveEnv = JSON.parse(

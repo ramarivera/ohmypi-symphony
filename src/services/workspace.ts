@@ -579,33 +579,51 @@ export const assertT3GitCredentials = (
   allowGatewayHeader = false,
 ): Effect.Effect<void, WorkspaceError> =>
   Effect.gen(function* () {
-    const config = yield* runGitOutput(
-      ["config", "--file", join(target, ".git", "config"), "--null", "--list"],
-      target,
-      sessionId,
-      timeoutMs,
+    const configs = yield* Effect.forEach(
+      [
+        join(target, ".git", "config"),
+        join(target, ".omp-home", ".gitconfig"),
+        join(target, ".omp-home", ".config", "git", "config"),
+      ],
+      (file, index) =>
+        Effect.gen(function* () {
+          if (
+            index > 0 &&
+            Option.isNone(yield* lstatOrMissing(file, sessionId, "git_failed"))
+          )
+            return "";
+          return yield* runGitOutput(
+            ["config", "--file", file, "--null", "--list"],
+            target,
+            sessionId,
+            timeoutMs,
+          );
+        }),
     );
-    const unsafe = config.split("\0").some((entry) => {
-      const separator = entry.indexOf("\n");
-      const key = entry.slice(0, separator).toLowerCase();
-      const value = entry.slice(separator + 1);
-      return (
-        key.startsWith("credential.") ||
-        key.startsWith("include.") ||
-        key.startsWith("includeif.") ||
-        key === "core.askpass" ||
-        (key.endsWith(".extraheader") &&
-          !(
-            allowGatewayHeader &&
-            key === GITHUB_EXTRA_HEADER_KEY &&
-            isGatewayGitHubExtraHeader(value)
-          )) ||
-        key.endsWith(".proxy") ||
-        key.endsWith(".sslkey") ||
-        key.endsWith(".sslcert") ||
-        /https?:\/\/[^/\s]*@/iu.test(value)
-      );
-    });
+    const unsafe = configs
+      .join("\0")
+      .split("\0")
+      .some((entry) => {
+        const separator = entry.indexOf("\n");
+        const key = entry.slice(0, separator).toLowerCase();
+        const value = entry.slice(separator + 1);
+        return (
+          key.startsWith("credential.") ||
+          key.startsWith("include.") ||
+          key.startsWith("includeif.") ||
+          key === "core.askpass" ||
+          (key.endsWith(".extraheader") &&
+            !(
+              allowGatewayHeader &&
+              key === GITHUB_EXTRA_HEADER_KEY &&
+              isGatewayGitHubExtraHeader(value)
+            )) ||
+          key.endsWith(".proxy") ||
+          key.endsWith(".sslkey") ||
+          key.endsWith(".sslcert") ||
+          /https?:\/\/[^/\s]*@/iu.test(value)
+        );
+      });
     const credentialFiles = yield* Effect.tryPromise({
       try: async () => {
         for (const name of [

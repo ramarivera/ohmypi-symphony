@@ -23,6 +23,7 @@ const baseValues: ReadonlyArray<readonly [string, string]> = [
 
 const t3Values: ReadonlyArray<readonly [string, string]> = [
   ["T3_BASE_URL", "http://t3:3773"],
+  ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
   ["T3_TOKEN", "t3-bearer"],
   ["T3_PROJECT_ID", "project-1"],
   ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
@@ -96,6 +97,79 @@ describe("T3 driver config", () => {
         expect(String(connection.token.token)).not.toContain("t3-bearer");
         expect(Redacted.value(connection.token.token)).toBe("t3-bearer");
       }
+    }),
+  );
+
+  it.effect(
+    "requires HTTPS unless private-network HTTP is explicitly enabled",
+    () =>
+      Effect.gen(function* () {
+        for (const url of [
+          "http://t3:3773",
+          "http://127.0.0.1:3773",
+          "http://[::1]:3773",
+          "http://public.example.test",
+        ]) {
+          for (const optIn of [undefined, "false", "true"]) {
+            const result = yield* load([
+              ...t3Values.filter(
+                ([key]) => key !== "T3_ALLOW_PRIVATE_NETWORK_HTTP",
+              ),
+              ["T3_BASE_URL", url],
+              ...(optIn === undefined
+                ? []
+                : [["T3_ALLOW_PRIVATE_NETWORK_HTTP", optIn] as const]),
+            ]);
+            expect(Result.isSuccess(result)).toBe(optIn === "true");
+          }
+        }
+        const https = yield* load([
+          ...t3Values.filter(
+            ([key]) => key !== "T3_ALLOW_PRIVATE_NETWORK_HTTP",
+          ),
+          ["T3_BASE_URL", "https://t3.example.test"],
+        ]);
+        expect(Result.isSuccess(https)).toBe(true);
+      }),
+  );
+
+  it.effect("rejects non-digit launch numbers and timer overflow", () =>
+    Effect.gen(function* () {
+      for (const key of [
+        "T3_PORT_BASE",
+        "T3_PORT_COUNT",
+        "T3_LAUNCH_TIMEOUT_MS",
+      ]) {
+        for (const value of [
+          "4e4",
+          "0x9C40",
+          "+40000",
+          "40000.0",
+          "",
+          "0",
+          "-1",
+        ]) {
+          const result = yield* load([...launchValues, [key, value]]);
+          expect(Result.isFailure(result), `${key}=${value}`).toBe(true);
+        }
+      }
+      const overflow = yield* load([
+        ...launchValues,
+        ["T3_LAUNCH_TIMEOUT_MS", "2147483648"],
+      ]);
+      expect(Result.isFailure(overflow)).toBe(true);
+      const valid = yield* load([
+        ...launchValues,
+        ["T3_PORT_BASE", " 40000 "],
+        ["T3_PORT_COUNT", " 8 "],
+        ["T3_LAUNCH_TIMEOUT_MS", " 2147483647 "],
+      ]);
+      if (Result.isFailure(valid)) throw valid.failure;
+      expect(valid.success.t3Driver?.connection).toMatchObject({
+        portBase: 40000,
+        portCount: 8,
+        launchTimeoutMs: 2147483647,
+      });
     }),
   );
 

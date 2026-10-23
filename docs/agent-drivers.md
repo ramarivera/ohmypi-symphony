@@ -87,6 +87,11 @@ Verified against T3 0.1.2 in its own image: two daemons under uids 1001 and
 its own bearer and rejected the other's with 401, `/proc/net/tcp` reported each
 listener under its own uid, and uid 1002 couldn't list uid 1001's state.
 
+Remote endpoints require HTTPS by default, including loopback endpoints. For a
+trusted private network only, set `T3_ALLOW_PRIVATE_NETWORK_HTTP=true` to use
+HTTP, for example `T3_BASE_URL=http://t3:3773`. HTTP sends the bearer without
+transport encryption. This opt-in does not verify the endpoint's network.
+
 ### Git and pull requests
 
 Launched T3 agents use the same credential path as OMP workers: the GitHub
@@ -100,7 +105,8 @@ installation needs Contents and Pull requests write access on the repository.
 Both modes refuse retained non-gateway Git credentials and config includes
 before opening T3. Launch mode checks as the session uid and allows only the
 gateway's GitHub extraheader. Remote mode first removes that header and uses
-a contract without push instructions.
+a contract without push instructions. Organization `contract` templates apply
+only to OMP; T3 always receives the contract for its connection mode.
 
 `T3_RUNTIME_MODE` defaults to `auto`. The authority answers any approval that
 still escalates with `accept` once, inside the session's cancellation mutation

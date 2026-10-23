@@ -575,6 +575,13 @@ const t3RemoteConnection = Effect.fn("GatewayConfig.t3RemoteConnection")(
       return yield* configFailure(
         "T3_BASE_URL must use http(s) without credentials, query, or fragment",
       );
+    const allowPrivateNetworkHttp = yield* Config.Boolean(
+      "T3_ALLOW_PRIVATE_NETWORK_HTTP",
+    ).pipe(Config.withDefault(false));
+    if (baseUrl.protocol === "http:" && !allowPrivateNetworkHttp)
+      return yield* configFailure(
+        "T3_BASE_URL requires HTTPS unless T3_ALLOW_PRIVATE_NETWORK_HTTP=true on a trusted private network",
+      );
     const tokenFile = yield* Config.option(Config.String("T3_TOKEN_FILE"));
     const directToken = yield* Config.option(Config.String("T3_TOKEN"));
     const hasDirectToken =
@@ -614,11 +621,10 @@ const t3LaunchConnection = Effect.fn("GatewayConfig.t3LaunchConnection")(
       return yield* configFailure(
         "T3_MODE=launch starts a daemon per session; unset T3_BASE_URL, T3_TOKEN and T3_TOKEN_FILE",
       );
-    const portBase = Number((yield* optionalValue("T3_PORT_BASE")) ?? "47100");
-    const portCount = Number(
-      (yield* optionalValue("T3_PORT_COUNT")) ??
-        (yield* optionalValue("WORKER_UID_COUNT")) ??
-        "64",
+    const portBase = yield* positiveInteger("T3_PORT_BASE", 47100);
+    const portCount = yield* positiveInteger(
+      "T3_PORT_COUNT",
+      yield* positiveInteger("WORKER_UID_COUNT", 64),
     );
     if (
       !Number.isSafeInteger(portBase) ||
@@ -630,13 +636,10 @@ const t3LaunchConnection = Effect.fn("GatewayConfig.t3LaunchConnection")(
       return yield* configFailure(
         "T3_PORT_BASE and T3_PORT_COUNT must describe unprivileged TCP ports",
       );
-    const launchTimeoutMs = Number(
-      (yield* optionalValue("T3_LAUNCH_TIMEOUT_MS")) ?? "60000",
+    const launchTimeoutMs = yield* timeoutMilliseconds(
+      "T3_LAUNCH_TIMEOUT_MS",
+      60_000,
     );
-    if (!Number.isSafeInteger(launchTimeoutMs) || launchTimeoutMs <= 0)
-      return yield* configFailure(
-        "T3_LAUNCH_TIMEOUT_MS must be a positive integer",
-      );
     const value = (name: string, fallback: string) =>
       optionalValue(name).pipe(
         Effect.map((raw) => raw ?? fallback),
