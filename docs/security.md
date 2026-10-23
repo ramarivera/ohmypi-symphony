@@ -47,6 +47,10 @@ hardlinks remain valid across retries and resumes. MCP materialization, cleanup,
 and Git credential updates execute as the worker uid, including on resume, so
 worker-planted paths never cause privileged gateway writes. Git subprocesses receive a transport
 environment allowlist, without gateway or model-provider credentials.
+Retention removes workspace contents as the worker uid while holding its synchronous
+SQLite reopen fence. The gateway only removes the empty top-level directory; it
+never recursively deletes a worker-controlled tree with gateway privileges. A
+failed cleanup leaves the workspace records intact for a later sweep.
 `/app/workspaces` must be a separate writable volume,
 outside `/app/data`; the image sets `WORKSPACE_ROOT=/app/workspaces`.
 

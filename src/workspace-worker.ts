@@ -1,3 +1,4 @@
+import { readdirSync, rmSync } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect } from "effect";
@@ -40,6 +41,12 @@ switch (action) {
     break;
   case "clear-git":
     await Effect.runPromise(removeGitHubExtraHeaders(cwd, "worker"));
+    break;
+  case "remove-workspace-contents":
+    // Relative paths stay anchored to the subprocess cwd. rm unlinks symlinks;
+    // traversal runs as the worker and cannot access gateway-owned files.
+    for (const name of readdirSync("."))
+      rmSync(name, { recursive: true, force: true });
     break;
   case "tool-directories": {
     for (const name of [".omp-home", ".omp-tmp"])

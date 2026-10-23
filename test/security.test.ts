@@ -6,6 +6,7 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readdir,
   realpath,
   rm,
   stat,
@@ -135,6 +136,20 @@ const legacyToken = (plaintext: string): string => {
 };
 
 describe("security boundaries", () => {
+  it("worker retention cleanup preserves its parent and external link targets", async () => {
+    const dir = await temporary();
+    const external = await temporary();
+    const sentinel = join(external, "sentinel");
+    await writeFile(sentinel, "keep");
+    await symlink(external, join(dir, "directory-link"));
+    await symlink(sentinel, join(dir, "file-link"));
+    await link(sentinel, join(dir, "hardlink"));
+    await workspaceProcess(dir, "remove-workspace-contents", null);
+    expect((await stat(dir)).isDirectory()).toBe(true);
+    expect(await readdir(dir)).toEqual([]);
+    await expect(Bun.file(sentinel).text()).resolves.toBe("keep");
+  });
+
   it("excludes unlisted secrets, secret files, database paths, and runtime injection variables from worker env", () => {
     const result = workerEnvironment({
       PATH: "/bin",

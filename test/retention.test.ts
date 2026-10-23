@@ -1,5 +1,5 @@
 import { existsSync, rmSync } from "node:fs";
-import { symlink, writeFile } from "node:fs/promises";
+import { link, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
 import {
@@ -211,6 +211,37 @@ describe("retention", () => {
       expect(existsSync(join(external, "sentinel"))).toBe(true);
       expect(existsSync(shared)).toBe(true);
     }).pipe(withDatabase),
+  );
+
+  it.scopedLive(
+    "removes nested workspace links without deleting or rewriting their external targets",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        const external = testPath("external");
+        const sentinel = join(external, "sentinel");
+        yield* Effect.promise(async () => {
+          await writeFile(sentinel, "keep");
+          await symlink(external, join(expired, "directory-link"));
+          await symlink(sentinel, join(expired, "file-link"));
+          await link(sentinel, join(expired, "hardlink"));
+        });
+        insertRun(db, "expired", "succeeded", expired);
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+        }).sweep(now);
+        expect(result.workspaces).toBe(1);
+        expect(result.skippedWorkspaces).toBe(0);
+        expect(existsSync(expired)).toBe(false);
+        expect(yield* Effect.promise(() => readFile(sentinel, "utf8"))).toBe(
+          "keep",
+        );
+      }).pipe(withDatabase),
   );
 
   it.scopedLive(
