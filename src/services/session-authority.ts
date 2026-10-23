@@ -1930,7 +1930,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       const now = yield* Clock.currentTimeMillis;
                       yield* runEventRepo.upsert({
                         sourceKey:
-                          `mcp-refresh:${run.sessionId}:${server.id}:${randomUUID()}` as SourceKey,
+                          `mcp-refresh:${run.sessionId}:${server.id}` as SourceKey,
                         sessionId: run.sessionId,
                         kind: "mcp_refresh_failed",
                         level: "error",

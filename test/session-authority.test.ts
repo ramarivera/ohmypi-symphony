@@ -664,7 +664,7 @@ describe("SessionAuthority behavior invariants", () => {
     { timeout: 15_000 },
   );
   it.effect(
-    "records proxy renewal failures as run events and revokes its session bearer on shutdown",
+    "deduplicates proxy renewal failures per session and server and revokes its bearer on shutdown",
     () =>
       withAuthority((db) =>
         Effect.gen(function* () {
@@ -753,10 +753,28 @@ describe("SessionAuthority behavior invariants", () => {
             }),
           );
           expect(response.status).toBe(502);
+          const retries = yield* Effect.promise(() =>
+            Promise.all(
+              Array.from({ length: 12 }, () =>
+                fetch(server.url, {
+                  method: "POST",
+                  headers: server.headers,
+                  body: "{}",
+                }),
+              ),
+            ),
+          );
+          expect(retries.map((retry) => retry.status)).toEqual(
+            Array(12).fill(502),
+          );
           const events = yield* RunEventRepo.list(sid);
+          expect(
+            events.filter((event) => event.kind === "mcp_refresh_failed"),
+          ).toHaveLength(1);
           expect(
             events.find((event) => event.kind === "mcp_refresh_failed"),
           ).toMatchObject({
+            sourceKey: `mcp-refresh:${sid}:${serverId}`,
             level: "error",
             text: Option.some(
               "MCP credential renewal failed for renewal-test. Reconnect this server in the gateway and retry the tool call.",

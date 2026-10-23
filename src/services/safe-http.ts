@@ -113,6 +113,13 @@ const pinnedRequest = (
             pipeline(res, decoder, (error) => {
               if (error) reject(error);
             });
+          const abortResponse = () =>
+            res.destroy(new Error("HTTP request aborted"));
+          init.signal?.addEventListener("abort", abortResponse, { once: true });
+          init.signal?.removeEventListener("abort", abortRequest);
+          res.once("close", () =>
+            init.signal?.removeEventListener("abort", abortResponse),
+          );
           resolve(
             new Response(
               bodyless
@@ -123,6 +130,7 @@ const pinnedRequest = (
               { status, headers: responseHeaders },
             ),
           );
+          if (init.signal?.aborted) abortResponse();
           if (bodyless) {
             decoder?.destroy();
             res.resume();
@@ -133,7 +141,22 @@ const pinnedRequest = (
         }
       },
     );
-    req.on("error", reject);
+    // Keep cancellation active until headers arrive, then hand it to the body.
+    // Bun may emit request "close" before headers, so that isn't a cleanup point.
+    const abortRequest = () => {
+      const error = new Error("HTTP request aborted");
+      req.destroy(error);
+      reject(error);
+    };
+    req.on("error", (error) => {
+      init.signal?.removeEventListener("abort", abortRequest);
+      reject(error);
+    });
+    init.signal?.addEventListener("abort", abortRequest, { once: true });
+    if (init.signal?.aborted) {
+      abortRequest();
+      return;
+    }
     // These endpoints only send form/JSON strings. Never forward arbitrary bodies.
     if (typeof init.body === "string") req.write(init.body);
     req.end();
@@ -145,9 +168,10 @@ async function safeEndpointFetch(
   policy: NetworkPolicy = {},
   transport = nativeFetch,
   streaming = false,
+  timeoutMs = 5000,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     let url = new URL(input instanceof Request ? input.url : input);
     for (let hop = 0; hop <= 3; hop++) {
@@ -243,5 +267,6 @@ export const safeMcpFetch = (
   input: string | URL,
   init: RequestInit,
   policy: NetworkPolicy,
+  headerTimeoutMs = 300_000,
 ): Promise<Response> =>
-  safeEndpointFetch(input, init, policy, nativeFetch, true);
+  safeEndpointFetch(input, init, policy, nativeFetch, true, headerTimeoutMs);

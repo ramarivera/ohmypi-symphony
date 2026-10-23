@@ -40,7 +40,7 @@ export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
   const expected = Buffer.from(`Bearer ${bearer}`);
   const lifetime = new AbortController();
   const routes = new Map<string, { server: McpServerRecord; upstream: URL }>();
-  const endpoints = new Map<string, string>();
+  const endpoints = new Map<string, () => void>();
   const inputs = options.servers.map((server, index) => {
     const path = `/mcp/${index}`;
     routes.set(path, {
@@ -109,6 +109,11 @@ export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
         if (response.status === 401) {
           await response.body?.cancel();
           response = await send(await token(access));
+          if (response.status === 401) {
+            await response.body?.cancel();
+            await options.refreshFailed(server);
+            throw new Error("MCP credential renewal failed");
+          }
         }
         if (!response.ok) {
           await response.body?.cancel();
@@ -127,6 +132,7 @@ export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
           // with an opaque local route; never accept a worker-supplied target.
           let pending = "";
           const decoder = new TextDecoder();
+          const streamRoutes = new Map<string, string>();
           stream = stream
             .pipeThrough(
               new TransformStream<Uint8Array, string>({
@@ -165,13 +171,18 @@ export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
                         target.hash
                       )
                         throw new Error("Untrusted MCP SSE endpoint");
-                      const key = `${server.id}:${target.href}`;
-                      let path = endpoints.get(key);
+                      let path = streamRoutes.get(target.href);
                       if (path === undefined) {
                         if (endpoints.size >= 256)
-                          throw new Error("Too many MCP SSE endpoints");
-                        path = `/messages/${randomBytes(16).toString("hex")}`;
-                        endpoints.set(key, path);
+                          endpoints.values().next().value?.();
+                        const newPath = `/messages/${randomBytes(16).toString("hex")}`;
+                        path = newPath;
+                        streamRoutes.set(target.href, newPath);
+                        endpoints.set(newPath, () => {
+                          endpoints.delete(newPath);
+                          routes.delete(newPath);
+                          streamRoutes.delete(target.href);
+                        });
                         routes.set(path, { server, upstream: target });
                       }
                       event = `event: endpoint\ndata: ${path}`;
@@ -185,6 +196,31 @@ export const startWorkerMcpProxy = (options: ProxyOptions): WorkerMcpProxy => {
                 },
               }),
             );
+          const reader = stream.getReader();
+          const release = () => {
+            for (const path of streamRoutes.values()) endpoints.get(path)?.();
+            request.signal.removeEventListener("abort", release);
+          };
+          request.signal.addEventListener("abort", release, { once: true });
+          if (request.signal.aborted) release();
+          stream = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              try {
+                const next = await reader.read();
+                if (next.done) {
+                  release();
+                  controller.close();
+                } else controller.enqueue(next.value);
+              } catch (error) {
+                release();
+                controller.error(error);
+              }
+            },
+            cancel(reason) {
+              release();
+              return reader.cancel(reason);
+            },
+          });
         }
         return new Response(stream, {
           status: response.status,
