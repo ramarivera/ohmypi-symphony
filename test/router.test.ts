@@ -62,6 +62,7 @@ describe("HTTP router parity", () => {
   it("delegates non-POST webhook methods so the pipeline owns 405 behavior", async () => {
     const methods: string[] = [];
     const pipeline: WebhookPipeline["Service"] = {
+      recoverPendingDeliveries: () => Effect.void,
       handle: (incoming: Request) =>
         Effect.sync(() => {
           methods.push(incoming.method);
@@ -99,6 +100,7 @@ describe("HTTP router parity", () => {
   it("enqueues reconciliation without delaying a successful webhook response", async () => {
     let triggerCalls = 0;
     const pipeline: WebhookPipeline["Service"] = {
+      recoverPendingDeliveries: () => Effect.void,
       handle: (_incoming: Request) =>
         Effect.succeed(new Response(null, { status: 204 })),
     };
@@ -156,6 +158,7 @@ describe("HTTP router parity", () => {
         }: typeof cases extends fc.Arbitrary<infer A> ? A : never) => {
           let triggerCalls = 0;
           const pipeline: WebhookPipeline["Service"] = {
+            recoverPendingDeliveries: () => Effect.void,
             handle: () => Effect.succeed(new Response(null, { status })),
           };
           const reconciler: Reconciler["Service"] = {

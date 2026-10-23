@@ -391,7 +391,7 @@ describe("retention", () => {
           ).run(id, id);
         }
         db.query(
-          "INSERT INTO webhook_delivery VALUES ('old', 'org', 1, 'hash', '{}', 'processed', NULL), ('pending', 'org', 1, 'hash', '{}', 'pending', NULL), ('failed', 'org', 1, 'hash', '{}', 'failed', 'error'), ('new', 'org', 950, 'hash', '{}', 'processed', NULL)",
+          "INSERT INTO webhook_delivery (delivery_id, organization_id, received_at, payload_hash, payload_json, status, error) VALUES ('old', 'org', 1, 'hash', '{}', 'processed', NULL), ('pending', 'org', 1, 'hash', '{}', 'pending', NULL), ('failed', 'org', 1, 'hash', '{}', 'failed', 'error'), ('new', 'org', 950, 'hash', '{}', 'processed', NULL)",
         ).run();
         db.query(
           "INSERT INTO oauth_state VALUES ('old', 1, 1, NULL), ('new', 1, 950, NULL)",
@@ -542,7 +542,7 @@ describe("retention", () => {
           "INSERT INTO activity_projection VALUES ('pending', 'terminal', 'thought', 'hash', NULL, 'pending', 1, 1)",
         ).run();
         db.query(
-          "INSERT INTO webhook_delivery VALUES ('old', 'org', 1, 'hash', '{}', 'processed', NULL)",
+          "INSERT INTO webhook_delivery (delivery_id, organization_id, received_at, payload_hash, payload_json, status, error) VALUES ('old', 'org', 1, 'hash', '{}', 'processed', NULL)",
         ).run();
         const result = yield* makeRetention({
           db,

@@ -76,7 +76,7 @@ export const GatewayServicesLive = Layer.mergeAll(
 // Recovery must finish before accepting deliveries or starting reconciliation.
 export const recoverGateway = Effect.gen(function* () {
   yield* RunRepo.use((service) => service.recoverInterruptedRuns());
-  yield* DeliveryRepo.use((service) => service.recoverPendingDeliveries());
+  yield* WebhookPipeline.use((service) => service.recoverPendingDeliveries());
 });
 
 const recoveredServices = Layer.provideMerge(
