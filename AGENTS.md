@@ -172,10 +172,16 @@ Summary only. `docs/security.md` is authoritative.
 - Writes into worker-controlled trees (MCP config, Git credential headers,
   cleanup) run as the worker uid through `src/workspace-worker.ts`, started
   from the gateway install dir with Bun config pinned to `/dev/null` and an env
-  allowlist. The gateway only removes the empty top-level directory.
+  allowlist. The gateway only removes the empty top-level directory. This
+  applies when a worker identity is configured; in native same-uid mode
+  (no `WORKER_UID_BASE`) the gateway removes the workspace recursively itself.
 - Worker and Git env come from allowlists (`workerEnvironment`,
-  `gitEnvironment`). Gateway secrets, model-provider keys, and `BUN_*`/`NODE_OPTIONS`
-  never reach workers.
+  `gitEnvironment`). Gateway secrets and arbitrary variables (including
+  `BUN_*`/`NODE_OPTIONS`) never reach workers. Exception: the provider API keys
+  and base URLs in the `workerEnvironment` allowlist (`ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
+  `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`) are passed to `omp` when set, so
+  worker code can read them. Only configure keys you accept that exposure for.
 - MCP: `startWorkerMcpProxy` binds one `127.0.0.1` listener per worker with a
   random bearer. Generated MCP config holds only the loopback URL and that
   bearer; upstream tokens and OAuth client records stay in the gateway. Only a
