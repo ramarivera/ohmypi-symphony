@@ -84,8 +84,31 @@ capabilities. A deployment may also apply `--cap-drop=ALL` with these six
 or worker startup.
 Mount all gateway secret files root-owned with mode **0400**, including Docker
 secrets. Startup rejects insecure `_FILE` mounts. Existing data/log volume roots
-are secured by the entrypoint before the gateway starts. Don't share gateway
-state or key volumes with workers or mount the Docker socket into the container.
+must be real directories and are secured by the entrypoint before the gateway
+starts. Before dropping capabilities, the entrypoint migrates legacy ownership
+of regular files and directories under `/app/data` to root:root, including nested
+database paths and SQLite `-wal`, `-shm` and `-journal` sidecars. It skips symlinks.
+Foreign-owned multiply-linked files fail startup; replace them with independent
+copies before upgrading.
+Keep all gateway state that needs ownership migration inside `/app/data`, and
+stop the old gateway before starting the upgrade. Custom `DATABASE_PATH` values
+outside that directory require an operator-managed ownership migration.
+
+Workspace ownership is migrated separately by preparation and retention under
+`/app/workspaces`. Existing log files and Nix roots don't receive a recursive
+ownership migration: gateway log append/rotation and Nix root creation/removal
+don't chmod legacy files and retain access through DAC_OVERRIDE. Nix roots contain
+result symlinks into `/nix`; their targets must never be recursively chowned by
+this migration. The `/nix` store retains its Nix-managed ownership. The root
+gateway also needs a root-readable single-user Nix configuration: the legacy
+uid-1000 HOME at `/home/bun` causes Nix to fall back to `/root` and miss its
+experimental-feature settings. This separate deployment issue is tracked in
+`sym-2sm.18`.
+
+Gateway auth/key mounts and Docker secrets outside `/app/data` aren't modified;
+provision them root-owned with mode 0400 before upgrading, including readonly mounts.
+Don't share gateway state or key volumes with workers or mount the Docker socket
+into the container.
 
 Native launches without `WORKER_UID` retain same-uid workers. The environment
 allowlist and mode-0600 SQLite files still apply, but same-uid workers can read the
