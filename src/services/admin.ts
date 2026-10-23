@@ -78,6 +78,7 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
+import { runEventCursor } from "./store/run-event-repo.js";
 import {
   isHttpsGitHubRepositoryUrl,
   type RepositoryResolution,
@@ -189,6 +190,24 @@ class AdminError extends Schema.TaggedError<AdminError>()(
     status: Schema.Literals([400, 401, 403, 404, 409, 429, 500, 502]),
   },
 ) {}
+
+const RunEventCursorParam = Schema.StringFromBase64Url.pipe(
+  Schema.decodeTo(
+    Schema.fromJsonString(
+      Schema.Struct({
+        createdAt: Schema.Finite,
+        sourceKey: Schema.String,
+      }),
+    ),
+  ),
+);
+const RunEventQuery = Schema.Struct({
+  limit: Schema.NumberFromString.check(
+    Schema.isInt(),
+    Schema.isBetween({ minimum: 1, maximum: 1000 }),
+  ),
+  cursor: Schema.optionalKey(RunEventCursorParam),
+});
 
 function isSecure(config: { publicUrl: URL }): boolean {
   return config.publicUrl.protocol === "https:";
@@ -695,6 +714,15 @@ function redactedStringField(
   return field === null ? null : redact(field);
 }
 
+function hasIssueEvent(events: ReadonlyArray<RunEvent>): boolean {
+  return events.some(
+    (event) =>
+      record(event.payload) &&
+      record(event.payload.agentSession) &&
+      record(event.payload.agentSession.issue),
+  );
+}
+
 function issueForRun(
   run: AgentRun,
   events: ReadonlyArray<RunEvent>,
@@ -728,6 +756,7 @@ function redactOption(value: Option.Option<string>): string | null {
 function runDetailModel(
   run: AgentRun,
   events: ReadonlyArray<RunEvent>,
+  issueEvents: ReadonlyArray<RunEvent> = events,
 ): RunDetailModel {
   return {
     run: {
@@ -753,7 +782,7 @@ function runDetailModel(
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
     },
-    issue: issueForRun(run, events),
+    issue: issueForRun(run, issueEvents),
     events: events.map((event) => ({
       sourceKey: redact(String(event.sourceKey)),
       kind: redact(event.kind),
@@ -1032,8 +1061,57 @@ export const createAdminHandle = (deps: AdminDeps) =>
         const run = runOption.value;
         if (run.organizationId !== session.organizationId)
           return Option.some(text("Not found", 404));
-        const events = yield* deps.runEventRepo.list(sessionId);
-        const model = runDetailModel(run, events);
+        const pageOptions = yield* Schema.decodeUnknownEffect(RunEventQuery)({
+          limit: url.searchParams.get("limit") ?? "100",
+          ...(url.searchParams.has("cursor")
+            ? { cursor: url.searchParams.get("cursor") }
+            : {}),
+        }).pipe(
+          Effect.catchTags({
+            SchemaError: () =>
+              Effect.fail(
+                new AdminError({
+                  message: "Invalid event pagination",
+                  status: 400,
+                }),
+              ),
+          }),
+        );
+        const events = yield* deps.runEventRepo.list(sessionId, pageOptions);
+        const lastEvent = events.at(-1);
+        let nextEventsUrl: string | null = null;
+        if (events.length === pageOptions.limit && lastEvent !== undefined) {
+          const cursor = runEventCursor(lastEvent);
+          const remaining = yield* deps.runEventRepo.list(sessionId, {
+            limit: 1,
+            cursor,
+          });
+          if (remaining.length > 0) {
+            const encodedCursor = yield* Schema.encodeEffect(
+              RunEventCursorParam,
+            )(cursor).pipe(
+              Effect.mapError(
+                () =>
+                  new AdminError({
+                    message: "Could not encode event cursor",
+                    status: 500,
+                  }),
+              ),
+            );
+            const query = new URLSearchParams({
+              limit: String(pageOptions.limit),
+              cursor: encodedCursor,
+            });
+            nextEventsUrl = `${url.pathname}?${query}`;
+          }
+        }
+        // Issue metadata arrives with the first webhook events, so later pages
+        // read it from the head of the timeline instead of the current page.
+        const issueEvents =
+          pageOptions.cursor === undefined || hasIssueEvent(events)
+            ? events
+            : yield* deps.runEventRepo.list(sessionId, { limit: 100 });
+        const model = runDetailModel(run, events, issueEvents);
 
         const rawToken = findCookieValue(request, ADMIN_COOKIE);
         const adminSession =
@@ -1065,11 +1143,13 @@ export const createAdminHandle = (deps: AdminDeps) =>
           lastActivityAt: model.run.lastActivityAt,
           ...model,
         };
-        return Option.some(
+        const response =
           isJsonPath || acceptsJson
             ? json(detail)
-            : html(renderRunDetailPage(model, csrfToken)),
-        );
+            : html(renderRunDetailPage(model, csrfToken, nextEventsUrl));
+        if (nextEventsUrl !== null)
+          response.headers.set("Link", `<${nextEventsUrl}>; rel="next"`);
+        return Option.some(response);
       }
 
       const rerunMatch = /^\/api\/admin\/runs\/([^/]+)\/rerun$/u.exec(
