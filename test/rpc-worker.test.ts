@@ -333,7 +333,7 @@ describe("RPC liveness regressions", () => {
       const worker = yield* rpc.spawn({
         command: [process.execPath, "run", fixture],
         cwd: process.cwd(),
-        env: { FAKE_RPC_HANG_COMMAND: "get_state" },
+        injectedEnv: { FAKE_RPC_HANG_COMMAND: "get_state" },
         requestTimeoutMs: 30,
       });
       yield* worker.start();

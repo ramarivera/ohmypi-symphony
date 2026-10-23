@@ -78,6 +78,7 @@ import {
 import {
   cleanupWorkspaceProcess,
   gitEnvironment,
+  removeWorkerWorkspace,
   removeWorkerWorkspaceSync,
   workspaceProcess,
 } from "../src/services/workspace-process.js";
@@ -311,6 +312,46 @@ process.exit(0);`;
     expect(options?.cwd).not.toBe(dir);
     expect(options?.env).not.toHaveProperty("BUN_OPTIONS");
     expect(options?.env).not.toHaveProperty("NODE_OPTIONS");
+  });
+
+  it("uses the hardened helper and worker identity for asynchronous clone cleanup", async () => {
+    const root = await temporary();
+    const dir = join(root, "workspace");
+    await mkdir(dir);
+    const marker = join(root, "preload-input.json");
+    await writeFile(join(dir, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
+    await writeFile(
+      join(dir, "preload.ts"),
+      `await Bun.write(${JSON.stringify(marker)}, await Bun.stdin.text()); process.exit(0);`,
+    );
+    await writeFile(join(dir, ".env"), "WORKER_UID=0\n");
+    const uid = process.getuid?.() ?? 1000;
+    vi.stubEnv("WORKER_UID", String(uid));
+    vi.stubEnv("BUN_OPTIONS", "--preload=evil");
+    vi.spyOn(process, "getuid").mockReturnValue(uid + 1);
+    const originalSpawn = Bun.spawn;
+    const spawn = vi
+      .spyOn(Bun, "spawn")
+      .mockImplementation((command, options) => {
+        if (!Array.isArray(command)) throw new Error("Expected helper command");
+        return originalSpawn(command.slice(command.indexOf("--") + 1), options);
+      });
+    await removeWorkerWorkspace(dir, root);
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(await readdir(root)).toEqual([]);
+    const [command, options] = spawn.mock.calls[0] ?? [];
+    expect(command).toEqual(
+      expect.arrayContaining([
+        "/usr/bin/setpriv",
+        "--config=/dev/null",
+        "--no-env-file",
+        "--no-install",
+        "remove-workspace-contents",
+        dir,
+      ]),
+    );
+    expect(options?.cwd).not.toBe(dir);
+    expect(options?.env).not.toHaveProperty("BUN_OPTIONS");
   });
 
   it("excludes unlisted secrets, secret files, database paths, and runtime injection variables from worker env", () => {

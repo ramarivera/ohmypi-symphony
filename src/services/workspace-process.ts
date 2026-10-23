@@ -1,9 +1,11 @@
 import { realpathSync, rmdirSync, rmSync } from "node:fs";
+import { lstat, realpath, rm, rmdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Effect } from "effect";
 import { isWithin } from "../util/paths.js";
 import {
+  prepareWorkerWorkspace,
   prepareWorkerWorkspaceSync,
   workerIdentityCommand,
 } from "./worker-security.js";
@@ -85,6 +87,35 @@ export const workspaceProcess = async (
   if (code !== 0)
     throw new Error(`Workspace ${action} failed: ${stderr.trim()}`);
   return stdout;
+};
+
+/** Staging cleanup has the same uid boundary as terminal workspace retention. */
+export const removeWorkerWorkspace = async (
+  cwd: string,
+  workspaceRoot: string,
+): Promise<void> => {
+  const root = await realpath(workspaceRoot);
+  const node = await lstat(cwd).catch((error: unknown) => {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return undefined;
+    throw error;
+  });
+  if (node === undefined) return;
+  if (
+    cwd === root ||
+    !isWithin(root, cwd) ||
+    node.isSymbolicLink() ||
+    !node.isDirectory() ||
+    (await realpath(cwd)) !== cwd
+  )
+    throw new Error("Staging workspace must be inside the workspace root");
+  if (!needsWorkspaceIdentity()) {
+    await rm(cwd, { recursive: true, force: true });
+    return;
+  }
+  await prepareWorkerWorkspace(cwd, process.env.WORKER_UID);
+  await workspaceProcess(cwd, "remove-workspace-contents", null);
+  await rmdir(cwd);
 };
 
 /** Keep retention's SQLite reopen fence synchronous while dropping tree writes to the worker. */

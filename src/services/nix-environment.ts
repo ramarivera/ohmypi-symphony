@@ -179,7 +179,7 @@ const parseClosureSize = (output: string): number | NixEnvironmentError => {
   }
 };
 
-const nativeRunner = async (
+export const nativeRunner = async (
   argv: ReadonlyArray<string>,
   signal?: AbortSignal,
 ): Promise<NixProcessResult> => {

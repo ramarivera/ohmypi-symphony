@@ -1,5 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { Effect, Option, Redacted, Schema } from "effect";
+import { Cause, Effect, Option, Redacted, Schema } from "effect";
 import {
   type DatabaseError,
   type RowDecodeError,
@@ -955,20 +955,21 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       const deliveryRepo = yield* DeliveryRepo;
       const promptTemplateRepo = yield* PromptTemplateRepo;
       const failedCleanup = new Set<DeliveryId>();
-      const markClaimFailed = (id: DeliveryId) =>
-        deliveryRepo
-          .mark(id, "failed", "Webhook processing interrupted or failed")
-          .pipe(
-            Effect.tap(() => Effect.sync(() => failedCleanup.delete(id))),
-            Effect.catchAll((error) =>
-              Effect.gen(function* () {
-                failedCleanup.add(id);
-                yield* Effect.logError("webhook.delivery_cleanup_failed").pipe(
-                  Effect.annotateLogs({ deliveryId: id, error: String(error) }),
-                );
-              }),
-            ),
-          );
+      const markClaimFailed = (
+        id: DeliveryId,
+        reason = "Webhook processing interrupted or failed",
+      ) =>
+        deliveryRepo.mark(id, "failed", reason).pipe(
+          Effect.tap(() => Effect.sync(() => failedCleanup.delete(id))),
+          Effect.catchAll((error) =>
+            Effect.gen(function* () {
+              failedCleanup.add(id);
+              yield* Effect.logError("webhook.delivery_cleanup_failed").pipe(
+                Effect.annotateLogs({ deliveryId: id, error: String(error) }),
+              );
+            }),
+          ),
+        );
 
       const handle = Effect.fn("WebhookPipeline.handle")(function* (
         request: Request,
@@ -1352,11 +1353,30 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
           });
 
         return yield* process.pipe(
-          Effect.onError(() =>
-            claimedDelivery && deliveryId !== undefined
-              ? markClaimFailed(deliveryId)
-              : Effect.void,
-          ),
+          Effect.onError((cause) => {
+            const failure = Cause.failureOption(cause);
+            const reason =
+              Option.isSome(failure) &&
+              (failure.value._tag === "@Gateway/WebhookPayloadError" ||
+                failure.value._tag === "@Gateway/WebhookIdentityError")
+                ? failure.value.message
+                    .replace(
+                      /^OAuth client identity mismatch[\s\S]*$/u,
+                      "OAuth client identity mismatch",
+                    )
+                    .replace(
+                      /^Invalid (identifier|session id|organization id|input id|app user id|team id|issue id) [\s\S]*$/u,
+                      "Invalid $1",
+                    )
+                    .replace(
+                      /^AgentSessionEvent payload is invalid:[\s\S]*$/u,
+                      "AgentSessionEvent payload is invalid",
+                    )
+                : "Webhook processing interrupted or failed";
+            return claimedDelivery && deliveryId !== undefined
+              ? markClaimFailed(deliveryId, reason)
+              : Effect.void;
+          }),
           Effect.catchTags({
             "@Gateway/WebhookPayloadError": (error) =>
               Effect.succeed(

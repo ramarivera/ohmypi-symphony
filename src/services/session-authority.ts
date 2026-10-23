@@ -2326,9 +2326,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             if (inputs.length === 0) {
               if (
                 worker === undefined &&
-                ["orphaned", "starting", "running", "waiting"].includes(
-                  run.state,
-                )
+                (["orphaned", "starting", "running"].includes(run.state) ||
+                  (run.state === "waiting" && Option.isSome(run.workspacePath)))
               ) {
                 yield* updateRun(sessionId, {
                   state: "starting",

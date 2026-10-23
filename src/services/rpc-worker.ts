@@ -5,9 +5,8 @@ import {
   RpcSpawnError,
   RpcTimeoutError,
 } from "../domain/errors.js";
-import { workerEnvironment, workerIdentityCommand } from "./worker-security.js";
-
 import { detachedProcessGroup, signalProcessTree } from "./process.js";
+import { workerEnvironment, workerIdentityCommand } from "./worker-security.js";
 
 export interface RpcEvent {
   readonly type: string;

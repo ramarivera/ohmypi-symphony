@@ -2179,7 +2179,7 @@ describe("Recovery and concurrency regressions", () => {
           expect(failed.state).toBe("orphaned");
           expect(failed.attempt).toBe(1);
           expect(Option.getOrNull(failed.terminalReason)).toContain(
-            "git clone failed",
+            "Repository must be an HTTPS GitHub URL with a valid ref",
           );
           expect(Option.getOrThrow(yield* RunRepo.get(good)).state).toBe(
             "running",
@@ -2424,6 +2424,52 @@ describe("Recovery and concurrency regressions", () => {
   );
 
   it.effect(
+    "leaves waiting runs without workspaces idle until actionable input arrives",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          yield* seedInterrupted(testSessionId);
+          yield* RunRepo.update(testSessionId, {
+            state: "waiting",
+            workspacePath: Option.none(),
+            ompSessionFile: Option.none(),
+          });
+          for (let tick = 0; tick < 4; tick++)
+            yield* SessionAuthority.processRunnable();
+          const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+          expect(run.state).toBe("waiting");
+          expect(run.attempt).toBe(0);
+          expect(run.terminalReason).toEqual(Option.none());
+          expect(workerSpawnInputs).toHaveLength(0);
+          const repositoryId =
+            Schema.decodeUnknownSync(WorkspaceId)("waiting-repository");
+          yield* WorkspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://github.com/fixture/waiting.git",
+            ref: "main",
+          });
+          yield* RunRepo.update(testSessionId, {
+            workspacePath: Option.some(authorityTestRoot),
+            repositoryId: Option.some(repositoryId),
+          });
+          yield* RunInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("waiting-prompt"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "Start working",
+            payload: {},
+          });
+          yield* SessionAuthority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(
+            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+          ).toBe("running");
+        }),
+      ),
+  );
+
+  it.effect(
     "caps concurrent workers and admits a waiting session when capacity is released",
     () =>
       withAuthority(
@@ -2442,9 +2488,23 @@ describe("Recovery and concurrency regressions", () => {
             );
             expect(workerSpawnInputs).toHaveLength(1);
             expect(yield* authority.activeWorkerCount()).toBe(1);
+            const first = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+            const second = Option.getOrThrow(yield* RunRepo.get(next));
+            const blocked = first.state === "running" ? next : testSessionId;
+            expect(
+              [first.state, second.state].filter(
+                (state) => state === "running",
+              ),
+            ).toHaveLength(1);
+            expect(
+              Option.getOrThrow(yield* RunRepo.get(blocked)).state,
+            ).not.toBe("running");
             yield* authority.shutdown();
-            yield* authority.processSession(next);
+            yield* authority.processSession(blocked);
             expect(workerSpawnInputs).toHaveLength(2);
+            expect(Option.getOrThrow(yield* RunRepo.get(blocked)).state).toBe(
+              "running",
+            );
           }),
         { config: [["MAX_CONCURRENT_WORKERS", "1"]] },
       ),
@@ -2533,8 +2593,8 @@ describe("Authority lease loss", () => {
           if (workerEventListener === undefined)
             throw new Error("listener missing");
           workerEventListener({ type: "agent_end" });
-          yield* Effect.repeat(Effect.yieldNow(), {
-            until: () => orderEvents.includes("worker-stopped"),
+          yield* Effect.repeat(authority.activeWorkerCount(), {
+            until: (count) => count === 0,
           });
           expect(
             Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,

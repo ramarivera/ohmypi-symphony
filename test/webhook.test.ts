@@ -1582,6 +1582,37 @@ describe("Webhook cleanup write failures", () => {
 });
 
 describe("Webhook claim-owned failure marking", () => {
+  it.scopedLive.each(["identity", "payload"] as const)(
+    "persists a safe reason for a post-claim %s failure",
+    (kind) =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const deliveries = yield* DeliveryRepo;
+          const mark = yield* Effect.acquireRelease(
+            Effect.sync(() => vi.spyOn(deliveries, "mark")),
+            (spy) => Effect.sync(() => spy.mockRestore()),
+          );
+          const original = createdPayload(yield* Clock.currentTimeMillis);
+          const payload =
+            kind === "identity"
+              ? { ...original, oauthClientId: "untrusted-client-value" }
+              : { ...original, agentSession: "untrusted-session-value" };
+          const response = yield* WebhookPipeline.handle(
+            signedRequest(payload),
+          );
+          expect(response.status).toBe(kind === "identity" ? 401 : 400);
+          expect(mark).toHaveBeenCalledTimes(1);
+          expect(mark.mock.calls[0]?.slice(1)).toEqual([
+            "failed",
+            kind === "identity"
+              ? "OAuth client identity mismatch"
+              : "AgentSessionEvent payload is invalid",
+          ]);
+        }).pipe(Effect.scoped),
+      ),
+  );
+
   it.scopedLive(
     "does not overwrite a reclaimed delivery after a tagged processing failure",
     () =>

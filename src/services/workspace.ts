@@ -1,11 +1,19 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, opendir, readFile, realpath, rename, rm, rmdir,
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  opendir,
+  readFile,
+  realpath,
+  rename,
   writeFile,
 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
-import { Effect, Option } from "effect";
+import { Clock, Effect, Option } from "effect";
 import {
   type DatabaseError,
   type RowDecodeError,
@@ -30,6 +38,7 @@ import {
   cleanupWorkspaceProcess,
   gitEnvironment,
   needsWorkspaceIdentity,
+  removeWorkerWorkspace,
   workspaceProcess,
 } from "./workspace-process.js";
 
@@ -344,7 +353,10 @@ const runGit = (
   sessionId: string,
   timeoutMs = 120_000,
   extraHeader?: string,
-) => runGitOutput(args, cwd, sessionId, timeoutMs, extraHeader).pipe(Effect.asVoid);
+) =>
+  runGitOutput(args, cwd, sessionId, timeoutMs, extraHeader).pipe(
+    Effect.asVoid,
+  );
 
 export const persistGitHubExtraHeader = (
   target: string,
@@ -429,17 +441,35 @@ export const runGitOutput = (
 ) =>
   Effect.tryPromise({
     try: async (signal) => {
-      const command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", ...args];
-      const process = Bun.spawn(cwd === undefined ? command : workerIdentityCommand(command, globalThis.process.env.WORKER_UID), {
-        env: {
-          ...gitEnvironment(globalThis.process.env),
-          ...(extraHeader === undefined ? {} : { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: GITHUB_EXTRA_HEADER_KEY, GIT_CONFIG_VALUE_0: extraHeader }),
+      const command = [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "credential.helper=",
+        ...args,
+      ];
+      const process = Bun.spawn(
+        cwd === undefined
+          ? command
+          : workerIdentityCommand(command, globalThis.process.env.WORKER_UID),
+        {
+          env: {
+            ...gitEnvironment(globalThis.process.env),
+            ...(extraHeader === undefined
+              ? {}
+              : {
+                  GIT_CONFIG_COUNT: "1",
+                  GIT_CONFIG_KEY_0: GITHUB_EXTRA_HEADER_KEY,
+                  GIT_CONFIG_VALUE_0: extraHeader,
+                }),
+          },
+          detached: detachedProcessGroup,
+          ...(cwd ? { cwd } : {}),
+          stdout: "pipe",
+          stderr: "pipe",
         },
-        detached: detachedProcessGroup,
-        ...(cwd ? { cwd } : {}),
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      );
       const abort = () => signalProcessTree(process, "SIGKILL");
       signal.addEventListener("abort", abort, { once: true });
       const [exitCode, stdout, stderr] = await Promise.all([
@@ -697,75 +727,81 @@ export const makeWorkspace = (input: {
     // write leaves enough information for recovery. Never infer death from age.
     const stagingRecoveryGate = yield* Effect.makeSemaphore(1);
     let stagingRecovered = false;
+    let stagingRetryAt = 0;
     const recoverStaging = stagingRecoveryGate.withPermits(1)(
-      Effect.suspend(() =>
-        stagingRecovered
-          ? Effect.void
-          : ensureRoot(input.workspaceRoot, "startup").pipe(
-              Effect.flatMap((root) =>
-                Effect.tryPromise({
-                  try: async () => {
-                    const entries = await opendir(root);
-                    let scanned = 0;
-                    let removed = 0;
-                    for await (const entry of entries) {
-                      if (++scanned > 10_000 || removed >= 100) break;
-                      const owner =
-                        /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
-                          entry.name,
-                        );
-                      if (
-                        owner === null ||
-                        owner[1] !== hostKey ||
-                        !entry.isDirectory()
+      Effect.gen(function* () {
+        if (
+          stagingRecovered ||
+          (yield* Clock.currentTimeMillis) < stagingRetryAt
+        )
+          return;
+        yield* ensureRoot(input.workspaceRoot, "startup").pipe(
+          Effect.flatMap((root) =>
+            Effect.tryPromise({
+              try: async () => {
+                const entries = await opendir(root);
+                let scanned = 0;
+                let removed = 0;
+                for await (const entry of entries) {
+                  if (++scanned > 10_000 || removed >= 100) break;
+                  const owner =
+                    /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
+                      entry.name,
+                    );
+                  if (
+                    owner === null ||
+                    owner[1] !== hostKey ||
+                    !entry.isDirectory()
+                  )
+                    continue;
+                  const pid = Number(owner[2]);
+                  if (!Number.isSafeInteger(pid)) continue;
+                  try {
+                    process.kill(pid, 0);
+                    continue;
+                  } catch (error) {
+                    if (
+                      !(
+                        error instanceof Error &&
+                        "code" in error &&
+                        error.code === "ESRCH"
                       )
-                        continue;
-                      const pid = Number(owner[2]);
-                      if (!Number.isSafeInteger(pid)) continue;
-                      try {
-                        process.kill(pid, 0);
-                        continue;
-                      } catch (error) {
-                        if (
-                          !(
-                            error instanceof Error &&
-                            "code" in error &&
-                            error.code === "ESRCH"
-                          )
-                        )
-                          continue;
-                      }
-                      // Dead owners cannot publish these random, per-clone names.
-                      // Forced removal is idempotent when multiple gateways clean up.
-                      await rm(join(root, entry.name), {
-                        recursive: true,
-                        force: true,
-                      });
-                      removed++;
-                    }
-                  },
-                  catch: workspaceFailure(
-                    "recover abandoned clones",
-                    "git_failed",
-                    "startup",
-                  ),
+                    )
+                      continue;
+                  }
+                  // Dead owners cannot publish these random, per-clone names.
+                  // Forced removal is idempotent when multiple gateways clean up.
+                  await removeWorkerWorkspace(join(root, entry.name), root);
+                  removed++;
+                }
+              },
+              catch: workspaceFailure(
+                "recover abandoned clones",
+                "git_failed",
+                "startup",
+              ),
+            }),
+          ),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              stagingRecovered = true;
+            }),
+          ),
+          Effect.catchAll((error) =>
+            Effect.gen(function* () {
+              stagingRetryAt = (yield* Clock.currentTimeMillis) + 30_000;
+              yield* Effect.logWarning(
+                "workspace.staging_recovery_failed",
+              ).pipe(
+                Effect.annotateLogs({
+                  event: "workspace.staging_recovery_failed",
+                  error: String(error),
                 }),
-              ),
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  stagingRecovered = true;
-                }),
-              ),
-              Effect.catchAll((error) =>
-                Effect.logWarning("workspace.staging_recovery_failed").pipe(
-                  Effect.annotateLogs({
-                    event: "workspace.staging_recovery_failed",
-                    error: String(error),
-                  }),
-                ),
-              ),
-            ),
-      ),
+              );
+            }),
+          ),
+        );
+      }),
     );
     const git = (
       args: ReadonlyArray<string>,
@@ -1006,7 +1042,20 @@ export const makeWorkspace = (input: {
               ),
             }),
             (path) =>
-              Effect.promise(() => rm(path, { force: true, recursive: true })),
+              Effect.tryPromise({
+                try: () => removeWorkerWorkspace(path, canonicalRoot),
+                catch: workspaceFailure(
+                  "remove clone staging",
+                  "git_failed",
+                  sessionId,
+                ),
+              }).pipe(
+                Effect.catchAll((error) =>
+                  Effect.logWarning("workspace.staging_cleanup_failed").pipe(
+                    Effect.annotateLogs({ sessionId, error: error.message }),
+                  ),
+                ),
+              ),
           );
           const cloneArgs = [
             "clone",
@@ -1016,13 +1065,29 @@ export const makeWorkspace = (input: {
             repository.url,
             staging,
           ];
-          yield* runGit(cloneArgs, undefined, sessionId, input.gitTimeoutMs, githubExtraHeader);
-          if (process.env.WORKER_UID) yield* Effect.tryPromise({
-            try: () => prepareWorkerWorkspace(staging, process.env.WORKER_UID),
-            catch: workspaceFailure("Could not assign workspace ownership", "git_failed", sessionId),
-          });
+          yield* runGit(
+            cloneArgs,
+            undefined,
+            sessionId,
+            input.gitTimeoutMs,
+            githubExtraHeader,
+          );
+          if (process.env.WORKER_UID)
+            yield* Effect.tryPromise({
+              try: () =>
+                prepareWorkerWorkspace(staging, process.env.WORKER_UID),
+              catch: workspaceFailure(
+                "Could not assign workspace ownership",
+                "git_failed",
+                sessionId,
+              ),
+            });
           if (githubExtraHeader !== undefined) {
-            yield* persistGitHubExtraHeader(staging, sessionId, githubExtraHeader);
+            yield* persistGitHubExtraHeader(
+              staging,
+              sessionId,
+              githubExtraHeader,
+            );
           }
           // If anything after persisting the header fails, drop it so the next
           // attempt doesn't inherit a stale/expired credential.

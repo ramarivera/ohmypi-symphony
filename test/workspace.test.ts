@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
+import * as filesystem from "node:fs/promises";
 import {
-  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -13,7 +13,15 @@ import {
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
-import { ConfigProvider, Effect, Either, Layer, Logger, Schema } from "effect";
+import {
+  ConfigProvider,
+  Effect,
+  Either,
+  Layer,
+  Logger,
+  Schema,
+  TestClock,
+} from "effect";
 import * as fc from "effect/FastCheck";
 import { describe, expect, vi } from "vitest";
 import { WorkspaceError } from "../src/domain/errors.js";
@@ -36,6 +44,11 @@ import {
   safeSessionKey,
   Workspace,
 } from "../src/services/workspace.js";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, rm: vi.fn(actual.rm) };
+});
 
 const MARKER_FILE = ".linear-gateway-workspace.json";
 const TEST_KEY_BASE64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
@@ -1167,6 +1180,9 @@ it.scopedLive(
       );
       expect(clone?.[0]).toContain("--");
       expect(clone?.[1]?.env?.GIT_CONFIG_VALUE_0).toBe(header);
+      expect(clone?.[1]?.env?.GIT_TERMINAL_PROMPT).toBe("0");
+      expect(clone?.[1]?.env?.GIT_ASKPASS).toBe("");
+      expect(clone?.[1]?.env).not.toHaveProperty("LINEAR_CLIENT_SECRET");
       expect(
         yield* readGitConfig("http.https://github.com/.extraheader", target),
       ).toBe(header);
@@ -1304,8 +1320,8 @@ describe("Workspace recovery regressions", () => {
       }),
   );
 
-  it.scopedLive(
-    "logs a failed staging scan, materializes, and retries recovery later",
+  it.scoped(
+    "backs off a failed staging scan and retries after its deadline",
     () =>
       Effect.gen(function* () {
         const fixture = yield* gitFixture;
@@ -1328,8 +1344,19 @@ describe("Workspace recovery regressions", () => {
           githubApp: undefined,
         });
         const abandonedPath = join(fixture.workspaceRoot, abandoned);
-        yield* fixtureIo("deny abandoned clone cleanup", () =>
-          chmod(abandonedPath, 0),
+        const originalRemove = vi.mocked(filesystem.rm).getMockImplementation();
+        if (originalRemove === undefined)
+          throw new Error("filesystem implementation missing");
+        let attempts = 0;
+        const removeSpy = yield* Effect.acquireRelease(
+          Effect.sync(() =>
+            vi.spyOn(filesystem, "rm").mockImplementation((path, options) => {
+              if (path === abandonedPath && ++attempts === 1)
+                return Promise.reject(new Error("controlled cleanup denial"));
+              return originalRemove(path, options);
+            }),
+          ),
+          (spy) => Effect.sync(() => spy.mockRestore()),
         );
         const messages: string[] = [];
         const logger = Logger.make((options) =>
@@ -1337,7 +1364,7 @@ describe("Workspace recovery regressions", () => {
         );
         const repository = repositoryRecord({
           id: "scan-retry",
-          url: fixture.source,
+          url: fixture.url,
           ref: "HEAD",
         });
         yield* Effect.gen(function* () {
@@ -1353,15 +1380,14 @@ describe("Workspace recovery regressions", () => {
               readdir(fixture.workspaceRoot),
             ),
           ).toContain(abandoned);
-        }).pipe(
-          Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
-          Effect.ensuring(
-            fixtureIo("restore staging permissions", () =>
-              chmod(abandonedPath, 0o700),
-            ).pipe(Effect.orDie),
-          ),
-        );
+        }).pipe(Effect.provide(Logger.replace(Logger.defaultLogger, logger)));
+        expect(attempts).toBe(1);
         yield* workspace.materialize("second", repository);
+        expect(attempts).toBe(1);
+        expect(removeSpy).toHaveBeenCalled();
+        yield* TestClock.adjust(30_000);
+        yield* workspace.materialize("third", repository);
+        expect(attempts).toBe(2);
         expect(
           yield* fixtureIo("read staging", () =>
             readdir(fixture.workspaceRoot),
