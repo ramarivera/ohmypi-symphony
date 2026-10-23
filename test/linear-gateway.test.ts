@@ -1,5 +1,8 @@
 import type * as LinearSdk from "@linear/sdk";
 import { vi } from "vitest";
+import { suitePaths } from "./fixtures/paths.js";
+
+const suitePath = suitePaths();
 
 const sdkState = vi.hoisted(() => {
   type ActivityInput = {
@@ -282,9 +285,9 @@ const gatewayDependencies = Layer.mergeAll(
       nixBinaryPath: "nix",
       nixpkgsFlakeRef:
         "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
-      nixRootsDir: "/tmp/nix-roots",
+      nixRootsDir: suitePath("nix-roots"),
       nixGcMaxBytes: 1_000_000,
-      workspaceRoot: "/tmp/workspaces",
+      workspaceRoot: suitePath("workspaces"),
       ompCliPath: "omp",
       port: 3000,
       leaseDurationMs: 60_000,

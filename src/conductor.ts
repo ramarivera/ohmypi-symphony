@@ -13,6 +13,7 @@ import { NixEnvironment } from "./services/nix-environment.js";
 import { OAuth } from "./services/oauth.js";
 import { ActivityProjector } from "./services/projector.js";
 import { Reconciler } from "./services/reconciler.js";
+import { Retention } from "./services/retention.js";
 import { RpcWorker } from "./services/rpc-worker.js";
 import { SessionAuthority } from "./services/session-authority.js";
 import {
@@ -64,6 +65,7 @@ export const GatewayServicesLive = Layer.mergeAll(
   OAuth.Default,
   McpOAuth.Default,
   Reconciler.Default,
+  Retention.Default,
   Workspace.Default,
   Admin.Default,
 ).pipe(
@@ -105,7 +107,14 @@ const servicesWithHttp = Layer.provideMerge(
   servicesWithServer,
 );
 const servicesWithScheduler = Layer.provideMerge(
-  scheduledReconciler,
+  Layer.merge(
+    scheduledReconciler,
+    Layer.scopedDiscard(
+      Effect.flatMap(Retention, (retention) =>
+        Effect.forkScoped(retention.run),
+      ),
+    ),
+  ),
   servicesWithHttp,
 );
 

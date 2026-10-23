@@ -1,5 +1,4 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, test } from "@effect/vitest";
 import {
@@ -12,6 +11,7 @@ import {
   Schema,
 } from "effect";
 import { GatewayConfig } from "../src/services/config.js";
+import { testPaths } from "./fixtures/paths.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -54,9 +54,13 @@ afterEach(async () => {
   );
 });
 
+const testPath = testPaths();
+
 describe("GatewayConfig", () => {
   test("loads required values from Docker secret files", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "gateway-secrets-"));
+    const directory = await mkdtemp(
+      join(testPath("temporary"), "gateway-secrets-"),
+    );
     temporaryDirectories.push(directory);
     const values = {
       LINEAR_CLIENT_ID: "client",
@@ -95,7 +99,9 @@ describe("GatewayConfig", () => {
   });
 
   test("prefers a direct value over its file fallback", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "gateway-secrets-"));
+    const directory = await mkdtemp(
+      join(testPath("temporary"), "gateway-secrets-"),
+    );
     temporaryDirectories.push(directory);
     const clientIdFile = join(directory, "linear-client-id");
     await writeFile(clientIdFile, "file-client\n", { mode: 0o600 });
@@ -304,7 +310,7 @@ describe("GatewayConfig", () => {
   test("preserves configured path boundaries", async () => {
     const values = valuesWith([
       ["DATABASE_PATH", ":memory:"],
-      ["WORKSPACE_ROOT", "/tmp/gateway-workspaces"],
+      ["WORKSPACE_ROOT", testPath("gateway-workspaces")],
       ["OMP_CLI_PATH", ""],
     ]);
     const config = await Effect.runPromise(
@@ -314,7 +320,7 @@ describe("GatewayConfig", () => {
     );
 
     expect(config.databasePath).toBe(":memory:");
-    expect(config.workspaceRoot).toBe("/tmp/gateway-workspaces");
+    expect(config.workspaceRoot).toBe(testPath("gateway-workspaces"));
     expect(config.ompCliPath).toBe("omp");
   });
 

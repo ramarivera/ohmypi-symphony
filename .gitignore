@@ -13,3 +13,7 @@ fnox.out
 .dolt/
 *.db
 .beads-credential-key
+
+# Beads local worktree coordination
+.beads.gate.lock
+.beads.gate.lock.*

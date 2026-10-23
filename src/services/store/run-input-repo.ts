@@ -199,7 +199,11 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
             );
           }
 
-          if (input.kind === "stop" && !isDeferredNotificationStop(input)) {
+          if (
+            inserted &&
+            input.kind === "stop" &&
+            !isDeferredNotificationStop(input)
+          ) {
             yield* applyStop(input.sessionId, createdAt);
           }
 

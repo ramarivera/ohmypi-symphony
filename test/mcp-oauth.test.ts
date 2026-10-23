@@ -22,9 +22,12 @@ import {
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { testPaths } from "./fixtures/paths.js";
 
 const hash = (value: string) =>
   createHash("sha256").update(value).digest("base64url");
+
+const testPath = testPaths();
 
 describe("MCP OAuth primitives", () => {
   it("builds an RFC 7636 S256 authorize URL", () => {
@@ -175,7 +178,7 @@ describe("MCP OAuth primitives", () => {
   });
 
   it("rejects duplicate provider keys during credential materialization", async () => {
-    const workspace = `/tmp/mcp-oauth-duplicate-${crypto.randomUUID()}`;
+    const workspace = testPath(`mcp-oauth-duplicate-${crypto.randomUUID()}`);
     await expect(
       materializeMcpAgentDb(workspace, [
         {
@@ -221,7 +224,7 @@ describe("MCP OAuth primitives", () => {
           "NIXPKGS_FLAKE_REF",
           "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
         ],
-        ["WORKSPACE_ROOT", "/tmp/mcp-oauth-basic"],
+        ["WORKSPACE_ROOT", testPath("mcp-oauth-basic")],
       ]),
     );
     const sqlite = SqliteClientLive(":memory:");
@@ -395,7 +398,7 @@ describe("MCP OAuth primitives", () => {
           "NIXPKGS_FLAKE_REF",
           "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
         ],
-        ["WORKSPACE_ROOT", "/tmp/mcp-oauth-retry-state"],
+        ["WORKSPACE_ROOT", testPath("mcp-oauth-retry-state")],
       ]),
     );
     const sqlite = SqliteClientLive(":memory:");
@@ -473,7 +476,7 @@ describe("MCP OAuth primitives", () => {
     }
   });
   it("materializes an isolated Pi auth database with access-only MCP credentials", async () => {
-    const workspace = `/tmp/mcp-oauth-test-${crypto.randomUUID()}`;
+    const workspace = testPath(`mcp-oauth-test-${crypto.randomUUID()}`);
     const agentDir = await materializeMcpAgentDb(workspace, [
       {
         serverUrl: "https://mcp.example/server",
@@ -521,7 +524,7 @@ describe("MCP OAuth primitives", () => {
     await rm(workspace, { recursive: true, force: true });
   });
   it("materializes refresh material for a live MCP connection", async () => {
-    const workspace = `/tmp/mcp-oauth-refresh-${crypto.randomUUID()}`;
+    const workspace = testPath(`mcp-oauth-refresh-${crypto.randomUUID()}`);
     const agentDir = await materializeMcpAgentDb(workspace, [
       {
         serverUrl: "https://mcp.example/server",
@@ -586,7 +589,7 @@ describe("MCP OAuth primitives", () => {
           "NIXPKGS_FLAKE_REF",
           "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
         ],
-        ["WORKSPACE_ROOT", "/tmp/mcp-oauth-race"],
+        ["WORKSPACE_ROOT", testPath("mcp-oauth-race")],
       ]),
     );
     const sqlite = SqliteClientLive(":memory:");

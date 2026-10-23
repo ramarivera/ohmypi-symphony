@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { join, relative, sep } from "node:path";
+import { join } from "node:path";
 import { Effect, Option } from "effect";
 import {
   type DatabaseError,
@@ -9,6 +9,7 @@ import {
 } from "../domain/errors.js";
 import type { OrganizationId } from "../domain/ids.js";
 import type { RepositoryRecord } from "../domain/models.js";
+import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
 import {
   buildGitHubExtraHeader,
@@ -16,6 +17,9 @@ import {
   type GitHubAppTokenService,
 } from "./github-app.js";
 import { WorkspaceRepo } from "./store/repositories.js";
+
+export { isWithin } from "../util/paths.js";
+
 export type RepositoryResolution =
   | { readonly kind: "match"; readonly repository: RepositoryRecord }
   | { readonly kind: "none" }
@@ -50,11 +54,6 @@ export interface WorkspaceRepoShape {
 
 export function safeSessionKey(sessionId: string): string {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 32);
-}
-
-export function isWithin(root: string, candidate: string): boolean {
-  const path = relative(root, candidate);
-  return path === "" || (!path.startsWith(`..${sep}`) && path !== "..");
 }
 
 function hasIntersection(

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Deferred, Effect, Option, Schema } from "effect";
 import { RpcWorker } from "../src/services/rpc-worker.js";
+import { testPaths } from "./fixtures/paths.js";
 
 const fixture = new URL("./fixtures/fake-rpc.ts", import.meta.url).pathname;
 const uiResponseFixture = String.raw`
@@ -58,6 +59,8 @@ process.on("SIGTERM", async () => {
 });
 await Bun.sleep(60_000);
 `;
+const testPath = testPaths();
+
 describe("RpcWorker", () => {
   const Live = RpcWorker.Default;
 
@@ -199,7 +202,7 @@ describe("RpcWorker", () => {
   it.effect("escalates when stdin close does not stop the process", () =>
     Effect.gen(function* () {
       const rpc = yield* RpcWorker;
-      const marker = `/tmp/omp-rpc-stop-${Date.now()}-${Math.random()}`;
+      const marker = testPath(`omp-rpc-stop-${Date.now()}-${Math.random()}`);
       const worker = yield* rpc.spawn({
         command: ["bun", "-e", ignoresStdinCloseFixture],
         cwd: process.cwd(),

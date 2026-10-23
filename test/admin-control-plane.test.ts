@@ -48,6 +48,9 @@ import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { WebhookPipeline } from "../src/services/webhook.js";
 import { Workspace } from "../src/services/workspace.js";
+import { suitePaths } from "./fixtures/paths.js";
+
+const suitePath = suitePaths();
 
 const PUBLIC_URL = "http://localhost:3000";
 const TEST_KEY = Buffer.from(new Uint8Array(32).fill(9)).toString("base64");
@@ -60,7 +63,7 @@ const configProvider = ConfigProvider.fromMap(
     ["LINEAR_WEBHOOK_SECRET", "webhook"],
     ["TOKEN_ENCRYPTION_KEY", TEST_KEY],
     ["DATABASE_PATH", ":memory:"],
-    ["WORKSPACE_ROOT", "/tmp/gateway-admin-workspaces"],
+    ["WORKSPACE_ROOT", suitePath("gateway-admin-workspaces")],
     ["PORT", "3000"],
     ["OMP_CLI_PATH", "omp"],
     ["LEASE_DURATION_MS", "60000"],
@@ -71,7 +74,7 @@ const configProvider = ConfigProvider.fromMap(
       "NIXPKGS_FLAKE_REF",
       "github:NixOS/nixpkgs/0123456789abcdef0123456789abcdef01234567",
     ],
-    ["NIX_ROOTS_DIR", "/tmp/gateway-admin-nix-roots"],
+    ["NIX_ROOTS_DIR", suitePath("gateway-admin-nix-roots")],
     ["NIX_GC_MAX_BYTES", "1000000"],
   ]),
 );
