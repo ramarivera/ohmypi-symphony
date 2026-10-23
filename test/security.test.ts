@@ -17,6 +17,7 @@ import {
 import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { brotliCompressSync, deflateSync, gzipSync } from "node:zlib";
 import {
   ConfigProvider,
   Effect,
@@ -774,6 +775,114 @@ describe("security boundaries", () => {
       await server.stop(true);
     }
   });
+
+  it.each([
+    ["gzip", gzipSync],
+    ["x-gzip", gzipSync],
+    ["deflate", deflateSync],
+    ["br", brotliCompressSync],
+  ] as const)("decodes %s OAuth JSON responses", async (encoding, compress) => {
+    const metadata = { token_endpoint: "https://issuer.example/token" };
+    const compressed = compress(JSON.stringify(metadata));
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (request) => {
+        if (request.headers.get("x-check-encoding") === "true")
+          expect(request.headers.get("accept-encoding")).toBe(
+            "gzip, deflate, br",
+          );
+        return new Response(compressed, {
+          headers: {
+            "content-type": "application/json",
+            "content-encoding": encoding,
+            "content-length": String(compressed.byteLength),
+          },
+        });
+      },
+    });
+    try {
+      const url = `http://127.0.0.1:${server.port}/metadata`;
+      if (encoding === "gzip")
+        expect(await (await fetch(url)).json()).toEqual(metadata);
+      const response = await safeOAuthFetch(
+        url,
+        {
+          headers: {
+            "accept-encoding": "unsupported",
+            "x-check-encoding": "true",
+          },
+        },
+        { allowLoopbackHttp: true },
+      );
+      expect(await response.json()).toEqual(metadata);
+      expect(response.headers.get("content-type")).toBe("application/json");
+      expect(response.headers.has("content-encoding")).toBe(false);
+      expect(response.headers.has("content-length")).toBe(false);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it("rejects a decompression bomb and cancels the unfinished upstream body", async () => {
+    const compressed = gzipSync("x".repeat(MCP_MAX_RESPONSE_BYTES + 1));
+    expect(compressed.byteLength).toBeLessThan(MCP_MAX_RESPONSE_BYTES);
+    let cancelled = false;
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(compressed);
+              // Leave the response open to prove overflow stops upstream input.
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "content-encoding": "gzip" } },
+        ),
+    });
+    try {
+      await expect(
+        safeOAuthFetch(
+          `http://127.0.0.1:${server.port}/metadata`,
+          {},
+          { allowLoopbackHttp: true },
+        ),
+      ).rejects.toBeInstanceOf(BodyTooLargeError);
+      await vi.waitFor(() => expect(cancelled).toBe(true));
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  it.each(["zstd", "gzip, br", "identity, gzip"])(
+    "rejects unsupported or stacked OAuth content encoding %s",
+    async (encoding) => {
+      const server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: () =>
+          new Response('{"ok":true}', {
+            headers: { "content-encoding": encoding },
+          }),
+      });
+      try {
+        await expect(
+          safeOAuthFetch(
+            `http://127.0.0.1:${server.port}/metadata`,
+            {},
+            { allowLoopbackHttp: true },
+          ),
+        ).rejects.toThrow("Unsupported OAuth content encoding");
+      } finally {
+        await server.stop(true);
+      }
+    },
+  );
 
   it("rejects invalid upstream statuses without an uncaught callback exception", async () => {
     const server = createServer((socket) => {

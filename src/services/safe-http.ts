@@ -2,7 +2,8 @@ import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { BlockList, isIP } from "node:net";
-import { Readable } from "node:stream";
+import { pipeline, Readable } from "node:stream";
+import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { readBoundedBody } from "./bounded-body.js";
 
 const nativeFetch = globalThis.fetch;
@@ -56,7 +57,9 @@ const pinnedRequest = (
 ): Promise<Response> =>
   new Promise((resolve, reject) => {
     const transport = url.protocol === "https:" ? httpsRequest : httpRequest;
-    const headers = Object.fromEntries(new Headers(init.headers));
+    const requestHeaders = new Headers(init.headers);
+    requestHeaders.set("accept-encoding", "gzip, deflate, br");
+    const headers = Object.fromEntries(requestHeaders);
     const req = transport(
       url,
       {
@@ -81,17 +84,49 @@ const pinnedRequest = (
                 Array.isArray(value) ? value.join(", ") : value,
               );
           }
+          const encoding = (
+            responseHeaders.get("content-encoding") ?? "identity"
+          )
+            .trim()
+            .toLowerCase();
+          const decoder = (() => {
+            switch (encoding) {
+              case "identity":
+                return undefined;
+              case "gzip":
+              case "x-gzip":
+                return createGunzip();
+              case "deflate":
+                return createInflate();
+              case "br":
+                return createBrotliDecompress();
+              default:
+                throw new Error("Unsupported OAuth content encoding");
+            }
+          })();
+          responseHeaders.delete("content-encoding");
+          responseHeaders.delete("content-length");
+          const bodyless = [204, 205, 304].includes(status);
+          // Cancelling the bounded reader destroys the decoder. pipeline also
+          // destroys the upstream response, stopping compressed input on overflow.
+          if (decoder && !bodyless)
+            pipeline(res, decoder, (error) => {
+              if (error) reject(error);
+            });
           resolve(
             new Response(
-              [204, 205, 304].includes(status)
+              bodyless
                 ? null
                 : (Readable.toWeb(
-                    res,
+                    decoder ?? res,
                   ) as unknown as ReadableStream<Uint8Array>),
               { status, headers: responseHeaders },
             ),
           );
-          if ([204, 205, 304].includes(status)) res.resume();
+          if (bodyless) {
+            decoder?.destroy();
+            res.resume();
+          }
         } catch (error) {
           res.destroy();
           reject(error);
@@ -182,6 +217,9 @@ export async function safeOAuthFetch(
       );
     }
     throw new Error("OAuth redirect limit reached");
+  } catch (error) {
+    controller.abort();
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
