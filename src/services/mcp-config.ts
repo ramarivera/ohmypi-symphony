@@ -140,12 +140,21 @@ export const writeOmpMcpConfig = (
   if (needsWorkspaceIdentity())
     return Effect.tryPromise({
       try: async () => {
-        await workspaceProcess(cwd, "mcp-config", servers);
+        await workspaceProcess(cwd, "mcp-config", toOmpMcpConfig(servers));
       },
       catch: (error) =>
         error instanceof Error ? error : new Error(String(error)),
     });
-  const contents = `${JSON.stringify(toOmpMcpConfig(servers), null, 2)}\n`;
+  return writeOmpMcpConfigFile(cwd, toOmpMcpConfig(servers), sessionId);
+};
+
+/** Accept only the already-projected worker config across the uid boundary. */
+export const writeOmpMcpConfigFile = (
+  cwd: string,
+  config: ReturnType<typeof toOmpMcpConfig>,
+  sessionId?: string,
+): Effect.Effect<void, Error> => {
+  const contents = `${JSON.stringify(config, null, 2)}\n`;
   return Effect.gen(function* () {
     if (yield* Effect.promise(() => isTrackedMcpConfig(cwd))) {
       yield* Effect.logWarning("mcp.config.tracked_skip").pipe(

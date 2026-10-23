@@ -47,6 +47,22 @@ hardlinks remain valid across retries and resumes. MCP materialization, cleanup,
 and Git credential updates execute as the worker uid, including on resume, so
 worker-planted paths never cause privileged gateway writes. Git subprocesses receive a transport
 environment allowlist, without gateway or model-provider credentials.
+The workspace helper starts from its gateway-owned installation directory and
+receives the workspace as an absolute argument. Both asynchronous operations and
+synchronous retention pin Bun's configuration to `/dev/null`, disable `.env`
+autoloading and automatic package installation, and use an environment allowlist
+that excludes `BUN_*`, `NODE_OPTIONS` and loader injection variables. Keep the
+helper, its installation directory, dependencies and parent directories unwritable
+by the worker uid. Repository `bunfig.toml`, `.env`, `package.json`, `tsconfig.json`
+and `node_modules` are never helper startup inputs. Cleanup uses explicit workspace
+paths and doesn't depend on the helper's cwd.
+
+MCP configuration is projected to its generated `mcpServers` fields before helper
+stdin is serialized. OAuth client records and renewal fields never cross that uid
+boundary. Agent database inputs contain only server URLs and short-lived access
+tokens with expirations. Git persistence sends only the repository-scoped header
+string on stdin, never argv; cleanup operations carry no credential payload.
+
 Retention removes workspace contents as the worker uid while holding its synchronous
 SQLite reopen fence. Before delegation, the gateway migrates legacy ownership with
 the same descriptor-based, no-follow walk used for workspace preparation. Only

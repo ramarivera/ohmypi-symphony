@@ -1,4 +1,5 @@
 import { realpathSync, rmdirSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Effect } from "effect";
 import { isWithin } from "../util/paths.js";
@@ -46,25 +47,36 @@ const workspaceWorkerScript = fileURLToPath(
   ),
 );
 
+// Only gateway-installed code and dependencies may initialize the helper. The
+// workspace is data, never Bun's cwd/config/module-resolution root.
+const workspaceWorkerCommand = (cwd: string, action: string): string[] =>
+  workerIdentityCommand(
+    [
+      process.execPath,
+      "--config=/dev/null",
+      "--no-env-file",
+      "--no-install",
+      workspaceWorkerScript,
+      action,
+      cwd,
+    ],
+    process.env.WORKER_UID,
+  );
+
 /** All writes into worker-controlled trees run without gateway privileges. */
 export const workspaceProcess = async (
   cwd: string,
   action: string,
   payload: unknown,
 ): Promise<string> => {
-  const child = Bun.spawn(
-    workerIdentityCommand(
-      [process.execPath, workspaceWorkerScript, action],
-      process.env.WORKER_UID,
-    ),
-    {
-      cwd,
-      env: gitEnvironment(process.env),
-      stdin: new Response(JSON.stringify(payload)),
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
+  const child = Bun.spawn(workspaceWorkerCommand(cwd, action), {
+    cwd: dirname(workspaceWorkerScript),
+    // This allowlist excludes BUN_*, NODE_OPTIONS and loader variables.
+    env: gitEnvironment(process.env),
+    stdin: new Response(JSON.stringify(payload)),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const [code, stdout, stderr] = await Promise.all([
     child.exited,
     new Response(child.stdout).text(),
@@ -91,12 +103,10 @@ export const removeWorkerWorkspaceSync = (
   // Migrate them before delegation, without yielding retention's reopen fence.
   prepareWorkerWorkspaceSync(cwd, process.env.WORKER_UID);
   const child = Bun.spawnSync(
-    workerIdentityCommand(
-      [process.execPath, workspaceWorkerScript, "remove-workspace-contents"],
-      process.env.WORKER_UID,
-    ),
+    workspaceWorkerCommand(cwd, "remove-workspace-contents"),
     {
-      cwd,
+      cwd: dirname(workspaceWorkerScript),
+      // This allowlist excludes BUN_*, NODE_OPTIONS and loader variables.
       env: gitEnvironment(process.env),
       stdin: Buffer.from("null"),
       stdout: "pipe",

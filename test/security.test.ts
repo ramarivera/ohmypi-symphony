@@ -30,6 +30,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { redact } from "../src/admin-ui/run-detail.js";
 import { OrganizationId } from "../src/domain/ids.js";
+import { McpServerRecord } from "../src/domain/models.js";
 import {
   rerunIssueGateCount,
   withRerunIssueGate,
@@ -40,7 +41,10 @@ import {
 } from "../src/services/bounded-body.js";
 import { GatewayConfig } from "../src/services/config.js";
 import { makeGitHubApp } from "../src/services/github-app.js";
-import { removeMcpConfig } from "../src/services/mcp-config.js";
+import {
+  removeMcpConfig,
+  writeOmpMcpConfig,
+} from "../src/services/mcp-config.js";
 import {
   materializeMcpAgentDb,
   removeMcpAgentDb,
@@ -183,6 +187,132 @@ describe("security boundaries", () => {
     await expect(Bun.file(sentinel).text()).resolves.toBe("keep");
   });
 
+  it.each([
+    "agent-db",
+    "mcp-config",
+    "remove-agent-db",
+    "remove-mcp-config",
+    "persist-git",
+    "clear-git",
+    "remove-workspace-contents",
+    "tool-directories",
+  ])(
+    "ignores repository runtime injection for helper action %s",
+    async (action) => {
+      const parent = await temporary();
+      const dir = join(parent, "workspace");
+      await mkdir(dir);
+      const initialized = Bun.spawnSync(["git", "init", "-q", dir]);
+      expect(initialized.exitCode).toBe(0);
+      const marker = join(parent, "preload-input.json");
+      const preload = `import { readFileSync, writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(marker)}, readFileSync(0));
+process.exit(0);`;
+      for (const location of [parent, dir]) {
+        await writeFile(
+          join(location, "bunfig.toml"),
+          'preload = ["./preload.ts"]\n',
+        );
+        await writeFile(join(location, "preload.ts"), preload);
+        await writeFile(join(location, ".env"), "WORKER_UID=0\n");
+        await writeFile(
+          join(location, "tsconfig.json"),
+          JSON.stringify({
+            compilerOptions: {
+              baseUrl: ".",
+              paths: { effect: ["./preload.ts"] },
+            },
+          }),
+        );
+        await writeFile(
+          join(location, "package.json"),
+          JSON.stringify({
+            type: "module",
+            imports: { "#helper": "./preload.ts" },
+            scripts: { prestart: "bun preload.ts" },
+          }),
+        );
+        await mkdir(join(location, "node_modules", "effect"), {
+          recursive: true,
+        });
+        await writeFile(
+          join(location, "node_modules", "effect", "package.json"),
+          JSON.stringify({ name: "effect", main: "../../preload.ts" }),
+        );
+      }
+      vi.stubEnv("BUN_OPTIONS", `--preload=${join(dir, "preload.ts")}`);
+      vi.stubEnv("BUN_INSPECT", "127.0.0.1:6499");
+      vi.stubEnv("NODE_OPTIONS", `--require=${join(dir, "preload.ts")}`);
+      const payload =
+        action === "agent-db"
+          ? []
+          : action === "mcp-config"
+            ? { mcpServers: {} }
+            : action === "persist-git"
+              ? `AUTHORIZATION: basic ${Buffer.from("x-access-token:synthetic").toString("base64")}`
+              : null;
+      const output = await workspaceProcess(dir, action, payload);
+      expect(await Bun.file(marker).exists()).toBe(false);
+      if (action === "agent-db") expect(output).toBe(join(dir, ".omp-gateway"));
+      if (action === "mcp-config")
+        expect(await Bun.file(join(dir, "mcp.json")).json()).toEqual(payload);
+      if (action === "remove-workspace-contents")
+        expect(await readdir(dir)).toEqual([]);
+    },
+  );
+
+  it("does not autoload a workspace .env into the helper", async () => {
+    const dir = await temporary();
+    // Loading this value makes materialization try an invalid root identity.
+    await writeFile(join(dir, ".env"), "WORKER_UID=0\n");
+    expect(await workspaceProcess(dir, "agent-db", [])).toBe(
+      join(dir, ".omp-gateway"),
+    );
+  });
+
+  it("uses the hardened Bun launch for synchronous retention too", async () => {
+    const root = await temporary();
+    const dir = join(root, "workspace");
+    await mkdir(dir);
+    const marker = join(root, "preload-input.json");
+    await writeFile(join(dir, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
+    await writeFile(
+      join(dir, "preload.ts"),
+      `await Bun.write(${JSON.stringify(marker)}, await Bun.stdin.text()); process.exit(0);`,
+    );
+    await writeFile(join(dir, ".env"), "WORKER_UID=0\n");
+    const uid = process.getuid?.() ?? 1000;
+    vi.stubEnv("WORKER_UID", String(uid));
+    vi.stubEnv("BUN_OPTIONS", "--preload=evil");
+    vi.stubEnv("NODE_OPTIONS", "--require=evil");
+    vi.spyOn(process, "getuid").mockReturnValue(uid + 1);
+    const spawnSync = Bun.spawnSync;
+    const spawn = vi
+      .spyOn(Bun, "spawnSync")
+      .mockImplementation((command, options) => {
+        if (!Array.isArray(command)) throw new Error("Expected helper command");
+        // Exercise the real Bun helper as our uid; native tests can't setgroups.
+        return spawnSync(command.slice(command.indexOf("--") + 1), options);
+      });
+    removeWorkerWorkspaceSync(dir, root);
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(await readdir(root)).toEqual([]);
+    const [command, options] = spawn.mock.calls[0] ?? [];
+    expect(command).toEqual(
+      expect.arrayContaining([
+        "/usr/bin/setpriv",
+        "--config=/dev/null",
+        "--no-env-file",
+        "--no-install",
+        "remove-workspace-contents",
+        dir,
+      ]),
+    );
+    expect(options?.cwd).not.toBe(dir);
+    expect(options?.env).not.toHaveProperty("BUN_OPTIONS");
+    expect(options?.env).not.toHaveProperty("NODE_OPTIONS");
+  });
+
   it("excludes unlisted secrets, secret files, database paths, and runtime injection variables from worker env", () => {
     const result = workerEnvironment({
       PATH: "/bin",
@@ -198,6 +328,9 @@ describe("security boundaries", () => {
       LINEAR_CLIENT_SECRET: "secret",
       DATABASE_PATH: "/app/data/gateway.sqlite",
       FUTURE_GATEWAY_SECRET: "secret",
+      BUN_OPTIONS: "--preload=evil",
+      BUN_INSPECT: "127.0.0.1:6499",
+      BUN_CONFIG_VERBOSE_FETCH: "1",
       NODE_OPTIONS: "--import=evil",
       LD_PRELOAD: "/evil",
       NIX_SECRET_FILE: "/keys/nix",
@@ -451,6 +584,9 @@ describe("security boundaries", () => {
       GITHUB_APP_PRIVATE_KEY: "private",
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_VALUE_0: "stale",
+      BUN_OPTIONS: "--preload=evil",
+      BUN_INSPECT: "127.0.0.1:6499",
+      BUN_CONFIG_VERBOSE_FETCH: "1",
       NODE_OPTIONS: "--import=evil",
     });
     expect(environment).toEqual({
@@ -1085,6 +1221,90 @@ describe("security boundaries", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("projects MCP configuration before serializing helper stdin", async () => {
+    const dir = await temporary();
+    const record = {
+      ...Schema.decodeUnknownSync(McpServerRecord)({
+        id: "mcp",
+        organizationId: "org",
+        name: "remote",
+        transport: "http",
+        command: null,
+        args: [],
+        url: "https://mcp.example",
+        env: {},
+        headers: { Authorization: "Bearer worker-access" },
+        oauthClient: {
+          clientId: "client",
+          clientSecret: "gateway-client-secret",
+        },
+        repositoryId: null,
+        enabled: true,
+        createdAt: 0,
+        updatedAt: 0,
+      }),
+      refreshToken: "gateway-refresh-token",
+      tokenEndpoint: "https://issuer.example/token",
+    };
+    vi.stubEnv("WORKER_UID", String((process.getuid?.() ?? 1000) + 1));
+    const spawn = vi.spyOn(Bun, "spawn").mockImplementation(() => {
+      throw new Error("Worker payload intercepted");
+    });
+    await expect(
+      Effect.runPromise(writeOmpMcpConfig(dir, [record])),
+    ).rejects.toThrow("Worker payload intercepted");
+    expect(spawn).toHaveBeenCalledOnce();
+    const [command, options] = spawn.mock.calls[0] ?? [];
+    expect(command).toEqual(
+      expect.arrayContaining([
+        "--config=/dev/null",
+        "--no-env-file",
+        "--no-install",
+        "mcp-config",
+        dir,
+      ]),
+    );
+    expect(options?.cwd).not.toBe(dir);
+    if (!(options?.stdin instanceof Response))
+      throw new Error("Missing serialized worker input");
+    const serialized = await options.stdin.text();
+    expect(serialized).not.toMatch(
+      /clientSecret|refresh|oauthClient|tokenEndpoint/iu,
+    );
+    expect(JSON.parse(serialized)).toEqual({
+      mcpServers: {
+        remote: {
+          type: "http",
+          url: "https://mcp.example",
+          headers: { Authorization: "Bearer worker-access" },
+        },
+      },
+    });
+  });
+
+  it("sends only the Git header on helper stdin, never argv", async () => {
+    const dir = await temporary();
+    const handle = await open(dir, "r");
+    const prototype = Object.getPrototypeOf(handle) as FileHandle;
+    await handle.close();
+    vi.spyOn(prototype, "chown").mockResolvedValue(undefined);
+    vi.stubEnv("WORKER_UID", String((process.getuid?.() ?? 1000) + 1));
+    const spawn = vi.spyOn(Bun, "spawn").mockImplementation(() => {
+      throw new Error("Worker payload intercepted");
+    });
+    const header = `AUTHORIZATION: basic ${Buffer.from("x-access-token:synthetic-token").toString("base64")}`;
+    const result = await Effect.runPromise(
+      Effect.either(persistGitHubExtraHeader(dir, "test", header)),
+    );
+    expect(Either.isLeft(result)).toBe(true);
+    expect(spawn).toHaveBeenCalledOnce();
+    const [command, options] = spawn.mock.calls[0] ?? [];
+    expect(JSON.stringify(command)).not.toContain(header);
+    if (!(options?.stdin instanceof Response))
+      throw new Error("Missing serialized worker input");
+    expect(await options.stdin.json()).toBe(header);
   });
 
   it("strips all renewal material before serializing the agent-db worker payload", async () => {

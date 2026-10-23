@@ -1,10 +1,10 @@
 import { readdirSync, rmSync } from "node:fs";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { Effect } from "effect";
 import {
   removeMcpConfigFile,
-  writeOmpMcpConfig,
+  writeOmpMcpConfigFile,
 } from "./services/mcp-config.js";
 import {
   materializeMcpAgentDb,
@@ -16,7 +16,9 @@ import {
   removeGitHubExtraHeaders,
 } from "./services/workspace.js";
 
-const cwd = process.cwd();
+const cwd = process.argv[3];
+if (cwd === undefined || !isAbsolute(cwd))
+  throw new Error("Expected absolute workspace path");
 const action = process.argv[2];
 const input: unknown = await Bun.stdin.json();
 switch (action) {
@@ -35,7 +37,10 @@ switch (action) {
   }
   case "mcp-config":
     await Effect.runPromise(
-      writeOmpMcpConfig(cwd, input as Parameters<typeof writeOmpMcpConfig>[1]),
+      writeOmpMcpConfigFile(
+        cwd,
+        input as Parameters<typeof writeOmpMcpConfigFile>[1],
+      ),
     );
     break;
   case "remove-agent-db":
@@ -52,10 +57,10 @@ switch (action) {
     await Effect.runPromise(removeGitHubExtraHeaders(cwd, "worker"));
     break;
   case "remove-workspace-contents":
-    // Relative paths stay anchored to the subprocess cwd. rm unlinks symlinks;
-    // traversal runs as the worker and cannot access gateway-owned files.
-    for (const name of readdirSync("."))
-      rmSync(name, { recursive: true, force: true });
+    // rm unlinks symlinks; traversal stays under the explicit workspace path
+    // and runs as the worker, without access to gateway-owned files.
+    for (const name of readdirSync(cwd))
+      rmSync(join(cwd, name), { recursive: true, force: true });
     break;
   case "tool-directories": {
     for (const name of [".omp-home", ".omp-tmp"])

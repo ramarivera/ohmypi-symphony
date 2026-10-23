@@ -2,7 +2,6 @@ import * as fs from "node:fs";
 import { existsSync, realpathSync, rmSync, statSync } from "node:fs";
 import { link, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { it } from "@effect/vitest";
 import {
   Config,
@@ -101,27 +100,17 @@ describe("retention", () => {
           migrated.push(realpathSync(`/proc/self/fd/${fd}`));
         });
         const spawnSync = Bun.spawnSync;
-        const worker = vi.spyOn(Bun, "spawnSync").mockImplementation(() => {
-          expect(db.inTransaction).toBe(true);
-          expect(migrated.sort()).toEqual([expired, nested, file].sort());
-          // Run the real deletion entry point as the test uid after the mocked
-          // migration. Production uses setpriv to select the migrated uid.
-          return spawnSync(
-            [
-              process.execPath,
-              fileURLToPath(
-                new URL("../src/workspace-worker.ts", import.meta.url),
-              ),
-              "remove-workspace-contents",
-            ],
-            {
-              cwd: expired,
-              stdin: Buffer.from("null"),
-              stdout: "pipe",
-              stderr: "pipe",
-            },
-          );
-        });
+        const worker = vi
+          .spyOn(Bun, "spawnSync")
+          .mockImplementation((command, options) => {
+            expect(db.inTransaction).toBe(true);
+            expect(migrated.sort()).toEqual([expired, nested, file].sort());
+            // Run the real deletion entry point as the test uid after the mocked
+            // migration. Production uses setpriv to select the migrated uid.
+            if (!Array.isArray(command))
+              throw new Error("Expected helper command");
+            return spawnSync(command.slice(command.indexOf("--") + 1), options);
+          });
         insertRun(db, "expired", "succeeded", expired);
         const result = yield* makeRetention({
           db,
@@ -135,9 +124,13 @@ describe("retention", () => {
           expect.arrayContaining([
             "--reuid",
             String(workerUid),
+            "--config=/dev/null",
+            "--no-env-file",
+            "--no-install",
             "remove-workspace-contents",
+            expired,
           ]),
-          expect.objectContaining({ cwd: expired }),
+          expect.objectContaining({ cwd: expect.not.stringContaining(root) }),
         );
         expect(existsSync(expired)).toBe(false);
         expect(statSync(sentinel)).toMatchObject({
