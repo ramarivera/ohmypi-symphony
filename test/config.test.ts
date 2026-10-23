@@ -469,6 +469,20 @@ describe("Worker model routing", () => {
     }),
   );
 
+  it.effect("ignores the deploy-only fnox token in native startup", () =>
+    Effect.gen(function* () {
+      const result = yield* configResult(
+        valuesWith([
+          ["SYMPHONY_DEPLOY_CLIPROXYAPI_API_KEY", "deploy-only-key"],
+        ]),
+      );
+      if (!Result.isSuccess(result)) throw new Error("expected success");
+      expect(result.success.cliproxyApiBaseUrl).toBeUndefined();
+      expect(result.success.cliproxyApiKey).toBeUndefined();
+      expect(result.success.workerDefaultModel).toBeUndefined();
+    }),
+  );
+
   test("reads the CLIProxyAPI key from a secret file and defaults to Codex", async () => {
     const directory = await mkdtemp(
       join(testPath("temporary"), "gateway-secrets-"),

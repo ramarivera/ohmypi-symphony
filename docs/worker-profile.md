@@ -81,6 +81,12 @@ providers:
 | `WORKER_EXTENSION_PATHS` | Comma-separated absolute paths of image-installed extensions loaded into every worker. The image sets pi-claude-cli. |
 | `WORKER_CLAUDE_EXECUTABLE` | Claude Code launcher for pi-claude-cli. The image sets `/usr/local/bin/claude-cliproxy`. |
 
+The repository's encrypted fnox entry is named
+`SYMPHONY_DEPLOY_CLIPROXYAPI_API_KEY`. Toolbox pre-up maps that value to the
+`CLIPROXYAPI_API_KEY` Docker secret file. Native `mise run start` and
+`mise run dev` don't map it, so they can start without model routing. To enable
+routing natively, explicitly supply both runtime settings above.
+
 Codex and OpenAI models use the `models.yml` provider, so omp calls
 `<CLIPROXYAPI_BASE_URL>/v1/responses` with the client key as a bearer token.
 
