@@ -17,6 +17,7 @@ export interface ReconcilerStatus {
   readonly running: boolean;
   readonly lastStartedAt: Option.Option<number>;
   readonly lastCompletedAt: Option.Option<number>;
+  readonly lastProgressAt?: Option.Option<number>;
   readonly lastError: Option.Option<string>;
 }
 
@@ -158,6 +159,11 @@ export class Reconciler extends Effect.Service<Reconciler>()("Reconciler", {
                   }),
               }),
             );
+          const progressedAt = yield* Clock.currentTimeMillis;
+          yield* Ref.update(statusRef, (status) => ({
+            ...status,
+            lastProgressAt: Option.some(progressedAt),
+          }));
           let injected = false;
           for (const activity of activities) {
             if (activity.type !== "prompt") continue;

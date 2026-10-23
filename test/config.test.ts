@@ -447,3 +447,20 @@ describe("Recovery bounds configuration", () => {
     }),
   );
 });
+
+describe("Finite operation deadlines", () => {
+  it.effect.each([
+    "RPC_REQUEST_TIMEOUT_MS",
+    "GIT_TIMEOUT_MS",
+    "NIX_TIMEOUT_MS",
+  ] as const)("bounds %s to the timer range", (name) =>
+    Effect.gen(function* () {
+      expect(
+        Either.isRight(yield* configResult(valuesWith([[name, "2147483647"]]))),
+      ).toBe(true);
+      expect(
+        Either.isLeft(yield* configResult(valuesWith([[name, "2147483648"]]))),
+      ).toBe(true);
+    }),
+  );
+});

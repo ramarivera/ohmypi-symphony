@@ -6,6 +6,7 @@ import {
   Fiber,
   HashMap,
   Logger,
+  LogLevel,
   Option,
   Schema,
 } from "effect";
@@ -433,4 +434,34 @@ describe("Worker fiber ownership", () => {
       yield* worker.stop();
     }).pipe(Effect.provide(RpcWorker.Default)),
   );
+});
+
+describe("Bounded worker shutdown registrations", () => {
+  it.live("keeps only active workers in gateway shutdown cleanup", () => {
+    let scopeCleanups = 0;
+    const logger = Logger.make((options) => {
+      if (String(options.message) === "worker.scope_cleanup") scopeCleanups++;
+    });
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        for (let i = 0; i < 10; i++) {
+          const worker = yield* RpcWorker.spawn({
+            command: [process.execPath, "run", fixture],
+            cwd: process.cwd(),
+          });
+          yield* worker.start();
+          yield* worker.stop();
+        }
+        const active = yield* RpcWorker.spawn({
+          command: [process.execPath, "run", fixture],
+          cwd: process.cwd(),
+        });
+        yield* active.start();
+      }).pipe(Effect.provide(RpcWorker.Default));
+      expect(scopeCleanups).toBe(1);
+    }).pipe(
+      Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+      Logger.withMinimumLogLevel(LogLevel.Debug),
+    );
+  });
 });

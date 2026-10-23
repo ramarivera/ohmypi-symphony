@@ -15,6 +15,7 @@ import {
 } from "effect";
 import pino from "pino";
 import { describe, expect, vi } from "vitest";
+import { DatabaseError } from "../src/domain/errors.js";
 import {
   AppUserId,
   IssueId,
@@ -1512,6 +1513,66 @@ describe("Interrupted webhook delivery recovery", () => {
           );
           expect(response.status).toBe(200);
           expect(yield* Effect.promise(() => response.text())).toBe("OK");
+          expect(
+            Option.isSome(yield* RunRepo.get(sessionId("session-1"))),
+          ).toBe(true);
+        }),
+      ),
+  );
+});
+
+describe("Webhook cleanup write failures", () => {
+  it.scopedLive(
+    "logs failed cleanup and retries it on redelivery without a restart",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const installations = yield* InstallationRepo;
+          const deliveries = yield* DeliveryRepo;
+          const pipeline = yield* WebhookPipeline;
+          const entered = yield* Deferred.make<void>();
+          const blocked = vi
+            .spyOn(installations, "get")
+            .mockImplementation(() =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.zipRight(Effect.never),
+              ),
+            );
+          const mark = vi
+            .spyOn(deliveries, "mark")
+            .mockImplementation(() =>
+              Effect.fail(new DatabaseError({ message: "disk unavailable" })),
+            );
+          const messages: string[] = [];
+          const logger = Logger.make((options) => {
+            messages.push(String(options.message));
+          });
+          const payload = createdPayload(yield* Clock.currentTimeMillis);
+          const processing = yield* Effect.fork(
+            pipeline
+              .handle(
+                signedRequest(payload, { delivery: "cleanup-write-failure" }),
+              )
+              .pipe(
+                Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+              ),
+          );
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(processing);
+          expect(messages).toContain("webhook.delivery_cleanup_failed");
+          blocked.mockRestore();
+          // Even when repair also fails, return a retryable error instead of a false duplicate success.
+          const unavailable = yield* pipeline.handle(
+            signedRequest(payload, { delivery: "cleanup-write-failure" }),
+          );
+          expect(unavailable.status).toBe(500);
+          mark.mockRestore();
+          const retried = yield* pipeline.handle(
+            signedRequest(payload, { delivery: "cleanup-write-failure" }),
+          );
+          expect(retried.status).toBe(200);
+          expect(yield* Effect.promise(() => retried.text())).toBe("OK");
           expect(
             Option.isSome(yield* RunRepo.get(sessionId("session-1"))),
           ).toBe(true);

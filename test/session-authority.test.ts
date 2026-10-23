@@ -858,6 +858,9 @@ let hostToolListener:
       request: RpcHostToolCall,
     ) => Effect.Effect<RpcHostToolResult, never, never>)
   | undefined;
+let workerStopBlock:
+  | { entered: Deferred.Deferred<void>; release: Deferred.Deferred<void> }
+  | undefined;
 let hostToolRegistrationError: RpcProtocolError | undefined;
 const orderEvents: Array<string> = [];
 const mockWorker: RpcWorkerHandle = {
@@ -866,7 +869,11 @@ const mockWorker: RpcWorkerHandle = {
   isStreaming: Effect.succeed(false),
   start: () => Effect.void,
   stop: () =>
-    Effect.sync(() => {
+    Effect.gen(function* () {
+      if (workerStopBlock !== undefined) {
+        yield* Deferred.succeed(workerStopBlock.entered, undefined);
+        yield* Deferred.await(workerStopBlock.release);
+      }
       orderEvents.push("worker-stopped");
     }),
   prompt: (message) =>
@@ -1047,6 +1054,7 @@ const withAuthority = <A, E>(
       elicitationWaiter = undefined;
       registeredHostTools = [];
       hostToolRegistrationError = undefined;
+      workerStopBlock = undefined;
       projectionExpected = 0;
       projectorEvents.length = 0;
       projectorElicitations.length = 0;
@@ -2436,6 +2444,107 @@ describe("Recovery admission fencing", () => {
           expect(run.state).toBe("failed");
           expect(run.attempt).toBe(5);
           expect(workerSpawnInputs).toEqual([]);
+        }),
+      ),
+  );
+});
+
+describe("Recovery review regressions", () => {
+  it.effect(
+    "serializes new input behind worker teardown and the failure transition",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          yield* seedInterrupted(testSessionId);
+          yield* authority.processSession(testSessionId);
+          const entered = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          workerStopBlock = { entered, release };
+          if (workerEventListener === undefined)
+            throw new Error("worker listener missing");
+          workerEventListener({
+            type: "worker_exited",
+            message: "worker failed",
+          });
+          yield* Deferred.await(entered);
+          expect(yield* authority.activeWorkerCount()).toBe(1);
+          // This prompt predates the scheduled retry and must remain under backoff.
+          yield* RunInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("during-teardown"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "continue",
+            payload: {},
+            createdAt: yield* Clock.currentTimeMillis,
+          });
+          const processing = yield* Effect.fork(
+            authority.processSession(testSessionId),
+          );
+          yield* Effect.yieldNow();
+          expect(Option.isNone(yield* Fiber.poll(processing))).toBe(true);
+          expect(workerSpawnInputs).toHaveLength(1);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(processing);
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(yield* authority.activeWorkerCount()).toBe(0);
+          expect(
+            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+          ).toBe("orphaned");
+        }),
+      ),
+  );
+
+  it.effect(
+    "only fresh actionable input bypasses the persisted retry deadline",
+    () =>
+      withAuthority(() =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          yield* seedInterrupted(testSessionId);
+          const repositoryId =
+            Schema.decodeUnknownSync(WorkspaceId)("retry-workspace");
+          yield* WorkspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://example.invalid/retry",
+            ref: "main",
+          });
+          yield* RunRepo.update(testSessionId, {
+            repositoryId: Option.some(repositoryId),
+          });
+          yield* TestClock.adjust(1000);
+          yield* RunInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("old-retry-input"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "old input",
+            payload: {},
+            createdAt: 1000,
+          });
+          yield* RunRepo.update(testSessionId, {
+            state: "orphaned",
+            nextAttemptAt: Option.some(300000),
+          });
+          // A renewal changes updatedAt after scheduling and must not reset the cutoff.
+          yield* TestClock.adjust(1000);
+          yield* RunRepo.claimLease(testSessionId, "foreign", 10);
+          yield* RunRepo.releaseLease(testSessionId, "foreign");
+          yield* authority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(0);
+          yield* RunInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("fresh-retry-input"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "new input",
+            payload: {},
+            createdAt: 1500,
+          });
+          yield* authority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(1);
+          expect(
+            Option.getOrThrow(yield* RunRepo.get(testSessionId)).state,
+          ).toBe("running");
         }),
       ),
   );

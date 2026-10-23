@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, rmdir,
+import { lstat, mkdir, mkdtemp, open, opendir, readFile, realpath, rename, rm, rmdir,
   writeFile,
 } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { Effect, Option } from "effect";
 import {
@@ -688,6 +689,65 @@ export const makeWorkspace = (input: {
   readonly githubApp: GitHubAppTokenService | undefined;
 }) =>
   Effect.gen(function* () {
+    const hostKey = createHash("sha256")
+      .update(hostname())
+      .digest("hex")
+      .slice(0, 16);
+    // Ownership lives in the name, so even a crash between mkdir and the first
+    // write leaves enough information for recovery. Never infer death from age.
+    const recoverStaging = yield* Effect.once(
+      ensureRoot(input.workspaceRoot, "startup").pipe(
+        Effect.flatMap((root) =>
+          Effect.tryPromise({
+            try: async () => {
+              const entries = await opendir(root);
+              let scanned = 0;
+              let removed = 0;
+              for await (const entry of entries) {
+                if (++scanned > 10_000 || removed >= 100) break;
+                const owner =
+                  /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
+                    entry.name,
+                  );
+                if (
+                  owner === null ||
+                  owner[1] !== hostKey ||
+                  !entry.isDirectory()
+                )
+                  continue;
+                const pid = Number(owner[2]);
+                if (!Number.isSafeInteger(pid)) continue;
+                try {
+                  process.kill(pid, 0);
+                  continue;
+                } catch (error) {
+                  if (
+                    !(
+                      error instanceof Error &&
+                      "code" in error &&
+                      error.code === "ESRCH"
+                    )
+                  )
+                    continue;
+                }
+                // Dead owners cannot publish these random, per-clone names.
+                // Forced removal is idempotent when multiple gateways clean up.
+                await rm(join(root, entry.name), {
+                  recursive: true,
+                  force: true,
+                });
+                removed++;
+              }
+            },
+            catch: workspaceFailure(
+              "recover abandoned clones",
+              "git_failed",
+              "startup",
+            ),
+          }),
+        ),
+      ),
+    );
     const git = (
       args: ReadonlyArray<string>,
       cwd: string | undefined,
@@ -793,6 +853,7 @@ export const makeWorkspace = (input: {
           }),
         );
       }
+      yield* recoverStaging;
       const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
       const target = join(canonicalRoot, safeSessionKey(sessionId));
 
@@ -865,12 +926,19 @@ export const makeWorkspace = (input: {
 
           return canonicalTarget;
         }
-        // Interrupted pre-atomic clones have no marker. The target was checked
-        // above for symlinks and containment before removing the incomplete tree.
+        // A missing marker can also mean an agent removed an untracked file.
+        // Preserve user work even when the old checkout cannot be reused.
         yield* Effect.tryPromise({
-          try: () => rm(canonicalTarget, { recursive: true, force: true }),
+          try: () =>
+            rename(
+              canonicalTarget,
+              join(
+                canonicalRoot,
+                `.stale-${safeSessionKey(sessionId)}-${crypto.randomUUID()}`,
+              ),
+            ),
           catch: workspaceFailure(
-            "remove incomplete workspace",
+            "preserve marker-less workspace",
             "git_failed",
             sessionId,
           ),
@@ -907,7 +975,10 @@ export const makeWorkspace = (input: {
             Effect.tryPromise({
               try: () =>
                 mkdtemp(
-                  join(canonicalRoot, `.${safeSessionKey(sessionId)}-clone-`),
+                  join(
+                    canonicalRoot,
+                    `.${safeSessionKey(sessionId)}-clone-${hostKey}-${process.pid}-`,
+                  ),
                 ),
               catch: workspaceFailure(
                 "create clone directory",

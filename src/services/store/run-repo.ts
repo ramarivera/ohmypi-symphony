@@ -324,6 +324,22 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
                 ),
             "RunRepo.update",
           );
+          if (
+            patch.nextAttemptAt !== undefined &&
+            Option.isSome(nextAttemptAt)
+          ) {
+            yield* runEventRepo.upsert({
+              sourceKey: Schema.decodeUnknownSync(SourceKey)(
+                `retry:${sessionId}:${attempt}`,
+              ),
+              sessionId,
+              kind: "retry",
+              level: "info",
+              payload: { scheduledAt: now, nextAttemptAt: nextAttemptAt.value },
+              status: "observed",
+              now,
+            });
+          }
           if (state !== run.state) {
             const sourceKey = Schema.decodeUnknownSync(SourceKey)(
               `state:${sessionId}:${attempt}:${state}`,
@@ -562,8 +578,9 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
                   lease_expires_at=NULL,
                   updated_at=?
               WHERE state NOT IN ('succeeded','failed','canceled')
+                AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
             `)
-              .run(at, at),
+              .run(at, at, at),
           "RunRepo.recoverInterruptedRuns",
         );
         return yield* runChanges(result, "RunRepo.recoverInterruptedRuns");

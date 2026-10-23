@@ -496,7 +496,27 @@ it("preserves local run paths and queries", () => {
 
 describe("Health reports reconciler liveness", () => {
   it.live.each([
-    { running: true, age: 1000, error: "a session failed", expected: 200 },
+    {
+      running: true,
+      age: 1000,
+      progressAge: 60000,
+      error: "a session failed",
+      expected: 200,
+    },
+    {
+      running: true,
+      age: 60000,
+      progressAge: 1000,
+      error: null,
+      expected: 200,
+    },
+    {
+      running: true,
+      age: 60000,
+      progressAge: 60000,
+      error: null,
+      expected: 503,
+    },
     { running: true, age: 60_000, error: null, expected: 503 },
     { running: false, age: 1000, error: null, expected: 503 },
     { running: true, age: null, error: null, expected: 503 },
@@ -516,6 +536,10 @@ describe("Health reports reconciler liveness", () => {
               testCase.age === null
                 ? Option.none()
                 : Option.some(now - testCase.age),
+            lastProgressAt:
+              testCase.progressAge === undefined
+                ? Option.none()
+                : Option.some(now - testCase.progressAge),
             lastError: Option.fromNullable(testCase.error),
           }),
       });

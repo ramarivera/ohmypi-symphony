@@ -442,6 +442,45 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const processingSessions = yield* Ref.make<ReadonlySet<SessionId>>(
         new Set(),
       );
+      // Count owners and waiters so idle session gates are released without
+      // allowing a second gate to be created while an older waiter still exists.
+      const processingGates = yield* Ref.make(
+        new Map<SessionId, { semaphore: Effect.Semaphore; users: number }>(),
+      );
+      const withSessionProcessing = <A, E, R>(
+        sessionId: SessionId,
+        effect: Effect.Effect<A, E, R>,
+      ) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const candidate = yield* Effect.makeSemaphore(1);
+            const semaphore = yield* Ref.modify(processingGates, (gates) => {
+              const entry = gates.get(sessionId) ?? {
+                semaphore: candidate,
+                users: 0,
+              };
+              const next = new Map(gates).set(sessionId, {
+                ...entry,
+                users: entry.users + 1,
+              });
+              return [entry.semaphore, next] as const;
+            });
+            return yield* restore(semaphore.withPermits(1)(effect)).pipe(
+              Effect.ensuring(
+                Ref.update(processingGates, (gates) => {
+                  const next = new Map(gates);
+                  const entry = next.get(sessionId);
+                  if (entry !== undefined) {
+                    if (entry.users === 1) next.delete(sessionId);
+                    else
+                      next.set(sessionId, { ...entry, users: entry.users - 1 });
+                  }
+                  return next;
+                }),
+              ),
+            );
+          }),
+        );
       const leaseDurationMs = config.leaseDurationMs;
       const maxAttempts = 5;
 
@@ -1024,16 +1063,16 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
       const dropWorker = (sessionId: SessionId) =>
         Effect.gen(function* () {
-          const state = yield* Ref.modify(workersRef, (workers) => {
-            const existing = workers.get(sessionId);
-            const next = new Map(workers);
-            next.delete(sessionId);
-            return [existing, next] as const;
-          });
+          const state = (yield* Ref.get(workersRef)).get(sessionId);
           if (state !== undefined) {
             yield* state.unsubscribe();
             yield* state.worker.stop();
             yield* Queue.shutdown(state.queue);
+            yield* Ref.update(workersRef, (workers) => {
+              const next = new Map(workers);
+              if (next.get(sessionId) === state) next.delete(sessionId);
+              return next;
+            });
           }
         });
 
@@ -1964,15 +2003,22 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         const consumer = yield* Effect.forkIn(
           Effect.forever(
             Queue.take(queue).pipe(
-              Effect.flatMap((event) => handleEvent(run.sessionId, event)),
-            ),
-          ).pipe(
-            Effect.catchAllCause((cause) =>
-              Cause.isInterruptedOnly(cause)
-                ? Effect.failCause(cause)
-                : handleFailure(run.sessionId, {
-                    message: failureMessage(cause),
-                  }).pipe(Effect.ensuring(releaseIfNoWorker(run.sessionId))),
+              Effect.flatMap((event) =>
+                withSessionProcessing(
+                  run.sessionId,
+                  handleEvent(run.sessionId, event).pipe(
+                    Effect.catchAllCause((cause) =>
+                      Cause.isInterruptedOnly(cause)
+                        ? Effect.failCause(cause)
+                        : handleFailure(run.sessionId, {
+                            message: failureMessage(cause),
+                          }).pipe(
+                            Effect.ensuring(releaseIfNoWorker(run.sessionId)),
+                          ),
+                    ),
+                  ),
+                ),
+              ),
             ),
           ),
           scope,
@@ -2078,8 +2124,31 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               Option.isSome(initial.value.nextAttemptAt) &&
               initial.value.nextAttemptAt.value >
                 (yield* Clock.currentTimeMillis)
-            )
-              return;
+            ) {
+              const nextAttemptAt = initial.value.nextAttemptAt.value;
+              const events = yield* runEventRepo.list(sessionId);
+              const scheduledAt = events.reduce<number | undefined>(
+                (latest, event) => {
+                  if (
+                    event.kind !== "retry" ||
+                    !record(event.payload) ||
+                    event.payload.nextAttemptAt !== nextAttemptAt ||
+                    typeof event.payload.scheduledAt !== "number"
+                  )
+                    return latest;
+                  return Math.max(latest ?? 0, event.payload.scheduledAt);
+                },
+                undefined,
+              );
+              if (
+                scheduledAt === undefined ||
+                !inputs.some(
+                  (input) =>
+                    input.kind !== "stop" && input.createdAt > scheduledAt,
+                )
+              )
+                return;
+            }
             const workerState = yield* getWorker(sessionId);
             if (Option.isNone(workerState)) {
               const reserved = yield* Ref.modify(workerSlots, (slots) => {
@@ -2390,7 +2459,12 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   yield* projector.externalUrls(
                     sessionId,
                     `run-url:${sessionId}`,
-                    [{ label: "OhMyPi run", url: runUrlForSession(sessionId) }],
+                    [
+                      {
+                        label: "OhMyPi run",
+                        url: runUrlForSession(sessionId),
+                      },
+                    ],
                   );
                 }
                 yield* projector.thought(
@@ -2437,7 +2511,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     input.kind === "prompted" &&
                     latest.state === "waiting" &&
                     resolvedContext.repositoryId === null
-                      ? { ...resolvedContext, repositoryId: input.body.trim() }
+                      ? {
+                          ...resolvedContext,
+                          repositoryId: input.body.trim(),
+                        }
                       : resolvedContext;
                   const staticResolution = yield* workspace.resolve(context);
                   const augmented = yield* augmentResolution(
@@ -2556,6 +2633,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     return yield* Effect.failCause(cause);
                   }),
             ),
+            Effect.ensuring(releaseIfNoWorker(sessionId)),
+            (effect) => withSessionProcessing(sessionId, effect),
             Effect.ensuring(
               Ref.update(processingSessions, (sessions) => {
                 const next = new Set(sessions);
@@ -2563,10 +2642,6 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 return next;
               }),
             ),
-            // NOTE: stop-deferral counts survive across processSession
-            // invocations so the deferral bound can trip. Terminal paths
-            // clear them alongside their mutation gate cleanup.
-            Effect.ensuring(releaseIfNoWorker(sessionId)),
           );
         },
       );
@@ -2635,8 +2710,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               renewed
                 ? Effect.void
                 : Effect.forkIn(
-                    dropWorker(sessionId).pipe(
-                      Effect.ensuring(releaseIfNoWorker(sessionId)),
+                    withSessionProcessing(
+                      sessionId,
+                      dropWorker(sessionId).pipe(
+                        Effect.ensuring(releaseIfNoWorker(sessionId)),
+                      ),
                     ),
                     scope,
                   ).pipe(Effect.asVoid),

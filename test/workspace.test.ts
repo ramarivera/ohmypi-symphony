@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -8,6 +9,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
 import { ConfigProvider, Effect, Either, Layer, Schema } from "effect";
@@ -1211,32 +1213,94 @@ describe("Workspace recovery regressions", () => {
     }),
   );
 
-  it.scopedLive("replaces an old partial clone without a marker", () =>
-    Effect.gen(function* () {
-      const fixture = yield* gitFixture;
-      const target = join(
-        fixture.workspaceRoot,
-        safeSessionKey("partial-session"),
-      );
-      yield* fixtureIo("create partial clone", async () => {
-        await mkdir(target, { recursive: true });
-        await writeFile(join(target, "partial.txt"), "incomplete");
-      });
-      const workspace = yield* makeWorkspace({
-        workspaceRoot: fixture.workspaceRoot,
-        repo: { listRepositories: () => Effect.succeed([]) },
-        githubApp: undefined,
-      });
-      expect(
+  it.scopedLive(
+    "preserves a marker-less checkout while creating its replacement",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const target = join(
+          fixture.workspaceRoot,
+          safeSessionKey("partial-session"),
+        );
+        yield* fixtureIo("create partial clone", async () => {
+          await mkdir(target, { recursive: true });
+          await writeFile(join(target, "partial.txt"), "incomplete");
+        });
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: undefined,
+        });
+        expect(
+          yield* workspace.materialize(
+            "partial-session",
+            repositoryRecord({
+              id: "partial",
+              url: fixture.url,
+              ref: "HEAD",
+            }),
+          ),
+        ).toBe(target);
+        expect(
+          yield* fixtureIo("read recovered clone", () => readdir(target)),
+        ).not.toContain("partial.txt");
+        const siblings = yield* fixtureIo("find preserved checkout", () =>
+          readdir(fixture.workspaceRoot),
+        );
+        const stale = siblings.find((name) =>
+          name.startsWith(`.stale-${safeSessionKey("partial-session")}-`),
+        );
+        if (stale === undefined) throw new Error("preserved workspace missing");
+        expect(
+          yield* fixtureIo("read preserved work", () =>
+            readFile(join(fixture.workspaceRoot, stale, "partial.txt"), "utf8"),
+          ),
+        ).toBe("incomplete");
+      }),
+  );
+
+  it.scopedLive(
+    "reclaims dead local clone owners and preserves live, foreign and legacy staging",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const dead = Bun.spawn(["bun", "-e", "process.exit(0)"], {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        yield* Effect.promise(() => dead.exited);
+        const host = createHash("sha256")
+          .update(hostname())
+          .digest("hex")
+          .slice(0, 16);
+        const prefix = `.${safeSessionKey("abandoned")}-clone-`;
+        const abandoned = `${prefix}${host}-${dead.pid}-dead00`;
+        const live = `${prefix}${host}-${process.pid}-active`;
+        const foreign = `${prefix}${host === "0000000000000000" ? "1111111111111111" : "0000000000000000"}-${dead.pid}-remote`;
+        const legacy = `${prefix}legacy`;
+        yield* fixtureIo("seed staging", async () => {
+          for (const name of [abandoned, live, foreign, legacy])
+            await mkdir(join(fixture.workspaceRoot, name), { recursive: true });
+        });
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: undefined,
+        });
         yield* workspace.materialize(
-          "partial-session",
-          repositoryRecord({ id: "partial", url: fixture.url, ref: "HEAD" }),
-        ),
-      ).toBe(target);
-      expect(
-        yield* fixtureIo("read recovered clone", () => readdir(target)),
-      ).not.toContain("partial.txt");
-    }),
+          "recovered",
+          repositoryRecord({
+            id: "recovered",
+            url: fixture.url,
+            ref: "HEAD",
+          }),
+        );
+        const names = yield* fixtureIo("read staging", () =>
+          readdir(fixture.workspaceRoot),
+        );
+        expect(names).not.toContain(abandoned);
+        expect(names).toEqual(expect.arrayContaining([live, foreign, legacy]));
+      }),
   );
 
   it.scopedLive(
@@ -1244,15 +1308,45 @@ describe("Workspace recovery regressions", () => {
     () =>
       Effect.gen(function* () {
         const fixture = yield* gitFixture;
+        const pidFile = join(fixture.root, "descendant.pid");
         const result = yield* runGitOutput(
-          ["-c", "alias.hang=!sleep 60", "hang"],
+          [
+            "-c",
+            `alias.hang=!sleep 60 & child=$!; echo $child > '${pidFile}'; wait $child`,
+            "hang",
+          ],
           fixture.root,
           "git-timeout",
-          30,
+          300,
         ).pipe(Effect.either);
         expect(Either.isLeft(result)).toBe(true);
         if (Either.isLeft(result))
-          expect(result.left.message).toContain("timed out after 30ms");
+          expect(result.left.message).toContain("timed out after 300ms");
+        const pid = Number(
+          yield* fixtureIo("read descendant pid", () =>
+            readFile(pidFile, "utf8"),
+          ),
+        );
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+        const gone = yield* fixtureIo("await descendant exit", async () => {
+          const deadline = Date.now() + 3000;
+          while (Date.now() < deadline) {
+            try {
+              process.kill(pid, 0);
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                "code" in error &&
+                error.code === "ESRCH"
+              )
+                return true;
+              throw error;
+            }
+            await Bun.sleep(20);
+          }
+          return false;
+        });
+        expect(gone).toBe(true);
       }),
   );
 });

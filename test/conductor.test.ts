@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { ConfigProvider, Effect, Layer, Option, Schema } from "effect";
+import { Clock, ConfigProvider, Effect, Layer, Option, Schema } from "effect";
 import { GatewayServicesLive, recoverGateway } from "../src/conductor.js";
 import { DeliveryId, OrganizationId, SessionId } from "../src/domain/ids.js";
 import { GatewayConfig } from "../src/services/config.js";
@@ -52,7 +52,12 @@ describe("Gateway startup recovery", () => {
           issueId: Option.none(),
         });
         yield* RunRepo.update(sid, { state: "starting" });
-        yield* RunRepo.claimLease(sid, "dead-process", 60_000);
+        yield* RunRepo.claimLease(
+          sid,
+          "dead-process",
+          60_000,
+          (yield* Clock.currentTimeMillis) - 60_001,
+        );
         const delivery = {
           id: Schema.decodeUnknownSync(DeliveryId)("startup-delivery"),
           organizationId: org,

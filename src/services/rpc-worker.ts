@@ -1,5 +1,5 @@
 import type { Subprocess } from "bun";
-import { Config, Deferred, Effect, Fiber, Option, Ref, Scope } from "effect";
+import { Config, Deferred, Effect, Fiber, Option, Ref } from "effect";
 import {
   RpcProtocolError,
   RpcSpawnError,
@@ -136,6 +136,15 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
   dependencies: [],
   scoped: Effect.gen(function* () {
     const scope = yield* Effect.scope;
+    const activeStops = new Set<() => Effect.Effect<void>>();
+    yield* Effect.addFinalizer(() =>
+      Effect.forEach(
+        [...activeStops],
+        (stop) =>
+          Effect.logDebug("worker.scope_cleanup").pipe(Effect.zipRight(stop())),
+        { discard: true },
+      ),
+    );
     const spawn = Effect.fn("RpcWorker.spawn")(function* (input: {
       readonly command: ReadonlyArray<string>;
       readonly cwd: string;
@@ -164,6 +173,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const startTimeoutMs = input.startTimeoutMs ?? 30_000;
       const requestTimeoutMs = input.requestTimeoutMs ?? 30_000;
       const stoppingRef = yield* Ref.make(false);
+      const stopGate = yield* Effect.makeSemaphore(1);
       const env = {
         ...workerEnvironment(
           input.env ?? {
@@ -305,6 +315,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
               new RpcProtocolError({ method: "worker", message: normalized }),
             );
             yield* emit({ type: "worker_exited", message: normalized });
+            yield* stop();
           } else {
             yield* rejectPending(
               new RpcProtocolError({
@@ -989,87 +1000,92 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         );
       });
 
-      const stop = Effect.fn("RpcWorker.stop")(function* (): Effect.fn.Return<
-        void,
-        never
-      > {
-        yield* Ref.set(stoppingRef, true);
-        const hostToolResultFibers = yield* Ref.get(hostToolResultFibersRef);
-        for (const fiber of hostToolResultFibers) {
-          yield* Fiber.interruptFork(fiber);
-        }
-        yield* Ref.set(hostToolResultFibersRef, new Set());
+      const stop: () => Effect.Effect<void> = Effect.fn("RpcWorker.stop")(
+        function* (): Effect.fn.Return<void, never> {
+          yield* Ref.set(stoppingRef, true);
+          const hostToolResultFibers = yield* Ref.get(hostToolResultFibersRef);
+          for (const fiber of hostToolResultFibers) {
+            yield* Fiber.interruptFork(fiber);
+          }
+          yield* Ref.set(hostToolResultFibersRef, new Set());
 
-        const process = yield* Ref.get(processRef);
-        if (Option.isNone(process)) {
-          return;
-        }
-        yield* Effect.try(() => process.value.stdin.end()).pipe(
-          Effect.matchEffect({
-            onSuccess: () => Effect.void,
-            onFailure: () =>
-              bestEffort(
-                "force-kill after stdin close failure",
-                Effect.try(() => signalProcessTree(process.value)),
-              ),
-          }),
-        );
-        const exitedGracefully = yield* Effect.promise(() =>
-          Promise.race([
-            process.value.exited.then(() => true),
-            new Promise<boolean>((resolve) =>
-              setTimeout(() => resolve(false), GRACEFUL_STOP_TIMEOUT_MS),
-            ),
-          ]),
-        );
-        if (!exitedGracefully) {
-          yield* bestEffort(
-            "force-kill worker after graceful stop timeout",
-            Effect.try(() => signalProcessTree(process.value)),
+          const exitFiber = yield* Ref.get(exitFiberRef);
+          if (Option.isSome(exitFiber))
+            yield* Fiber.interruptFork(exitFiber.value);
+          yield* Ref.set(exitFiberRef, Option.none());
+          const stdoutFiber = yield* Ref.get(stdoutFiberRef);
+          const stderrFiber = yield* Ref.get(stderrFiberRef);
+          if (Option.isSome(stdoutFiber)) {
+            yield* Fiber.interruptFork(stdoutFiber.value);
+          }
+          if (Option.isSome(stderrFiber)) {
+            yield* Fiber.interruptFork(stderrFiber.value);
+          }
+          yield* Ref.set(stdoutFiberRef, Option.none());
+          yield* Ref.set(stderrFiberRef, Option.none());
+
+          yield* rejectPending(
+            new RpcProtocolError({
+              method: "stop",
+              message: "OhMyPi RPC worker stopped",
+            }),
           );
-          yield* Effect.promise(() =>
+
+          const process = yield* Ref.get(processRef);
+          if (Option.isNone(process)) {
+            return;
+          }
+          yield* Effect.try(() => process.value.stdin.end()).pipe(
+            Effect.matchEffect({
+              onSuccess: () => Effect.void,
+              onFailure: () =>
+                bestEffort(
+                  "force-kill after stdin close failure",
+                  Effect.try(() => signalProcessTree(process.value)),
+                ),
+            }),
+          );
+          const exitedGracefully = yield* Effect.promise(() =>
             Promise.race([
-              process.value.exited.then(() => undefined),
-              new Promise<void>((resolve) =>
-                setTimeout(() => resolve(), FORCE_STOP_TIMEOUT_MS),
+              process.value.exited.then(() => true),
+              new Promise<boolean>((resolve) =>
+                setTimeout(() => resolve(false), GRACEFUL_STOP_TIMEOUT_MS),
               ),
             ]),
           );
-        }
-        yield* bestEffort(
-          "kill remaining worker children",
-          Effect.try(() => signalProcessTree(process.value, "SIGKILL")),
-        );
-        yield* Ref.set(processRef, Option.none());
-        const exitFiber = yield* Ref.get(exitFiberRef);
-        if (Option.isSome(exitFiber))
-          yield* Fiber.interruptFork(exitFiber.value);
-        yield* Ref.set(exitFiberRef, Option.none());
-        const stdoutFiber = yield* Ref.get(stdoutFiberRef);
-        const stderrFiber = yield* Ref.get(stderrFiberRef);
-        if (Option.isSome(stdoutFiber)) {
-          yield* Fiber.interruptFork(stdoutFiber.value);
-        }
-        if (Option.isSome(stderrFiber)) {
-          yield* Fiber.interruptFork(stderrFiber.value);
-        }
-        yield* Ref.set(stdoutFiberRef, Option.none());
-        yield* Ref.set(stderrFiberRef, Option.none());
-
-        yield* rejectPending(
-          new RpcProtocolError({
-            method: "stop",
-            message: "OhMyPi RPC worker stopped",
-          }),
-        );
-
-        yield* Effect.logInfo("worker.stopped").pipe(
-          Effect.annotateLogs({
-            event: "worker.stopped",
-            workerPid: process.value.pid,
-          }),
-        );
-      });
+          if (!exitedGracefully) {
+            yield* bestEffort(
+              "force-kill worker after graceful stop timeout",
+              Effect.try(() => signalProcessTree(process.value)),
+            );
+            yield* Effect.promise(() =>
+              Promise.race([
+                process.value.exited.then(() => undefined),
+                new Promise<void>((resolve) =>
+                  setTimeout(() => resolve(), FORCE_STOP_TIMEOUT_MS),
+                ),
+              ]),
+            );
+          }
+          yield* bestEffort(
+            "kill remaining worker children",
+            Effect.try(() => signalProcessTree(process.value, "SIGKILL")),
+          );
+          yield* Ref.set(processRef, Option.none());
+          yield* Effect.logInfo("worker.stopped").pipe(
+            Effect.annotateLogs({
+              event: "worker.stopped",
+              workerPid: process.value.pid,
+            }),
+          );
+        },
+        (effect) =>
+          effect.pipe(
+            stopGate.withPermits(1),
+            Effect.uninterruptible,
+            Effect.ensuring(Effect.sync(() => activeStops.delete(stop))),
+          ),
+      );
 
       const prompt = Effect.fn("RpcWorker.prompt")(function* (
         message: string,
@@ -1169,7 +1185,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       const sessionFile = Ref.get(sessionFileRef);
       const isStreaming = Ref.get(isStreamingRef);
 
-      yield* Scope.addFinalizerExit(scope, () => stop());
+      activeStops.add(stop);
       const handle: RpcWorkerHandle = {
         sessionId,
         sessionFile,

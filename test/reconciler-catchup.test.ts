@@ -1,8 +1,18 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Clock, Effect, Layer, Option, Schema, TestClock } from "effect";
+import {
+  Clock,
+  Deferred,
+  Effect,
+  Fiber,
+  Layer,
+  Option,
+  Schema,
+  TestClock,
+} from "effect";
 import { LinearApiError } from "../src/domain/errors.js";
 import { OrganizationId, SessionId } from "../src/domain/ids.js";
 import type { AgentRun } from "../src/domain/models.js";
+import { health } from "../src/http/router.js";
 import type { ListedSessionActivity } from "../src/services/linear-gateway.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
 import { Reconciler } from "../src/services/reconciler.js";
@@ -283,5 +293,43 @@ describe("Reconciler catch-up", () => {
       }).pipe(Effect.provide(layer));
       expect(ids).toEqual([]);
     }),
+  );
+});
+
+describe("Catchup health progress", () => {
+  it.effect(
+    "keeps a progressing sweep healthy and detects a stalled request",
+    () =>
+      Effect.gen(function* () {
+        const thirdEntered = yield* Deferred.make<void>();
+        let calls = 0;
+        const { layer } = makeLayer(
+          [
+            run(sessionA),
+            run(sessionB),
+            run(Schema.decodeUnknownSync(SessionId)("third")),
+          ],
+          () =>
+            Effect.gen(function* () {
+              if (++calls === 3) {
+                yield* Deferred.succeed(thirdEntered, undefined);
+                return yield* Effect.never;
+              }
+              yield* Effect.sleep(20000);
+              return [];
+            }),
+        );
+        yield* Effect.gen(function* () {
+          yield* TestClock.adjust(600000);
+          const ticking = yield* Effect.fork(Reconciler.tick());
+          yield* TestClock.adjust(20000);
+          yield* TestClock.adjust(20000);
+          yield* Deferred.await(thirdEntered);
+          expect((yield* health).status).toBe(200);
+          yield* TestClock.adjust(30001);
+          expect((yield* health).status).toBe(503);
+          yield* Fiber.interrupt(ticking);
+        }).pipe(Effect.provide(layer));
+      }),
   );
 });

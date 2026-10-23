@@ -342,6 +342,34 @@ describe("Store repositories", () => {
     ),
   );
 
+  it.scopedLive("startup preserves another gateway's live lease", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const repo = yield* RunRepo;
+        const sid = makeSessionId("live-gateway");
+        yield* repo.create({
+          sessionId: sid,
+          organizationId: makeOrganizationId("org"),
+          issueId: Option.none(),
+          now: 1000,
+        });
+        yield* repo.update(sid, { state: "starting" });
+        yield* repo.claimLease(sid, "live-owner", 60000, 1000);
+        expect(yield* repo.recoverInterruptedRuns(2000)).toBe(0);
+        const preserved = Option.getOrThrow(yield* repo.get(sid));
+        expect(preserved.state).toBe("starting");
+        expect(preserved.leaseOwner).toEqual(Option.some("live-owner"));
+        expect(yield* repo.claimLease(sid, "new-owner", 60000, 2000)).toBe(
+          false,
+        );
+        expect(yield* repo.recoverInterruptedRuns(61001)).toBe(1);
+        expect(yield* repo.claimLease(sid, "new-owner", 60000, 61001)).toBe(
+          true,
+        );
+      }),
+    ),
+  );
+
   it.scopedLive("recovers active runs and leases after a process restart", () =>
     withRepos(
       Effect.gen(function* () {
@@ -363,7 +391,7 @@ describe("Store repositories", () => {
           yield* runRepo.claimLease(
             makeSessionId("running-session"),
             "dead-process",
-            60_000,
+            500,
             1_000,
           ),
         ).toBe(true);

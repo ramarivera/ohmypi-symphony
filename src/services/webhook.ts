@@ -943,7 +943,15 @@ const markDelivery = (
 ): Effect.Effect<void, never, never> =>
   deliveryId === undefined
     ? Effect.void
-    : deliveryRepo.mark(deliveryId, status, error).pipe(Effect.ignore);
+    : deliveryRepo
+        .mark(deliveryId, status, error)
+        .pipe(
+          Effect.catchAll((cause) =>
+            Effect.logError("webhook.delivery_mark_failed").pipe(
+              Effect.annotateLogs({ deliveryId, status, error: String(cause) }),
+            ),
+          ),
+        );
 
 export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
   "WebhookPipeline",
@@ -964,6 +972,21 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       const runInputRepo = yield* RunInputRepo;
       const deliveryRepo = yield* DeliveryRepo;
       const promptTemplateRepo = yield* PromptTemplateRepo;
+      const failedCleanup = new Set<DeliveryId>();
+      const markClaimFailed = (id: DeliveryId) =>
+        deliveryRepo
+          .mark(id, "failed", "Webhook processing interrupted or failed")
+          .pipe(
+            Effect.tap(() => Effect.sync(() => failedCleanup.delete(id))),
+            Effect.catchAll((error) =>
+              Effect.gen(function* () {
+                failedCleanup.add(id);
+                yield* Effect.logError("webhook.delivery_cleanup_failed").pipe(
+                  Effect.annotateLogs({ deliveryId: id, error: String(error) }),
+                );
+              }),
+            ),
+          );
 
       const handle = Effect.fn("WebhookPipeline.handle")(function* (
         request: Request,
@@ -1150,6 +1173,27 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
               }),
             );
 
+            // Retry a failed cleanup on redelivery before consulting the durable
+            // dedupe status. Only this process's completed, failed claims enter
+            // this set; an actively processing request is never reset here.
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                if (failedCleanup.delete(decodedDeliveryId)) {
+                  yield* deliveryRepo
+                    .mark(
+                      decodedDeliveryId,
+                      "failed",
+                      "Retry failed webhook cleanup",
+                    )
+                    .pipe(
+                      Effect.onError(() =>
+                        Effect.sync(() => failedCleanup.add(decodedDeliveryId)),
+                      ),
+                    );
+                }
+              }),
+            );
+
             // Keep the durable claim and its cleanup ownership hand-off atomic
             // with respect to request-fiber interruption.
             const claim = yield* deliveryRepo
@@ -1327,13 +1371,8 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
 
         return yield* process.pipe(
           Effect.onError(() =>
-            claimedDelivery
-              ? markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  "Webhook processing interrupted or failed",
-                )
+            claimedDelivery && deliveryId !== undefined
+              ? markClaimFailed(deliveryId)
               : Effect.void,
           ),
           Effect.catchTags({

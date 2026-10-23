@@ -69,6 +69,14 @@ const positiveInteger = (name: string, fallback: number) =>
           );
     }),
   );
+const timeoutMilliseconds = (name: string, fallback: number) =>
+  positiveInteger(name, fallback).pipe(
+    Config.validate({
+      message: `${name} must not exceed 2147483647 ms`,
+      validation: (value) => value <= 2_147_483_647,
+    }),
+  );
+
 const decimalBetween = (name: string, fallback: number) =>
   Config.option(Config.string(name)).pipe(
     Config.mapOrFail((value) => {
@@ -207,9 +215,9 @@ const GatewayConfigValues = Config.all({
   ),
   port: positiveInteger("PORT", 3000),
   leaseDurationMs: positiveInteger("LEASE_DURATION_MS", 60_000),
-  rpcRequestTimeoutMs: positiveInteger("RPC_REQUEST_TIMEOUT_MS", 30_000),
-  gitTimeoutMs: positiveInteger("GIT_TIMEOUT_MS", 120_000),
-  nixTimeoutMs: positiveInteger("NIX_TIMEOUT_MS", 600_000),
+  rpcRequestTimeoutMs: timeoutMilliseconds("RPC_REQUEST_TIMEOUT_MS", 30_000),
+  gitTimeoutMs: timeoutMilliseconds("GIT_TIMEOUT_MS", 120_000),
+  nixTimeoutMs: timeoutMilliseconds("NIX_TIMEOUT_MS", 600_000),
   maxConcurrentWorkers: positiveInteger("MAX_CONCURRENT_WORKERS", 4),
   reconcilerIntervalMs: positiveInteger("RECONCILER_INTERVAL_MS", 1_000),
   reconcilerCatchupIntervalMs: positiveInteger(

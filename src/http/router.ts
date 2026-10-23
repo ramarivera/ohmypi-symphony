@@ -33,10 +33,15 @@ export const health = Effect.gen(function* () {
     30_000,
     Option.isSome(config) ? config.value.reconcilerIntervalMs * 3 : 30_000,
   );
+  const lastAliveAt = Math.max(
+    Option.getOrElse(status.lastProgressAt ?? Option.none(), () => 0),
+    Option.getOrElse(status.lastCompletedAt, () => 0),
+  );
   const degraded =
     !status.running ||
-    Option.isNone(status.lastCompletedAt) ||
-    now - status.lastCompletedAt.value > maxAgeMs;
+    (Option.isNone(status.lastCompletedAt) &&
+      Option.isNone(status.lastProgressAt ?? Option.none())) ||
+    now - lastAliveAt > maxAgeMs;
   const body = {
     status: degraded ? "degraded" : "ok",
     reconciler: {
