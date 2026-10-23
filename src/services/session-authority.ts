@@ -1274,15 +1274,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           sessionId,
         );
         if (existingSequence === undefined) {
-          const events = yield* runEventRepo.list(sessionId);
-          const prefix = `rpc:${sessionId}:`;
-          const maxSequence = events.reduce((max, item) => {
-            if (!item.sourceKey.startsWith(prefix)) return max;
-            const value = Number(
-              item.sourceKey.slice(prefix.length).split(":")[0],
-            );
-            return Number.isSafeInteger(value) ? Math.max(max, value) : max;
-          }, 0);
+          const maxSequence = yield* runEventRepo.maxRpcSequence(sessionId);
           yield* Ref.update(eventSequenceRef, (m) =>
             new Map(m).set(sessionId, maxSequence),
           );
@@ -2119,6 +2111,62 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 }),
               );
             }
+            // Stops verify their notification state and cancel without a worker slot.
+            if (
+              Option.isSome(initial) &&
+              inputs.some((input) => input.kind === "stop")
+            ) {
+              // Lease fencing still applies to stop inputs; capacity limits do not.
+              if (
+                !(yield* runRepo.claimLease(sessionId, owner, leaseDurationMs))
+              )
+                return;
+              yield* Ref.update(leasedSessions, (sessions) =>
+                new Set(sessions).add(sessionId),
+              );
+              for (const input of inputs.filter(
+                (input) => input.kind === "stop",
+              )) {
+                const latestOption = yield* runRepo.get(sessionId);
+                let latest = Option.isSome(latestOption)
+                  ? latestOption.value
+                  : initial.value;
+                const stopDecision = yield* stopShouldApply(sessionId, input);
+                if (Option.isNone(stopDecision)) {
+                  const deferralCount = yield* recordStopDeferral(
+                    sessionId,
+                    input.id,
+                  );
+                  if (deferralCount < 10) return;
+                  yield* Effect.logWarning(
+                    "authority.stop_deferral_bound_reached_without_stop",
+                  ).pipe(
+                    Effect.annotateLogs({
+                      event:
+                        "authority.stop_deferral_bound_reached_without_stop",
+                      sessionId,
+                      inputId: input.id,
+                      deferralCount,
+                    }),
+                  );
+                  yield* runInputRepo.markProcessed(input.id);
+                  continue;
+                }
+                const shouldStop = Option.getOrElse(stopDecision, () => true);
+                if (!shouldStop) {
+                  yield* runInputRepo.markProcessed(input.id);
+                  continue;
+                }
+                if (isDeferredNotificationStopPayload(input.payload)) {
+                  yield* runInputRepo.applyStop(sessionId);
+                  const refreshed = yield* runRepo.get(sessionId);
+                  if (Option.isSome(refreshed)) latest = refreshed.value;
+                }
+                yield* cancel(latest);
+                yield* runInputRepo.markProcessed(input.id);
+                return;
+              }
+            }
             if (
               Option.isSome(initial) &&
               Option.isSome(initial.value.nextAttemptAt) &&
@@ -2126,20 +2174,19 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 (yield* Clock.currentTimeMillis)
             ) {
               const nextAttemptAt = initial.value.nextAttemptAt.value;
-              const events = yield* runEventRepo.list(sessionId);
-              const scheduledAt = events.reduce<number | undefined>(
-                (latest, event) => {
-                  if (
-                    event.kind !== "retry" ||
-                    !record(event.payload) ||
-                    event.payload.nextAttemptAt !== nextAttemptAt ||
-                    typeof event.payload.scheduledAt !== "number"
-                  )
-                    return latest;
-                  return Math.max(latest ?? 0, event.payload.scheduledAt);
-                },
-                undefined,
+              const retryEvent = yield* runEventRepo.getBySourceKey(
+                `retry:${sessionId}:${initial.value.attempt}` as SourceKey,
               );
+              const scheduledAt = Option.match(retryEvent, {
+                onNone: () => undefined,
+                onSome: (event) =>
+                  event.kind === "retry" &&
+                  record(event.payload) &&
+                  event.payload.nextAttemptAt === nextAttemptAt &&
+                  typeof event.payload.scheduledAt === "number"
+                    ? event.payload.scheduledAt
+                    : undefined,
+              });
               if (
                 scheduledAt === undefined ||
                 !inputs.some(
@@ -2376,49 +2423,13 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               }
               return;
             }
-            for (const input of inputs) {
+            for (const input of inputs.filter(
+              (input) => input.kind !== "stop",
+            )) {
               const latestOption = yield* runRepo.get(sessionId);
               let latest = Option.isSome(latestOption)
                 ? latestOption.value
                 : run;
-              const stopDecision = yield* stopShouldApply(sessionId, input);
-              if (Option.isNone(stopDecision)) {
-                const deferralCount = yield* recordStopDeferral(
-                  sessionId,
-                  input.id,
-                );
-                if (deferralCount < 10) return;
-                yield* Effect.logWarning(
-                  "authority.stop_deferral_bound_reached_without_stop",
-                ).pipe(
-                  Effect.annotateLogs({
-                    event: "authority.stop_deferral_bound_reached_without_stop",
-                    sessionId,
-                    inputId: input.id,
-                    deferralCount,
-                  }),
-                );
-                yield* runInputRepo.markProcessed(input.id);
-                continue;
-              }
-              const shouldStop = Option.getOrElse(stopDecision, () => true);
-              if (!shouldStop) {
-                yield* runInputRepo.markProcessed(input.id);
-                continue;
-              }
-              if (
-                input.kind === "stop" &&
-                isDeferredNotificationStopPayload(input.payload)
-              ) {
-                yield* runInputRepo.applyStop(sessionId);
-                const refreshed = yield* runRepo.get(sessionId);
-                if (Option.isSome(refreshed)) latest = refreshed.value;
-              }
-              if (input.kind === "stop") {
-                yield* cancel(latest);
-                yield* runInputRepo.markProcessed(input.id);
-                break;
-              }
               if (latest.desiredState === "canceled") {
                 // A follow-up prompt on a user-stopped session resumes the
                 // run; any other input on a canceled run still honors the

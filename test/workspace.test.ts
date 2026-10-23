@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  chmod,
   lstat,
   mkdir,
   mkdtemp,
@@ -12,7 +13,7 @@ import {
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
-import { ConfigProvider, Effect, Either, Layer, Schema } from "effect";
+import { ConfigProvider, Effect, Either, Layer, Logger, Schema } from "effect";
 import * as fc from "effect/FastCheck";
 import { describe, expect, vi } from "vitest";
 import { WorkspaceError } from "../src/domain/errors.js";
@@ -1300,6 +1301,72 @@ describe("Workspace recovery regressions", () => {
         );
         expect(names).not.toContain(abandoned);
         expect(names).toEqual(expect.arrayContaining([live, foreign, legacy]));
+      }),
+  );
+
+  it.scopedLive(
+    "logs a failed staging scan, materializes, and retries recovery later",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const dead = Bun.spawn([process.execPath, "-e", "process.exit(0)"], {
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        yield* Effect.promise(() => dead.exited);
+        const host = createHash("sha256")
+          .update(hostname())
+          .digest("hex")
+          .slice(0, 16);
+        const abandoned = `.${safeSessionKey("scan-retry")}-clone-${host}-${dead.pid}-dead00`;
+        yield* fixtureIo("seed abandoned clone", () =>
+          mkdir(join(fixture.workspaceRoot, abandoned), { recursive: true }),
+        );
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: undefined,
+        });
+        const abandonedPath = join(fixture.workspaceRoot, abandoned);
+        yield* fixtureIo("deny abandoned clone cleanup", () =>
+          chmod(abandonedPath, 0),
+        );
+        const messages: string[] = [];
+        const logger = Logger.make((options) =>
+          messages.push(String(options.message)),
+        );
+        const repository = repositoryRecord({
+          id: "scan-retry",
+          url: fixture.source,
+          ref: "HEAD",
+        });
+        yield* Effect.gen(function* () {
+          const path = yield* workspace.materialize("first", repository);
+          expect(
+            yield* fixtureIo("read workspace", () =>
+              readFile(join(path, "README.txt"), "utf8"),
+            ),
+          ).toBe("fixture\n");
+          expect(messages).toContain("workspace.staging_recovery_failed");
+          expect(
+            yield* fixtureIo("read staging", () =>
+              readdir(fixture.workspaceRoot),
+            ),
+          ).toContain(abandoned);
+        }).pipe(
+          Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+          Effect.ensuring(
+            fixtureIo("restore staging permissions", () =>
+              chmod(abandonedPath, 0o700),
+            ).pipe(Effect.orDie),
+          ),
+        );
+        yield* workspace.materialize("second", repository);
+        expect(
+          yield* fixtureIo("read staging", () =>
+            readdir(fixture.workspaceRoot),
+          ),
+        ).not.toContain(abandoned);
       }),
   );
 

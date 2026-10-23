@@ -935,24 +935,6 @@ const decodeDeliveryId = (
     ),
   );
 
-const markDelivery = (
-  deliveryRepo: DeliveryRepo,
-  deliveryId: DeliveryId | undefined,
-  status: "processed" | "failed",
-  error?: string,
-): Effect.Effect<void, never, never> =>
-  deliveryId === undefined
-    ? Effect.void
-    : deliveryRepo
-        .mark(deliveryId, status, error)
-        .pipe(
-          Effect.catchAll((cause) =>
-            Effect.logError("webhook.delivery_mark_failed").pipe(
-              Effect.annotateLogs({ deliveryId, status, error: String(cause) }),
-            ),
-          ),
-        );
-
 export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
   "WebhookPipeline",
   {
@@ -1377,63 +1359,23 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
           ),
           Effect.catchTags({
             "@Gateway/WebhookPayloadError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response(error.message, {
-                  status: error.status,
-                });
-              }),
+              Effect.succeed(
+                new Response(error.message, { status: error.status }),
+              ),
             "@Gateway/WebhookIdentityError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response(error.message, { status: 401 });
-              }),
-            "@Gateway/DatabaseError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response("Webhook processing failed", {
-                  status: 500,
-                });
-              }),
-            "@Gateway/RowDecodeError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response("Webhook processing failed", {
-                  status: 500,
-                });
-              }),
-            "@Gateway/TokenCipherError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response("Webhook processing failed", {
-                  status: 500,
-                });
-              }),
+              Effect.succeed(new Response(error.message, { status: 401 })),
+            "@Gateway/DatabaseError": () =>
+              Effect.succeed(
+                new Response("Webhook processing failed", { status: 500 }),
+              ),
+            "@Gateway/RowDecodeError": () =>
+              Effect.succeed(
+                new Response("Webhook processing failed", { status: 500 }),
+              ),
+            "@Gateway/TokenCipherError": () =>
+              Effect.succeed(
+                new Response("Webhook processing failed", { status: 500 }),
+              ),
           }),
         );
       });

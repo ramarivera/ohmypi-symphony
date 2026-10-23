@@ -695,57 +695,76 @@ export const makeWorkspace = (input: {
       .slice(0, 16);
     // Ownership lives in the name, so even a crash between mkdir and the first
     // write leaves enough information for recovery. Never infer death from age.
-    const recoverStaging = yield* Effect.once(
-      ensureRoot(input.workspaceRoot, "startup").pipe(
-        Effect.flatMap((root) =>
-          Effect.tryPromise({
-            try: async () => {
-              const entries = await opendir(root);
-              let scanned = 0;
-              let removed = 0;
-              for await (const entry of entries) {
-                if (++scanned > 10_000 || removed >= 100) break;
-                const owner =
-                  /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
-                    entry.name,
-                  );
-                if (
-                  owner === null ||
-                  owner[1] !== hostKey ||
-                  !entry.isDirectory()
-                )
-                  continue;
-                const pid = Number(owner[2]);
-                if (!Number.isSafeInteger(pid)) continue;
-                try {
-                  process.kill(pid, 0);
-                  continue;
-                } catch (error) {
-                  if (
-                    !(
-                      error instanceof Error &&
-                      "code" in error &&
-                      error.code === "ESRCH"
-                    )
-                  )
-                    continue;
-                }
-                // Dead owners cannot publish these random, per-clone names.
-                // Forced removal is idempotent when multiple gateways clean up.
-                await rm(join(root, entry.name), {
-                  recursive: true,
-                  force: true,
-                });
-                removed++;
-              }
-            },
-            catch: workspaceFailure(
-              "recover abandoned clones",
-              "git_failed",
-              "startup",
+    const stagingRecoveryGate = yield* Effect.makeSemaphore(1);
+    let stagingRecovered = false;
+    const recoverStaging = stagingRecoveryGate.withPermits(1)(
+      Effect.suspend(() =>
+        stagingRecovered
+          ? Effect.void
+          : ensureRoot(input.workspaceRoot, "startup").pipe(
+              Effect.flatMap((root) =>
+                Effect.tryPromise({
+                  try: async () => {
+                    const entries = await opendir(root);
+                    let scanned = 0;
+                    let removed = 0;
+                    for await (const entry of entries) {
+                      if (++scanned > 10_000 || removed >= 100) break;
+                      const owner =
+                        /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
+                          entry.name,
+                        );
+                      if (
+                        owner === null ||
+                        owner[1] !== hostKey ||
+                        !entry.isDirectory()
+                      )
+                        continue;
+                      const pid = Number(owner[2]);
+                      if (!Number.isSafeInteger(pid)) continue;
+                      try {
+                        process.kill(pid, 0);
+                        continue;
+                      } catch (error) {
+                        if (
+                          !(
+                            error instanceof Error &&
+                            "code" in error &&
+                            error.code === "ESRCH"
+                          )
+                        )
+                          continue;
+                      }
+                      // Dead owners cannot publish these random, per-clone names.
+                      // Forced removal is idempotent when multiple gateways clean up.
+                      await rm(join(root, entry.name), {
+                        recursive: true,
+                        force: true,
+                      });
+                      removed++;
+                    }
+                  },
+                  catch: workspaceFailure(
+                    "recover abandoned clones",
+                    "git_failed",
+                    "startup",
+                  ),
+                }),
+              ),
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  stagingRecovered = true;
+                }),
+              ),
+              Effect.catchAll((error) =>
+                Effect.logWarning("workspace.staging_recovery_failed").pipe(
+                  Effect.annotateLogs({
+                    event: "workspace.staging_recovery_failed",
+                    error: String(error),
+                  }),
+                ),
+              ),
             ),
-          }),
-        ),
       ),
     );
     const git = (

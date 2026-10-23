@@ -1,4 +1,4 @@
-import { Clock, Effect, Schema } from "effect";
+import { Clock, Effect, Option, Schema } from "effect";
 import { type DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type { SessionId, SourceKey } from "../../domain/ids.js";
 import { RunEvent } from "../../domain/models.js";
@@ -222,6 +222,65 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
         );
       });
 
+      const getBySourceKey = Effect.fn("RunEventRepo.getBySourceKey")(
+        function* (
+          sourceKey: SourceKey,
+        ): Effect.fn.Return<
+          Option.Option<RunEvent>,
+          DatabaseError | RowDecodeError
+        > {
+          const row = yield* tryDb(
+            () =>
+              db
+                .query<RunEventRow, [string]>(
+                  "SELECT * FROM run_event WHERE source_key=?",
+                )
+                .get(sourceKey),
+            "RunEventRepo.getBySourceKey",
+          );
+          if (row === null) return Option.none();
+          return Option.some(
+            yield* rowToRunEvent(
+              yield* decodeRow(RunEventRow, row, "RunEvent"),
+            ),
+          );
+        },
+      );
+
+      const maxRpcSequence = Effect.fn("RunEventRepo.maxRpcSequence")(
+        function* (
+          sessionId: SessionId,
+        ): Effect.fn.Return<number, DatabaseError | RowDecodeError> {
+          const prefix = `rpc:${sessionId}:`;
+          const row = yield* tryDb(
+            () =>
+              db
+                .query<
+                  { sequence: number | null },
+                  [string, string, string, string]
+                >(`
+            WITH sequences AS (
+              SELECT substr(source_key, length(?) + 1) AS suffix FROM run_event
+              WHERE session_id=? AND source_key>=? AND source_key<?
+            ), numbers AS (
+              SELECT substr(suffix, 1, instr(suffix, ':') - 1) AS value FROM sequences
+              WHERE instr(suffix, ':') > 1
+            )
+            SELECT MAX(CAST(value AS INTEGER)) AS sequence FROM numbers
+            WHERE value NOT GLOB '*[^0-9]*' AND CAST(value AS INTEGER)<=9007199254740991
+          `)
+                .get(prefix, sessionId, prefix, `${prefix}~`),
+            "RunEventRepo.maxRpcSequence",
+          );
+          const decoded = yield* decodeRow(
+            Schema.Struct({ sequence: Schema.NullOr(Schema.Number) }),
+            row,
+            "RpcSequence",
+          );
+          return decoded.sequence ?? 0;
+        },
+      );
+
       const list = Effect.fn("RunEventRepo.list")(function* (
         sessionId: SessionId,
         options: RunEventPageOptions = {},
@@ -264,7 +323,7 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
         return yield* Effect.forEach(decoded, rowToRunEvent);
       });
 
-      return { upsert, list };
+      return { upsert, list, getBySourceKey, maxRpcSequence };
     }),
   },
 ) {}

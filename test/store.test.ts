@@ -748,6 +748,67 @@ describe("Store repositories", () => {
       ),
   );
 
+  it.scopedLive(
+    "reads one event by source key and seeds RPC sequence numerically within a session",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const sid = makeSessionId("targeted-events-🚀");
+          const other = makeSessionId("targeted-events-other");
+          for (const sessionId of [sid, other])
+            yield* RunRepo.create({
+              sessionId,
+              organizationId: makeOrganizationId("org-1"),
+              issueId: Option.none(),
+            });
+          expect(yield* RunEventRepo.maxRpcSequence(sid)).toBe(0);
+          const key = makeSourceKey(`retry:${sid}:3`);
+          yield* RunEventRepo.upsert({
+            sourceKey: key,
+            sessionId: sid,
+            kind: "retry",
+            level: "info",
+            payload: { nextAttemptAt: 900, scheduledAt: 500 },
+          });
+          const event = Option.getOrThrow(
+            yield* RunEventRepo.getBySourceKey(key),
+          );
+          expect(event.sourceKey).toBe(key);
+          expect(event.payload).toEqual({
+            nextAttemptAt: 900,
+            scheduledAt: 500,
+          });
+          expect(
+            yield* RunEventRepo.getBySourceKey(makeSourceKey("absent")),
+          ).toEqual(Option.none());
+          for (const sourceKey of [
+            `rpc:${sid}:2:progress`,
+            `rpc:${sid}:10:progress`,
+            `rpc:${sid}:9:progress`,
+            `rpc:${sid}:99garbage:progress`,
+            `rpc:${sid}:9007199254740992:progress`,
+            `rpc:${sid}:500`,
+            `rpc:${sid}:1e4:progress`,
+            `rpc:${sid}extra:1000:progress`,
+          ])
+            yield* RunEventRepo.upsert({
+              sourceKey: makeSourceKey(sourceKey),
+              sessionId: sid,
+              kind: "progress",
+              level: "info",
+            });
+          yield* RunEventRepo.upsert({
+            sourceKey: makeSourceKey(`rpc:${other}:2000:progress`),
+            sessionId: other,
+            kind: "progress",
+            level: "info",
+          });
+          expect(yield* RunEventRepo.maxRpcSequence(sid)).toBe(10);
+          expect(yield* RunEventRepo.maxRpcSequence(other)).toBe(2000);
+        }),
+      ),
+  );
+
   it.scopedLive("tracks projection lifecycle status and errors", () =>
     withRepos(
       Effect.gen(function* () {

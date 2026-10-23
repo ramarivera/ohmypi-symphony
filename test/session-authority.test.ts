@@ -806,6 +806,7 @@ const toolExternalUrlCalls: Array<{
   }>;
 }> = [];
 let linearIssueLookupFails = false;
+let linearIssueStateType = "started";
 let elicitationWaiter: Deferred.Deferred<void, never> | undefined;
 
 const signalProjection = (): void => {
@@ -991,7 +992,7 @@ const mockToolsGateway = LinearGateway.make({
           description: null,
           stateId: "state-started",
           stateName: "In Progress",
-          stateType: "started",
+          stateType: linearIssueStateType,
           delegateId: "authority-app-user",
           url: null,
           teamId: null,
@@ -1045,6 +1046,7 @@ const withAuthority = <A, E>(
     Effect.gen(function* () {
       authorityTestRoot = testPath("temporary");
       linearIssueLookupFails = false;
+      linearIssueStateType = "started";
       toolExternalUrlCalls.length = 0;
       terminalFailure = undefined;
       workerEventListener = undefined;
@@ -2187,8 +2189,159 @@ describe("Recovery and concurrency regressions", () => {
       ),
   );
 
+  it.effect.each(["canceled", "started", "unavailable"] as const)(
+    "verifies a deferred %s stop before retry backoff and full worker capacity",
+    (issueState) =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const authority = yield* SessionAuthority;
+            const busy = Schema.decodeUnknownSync(SessionId)("busy-worker");
+            yield* seedInterrupted(busy);
+            yield* authority.processSession(busy);
+            yield* seedInterrupted(testSessionId);
+            const deadline = (yield* Clock.currentTimeMillis) + 60_000;
+            yield* RunRepo.update(testSessionId, {
+              nextAttemptAt: Option.some(deadline),
+            });
+            const inputId = Schema.decodeUnknownSync(InputId)("backoff-stop");
+            yield* RunInputRepo.enqueue({
+              id: inputId,
+              sessionId: testSessionId,
+              kind: "stop",
+              body: "Issue status changed",
+              payload: {
+                type: "AppUserNotification",
+                action: "issueStatusChanged",
+                notification: { issueId: "issue-1" },
+              },
+            });
+            linearIssueStateType = issueState;
+            linearIssueLookupFails = issueState === "unavailable";
+            yield* authority.processSession(testSessionId);
+            const run = Option.getOrThrow(yield* RunRepo.get(testSessionId));
+            expect(run.state).toBe(
+              issueState === "canceled" ? "canceled" : "orphaned",
+            );
+            expect(run.desiredState).toBe(
+              issueState === "canceled" ? "canceled" : "running",
+            );
+            expect(yield* RunInputRepo.pending(testSessionId)).toHaveLength(
+              issueState === "unavailable" ? 1 : 0,
+            );
+            expect(run.attempt).toBe(0);
+            expect(run.leaseOwner).toEqual(Option.none());
+            expect(workerSpawnInputs).toHaveLength(1);
+            expect(yield* authority.activeWorkerCount()).toBe(1);
+          }),
+        { withLinearGateway: true, config: [["MAX_CONCURRENT_WORKERS", "1"]] },
+      ),
+  );
+
+  it.effect(
+    "leaves a deferred stop untouched while another authority owns its lease",
+    () =>
+      withAuthority(
+        (db) =>
+          Effect.gen(function* () {
+            yield* seedInterrupted(testSessionId);
+            yield* RunInputRepo.enqueue({
+              id: Schema.decodeUnknownSync(InputId)("foreign-owned-stop"),
+              sessionId: testSessionId,
+              kind: "stop",
+              body: "Issue status changed",
+              payload: {
+                type: "AppUserNotification",
+                action: "issueStatusChanged",
+                notification: { issueId: "issue-1" },
+              },
+            });
+            db.query(
+              "UPDATE agent_run SET lease_owner='other-authority', lease_expires_at=? WHERE session_id=?",
+            ).run((yield* Clock.currentTimeMillis) + 60_000, testSessionId);
+            linearIssueStateType = "canceled";
+            const before = yield* RunRepo.get(testSessionId);
+            yield* SessionAuthority.processSession(testSessionId);
+            expect(yield* RunRepo.get(testSessionId)).toEqual(before);
+            expect(yield* RunInputRepo.pending(testSessionId)).toHaveLength(1);
+          }),
+        { withLinearGateway: true },
+      ),
+  );
+
+  it.effect.each(["matching", "mismatched", "missing", "invalid"] as const)(
+    "uses only the current retry event with a %s schedule",
+    (schedule) =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          yield* seedInterrupted(testSessionId);
+          const repositoryId =
+            Schema.decodeUnknownSync(WorkspaceId)("targeted-retry");
+          yield* WorkspaceRepo.createRepository({
+            organizationId: testOrganizationId,
+            id: repositoryId,
+            url: "https://example.invalid/unused",
+            ref: "main",
+          });
+          yield* RunRepo.update(testSessionId, {
+            repositoryId: Option.some(repositoryId),
+          });
+          const deadline = (yield* Clock.currentTimeMillis) + 60_000;
+          yield* RunRepo.update(testSessionId, {
+            nextAttemptAt: Option.some(deadline),
+          });
+          if (schedule !== "missing")
+            yield* RunEventRepo.upsert({
+              sourceKey: Schema.decodeUnknownSync(SourceKey)(
+                `retry:${testSessionId}:0`,
+              ),
+              sessionId: testSessionId,
+              kind: "retry",
+              level: "info",
+              payload: {
+                nextAttemptAt:
+                  schedule === "mismatched" ? deadline + 1 : deadline,
+                scheduledAt: schedule === "invalid" ? "bad" : 0,
+              },
+            });
+          if (schedule === "missing") {
+            db.query("DELETE FROM run_event WHERE source_key=?").run(
+              `retry:${testSessionId}:0`,
+            );
+          }
+          // An unrelated, unreadable payload must not be loaded on a retry tick.
+          yield* RunEventRepo.upsert({
+            sourceKey: Schema.decodeUnknownSync(SourceKey)(
+              `rpc:${testSessionId}:7:progress`,
+            ),
+            sessionId: testSessionId,
+            kind: "progress",
+            level: "info",
+          });
+          db.query(
+            "UPDATE run_event SET payload_json='invalid' WHERE kind='progress'",
+          ).run();
+          yield* RunInputRepo.enqueue({
+            id: Schema.decodeUnknownSync(InputId)("fresh-prompt"),
+            sessionId: testSessionId,
+            kind: "prompted",
+            body: "Continue",
+            payload: {},
+            createdAt: 1,
+          });
+          yield* SessionAuthority.processSession(testSessionId);
+          expect(workerSpawnInputs).toHaveLength(
+            schedule === "matching" ? 1 : 0,
+          );
+          expect(
+            Option.getOrThrow(yield* RunRepo.get(testSessionId)).attempt,
+          ).toBe(schedule === "matching" ? 1 : 0);
+        }),
+      ),
+  );
+
   it.effect("seeds event sequence from persisted events after restart", () =>
-    withAuthority(() =>
+    withAuthority((db) =>
       Effect.gen(function* () {
         const authority = yield* SessionAuthority;
         yield* seedInterrupted(testSessionId);
@@ -2201,6 +2354,10 @@ describe("Recovery and concurrency regressions", () => {
           level: "info",
           payload: { type: "progress", message: "old" },
         });
+        // Sequence seeding must read keys without decoding historical payloads.
+        db.query(
+          "UPDATE run_event SET payload_json='unreadable history' WHERE source_key=?",
+        ).run(`rpc:${testSessionId}:40:progress`);
         for (const sequence of [41, 42]) {
           yield* authority.processSession(testSessionId);
           const observed = yield* Deferred.make<void>();
@@ -2219,6 +2376,10 @@ describe("Recovery and concurrency regressions", () => {
             ),
           });
         }
+        db.query("UPDATE run_event SET payload_json=? WHERE source_key=?").run(
+          JSON.stringify({ type: "progress", message: "old" }),
+          `rpc:${testSessionId}:40:progress`,
+        );
         const events = (yield* RunEventRepo.list(testSessionId)).filter(
           (event) => event.kind === "progress",
         );

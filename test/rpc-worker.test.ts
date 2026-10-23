@@ -228,6 +228,30 @@ describe("RpcWorker", () => {
     }).pipe(Effect.provide(Live)),
   );
 
+  it.live("refuses start after stop without spawning a process", () =>
+    Effect.gen(function* () {
+      const marker = testPath("stopped-worker.txt");
+      const worker = yield* RpcWorker.spawn({
+        command: [
+          process.execPath,
+          "-e",
+          `await Bun.write(${JSON.stringify(marker)}, "spawned");`,
+        ],
+        cwd: process.cwd(),
+      });
+      yield* worker.stop();
+      const result = yield* Effect.either(worker.start());
+      expect(Either.isLeft(result)).toBe(true);
+      if (Either.isLeft(result)) {
+        expect(result.left._tag).toBe("@Gateway/RpcProtocolError");
+        expect(result.left.message).toBe("RPC worker is stopping");
+      }
+      expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(
+        false,
+      );
+    }).pipe(Effect.provide(Live)),
+  );
+
   it.effect("respondToUi and getState work after start", () =>
     Effect.gen(function* () {
       const rpc = yield* RpcWorker;
@@ -437,6 +461,36 @@ describe("Worker fiber ownership", () => {
 });
 
 describe("Bounded worker shutdown registrations", () => {
+  it.live(
+    "begins cleanup for every worker before waiting for a slow stop",
+    () => {
+      let cleanupsStarted = 0;
+      const countsAtStop: number[] = [];
+      const logger = Logger.make((options) => {
+        if (String(options.message) === "worker.scope_cleanup")
+          cleanupsStarted++;
+        if (String(options.message) === "worker.stopped")
+          countsAtStop.push(cleanupsStarted);
+      });
+      return Effect.gen(function* () {
+        yield* Effect.gen(function* () {
+          for (let i = 0; i < 2; i++) {
+            const worker = yield* RpcWorker.spawn({
+              command: [process.execPath, "-e", ignoresStdinCloseFixture],
+              cwd: process.cwd(),
+            });
+            yield* worker.start();
+          }
+        }).pipe(Effect.provide(RpcWorker.Default));
+        expect(countsAtStop).toEqual([2, 2]);
+      }).pipe(
+        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+        Logger.withMinimumLogLevel(LogLevel.Debug),
+      );
+    },
+    { timeout: 15_000 },
+  );
+
   it.live("keeps only active workers in gateway shutdown cleanup", () => {
     let scopeCleanups = 0;
     const logger = Logger.make((options) => {

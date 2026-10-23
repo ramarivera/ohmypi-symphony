@@ -1580,3 +1580,92 @@ describe("Webhook cleanup write failures", () => {
       ),
   );
 });
+
+describe("Webhook claim-owned failure marking", () => {
+  it.scopedLive(
+    "does not overwrite a reclaimed delivery after a tagged processing failure",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const installations = yield* InstallationRepo;
+          const deliveries = yield* DeliveryRepo;
+          const pipeline = yield* WebhookPipeline;
+          const claim = vi.spyOn(deliveries, "claim");
+          const originalClaim = deliveries.claim.bind(deliveries);
+          const originalMark = deliveries.mark.bind(deliveries);
+          const failed = vi
+            .spyOn(installations, "get")
+            .mockImplementationOnce(() =>
+              Effect.fail(new DatabaseError({ message: "processing failed" })),
+            );
+          const marks = vi
+            .spyOn(deliveries, "mark")
+            .mockImplementation((id, status, error) =>
+              originalMark(id, status, error).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    if (status !== "failed") return;
+                    const input = claim.mock.calls[0]?.[0];
+                    if (input === undefined)
+                      throw new Error("claim input missing");
+                    expect(yield* originalClaim(input).pipe(Effect.orDie)).toBe(
+                      "claimed",
+                    );
+                  }),
+                ),
+              ),
+            );
+          yield* Effect.gen(function* () {
+            const payload = createdPayload(yield* Clock.currentTimeMillis);
+            const response = yield* pipeline.handle(
+              signedRequest(payload, { delivery: "reclaimed-after-failure" }),
+            );
+            expect(response.status).toBe(500);
+            expect(marks).toHaveBeenCalledTimes(1);
+            const input = claim.mock.calls[0]?.[0];
+            if (input === undefined) throw new Error("claim input missing");
+            expect(yield* originalClaim(input)).toBe("duplicate");
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                claim.mockRestore();
+                marks.mockRestore();
+                failed.mockRestore();
+              }),
+            ),
+          );
+        }),
+      ),
+  );
+
+  it.scopedLive("does not mark a delivery when the claim itself fails", () =>
+    withWebhook(
+      Effect.gen(function* () {
+        yield* install();
+        const deliveries = yield* DeliveryRepo;
+        const claim = vi
+          .spyOn(deliveries, "claim")
+          .mockImplementation(() =>
+            Effect.fail(new DatabaseError({ message: "claim unavailable" })),
+          );
+        const mark = vi.spyOn(deliveries, "mark");
+        yield* Effect.gen(function* () {
+          const payload = createdPayload(yield* Clock.currentTimeMillis);
+          const response = yield* WebhookPipeline.handle(
+            signedRequest(payload),
+          );
+          expect(response.status).toBe(500);
+          expect(mark).not.toHaveBeenCalled();
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              claim.mockRestore();
+              mark.mockRestore();
+            }),
+          ),
+        );
+      }),
+    ),
+  );
+});

@@ -142,7 +142,7 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         [...activeStops],
         (stop) =>
           Effect.logDebug("worker.scope_cleanup").pipe(Effect.zipRight(stop())),
-        { discard: true },
+        { discard: true, concurrency: "unbounded" },
       ),
     );
     const spawn = Effect.fn("RpcWorker.spawn")(function* (input: {
@@ -897,47 +897,57 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
         void,
         RpcSpawnError | RpcTimeoutError | RpcProtocolError
       > {
-        const running = yield* Ref.get(processRef);
-        if (Option.isSome(running)) {
-          return yield* Effect.fail(
-            new RpcProtocolError({
-              method: "start",
-              message: "RPC worker already started",
-            }),
+        const process = yield* Effect.gen(function* () {
+          if (yield* Ref.get(stoppingRef)) {
+            return yield* Effect.fail(
+              new RpcProtocolError({
+                method: "start",
+                message: "RPC worker is stopping",
+              }),
+            );
+          }
+          if (Option.isSome(yield* Ref.get(processRef))) {
+            return yield* Effect.fail(
+              new RpcProtocolError({
+                method: "start",
+                message: "RPC worker already started",
+              }),
+            );
+          }
+          yield* Effect.logInfo("worker.starting").pipe(
+            Effect.annotateLogs({ event: "worker.starting", command, cwd }),
           );
-        }
+          const process = yield* Effect.try({
+            try: () =>
+              Bun.spawn(command, {
+                cwd,
+                env,
+                detached: detachedProcessGroup,
+                stdin: "pipe",
+                stdout: "pipe",
+                stderr: "pipe",
+              }),
+            catch: (error) =>
+              new RpcSpawnError({
+                message: error instanceof Error ? error.message : String(error),
+              }),
+          });
 
-        yield* Effect.logInfo("worker.starting").pipe(
-          Effect.annotateLogs({
-            event: "worker.starting",
-            command,
-            cwd,
-          }),
-        );
+          yield* Ref.set(processRef, Option.some(process));
 
-        const process = yield* Effect.try({
-          try: () =>
-            Bun.spawn(command, {
-              cwd,
-              env,
-              detached: detachedProcessGroup,
-              stdin: "pipe",
-              stdout: "pipe",
-              stderr: "pipe",
-            }),
-          catch: (error) =>
-            new RpcSpawnError({
-              message: error instanceof Error ? error.message : String(error),
-            }),
-        });
+          const stdoutFiber = yield* Effect.forkIn(
+            readOutput(process).pipe(Effect.interruptible),
+            scope,
+          );
+          const stderrFiber = yield* Effect.forkIn(
+            readStderr(process).pipe(Effect.interruptible),
+            scope,
+          );
 
-        yield* Ref.set(processRef, Option.some(process));
-
-        const stdoutFiber = yield* Effect.forkIn(readOutput(process), scope);
-        const stderrFiber = yield* Effect.forkIn(readStderr(process), scope);
-
-        yield* Ref.set(stdoutFiberRef, Option.some(stdoutFiber));
-        yield* Ref.set(stderrFiberRef, Option.some(stderrFiber));
+          yield* Ref.set(stdoutFiberRef, Option.some(stdoutFiber));
+          yield* Ref.set(stderrFiberRef, Option.some(stderrFiber));
+          return process;
+        }).pipe(stopGate.withPermits(1), Effect.uninterruptible);
 
         const timeout = Effect.sleep(startTimeoutMs).pipe(
           Effect.zipRight(
