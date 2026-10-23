@@ -552,7 +552,7 @@ const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
         ? { _tag: "File", path: tokenFile.value.trim() }
         : { _tag: "Inline", token: Redacted.make(token) };
     const runtimeModeValue =
-      (yield* optionalValue("T3_RUNTIME_MODE")) ?? "full-access";
+      (yield* optionalValue("T3_RUNTIME_MODE")) ?? "auto";
     if (!isRuntimeMode(runtimeModeValue)) {
       return yield* Effect.fail(
         ConfigError.InvalidData(

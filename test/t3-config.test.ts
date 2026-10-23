@@ -62,7 +62,7 @@ describe("T3 driver config", () => {
         providerInstanceId: "codex-cliproxy",
         model: "gpt-6-sol",
         modelOptions: [],
-        runtimeMode: "full-access",
+        runtimeMode: "auto",
         interactionMode: "default",
         idNamespace: "symphony",
       });
