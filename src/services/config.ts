@@ -10,6 +10,7 @@ import {
 } from "effect";
 import type { LogLevel } from "../domain/models.js";
 import { modelProvider } from "./worker-profile.js";
+import { RUNTIME_MODES, type RuntimeMode } from "../drivers/driver.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
 
@@ -22,6 +23,27 @@ export interface LogFileConfig {
   readonly size: string;
   readonly limit: number;
 }
+export type T3TokenSource =
+  | { readonly _tag: "Inline"; readonly token: Redacted.Redacted<string> }
+  /** Re-read on every connect so a rotated token file is picked up. */
+  | { readonly _tag: "File"; readonly path: string };
+
+export interface T3DriverConfig {
+  readonly baseUrl: URL;
+  readonly token: T3TokenSource;
+  readonly projectId: string;
+  readonly providerInstanceId: string;
+  readonly model: string;
+  readonly modelOptions: ReadonlyArray<{
+    readonly id: string;
+    readonly value: string | boolean;
+  }>;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: "default" | "plan";
+  /** Prefix for every id the driver derives (threads, commands, messages). */
+  readonly idNamespace: string;
+}
+
 export interface GatewayConfigShape {
   readonly allowedOrganizationIds?: ReadonlySet<string> | undefined;
   readonly gatewayAdminOrganizationIds?: ReadonlySet<string> | undefined;
@@ -70,6 +92,8 @@ export interface GatewayConfigShape {
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
   readonly workerExtensionPaths?: ReadonlyArray<string>;
   readonly workerClaudeExecutable?: string;
+  /** Present only when T3_BASE_URL is set. */
+  readonly t3Driver?: T3DriverConfig;
 }
 
 const positiveInteger = (name: string, fallback: number) =>
@@ -456,6 +480,125 @@ const workerModelRouting = Effect.fn("GatewayConfig.workerModelRouting")(
   },
 );
 
+const isRuntimeMode = (value: string): value is RuntimeMode =>
+  RUNTIME_MODES.some((mode) => mode === value);
+
+const t3ModelOptions = (
+  raw: string | undefined,
+): Either.Either<T3DriverConfig["modelOptions"], ConfigError.ConfigError> => {
+  if (raw === undefined) return Either.right([]);
+  const invalid = Either.left(
+    ConfigError.InvalidData(
+      ["T3_MODEL_OPTIONS"],
+      'T3_MODEL_OPTIONS must be a JSON object of string or boolean values, e.g. {"effort":"high"}',
+    ),
+  );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return invalid;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return invalid;
+  }
+  const options: Array<{ id: string; value: string | boolean }> = [];
+  for (const [id, value] of Object.entries(parsed)) {
+    if (id.trim().length === 0) return invalid;
+    if (typeof value === "boolean") {
+      options.push({ id: id.trim(), value });
+    } else if (typeof value === "string" && value.trim().length > 0) {
+      options.push({ id: id.trim(), value: value.trim() });
+    } else {
+      return invalid;
+    }
+  }
+  return Either.right(options);
+};
+
+const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
+  function* (): Effect.fn.Return<
+    T3DriverConfig | undefined,
+    ConfigError.ConfigError
+  > {
+    const baseUrlValue = yield* optionalValue("T3_BASE_URL");
+    if (baseUrlValue === undefined) return undefined;
+    const baseUrl = yield* Effect.try({
+      try: () => new URL(baseUrlValue),
+      catch: () =>
+        ConfigError.InvalidData(
+          ["T3_BASE_URL"],
+          "T3_BASE_URL must be a valid URL",
+        ),
+    });
+    if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
+      return yield* Effect.fail(
+        ConfigError.InvalidData(
+          ["T3_BASE_URL"],
+          "T3_BASE_URL must use http or https",
+        ),
+      );
+    }
+    const tokenFile = yield* Config.option(Config.string("T3_TOKEN_FILE"));
+    const directToken = yield* Config.option(Config.string("T3_TOKEN"));
+    const hasDirectToken =
+      Option.isSome(directToken) && directToken.value.trim().length > 0;
+    // requiredValue validates that the file (or variable) yields a token now.
+    const token = yield* requiredValue("T3_TOKEN");
+    const tokenSource: T3TokenSource =
+      !hasDirectToken &&
+      Option.isSome(tokenFile) &&
+      tokenFile.value.trim().length > 0
+        ? { _tag: "File", path: tokenFile.value.trim() }
+        : { _tag: "Inline", token: Redacted.make(token) };
+    const runtimeModeValue =
+      (yield* optionalValue("T3_RUNTIME_MODE")) ?? "full-access";
+    if (!isRuntimeMode(runtimeModeValue)) {
+      return yield* Effect.fail(
+        ConfigError.InvalidData(
+          ["T3_RUNTIME_MODE"],
+          `T3_RUNTIME_MODE must be one of ${RUNTIME_MODES.join(", ")}`,
+        ),
+      );
+    }
+    const interactionMode =
+      (yield* optionalValue("T3_INTERACTION_MODE")) ?? "default";
+    if (interactionMode !== "default" && interactionMode !== "plan") {
+      return yield* Effect.fail(
+        ConfigError.InvalidData(
+          ["T3_INTERACTION_MODE"],
+          "T3_INTERACTION_MODE must be default or plan",
+        ),
+      );
+    }
+    const idNamespace = (yield* optionalValue("T3_ID_NAMESPACE")) ?? "symphony";
+    if (!/^[A-Za-z0-9_-]{1,32}$/u.test(idNamespace)) {
+      return yield* Effect.fail(
+        ConfigError.InvalidData(
+          ["T3_ID_NAMESPACE"],
+          "T3_ID_NAMESPACE must be 1-32 letters, digits, '_' or '-'",
+        ),
+      );
+    }
+    const modelOptions = t3ModelOptions(
+      yield* optionalValue("T3_MODEL_OPTIONS"),
+    );
+    if (Either.isLeft(modelOptions))
+      return yield* Effect.fail(modelOptions.left);
+    return {
+      baseUrl,
+      token: tokenSource,
+      projectId: yield* requiredValue("T3_PROJECT_ID"),
+      providerInstanceId: yield* requiredValue("T3_PROVIDER_INSTANCE"),
+      model: yield* requiredValue("T3_MODEL"),
+      modelOptions: modelOptions.right,
+      runtimeMode: runtimeModeValue,
+      interactionMode,
+      idNamespace,
+    };
+  },
+);
+
 export class GatewayConfig extends Context.Service<GatewayConfig>()(
   "GatewayConfig",
   {
@@ -581,6 +724,7 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
         );
       }
       const routing = yield* workerModelRouting();
+      const t3Driver = yield* t3DriverConfig();
       return {
         ...values,
         ...routing,
@@ -589,6 +733,8 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
         githubAppAllowedOwners,
         tokenEncryptionPreviousKeys:
           previousKeys === undefined ? undefined : Redacted.make(previousKeys),
+        // Spread so the service type keeps t3Driver optional.
+        ...(t3Driver === undefined ? {} : { t3Driver }),
         linearClientId,
         githubAppId,
         githubAppPrivateKey:
