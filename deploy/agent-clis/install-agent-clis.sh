@@ -20,8 +20,6 @@ esac
 
 checksum() {
   case "$1-$2-$arch" in
-    claude-2.1.285-amd64) echo 33dad1ec615a2e08cc78b494f05c110e49916de2c79d78ec8799ebf46b233d29 ;;
-    claude-2.1.285-arm64) echo 24fac77749bed3d91365d6b6915aa4b824e14318ecb6bc17adbc192f01c9173d ;;
     claude-2.1.304-amd64) echo ea0f135784631619a7a409d07322ecec964f9cc4fd377508ed1ba3f141f27912 ;;
     claude-2.1.304-arm64) echo c487117526509ab6d2ee6013e14f181faf68d6d6afe6bb0d4b2b4a9feca5ecb3 ;;
     codex-0.156.1-amd64) echo 8b711520beddf385467b8da4d2c93736637c6ba1e46811cf0d8606b7c490b6f6 ;;

@@ -1,7 +1,7 @@
-# omp 18.8.6 is the release pi-claude-cli 0.5.0 targets and was verified on.
+# omp 18.8.6 is the release pi-claude-cli 0.5.1 targets and was verified on.
 ARG OMP_VERSION=18.8.6
-# pi-claude-cli's CLI driver refuses any other Claude Code build.
-ARG CLAUDE_VERSION=2.1.285
+# Shared with the T3 sidecar; within pi-claude-cli 0.5.1's supported range.
+ARG CLAUDE_VERSION=2.1.304
 
 FROM oven/bun:1.3.14 AS omp
 ARG OMP_VERSION

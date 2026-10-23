@@ -435,7 +435,7 @@ const workerModelRouting = Effect.fn("GatewayConfig.workerModelRouting")(
       : undefined;
     const workerDefaultModel =
       configuredModel ??
-      (cliproxyApiBaseUrl === undefined
+      (workerProfileDir === undefined || cliproxyApiBaseUrl === undefined
         ? undefined
         : DEFAULT_CLIPROXYAPI_WORKER_MODEL);
     if (

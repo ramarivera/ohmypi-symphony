@@ -77,7 +77,7 @@ providers:
 | --- | --- |
 | `CLIPROXYAPI_BASE_URL` | CLIProxyAPI origin, http(s) without credentials, query or fragment. |
 | `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE` | Dedicated, revocable Symphony client key. In Docker, a root-owned mode-0400 secret. Both settings are required together. |
-| `WORKER_DEFAULT_MODEL` | `provider/model[:thinking]`. Defaults to `cliproxyapi/gpt-6-sol` when CLIProxyAPI is configured. Passed as `--model` to fresh sessions only; resumed sessions keep their saved model. |
+| `WORKER_DEFAULT_MODEL` | `provider/model[:thinking]`. Defaults to `cliproxyapi/gpt-6-sol` when `WORKER_PROFILE_DIR` and CLIProxyAPI are configured. Native/dev runs without a profile leave omp's default unchanged. Passed as `--model` to fresh sessions only; resumed sessions keep their saved model. |
 | `WORKER_EXTENSION_PATHS` | Comma-separated absolute paths of image-installed extensions loaded into every worker. The image sets pi-claude-cli. |
 | `WORKER_CLAUDE_EXECUTABLE` | Claude Code launcher for pi-claude-cli. The image sets `/usr/local/bin/claude-cliproxy`. |
 
@@ -102,12 +102,15 @@ copy of the CLIProxyAPI key in the gateway's own environment.
 
 `deploy/agent-clis/install-agent-clis.sh` installs pinned, checksum-verified
 Claude Code and Codex builds under `/opt`. The gateway image installs Claude
-Code 2.1.285, the only build pi-claude-cli 0.5.0's CLI driver accepts. The T3
-sidecar image is meant to use the same installer. `deploy/worker-extensions`
+Code 2.1.304, matching the T3 sidecar's selected build. Both images can use the
+shared installer and its checksums. pi-claude-cli 0.5.1 supports Claude Code
+`>=2.1.285 <2.2.0`, Pi `>=0.99.1 <0.100.0`, and omp `^18.8.6`. Claude Code
+versions above the supported range warn by default;
+`PI_CLAUDE_CLI_STRICT_VERSION=1` makes that check strict. `deploy/worker-extensions`
 pins pi-claude-cli with its own `bun.lock`; it's installed with
 `--omit=optional --ignore-scripts`, so the Agent SDK's bundled Claude binaries
 are skipped.
 
 Upgrading pi-claude-cli means checking its omp peer range against
-`OMP_VERSION` and its required Claude Code version against `CLAUDE_VERSION`,
+`OMP_VERSION` and its supported Claude Code range against `CLAUDE_VERSION`,
 then adding both architectures' checksums to the installer.

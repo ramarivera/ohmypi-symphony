@@ -152,11 +152,15 @@ Each session has its own `.omp-home`, `.omp-tmp`, XDG config/data/cache director
 and Bun install/transpiler caches. omp's writable agent configuration and MCP
 SQLite database are also inside that session's private workspace. Existing
 `/home/bun/.omp` configuration is not a shared worker HOME. The environment
-allowlist forwards no model-provider keys or endpoints. The one model credential
+allowlist forwards no direct model-provider keys or endpoints, including
+`ANTHROPIC_*`, `OPENAI_*`, `GOOGLE_API_KEY`, `GEMINI_API_KEY` and
+`OPENROUTER_API_KEY`. The one model credential
 a worker sees is the dedicated CLIProxyAPI client key, which the gateway reads
 from `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE` and injects per run with
 `CLIPROXYAPI_BASE_URL`. The worker can read it, so give Symphony its own
-revocable key. Gateway-only keys and arbitrary
+client key. CLIProxyAPI currently stays keyless, so the gateway still sends its
+key but revocation won't take effect until CLIProxyAPI enforces client keys.
+Gateway-only keys and arbitrary
 environment variables don't reach workers. Skills, rules, extensions and
 `models.yml` come from a validated, credential-free profile copied into the
 private agent directory. omp gets no Anthropic credential or endpoint, so its
@@ -259,7 +263,7 @@ mode-0600 `mcp.json` under the session's mode-0700 workspace. Peer session uids 
 agent database; knowing another loopback proxy URL doesn't authorize requests.
 Native same-uid filesystem limitations still apply.
 
-The runtime is pinned to OMP 17.1.8 in `package.json` and `Dockerfile`. Its
+The runtime is pinned to OMP 18.8.6 in `package.json` and `Dockerfile`. Its
 `pi-ai/src/auth-storage.ts` caches credentials in `#data`, while
 `pi-coding-agent/src/mcp/manager.ts` resolves OAuth on connection and auth failure
 and retains resolved transport headers. Auth resolution can re-read SQLite rows,

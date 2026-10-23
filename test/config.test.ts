@@ -504,6 +504,25 @@ describe("Worker model routing", () => {
     ]);
   });
 
+  it.effect.each([
+    ["without a profile", undefined, undefined],
+    ["with a blank profile", "  ", undefined],
+    ["with a profile", "/app/worker-profile", "cliproxyapi/gpt-6-sol"],
+  ] as const)(
+    "uses the implicit CLIProxyAPI model only with a profile: %s",
+    ([, profile, model]) =>
+      Effect.gen(function* () {
+        const values = valuesWith([
+          ["CLIPROXYAPI_BASE_URL", "http://cliproxyapi:8317"],
+          ["CLIPROXYAPI_API_KEY", "key"],
+        ]);
+        if (profile !== undefined) values.set("WORKER_PROFILE_DIR", profile);
+        const result = yield* configResult(values);
+        if (!Result.isSuccess(result)) throw new Error("expected success");
+        expect(result.success.workerDefaultModel).toBe(model);
+      }),
+  );
+
   it.effect("accepts an explicit default model with a thinking level", () =>
     Effect.gen(function* () {
       const result = yield* configResult(
