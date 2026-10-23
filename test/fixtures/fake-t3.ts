@@ -53,6 +53,13 @@ export class FakeT3Server {
   readonly dropResponses = new Set<string>();
   /** Answer the next afterSequence resume with a snapshot instead. */
   forceSnapshotOnResume = false;
+  readonly projects = new Map<
+    string,
+    { id: string; workspaceRoot: string; deletedAt: string | null }
+  >();
+  readonly projectMutations: Array<Json> = [];
+  loseProjectMutationResponse = false;
+  projectMutationStatus = 200;
   private sequence = 0;
   private ticketCounter = 0;
   private socketCounter = 0;
@@ -183,10 +190,10 @@ export class FakeT3Server {
 
   // -- internals -----------------------------------------------------------
 
-  private handleHttp(
+  private async handleHttp(
     request: Request,
     server: Bun.Server<SocketData>,
-  ): Response | undefined {
+  ): Promise<Response | undefined> {
     const url = new URL(request.url);
     if (url.pathname === "/.well-known/t3/environment") {
       return Response.json({
@@ -197,6 +204,50 @@ export class FakeT3Server {
         orchestrationProtocolVersion: 2,
         capabilities: {},
       });
+    }
+    if (
+      url.pathname === "/api/projects" ||
+      url.pathname === "/api/projects/mutate"
+    ) {
+      if (request.headers.get("authorization") !== `Bearer ${this.token}`)
+        return new Response("unauthorized", { status: 401 });
+      if (url.pathname === "/api/projects" && request.method === "GET")
+        return Response.json({
+          projects: [...this.projects.values()],
+          updatedAt: now(),
+        });
+      if (request.method !== "POST")
+        return new Response("method", { status: 405 });
+      const body = (await request.json()) as Json;
+      this.projectMutations.push(body);
+      if (this.projectMutationStatus !== 200)
+        return new Response("mutation denied", {
+          status: this.projectMutationStatus,
+        });
+      if (
+        body.type !== "project.create" ||
+        typeof body.projectId !== "string" ||
+        typeof body.workspaceRoot !== "string"
+      )
+        return new Response("invalid", { status: 400 });
+      const existing = [...this.projects.values()].find(
+        (project) =>
+          project.workspaceRoot === body.workspaceRoot &&
+          project.deletedAt === null,
+      );
+      if (existing !== undefined)
+        return new Response("workspace exists", { status: 409 });
+      const project = {
+        id: body.projectId,
+        workspaceRoot: body.workspaceRoot,
+        deletedAt: null,
+      };
+      this.projects.set(project.id, project);
+      if (this.loseProjectMutationResponse) {
+        this.loseProjectMutationResponse = false;
+        return new Response("response lost", { status: 503 });
+      }
+      return Response.json(project);
     }
     if (url.pathname === "/api/auth/websocket-ticket") {
       if (

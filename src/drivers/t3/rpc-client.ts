@@ -100,7 +100,7 @@ export const t3Endpoint = (baseUrl: URL, path: string): URL => {
 const errorText = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
 
-const httpJson = (
+export const httpJson = (
   method: string,
   url: URL,
   init: RequestInit,

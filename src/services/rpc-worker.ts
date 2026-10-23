@@ -49,6 +49,7 @@ export interface RpcHostToolResult {
 }
 
 export interface RpcWorkerHandle {
+  readonly driverSession?: import("../drivers/driver.js").AgentSession;
   readonly sessionId: Effect.Effect<Option.Option<string>, never, never>;
   readonly sessionFile: Effect.Effect<Option.Option<string>, never, never>;
   readonly isStreaming: Effect.Effect<boolean, never, never>;
@@ -60,12 +61,15 @@ export interface RpcWorkerHandle {
   readonly stop: () => Effect.Effect<void, never, never>;
   readonly prompt: (
     message: string,
+    clientRequestId?: string,
   ) => Effect.Effect<boolean, RpcProtocolError | RpcTimeoutError, never>;
   readonly steer: (
     message: string,
+    clientRequestId?: string,
   ) => Effect.Effect<void, RpcProtocolError | RpcTimeoutError, never>;
   readonly followUp: (
     message: string,
+    clientRequestId?: string,
   ) => Effect.Effect<void, RpcProtocolError | RpcTimeoutError, never>;
   readonly setHostTools: (
     tools: ReadonlyArray<RpcHostToolDefinition>,

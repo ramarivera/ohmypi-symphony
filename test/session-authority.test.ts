@@ -11,6 +11,7 @@ import {
   Layer,
   Option,
   Result,
+  Schedule,
   Schema,
 } from "effect";
 import { TestClock } from "effect/testing";
@@ -74,6 +75,7 @@ import {
 import { WorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { tokenContext } from "../src/services/token-migration.js";
+import { FakeT3Server } from "./fixtures/fake-t3.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const testPath = testPaths();
@@ -1022,6 +1024,7 @@ const toolExternalUrlCalls: Array<{
     readonly url: string;
   }>;
 }> = [];
+let linearIssueLabels: ReadonlyArray<string> = [];
 let linearIssueLookupFails = false;
 let linearIssueStateType = "started";
 let elicitationWaiter: Deferred.Deferred<void, never> | undefined;
@@ -1215,7 +1218,7 @@ const mockToolsGateway = LinearGateway.of({
           delegateId: "authority-app-user",
           url: null,
           teamId: null,
-          labels: [],
+          labels: linearIssueLabels,
         }),
   updateIssue: () => Effect.void,
   addSessionExternalUrls: (input: {
@@ -1260,12 +1263,14 @@ const withAuthority = <A, E>(
     readonly config?: ReadonlyArray<readonly [string, string]>;
     readonly withLinearGateway?: boolean;
     readonly githubApp?: GitHubAppTokenService;
+    readonly workerUid?: string;
   },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       authorityTestRoot = testPath("temporary");
       linearIssueLookupFails = false;
+      linearIssueLabels = [];
       linearIssueStateType = "started";
       toolExternalUrlCalls.length = 0;
       terminalFailure = undefined;
@@ -1312,7 +1317,12 @@ const withAuthority = <A, E>(
         RunInputRepo.layer,
         RunRepo.layer,
         WorkspaceRepo.layer,
-        WorkerIdentityRepo.layer,
+        options?.workerUid === undefined
+          ? WorkerIdentityRepo.layer
+          : Layer.succeed(WorkerIdentityRepo, {
+              acquire: () => Effect.succeed(options.workerUid),
+              release: () => Effect.void,
+            }),
         GitHubApp.layer,
         githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
@@ -3264,5 +3274,325 @@ describe("Recovery review regressions", () => {
           ).toBe("running");
         }),
       ),
+  );
+});
+
+const seedDriverRun = (defaultDriver: "omp" | "t3") =>
+  Effect.gen(function* () {
+    const installations = yield* InstallationRepo;
+    const repositories = yield* WorkspaceRepo;
+    const runs = yield* RunRepo;
+    const inputs = yield* RunInputRepo;
+    yield* installations.put(install(testOrganizationId));
+    const id = Schema.decodeUnknownSync(WorkspaceId)("driver-repo");
+    yield* repositories.createRepository({
+      organizationId: testOrganizationId,
+      id,
+      url: "https://github.com/org/repo.git",
+      ref: "main",
+      defaultDriver,
+    });
+    const cwd = testPath("driver-workspace");
+    const configPath = testPath("driver-workspace/.git/config");
+    yield* Effect.promise(() =>
+      writeFile(
+        configPath,
+        '[core]\nrepositoryformatversion = 0\n[http "https://github.com/"]\nextraheader = AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0\n',
+      ),
+    );
+    yield* runs.create({
+      sessionId: testSessionId,
+      organizationId: testOrganizationId,
+      issueId: Option.some(testIssueId),
+    });
+    yield* runs.update(testSessionId, {
+      repositoryId: Option.some(id),
+      workspacePath: Option.some(cwd),
+    });
+    yield* inputs.enqueue({
+      id: Schema.decodeUnknownSync(InputId)("driver-input"),
+      sessionId: testSessionId,
+      kind: "created",
+      body: "Fix the test and open a PR",
+      payload: {},
+    });
+    return { cwd, configPath };
+  });
+const awaitState = (state: string) =>
+  Effect.gen(function* () {
+    const runs = yield* RunRepo;
+    yield* runs.get(testSessionId).pipe(
+      Effect.repeat({
+        while: (run) => Option.isNone(run) || run.value.state !== state,
+        schedule: Schedule.spaced(5),
+      }),
+      Effect.timeoutOrElse({
+        duration: 3_000,
+        orElse: () => Effect.die(new Error(`Run did not reach ${state}`)),
+      }),
+    );
+  });
+const withT3Authority = <A, E>(
+  task: Parameters<typeof withAuthority<A, E>>[0],
+  server: FakeT3Server,
+  workerUid?: string,
+) =>
+  withAuthority(task, {
+    withLinearGateway: true,
+    ...(workerUid === undefined ? {} : { workerUid }),
+    config: [
+      ["T3_BASE_URL", server.baseUrl.toString()],
+      ["T3_TOKEN", server.token],
+      ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+      ["T3_MODEL", "gpt-6-sol"],
+    ],
+  });
+const t3Server = Effect.acquireRelease(
+  Effect.sync(() => new FakeT3Server()),
+  (server) => Effect.sync(() => server.stop()),
+);
+
+describe("AgentDriver authority integration", () => {
+  it.live(
+    "runs T3 with the same projection/terminal lifecycle and persists its native ref",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              const authority = yield* SessionAuthority;
+              const repositories = yield* WorkspaceRepo;
+              const { cwd, configPath } = yield* seedDriverRun("t3");
+              yield* authority.processSession(testSessionId);
+              const ref = Option.getOrThrow(
+                yield* repositories.getDriverSession(testSessionId),
+              );
+              expect(ref.driver).toBe("t3");
+              expect(workerSpawnInputs).toHaveLength(0);
+              expect(server.projects.size).toBe(1);
+              expect([...server.projects.values()][0]?.workspaceRoot).toBe(cwd);
+              expect(
+                yield* Effect.promise(() => readFile(configPath, "utf8")),
+              ).not.toContain("AUTHORIZATION");
+              const command = server.commandsOf("message.dispatch")[0];
+              expect(command?.messageId).toBe(
+                `symphony:${ref.nativeId}:message:driver-input`,
+              );
+              expect(JSON.stringify(server.requests)).not.toContain(
+                "access-token",
+              );
+              server.updateRun(ref.nativeId, "run-1", { status: "running" });
+              server.upsertItem(ref.nativeId, {
+                id: "tool-1",
+                type: "command_execution",
+                runId: "run-1",
+                status: "running",
+                ordinal: 1,
+                input: "bun test",
+              });
+              server.upsertItem(ref.nativeId, {
+                id: "todo-1",
+                type: "todo_list",
+                runId: "run-1",
+                status: "completed",
+                ordinal: 2,
+                steps: [
+                  { id: "step-1", text: "Tests passed", status: "completed" },
+                ],
+              });
+              server.upsertItem(ref.nativeId, {
+                id: "message-1",
+                type: "assistant_message",
+                runId: "run-1",
+                status: "completed",
+                ordinal: 3,
+                messageId: "assistant-1",
+                text: "Fixed. https://github.com/org/repo/pull/12",
+                streaming: false,
+              });
+              server.updateRun(ref.nativeId, "run-1", { status: "completed" });
+              yield* awaitState("succeeded");
+              expect(
+                projectorEvents.some(
+                  ({ event }) => event.type === "tool_execution_start",
+                ),
+              ).toBe(true);
+              expect(
+                projectorEvents.some(({ event }) => event.type === "agent_end"),
+              ).toBe(true);
+              expect(toolExternalUrlCalls).toContainEqual({
+                sessionId: testSessionId,
+                urls: [
+                  {
+                    label: "Pull request",
+                    url: "https://github.com/org/repo/pull/12",
+                  },
+                ],
+              });
+              expect(
+                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                  .ompSessionFile,
+              ).toEqual(Option.none());
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "auto-approves T3 requests through the cancellation mutation gate",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              const authority = yield* SessionAuthority;
+              yield* authority.processSession(testSessionId);
+              const ref = Option.getOrThrow(
+                yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+              );
+              server.upsertItem(ref.nativeId, {
+                id: "approval",
+                type: "approval_request",
+                runId: "run-1",
+                status: "waiting",
+                ordinal: 1,
+                requestId: "approval-1",
+                requestKind: "command",
+                prompt: "Run tests?",
+                options: [{ decision: "accept", label: "Allow once" }],
+              });
+              server.upsertRequest(ref.nativeId, {
+                id: "approval-1",
+                kind: "command",
+                status: "pending",
+              });
+              yield* Effect.repeat(
+                Effect.sync(
+                  () => server.commandsOf("runtime-request.respond").length,
+                ),
+                {
+                  while: (count) => count === 0,
+                  schedule: Schedule.spaced(5),
+                },
+              ).pipe(
+                Effect.timeoutOrElse({
+                  duration: 3_000,
+                  orElse: () => Effect.die(new Error("approval not handled")),
+                }),
+              );
+              expect(
+                server.commandsOf("runtime-request.respond")[0],
+              ).toMatchObject({ requestId: "approval-1", decision: "accept" });
+              const inputs = yield* RunInputRepo;
+              yield* inputs.enqueue({
+                id: Schema.decodeUnknownSync(InputId)("driver-stop"),
+                sessionId: testSessionId,
+                kind: "stop",
+                body: "stop",
+                payload: {},
+              });
+              yield* authority.processSession(testSessionId);
+              expect(
+                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                  .state,
+              ).toBe("canceled");
+              expect(yield* authority.activeWorkerCount()).toBe(0);
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "reads Linear's current driver label over the stored repository default",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              linearIssueLabels = ["driver:omp"];
+              yield* (yield* SessionAuthority).processSession(testSessionId);
+              expect(workerSpawnInputs).toHaveLength(1);
+              expect(server.threads.size).toBe(0);
+              expect(
+                Option.getOrThrow(
+                  yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+                ).driver,
+              ).toBe("omp");
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "fails closed before contacting T3 when per-session uid isolation is active",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              const result = yield* (yield* SessionAuthority)
+                .processSession(testSessionId)
+                .pipe(Effect.result);
+              expect(Result.isFailure(result)).toBe(true);
+              if (Result.isFailure(result))
+                expect(result.failure.message).toContain(
+                  "per-session uid launcher",
+                );
+              expect(server.threads.size).toBe(0);
+              expect(server.projectMutations).toHaveLength(0);
+              expect(workerSpawnInputs).toHaveLength(0);
+              expect(
+                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                  .state,
+              ).toBe("orphaned");
+            }),
+          server,
+          "10001",
+        );
+      }),
+  );
+  it.live(
+    "reuses the T3 thread after restart while a new attempt ignores old terminal events",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              const authority = yield* SessionAuthority;
+              const runs = yield* RunRepo;
+              yield* authority.processSession(testSessionId);
+              const ref = Option.getOrThrow(
+                yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+              );
+              yield* authority.shutdown();
+              yield* runs.update(testSessionId, {
+                state: "orphaned",
+                nextAttemptAt: Option.none(),
+              });
+              yield* authority.processSession(testSessionId);
+              expect(
+                server.requestsFor("orchestration.launchThread"),
+              ).toHaveLength(1);
+              expect(server.projects.size).toBe(1);
+              expect(server.commandsOf("message.dispatch")).toHaveLength(2);
+              expect(server.commandsOf("message.dispatch")[1]?.threadId).toBe(
+                ref.nativeId,
+              );
+              expect(
+                Option.getOrThrow(yield* runs.get(testSessionId)).state,
+              ).toBe("running");
+            }),
+          server,
+        );
+      }),
   );
 });

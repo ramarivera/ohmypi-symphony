@@ -10,8 +10,8 @@ import {
   Result,
 } from "effect";
 import type { LogLevel } from "../domain/models.js";
-import { modelProvider } from "./worker-profile.js";
 import { RUNTIME_MODES, type RuntimeMode } from "../drivers/driver.js";
+import { modelProvider } from "./worker-profile.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
 
@@ -32,7 +32,7 @@ export type T3TokenSource =
 export interface T3DriverConfig {
   readonly baseUrl: URL;
   readonly token: T3TokenSource;
-  readonly projectId: string;
+  readonly projectId?: string;
   readonly providerInstanceId: string;
   readonly model: string;
   readonly modelOptions: ReadonlyArray<{
@@ -535,11 +535,18 @@ const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
           }),
         ),
     });
-    if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
+    if (
+      (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") ||
+      baseUrl.username !== "" ||
+      baseUrl.password !== "" ||
+      baseUrl.search !== "" ||
+      baseUrl.hash !== ""
+    ) {
       return yield* Effect.fail(
         new Config.ConfigError(
           new ConfigProvider.SourceError({
-            message: "T3_BASE_URL must use http or https",
+            message:
+              "T3_BASE_URL must use http(s) without credentials, query, or fragment",
           }),
         ),
       );
@@ -593,10 +600,11 @@ const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
     );
     if (Result.isFailure(modelOptions))
       return yield* Effect.fail(modelOptions.failure);
+    const projectId = yield* optionalValue("T3_PROJECT_ID");
     return {
       baseUrl,
       token: tokenSource,
-      projectId: yield* requiredValue("T3_PROJECT_ID"),
+      ...(projectId === undefined ? {} : { projectId }),
       providerInstanceId: yield* requiredValue("T3_PROVIDER_INSTANCE"),
       model: yield* requiredValue("T3_MODEL"),
       modelOptions: modelOptions.success,

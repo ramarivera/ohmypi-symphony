@@ -12,6 +12,7 @@ import {
   normalizeNixPackages,
   RepositoryRecord,
 } from "../../domain/models.js";
+import type { DriverKind, SessionRef } from "../../drivers/driver.js";
 import {
   decodeRow,
   decodeRows,
@@ -31,6 +32,7 @@ const RepositoryRow = Schema.Struct({
   labels_json: Schema.String,
   nix_packages_json: Schema.String,
   is_default: Schema.Number,
+  default_driver: Schema.Literals(["omp", "t3"]),
   created_at: Schema.Number,
   updated_at: Schema.Number,
 });
@@ -82,6 +84,7 @@ const validateRepository = (
     readonly labels?: ReadonlyArray<string>;
     readonly nixPackages?: ReadonlyArray<NixPackageName>;
     readonly isDefault?: boolean;
+    readonly defaultDriver?: DriverKind;
   },
   now: number,
 ): Effect.Effect<RepositoryRecord, RowDecodeError> =>
@@ -111,6 +114,7 @@ const validateRepository = (
         labels: normalizeStringArray(input.labels ?? [], "labels"),
         nixPackages: normalizeNixPackages(input.nixPackages ?? []),
         isDefault: input.isDefault === true,
+        defaultDriver: input.defaultDriver ?? "omp",
         createdAt: now,
         updatedAt: now,
       });
@@ -175,6 +179,7 @@ const rowToRepositoryRecord = (
         labels: validLabels,
         nixPackages: validNixPackages,
         isDefault: row.is_default === 1,
+        defaultDriver: row.default_driver,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       },
@@ -262,6 +267,7 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
           readonly labels?: ReadonlyArray<string>;
           readonly nixPackages?: ReadonlyArray<NixPackageName>;
           readonly isDefault?: boolean;
+          readonly defaultDriver?: DriverKind;
           readonly now?: number;
         }): Effect.fn.Return<RepositoryRecord, DatabaseError | RowDecodeError> {
           yield* Effect.annotateCurrentSpan("repositoryId", input.id);
@@ -303,8 +309,8 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
                 db
                   .query(`
                     INSERT INTO repository (
-                      organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, nix_packages_json, is_default, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      organization_id, id, url, ref, team_ids_json, project_ids_json, labels_json, nix_packages_json, is_default, default_driver, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                   `)
                   .run(
                     record.organizationId,
@@ -316,6 +322,7 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
                     JSON.stringify(record.labels),
                     JSON.stringify(record.nixPackages),
                     record.isDefault ? 1 : 0,
+                    record.defaultDriver ?? "omp",
                     record.createdAt,
                     record.updatedAt,
                   ),
@@ -341,6 +348,7 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
             readonly labels?: ReadonlyArray<string>;
             readonly nixPackages?: ReadonlyArray<NixPackageName>;
             readonly isDefault?: boolean;
+            readonly defaultDriver?: DriverKind;
             readonly now?: number;
           },
         ): Effect.fn.Return<RepositoryRecord, DatabaseError | RowDecodeError> {
@@ -367,6 +375,8 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
               labels: input.labels ?? existing.labels,
               nixPackages: input.nixPackages ?? existing.nixPackages,
               isDefault: input.isDefault ?? existing.isDefault,
+              defaultDriver:
+                input.defaultDriver ?? existing.defaultDriver ?? "omp",
             },
             now,
           );
@@ -389,7 +399,7 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
                 db
                   .query(`
                     UPDATE repository
-                    SET url=?, ref=?, team_ids_json=?, project_ids_json=?, labels_json=?, nix_packages_json=?, is_default=?, updated_at=?
+                    SET url=?, ref=?, team_ids_json=?, project_ids_json=?, labels_json=?, nix_packages_json=?, is_default=?, default_driver=?, updated_at=?
                     WHERE organization_id=? AND id=?
                   `)
                   .run(
@@ -400,6 +410,7 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
                     JSON.stringify(patch.labels),
                     JSON.stringify(patch.nixPackages),
                     patch.isDefault ? 1 : 0,
+                    patch.defaultDriver ?? "omp",
                     now,
                     organizationId,
                     id,
@@ -537,8 +548,47 @@ export class WorkspaceRepo extends Context.Service<WorkspaceRepo>()(
         return Option.some(record);
       });
 
+      const getDriverSession = (sessionId: SessionId) =>
+        Effect.gen(function* () {
+          const row = yield* tryDb(
+            () =>
+              db
+                .query<{ ref_json: string }, [string]>(
+                  "SELECT ref_json FROM driver_session WHERE session_id=?",
+                )
+                .get(sessionId),
+            "WorkspaceRepo.getDriverSession",
+          );
+          if (row === null) return Option.none<SessionRef>();
+          return Option.some(
+            yield* Effect.try({
+              try: () =>
+                Schema.decodeUnknownSync(
+                  Schema.Struct({
+                    driver: Schema.Literals(["omp", "t3"]),
+                    nativeId: Schema.String,
+                    locator: Schema.Record(Schema.String, Schema.String),
+                  }),
+                )(JSON.parse(row.ref_json)),
+              catch: () =>
+                new RowDecodeError({
+                  message: "Invalid driver session",
+                  entity: "driver_session",
+                }),
+            }),
+          );
+        });
+      const setDriverSession = (sessionId: SessionId, ref: SessionRef) =>
+        tryDb(() => {
+          db.query(
+            "INSERT INTO driver_session(session_id, ref_json) VALUES (?, ?) ON CONFLICT(session_id) DO UPDATE SET ref_json=excluded.ref_json",
+          ).run(sessionId, JSON.stringify(ref));
+        }, "WorkspaceRepo.setDriverSession");
+
       return {
         setWorkspace,
+        getDriverSession,
+        setDriverSession,
         createRepository,
         updateRepository,
         deleteRepository,

@@ -128,6 +128,8 @@ export interface TurnHandle {
    * submitting it again.
    */
   readonly adopted: boolean;
+  /** omp commands can finish without invoking the agent. */
+  readonly agentInvoked?: boolean;
   /** Completes on the terminal state of this turn, following restarts. */
   readonly outcome: Effect.Effect<TurnOutcome, DriverError>;
 }
@@ -159,6 +161,8 @@ interface EventBase {
   readonly key: string;
   /** Resume cursor after this event, or null when the driver has none. */
   readonly cursor: string | null;
+  /** Retains omp extension events while the authority migrates its protocol boundary. */
+  readonly runtimeEvent?: import("../services/rpc-worker.js").RpcEvent;
 }
 
 /**
@@ -168,6 +172,10 @@ interface EventBase {
  * terminal response or error.
  */
 export type AgentEvent =
+  | (EventBase & {
+      readonly _tag: "RuntimeEvent";
+      readonly event: import("../services/rpc-worker.js").RpcEvent;
+    })
   | (EventBase & { readonly _tag: "TurnStarted"; readonly turnId: string })
   | (EventBase & {
       readonly _tag: "Thinking";

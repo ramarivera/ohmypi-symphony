@@ -138,6 +138,7 @@ export const RepositoryRecord = Schema.Struct({
     organizationId: OrganizationId,
     labels: Schema.Array(Schema.String),
     isDefault: Schema.Boolean,
+    defaultDriver: Schema.optionalKey(Schema.Literals(["omp", "t3"])),
     createdAt: Schema.Number,
     updatedAt: Schema.Number,
   }).fields,

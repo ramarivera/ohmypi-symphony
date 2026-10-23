@@ -679,8 +679,20 @@ export class ActivityProjector extends Context.Service<ActivityProjector>()(
             "projector.sessionId": sessionId,
             "projector.sequence": sequence,
           });
-          const sourceKey = `rpc:${sessionId}:${sequence}:${event.type}`;
+          const sourceKey =
+            typeof event.driverEventKey === "string"
+              ? event.driverEventKey
+              : `rpc:${sessionId}:${sequence}:${event.type}`;
           switch (event.type) {
+            case "thinking":
+            case "driver_warning":
+              yield* thought(
+                sessionId,
+                sourceKey,
+                text(event.message) ?? "Agent is working",
+                true,
+              );
+              return;
             case "agent_start":
               yield* thought(
                 sessionId,

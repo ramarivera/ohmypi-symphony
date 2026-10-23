@@ -45,6 +45,7 @@ import {
   type WorkspaceSpec,
 } from "../driver.js";
 import { type RunView, T3EventMapper } from "./mapping.js";
+import { ensureT3Project } from "./projects.js";
 import {
   connectT3,
   fetchEnvironmentDescriptor,
@@ -72,7 +73,7 @@ import {
 export interface T3DriverOptions {
   readonly baseUrl: URL;
   readonly token: Effect.Effect<Redacted.Redacted<string>, T3RpcError>;
-  readonly projectId: string;
+  readonly projectId?: string;
   readonly modelSelection: ModelSelection;
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: "default" | "plan";
@@ -92,7 +93,7 @@ export const t3DriverOptionsFromConfig = (
 ): T3DriverOptions => ({
   baseUrl: config.baseUrl,
   token: tokenFromSource(config.token),
-  projectId: config.projectId,
+  ...(config.projectId === undefined ? {} : { projectId: config.projectId }),
   modelSelection: {
     instanceId: config.providerInstanceId,
     model: config.model,
@@ -349,7 +350,21 @@ export const makeT3Driver = (options: T3DriverOptions): AgentDriver => {
       const sessionScope = yield* Effect.scope;
       const threadId =
         input.resume?.ref.nativeId ?? ids.threadId(input.sessionKey);
-      const projectId = input.project ?? options.projectId;
+      const projectId =
+        input.resume?.ref.locator.projectId ??
+        (input.workspace._tag === "Directory"
+          ? yield* ensureT3Project({
+              ...connectOptions,
+              workspaceRoot: input.workspace.path,
+              title: input.title,
+              idNamespace: options.idNamespace,
+            }).pipe(Effect.mapError(fromRpcError("provisionProject", true)))
+          : (input.project ?? options.projectId));
+      if (projectId === undefined)
+        return yield* protocolError(
+          "open",
+          "T3 project is required for driver-managed workspaces",
+        );
 
       // -- connection management: one live socket, replaced when it dies.
       const lock = yield* Semaphore.make(1);

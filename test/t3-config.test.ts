@@ -125,10 +125,21 @@ describe("T3 driver config", () => {
     }),
   );
 
+  it.effect(
+    "allows automatic workspace project provisioning without T3_PROJECT_ID",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* load(
+          t3Values.filter(([key]) => key !== "T3_PROJECT_ID"),
+        );
+        if (Result.isFailure(result)) throw result.failure;
+        expect(result.success.t3Driver?.projectId).toBeUndefined();
+      }),
+  );
+
   it.effect("rejects partial or invalid T3 settings", () =>
     Effect.gen(function* () {
       const cases: ReadonlyArray<ReadonlyArray<readonly [string, string]>> = [
-        t3Values.filter(([key]) => key !== "T3_PROJECT_ID"),
         t3Values.filter(([key]) => key !== "T3_TOKEN"),
         [...t3Values, ["T3_RUNTIME_MODE", "yolo"]],
         [...t3Values, ["T3_INTERACTION_MODE", "chatty"]],
@@ -136,6 +147,8 @@ describe("T3 driver config", () => {
         [...t3Values, ["T3_MODEL_OPTIONS", '{"effort":3}']],
         [...t3Values, ["T3_ID_NAMESPACE", "has spaces"]],
         [["T3_BASE_URL", "ftp://t3"], ...t3Values.slice(1)],
+        [["T3_BASE_URL", "https://user:secret@t3"], ...t3Values.slice(1)],
+        [["T3_BASE_URL", "https://t3/?token=secret"], ...t3Values.slice(1)],
       ];
       for (const values of cases) {
         const result = yield* load(values);
