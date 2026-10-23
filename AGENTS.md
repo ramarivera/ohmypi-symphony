@@ -37,6 +37,7 @@ mise run start                      # fnox exec -- bun src/index.ts
 Without `node_modules`, `typecheck` fails with `Cannot find type definition file
 for 'bun-types'`. Run `mise run install` first.
 
+
 Vitest must run on the Bun runtime (`bunx --bun`): source and tests import
 `bun:sqlite` and `Bun.*`. Plain `npx vitest` does not work.
 
@@ -176,12 +177,14 @@ Summary only. `docs/security.md` is authoritative.
   applies when a worker identity is configured; in native same-uid mode
   (no `WORKER_UID_BASE`) the gateway removes the workspace recursively itself.
 - Worker and Git env come from allowlists (`workerEnvironment`,
-  `gitEnvironment`). Gateway secrets and arbitrary variables (including
-  `BUN_*`/`NODE_OPTIONS`) never reach workers. Exception: the provider API keys
-  and base URLs in the `workerEnvironment` allowlist (`ANTHROPIC_API_KEY`,
-  `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`,
-  `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`) are passed to `omp` when set, so
-  worker code can read them. Only configure keys you accept that exposure for.
+  `gitEnvironment`). Gateway-only secrets and arbitrary variables (including
+  `BUN_*`/`NODE_OPTIONS`) never reach workers. Direct provider credentials and
+  endpoints (`ANTHROPIC_*`, `OPENAI_*`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`,
+  `OPENROUTER_API_KEY`) aren't forwarded. The only model credential workers
+  receive is the dedicated CLIProxyAPI client key, injected per run with
+  `CLIPROXYAPI_BASE_URL`. Codex/OpenAI models use the curated profile's
+  CLIProxyAPI provider; Claude uses pi-claude-cli and `claude-cliproxy` to
+  route Claude Code through CLIProxyAPI. See `docs/worker-profile.md`.
 - MCP: `startWorkerMcpProxy` binds one `127.0.0.1` listener per worker with a
   random bearer. Generated MCP config holds only the loopback URL and that
   bearer; upstream tokens and OAuth client records stay in the gateway. Only a
@@ -240,9 +243,10 @@ v3 APIs such as `Context.Tag`, `Effect.Service`, `Effect.catchAll`, and
   `claim_token`.
 - All routes except the five public ones require an admin session for an
   allowed org; mutating admin API calls require CSRF.
-- Workers never receive gateway secrets, upstream MCP tokens, OAuth client
-  records, or GitHub App private keys. Git tokens go via env/0600 config, never
-  argv.
+- Workers never receive gateway-only secrets, direct model-provider keys,
+  upstream MCP tokens, OAuth client records, or GitHub App private keys. The
+  CLIProxyAPI client key and base URL are their only model credentials. Git
+  tokens go via env/0600 config, never argv.
 - The gateway never follows symlinks or recursively deletes inside a
   worker-owned tree with gateway privileges.
 - Migrations stay additive; existing rows must decode after upgrade.

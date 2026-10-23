@@ -151,9 +151,18 @@ Retained roots and abandoned clone roots stay inaccessible after slot reuse.
 Each session has its own `.omp-home`, `.omp-tmp`, XDG config/data/cache directories,
 and Bun install/transpiler caches. omp's writable agent configuration and MCP
 SQLite database are also inside that session's private workspace. Existing
-`/home/bun/.omp` configuration is not a shared worker HOME. Provider API keys
-explicitly allowed for omp remain visible to that worker. Gateway-only keys and
-arbitrary environment variables don't.
+`/home/bun/.omp` configuration is not a shared worker HOME. The environment
+allowlist forwards no model-provider keys or endpoints. The one model credential
+a worker sees is the dedicated CLIProxyAPI client key, which the gateway reads
+from `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE` and injects per run with
+`CLIPROXYAPI_BASE_URL`. The worker can read it, so give Symphony its own
+revocable key. Gateway-only keys and arbitrary
+environment variables don't reach workers. Skills, rules, extensions and
+`models.yml` come from a validated, credential-free profile copied into the
+private agent directory. omp gets no Anthropic credential or endpoint, so its
+built-in Anthropic provider stays unavailable; Claude goes through
+pi-claude-cli and Claude Code to CLIProxyAPI. See
+[worker-profile.md](worker-profile.md).
 
 Shared `/app/node_modules`, `/app/dist`, and Nix GC roots belong to root
 and have no group/other write permissions. The Nix store keeps its Nix-managed

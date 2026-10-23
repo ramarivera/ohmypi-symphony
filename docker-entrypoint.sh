@@ -41,7 +41,7 @@ chown -h root:root /app/data /app/logs
 chmod 0700 /app/data /app/logs
 # Docker secrets must be mounted root-owned with mode 0400. Reject insecure
 # mounts instead of assuming a readonly secret's mode can be changed.
-for name in LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET LINEAR_WEBHOOK_SECRET TOKEN_ENCRYPTION_KEY TOKEN_ENCRYPTION_PREVIOUS_KEYS_JSON GITHUB_APP_PRIVATE_KEY; do
+for name in LINEAR_CLIENT_ID LINEAR_CLIENT_SECRET LINEAR_WEBHOOK_SECRET TOKEN_ENCRYPTION_KEY TOKEN_ENCRYPTION_PREVIOUS_KEYS_JSON GITHUB_APP_PRIVATE_KEY CLIPROXYAPI_API_KEY; do
   path=$(printenv "${name}_FILE" || true)
   if [ -n "$path" ]; then
     owner=$(stat -c '%u' "$path")

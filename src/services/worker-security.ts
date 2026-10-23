@@ -22,6 +22,8 @@ import { join } from "node:path";
 
 // No prefixes such as AWS_*, GITHUB_*, PI_*, or *_FILE. New gateway secrets
 // are excluded by default. Per-run values use the same explicit contract.
+// No model-provider keys or endpoints: the only model credential a worker gets
+// is the CLIProxyAPI client key, injected per run by workerModelEnvironment.
 const WORKER_ENV = new Set([
   "PATH",
   "HOME",
@@ -42,13 +44,6 @@ const WORKER_ENV = new Set([
   "PI_PACKAGE_DIR",
   "OMP_SKIP_UPDATE_CHECK",
   "NO_COLOR",
-  "ANTHROPIC_API_KEY",
-  "OPENAI_API_KEY",
-  "OPENAI_BASE_URL",
-  "ANTHROPIC_BASE_URL",
-  "GOOGLE_API_KEY",
-  "GEMINI_API_KEY",
-  "OPENROUTER_API_KEY",
 ]);
 export const workerEnvironment = (
   input: Record<string, string | undefined>,
