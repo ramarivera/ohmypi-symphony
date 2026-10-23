@@ -1,6 +1,6 @@
 import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "@effect/vitest";
-import { Deferred, Effect, Either, Exit, Fiber, FiberId } from "effect";
+import { Deferred, Effect, Exit, Fiber, Result } from "effect";
 import {
   buildGitHubAppJwt,
   buildGitHubExtraHeader,
@@ -186,7 +186,7 @@ describe("GitHubApp", () => {
 
   it("returns a typed failure without exposing disabled credentials", async () => {
     const result = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         makeGitHubApp({
           allowedOwners: { "org-test": ["octo-org"] },
           appId: undefined,
@@ -194,10 +194,10 @@ describe("GitHubApp", () => {
         }).getInstallationToken("owner", "repo", "org-test"),
       ),
     );
-    expect(Either.isLeft(result)).toBe(true);
-    if (Either.isLeft(result)) {
-      expect(result.left.reason).toBe("disabled");
-      expect(result.left.message).not.toContain("private");
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(result.failure.reason).toBe("disabled");
+      expect(result.failure.message).not.toContain("private");
     }
   });
 
@@ -213,40 +213,40 @@ describe("GitHubApp", () => {
       fetch: fetchMock,
     });
     const result = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         service.getInstallationToken("octo-org", "other-repo", "org-test"),
       ),
     );
-    expect(Either.isLeft(result)).toBe(true);
-    if (Either.isLeft(result)) {
-      expect(result.left.reason).toBe("not_installed");
+    expect(Result.isFailure(result)).toBe(true);
+    if (Result.isFailure(result)) {
+      expect(result.failure.reason).toBe("not_installed");
     }
   });
 
   it("releases single-flight waiters when the winner is interrupted", async () => {
-    const started = Deferred.unsafeMake<void>(FiberId.none);
+    const started = Deferred.makeUnsafe<void>();
     const service = makeGitHubApp({
       allowedOwners: { "org-test": ["octo-org"] },
       appId: "12345",
       privateKey: privateKeyPem,
       fetch: async () => {
-        Deferred.unsafeDone(started, Effect.void);
+        Deferred.doneUnsafe(started, Effect.void);
         return new Promise<Response>(() => {}); // never resolves
       },
     });
     const program = Effect.gen(function* () {
-      const winner = yield* Effect.fork(
+      const winner = yield* Effect.forkChild(
         service.getInstallationToken("octo-org", "repo", "org-test"),
       );
       yield* Deferred.await(started);
-      const waiter = yield* Effect.fork(
+      const waiter = yield* Effect.forkChild(
         service.getInstallationToken("octo-org", "repo", "org-test"),
       );
-      yield* Effect.yieldNow();
+      yield* Effect.yieldNow;
       yield* Fiber.interrupt(winner);
       // The waiter must be released (interrupted exit), not hang forever.
       const waiterExit = yield* Fiber.await(waiter);
-      expect(Exit.isInterrupted(waiterExit)).toBe(true);
+      expect(Exit.hasInterrupts(waiterExit)).toBe(true);
     });
     await Effect.runPromise(Effect.timeout(program, "5 seconds"));
   });

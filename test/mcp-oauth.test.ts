@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { rm } from "node:fs/promises";
-import { ConfigProvider, Effect, Either, Fiber, Layer, Option } from "effect";
+import { ConfigProvider, Effect, Fiber, Layer, Option, Result } from "effect";
 import { describe, expect, it, vi } from "vitest";
 import type { McpServerId, OrganizationId } from "../src/domain/ids.js";
 import { GatewayConfig } from "../src/services/config.js";
@@ -215,33 +215,36 @@ describe("MCP OAuth primitives", () => {
         { status: 200 },
       ),
     );
-    const configProvider = ConfigProvider.fromMap(
-      new Map([
-        ["LINEAR_CLIENT_ID", "test-client"],
-        ["LINEAR_CLIENT_SECRET", "test-secret"],
-        ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
-        [
-          "TOKEN_ENCRYPTION_KEY",
-          Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),
-        ],
-        ["PUBLIC_URL", "http://localhost:3000"],
-        [
-          "NIXPKGS_FLAKE_REF",
-          "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
-        ],
-        ["WORKSPACE_ROOT", testPath("mcp-oauth-basic")],
-      ]),
+    const configProvider = ConfigProvider.fromUnknown(
+      Object.fromEntries(
+        new Map([
+          ["LINEAR_CLIENT_ID", "test-client"],
+          ["LINEAR_CLIENT_SECRET", "test-secret"],
+          ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
+          [
+            "TOKEN_ENCRYPTION_KEY",
+            Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),
+          ],
+          ["PUBLIC_URL", "http://localhost:3000"],
+          [
+            "NIXPKGS_FLAKE_REF",
+            "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
+          ],
+          ["WORKSPACE_ROOT", testPath("mcp-oauth-basic")],
+        ]),
+      ),
+      { preserveEmptyStrings: true },
     );
     const sqlite = SqliteClientLive(":memory:");
-    const configLayer = Layer.setConfigProvider(configProvider);
-    const token = TokenCrypto.Default.pipe(
+    const configLayer = ConfigProvider.layer(configProvider);
+    const token = TokenCrypto.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, configLayer)),
     );
-    const gateway = GatewayConfig.Default.pipe(Layer.provide(configLayer));
-    const servers = McpServerRepo.Default.pipe(
+    const gateway = GatewayConfig.layer.pipe(Layer.provide(configLayer));
+    const servers = McpServerRepo.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, token)),
     );
-    const oauth = McpOAuth.Default.pipe(
+    const oauth = McpOAuth.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, token, gateway, servers)),
     );
     const dependencies = Layer.mergeAll(sqlite, token, gateway, servers, oauth);
@@ -299,7 +302,7 @@ describe("MCP OAuth primitives", () => {
               now + 60_000,
             );
             const service = yield* McpOAuth;
-            const wrongSession = yield* Effect.either(
+            const wrongSession = yield* Effect.result(
               service.completeMcpAuthorization(
                 new URL(
                   "http://localhost:3000/oauth/mcp/callback?code=auth-code&state=state-basic-auth",
@@ -307,7 +310,7 @@ describe("MCP OAuth primitives", () => {
                 "other-admin-session",
               ),
             );
-            expect(Either.isLeft(wrongSession)).toBe(true);
+            expect(Result.isFailure(wrongSession)).toBe(true);
             yield* service.completeMcpAuthorization(
               new URL(
                 "http://localhost:3000/oauth/mcp/callback?code=auth-code&state=state-basic-auth",
@@ -332,7 +335,7 @@ describe("MCP OAuth primitives", () => {
               `${MCP_OAUTH_ENCRYPTED_PREFIX}${client}`,
               Date.now() + 60_000,
             );
-            const denied = yield* Effect.either(
+            const denied = yield* Effect.result(
               service.completeMcpAuthorization(
                 new URL(
                   "http://localhost:3000/oauth/mcp/callback?error=access_denied&error_description=User%20denied%20consent&state=state-denied",
@@ -340,9 +343,9 @@ describe("MCP OAuth primitives", () => {
                 "admin-session-hash",
               ),
             );
-            expect(Either.isLeft(denied)).toBe(true);
-            if (Either.isLeft(denied)) {
-              expect(denied.left.message).toContain("User denied consent");
+            expect(Result.isFailure(denied)).toBe(true);
+            if (Result.isFailure(denied)) {
+              expect(denied.failure.message).toContain("User denied consent");
             }
             expect(Option.getOrThrow(credential).token.expiresAt).toBe(
               Number.MAX_SAFE_INTEGER,
@@ -403,33 +406,36 @@ describe("MCP OAuth primitives", () => {
         new Response("unexpected discovery request", { status: 500 })
       );
     });
-    const configProvider = ConfigProvider.fromMap(
-      new Map([
-        ["LINEAR_CLIENT_ID", "test-client"],
-        ["LINEAR_CLIENT_SECRET", "test-secret"],
-        ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
-        [
-          "TOKEN_ENCRYPTION_KEY",
-          Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),
-        ],
-        ["PUBLIC_URL", "http://localhost:3000"],
-        [
-          "NIXPKGS_FLAKE_REF",
-          "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
-        ],
-        ["WORKSPACE_ROOT", testPath("mcp-oauth-retry-state")],
-      ]),
+    const configProvider = ConfigProvider.fromUnknown(
+      Object.fromEntries(
+        new Map([
+          ["LINEAR_CLIENT_ID", "test-client"],
+          ["LINEAR_CLIENT_SECRET", "test-secret"],
+          ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
+          [
+            "TOKEN_ENCRYPTION_KEY",
+            Buffer.from(new Uint8Array(32).fill(7)).toString("base64"),
+          ],
+          ["PUBLIC_URL", "http://localhost:3000"],
+          [
+            "NIXPKGS_FLAKE_REF",
+            "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
+          ],
+          ["WORKSPACE_ROOT", testPath("mcp-oauth-retry-state")],
+        ]),
+      ),
+      { preserveEmptyStrings: true },
     );
     const sqlite = SqliteClientLive(":memory:");
-    const configLayer = Layer.setConfigProvider(configProvider);
-    const token = TokenCrypto.Default.pipe(
+    const configLayer = ConfigProvider.layer(configProvider);
+    const token = TokenCrypto.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, configLayer)),
     );
-    const gateway = GatewayConfig.Default.pipe(Layer.provide(configLayer));
-    const servers = McpServerRepo.Default.pipe(
+    const gateway = GatewayConfig.layer.pipe(Layer.provide(configLayer));
+    const servers = McpServerRepo.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, token)),
     );
-    const oauth = McpOAuth.Default.pipe(
+    const oauth = McpOAuth.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, token, gateway, servers)),
     );
     const dependencies = Layer.mergeAll(sqlite, token, gateway, servers, oauth);
@@ -594,33 +600,36 @@ describe("MCP OAuth primitives", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const configProvider = ConfigProvider.fromMap(
-      new Map([
-        ["LINEAR_CLIENT_ID", "test-client"],
-        ["LINEAR_CLIENT_SECRET", "test-secret"],
-        ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
-        [
-          "TOKEN_ENCRYPTION_KEY",
-          "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
-        ],
-        ["PUBLIC_URL", "http://localhost:3000"],
-        [
-          "NIXPKGS_FLAKE_REF",
-          "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
-        ],
-        ["WORKSPACE_ROOT", testPath("mcp-oauth-race")],
-      ]),
+    const configProvider = ConfigProvider.fromUnknown(
+      Object.fromEntries(
+        new Map([
+          ["LINEAR_CLIENT_ID", "test-client"],
+          ["LINEAR_CLIENT_SECRET", "test-secret"],
+          ["LINEAR_WEBHOOK_SECRET", "test-webhook-secret"],
+          [
+            "TOKEN_ENCRYPTION_KEY",
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+          ],
+          ["PUBLIC_URL", "http://localhost:3000"],
+          [
+            "NIXPKGS_FLAKE_REF",
+            "github:NixOS/nixpkgs/0123456789012345678901234567890123456789",
+          ],
+          ["WORKSPACE_ROOT", testPath("mcp-oauth-race")],
+        ]),
+      ),
+      { preserveEmptyStrings: true },
     );
     const sqlite = SqliteClientLive(":memory:");
-    const configLayer = Layer.setConfigProvider(configProvider);
-    const token = TokenCrypto.Default.pipe(
+    const configLayer = ConfigProvider.layer(configProvider);
+    const token = TokenCrypto.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, configLayer)),
     );
-    const gateway = GatewayConfig.Default.pipe(Layer.provide(configLayer));
-    const servers = McpServerRepo.Default.pipe(
+    const gateway = GatewayConfig.layer.pipe(Layer.provide(configLayer));
+    const servers = McpServerRepo.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, token)),
     );
-    const oauth = McpOAuth.Default.pipe(
+    const oauth = McpOAuth.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, token, gateway, servers)),
     );
     const dependencies = Layer.mergeAll(sqlite, token, gateway, servers, oauth);
@@ -693,14 +702,14 @@ describe("MCP OAuth primitives", () => {
               ),
             ).toBe(true);
 
-            const refreshFiber = yield* Effect.fork(
-              Effect.either(oauth.mintCredential(organizationId, serverId)),
+            const refreshFiber = yield* Effect.forkChild(
+              Effect.result(oauth.mintCredential(organizationId, serverId)),
             );
             yield* Effect.promise(() => refreshStarted);
             yield* oauth.disconnect(organizationId, serverId);
             releaseRefresh();
             const outcome = yield* Fiber.join(refreshFiber);
-            expect(Either.isLeft(outcome)).toBe(true);
+            expect(Result.isFailure(outcome)).toBe(true);
             expect(
               Option.isNone(
                 yield* oauth.getCredential(organizationId, serverId),

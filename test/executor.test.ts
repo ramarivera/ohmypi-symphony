@@ -22,12 +22,12 @@ const unused = (..._args: ReadonlyArray<unknown>) => Effect.never;
 const runList = (
   configured: Option.Option<ExecutorInstanceFixture>,
 ): Promise<ReadonlyArray<unknown>> => {
-  const repo = ExecutorInstanceRepo.make({
+  const repo = ExecutorInstanceRepo.of({
     get: () => Effect.succeed(configured),
     put: unused,
     remove: unused,
   });
-  const layer = Executor.DefaultWithoutDependencies.pipe(
+  const layer = Executor.layerWithoutDependencies.pipe(
     Layer.provide(Layer.succeed(ExecutorInstanceRepo, repo)),
   );
   return Effect.runPromise(

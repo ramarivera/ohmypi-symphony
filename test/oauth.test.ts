@@ -1,6 +1,15 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Either, Layer, Option, Redacted, Schema } from "effect";
+import {
+  Context,
+  Effect,
+  Layer,
+  Option,
+  Redacted,
+  Result,
+  Schema,
+} from "effect";
+import * as fc from "fast-check";
 import { afterEach, beforeEach, vi } from "vitest";
 import { DatabaseError } from "../src/domain/errors.js";
 import type { Installation } from "../src/domain/models.js";
@@ -37,13 +46,13 @@ vi.mock("../src/services/store/repositories.js", async () => {
   // Vitest mock factories are hoisted before static imports resolve this module.
   const { Effect } = await import("effect");
 
-  class InstallationRepo extends Effect.Service<InstallationRepo>()(
+  class InstallationRepo extends Context.Service<InstallationRepo>()(
     "InstallationRepo",
-    {
-      accessors: true,
-      effect: Effect.succeed({}),
-    },
-  ) {}
+    { make: Effect.succeed({}) },
+  ) {
+    static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+    static readonly layer = this.layerWithoutDependencies;
+  }
 
   return { InstallationRepo };
 });
@@ -97,7 +106,7 @@ const resetTestState = (): void => {
   };
 };
 
-const installationRepo = InstallationRepo.make({
+const installationRepo = InstallationRepo.of({
   put: (installation) =>
     Effect.sync(() => {
       testState.installations.push(installation);
@@ -127,19 +136,19 @@ const installationRepo = InstallationRepo.make({
     }),
 });
 
-const tokenCrypto = TokenCrypto.make({
+const tokenCrypto = TokenCrypto.of({
   encrypt: (plaintext) => Effect.succeed(plaintext),
   decrypt: (ciphertext) => Effect.succeed(ciphertext),
 });
 
 const oauthDependencies = Layer.mergeAll(
-  Layer.succeed(GatewayConfig, GatewayConfig.make(testConfig)),
+  Layer.succeed(GatewayConfig, GatewayConfig.of(testConfig)),
   Layer.succeed(InstallationRepo, installationRepo),
   Layer.succeed(TokenCrypto, tokenCrypto),
 );
 
 const OAuthTestLayer = Layer.mergeAll(
-  OAuth.DefaultWithoutDependencies.pipe(Layer.provide(oauthDependencies)),
+  OAuth.layerWithoutDependencies.pipe(Layer.provide(oauthDependencies)),
   oauthDependencies,
 );
 
@@ -172,11 +181,11 @@ const stateHash = (state: string): string =>
   createHash("sha256").update(state).digest("base64url");
 
 const expectTaggedFailure = <A, E>(
-  result: Either.Either<A, E>,
+  result: Result.Result<A, E>,
   expected: Record<string, unknown>,
 ): void => {
-  if (Either.isLeft(result)) {
-    expect(result.left).toMatchObject(expected);
+  if (Result.isFailure(result)) {
+    expect(result.failure).toMatchObject(expected);
     return;
   }
   expect.fail("Expected Effect failure");
@@ -244,7 +253,7 @@ describe("OAuth", () => {
     testState.failCreateOAuthState = true;
 
     const storageFailure = await Effect.runPromise(
-      Effect.either(startAuthorization()),
+      Effect.result(startAuthorization()),
     );
     expectTaggedFailure(storageFailure, {
       _tag: "@Gateway/DatabaseError",
@@ -252,7 +261,7 @@ describe("OAuth", () => {
     });
 
     const invalidState = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         completeAuthorization(
           new URL(
             "https://gateway.example/base/oauth/callback?code=code&state=unknown",
@@ -269,7 +278,7 @@ describe("OAuth", () => {
 
   it("rejects missing, expired, and reused callback states before Linear calls", async () => {
     const missingCode = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         completeAuthorization(
           new URL(
             "https://gateway.example/base/oauth/callback?state=missing-code",
@@ -289,7 +298,7 @@ describe("OAuth", () => {
       consumed: false,
     });
     const expired = await Effect.runPromise(
-      Effect.either(completeAuthorization(callbackUrl(expiredState))),
+      Effect.result(completeAuthorization(callbackUrl(expiredState))),
     );
     expectTaggedFailure(expired, {
       _tag: "@Gateway/OAuthStateError",
@@ -309,7 +318,7 @@ describe("OAuth", () => {
       appUserId: "app-user",
     });
     const reused = await Effect.runPromise(
-      Effect.either(completeAuthorization(callbackUrl(authorization.state))),
+      Effect.result(completeAuthorization(callbackUrl(authorization.state))),
     );
     expectTaggedFailure(reused, {
       _tag: "@Gateway/OAuthStateError",
@@ -331,7 +340,7 @@ describe("OAuth", () => {
       startAuthorization(),
     );
     const invalidToken = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         completeAuthorization(callbackUrl(invalidTokenAuthorization.state)),
       ),
     );
@@ -351,7 +360,7 @@ describe("OAuth", () => {
     );
     const nonAppAuthorization = await Effect.runPromise(startAuthorization());
     const nonAppIdentity = await Effect.runPromise(
-      Effect.either(
+      Effect.result(
         completeAuthorization(callbackUrl(nonAppAuthorization.state)),
       ),
     );
@@ -362,85 +371,156 @@ describe("OAuth", () => {
     expect(testState.installations).toHaveLength(0);
   });
 
-  it.effect.prop(
+  it.effect(
     "OAuth state is single-use and expires only after its inclusive boundary",
-    {
-      rawState: Schema.String.pipe(Schema.minLength(1)),
-      now: Schema.Number.pipe(
-        Schema.int(),
-        Schema.between(1, 2_000_000_000_000),
-      ),
-    },
-    ({ rawState, now }) =>
+    () =>
       Effect.gen(function* () {
-        resetTestState();
-        const activeHash = stateHash(rawState);
-        expect(yield* createAndConsumeState(activeHash, now, now)).toBe(true);
-        expect(yield* consumeState(activeHash, now)).toBe(false);
-
-        const expiredHash = stateHash(`${rawState}:expired`);
-        expect(yield* createAndConsumeState(expiredHash, now - 1, now)).toBe(
-          false,
-        );
-      }),
-    { fastCheck: { numRuns: 50 } },
-  );
-
-  it.effect.prop(
-    "generated bearer responses preserve refresh tokens and compute millisecond expiry",
-    {
-      accessToken: Schema.String.pipe(Schema.minLength(1)),
-      refreshToken: Schema.String.pipe(Schema.minLength(1)),
-      expiresIn: Schema.Number.pipe(Schema.int(), Schema.between(1, 100_000)),
-    },
-    ({ accessToken, refreshToken, expiresIn }) =>
-      Effect.gen(function* () {
-        resetTestState();
-        fetchMock.mockReset();
-        fetchMock.mockResolvedValue(
-          new Response(
-            JSON.stringify(
-              tokenResponse({
-                access_token: accessToken,
-                refresh_token: refreshToken,
-                expires_in: expiresIn,
-              }),
+        const cases = fc.record({
+          rawState: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
             ),
-            { status: 200 },
+          now: fc.integer({ min: 1, max: 2_000_000_000_000 }).filter(
+            Schema.is(
+              Schema.Number.pipe(
+                Schema.check(Schema.isInt()),
+                Schema.check(
+                  Schema.isBetween({
+                    minimum: 1,
+                    maximum: 2_000_000_000_000,
+                  }),
+                ),
+              ),
+            ),
+          ),
+        });
+        const check = ({
+          rawState,
+          now,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          Effect.gen(function* () {
+            resetTestState();
+            const activeHash = stateHash(rawState);
+            expect(yield* createAndConsumeState(activeHash, now, now)).toBe(
+              true,
+            );
+            expect(yield* consumeState(activeHash, now)).toBe(false);
+
+            const expiredHash = stateHash(`${rawState}:expired`);
+            expect(
+              yield* createAndConsumeState(expiredHash, now - 1, now),
+            ).toBe(false);
+          });
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 50 },
           ),
         );
-
-        const authorization = yield* startAuthorization();
-        const before = yield* Effect.clockWith(
-          (clock) => clock.currentTimeMillis,
-        );
-        const installation = yield* completeAuthorization(
-          callbackUrl(authorization.state),
-        );
-        const after = yield* Effect.clockWith(
-          (clock) => clock.currentTimeMillis,
-        );
-
-        expect(installation.accessToken).toBe(accessToken);
-        expect(installation.refreshToken).toBe(refreshToken);
-        expect(installation.scopes).toEqual([
-          "read",
-          "write",
-          "app:assignable",
-          "app:mentionable",
-        ]);
-        expect(installation.revokedAt).toEqual(Option.none());
-        expect(installation.accessibleTeamIds).toEqual(Option.none());
-        expect(installation.canAccessAllPublicTeams).toEqual(Option.none());
-        expect(installation.expiresAt).toBeGreaterThanOrEqual(
-          before + expiresIn * 1_000,
-        );
-        expect(installation.expiresAt).toBeLessThanOrEqual(
-          after + expiresIn * 1_000,
-        );
-        expect(testState.installations).toEqual([installation]);
       }),
-    { fastCheck: { numRuns: 50 } },
+  );
+
+  it.effect(
+    "generated bearer responses preserve refresh tokens and compute millisecond expiry",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          accessToken: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          refreshToken: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          expiresIn: fc
+            .integer({ min: 1, max: 100_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 1, maximum: 100_000 }),
+                  ),
+                ),
+              ),
+            ),
+        });
+        const check = ({
+          accessToken,
+          refreshToken,
+          expiresIn,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          Effect.gen(function* () {
+            resetTestState();
+            fetchMock.mockReset();
+            fetchMock.mockResolvedValue(
+              new Response(
+                JSON.stringify(
+                  tokenResponse({
+                    access_token: accessToken,
+                    refresh_token: refreshToken,
+                    expires_in: expiresIn,
+                  }),
+                ),
+                { status: 200 },
+              ),
+            );
+
+            const authorization = yield* startAuthorization();
+            const before = yield* Effect.clockWith(
+              (clock) => clock.currentTimeMillis,
+            );
+            const installation = yield* completeAuthorization(
+              callbackUrl(authorization.state),
+            );
+            const after = yield* Effect.clockWith(
+              (clock) => clock.currentTimeMillis,
+            );
+
+            expect(installation.accessToken).toBe(accessToken);
+            expect(installation.refreshToken).toBe(refreshToken);
+            expect(installation.scopes).toEqual([
+              "read",
+              "write",
+              "app:assignable",
+              "app:mentionable",
+            ]);
+            expect(installation.revokedAt).toEqual(Option.none());
+            expect(installation.accessibleTeamIds).toEqual(Option.none());
+            expect(installation.canAccessAllPublicTeams).toEqual(Option.none());
+            expect(installation.expiresAt).toBeGreaterThanOrEqual(
+              before + expiresIn * 1_000,
+            );
+            expect(installation.expiresAt).toBeLessThanOrEqual(
+              after + expiresIn * 1_000,
+            );
+            expect(testState.installations).toEqual([installation]);
+          });
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 50 },
+          ),
+        );
+      }),
   );
 });
 
@@ -452,7 +532,7 @@ it("rejects OAuth admission before persisting an installation for an unallowed o
   const deniedDependencies = Layer.mergeAll(
     Layer.succeed(
       GatewayConfig,
-      GatewayConfig.make({
+      GatewayConfig.of({
         ...testConfig,
         allowedOrganizationIds: new Set(["other-org"]),
       }),
@@ -460,17 +540,17 @@ it("rejects OAuth admission before persisting an installation for an unallowed o
     Layer.succeed(InstallationRepo, installationRepo),
     Layer.succeed(TokenCrypto, tokenCrypto),
   );
-  const deniedLayer = OAuth.DefaultWithoutDependencies.pipe(
+  const deniedLayer = OAuth.layerWithoutDependencies.pipe(
     Layer.provide(deniedDependencies),
   );
   const result = await Effect.runPromise(
-    Effect.either(
-      OAuth.completeAuthorization(callbackUrl(authorization.state)).pipe(
-        Effect.provide(deniedLayer),
-      ),
+    Effect.result(
+      OAuth.use((service) =>
+        service.completeAuthorization(callbackUrl(authorization.state)),
+      ).pipe(Effect.provide(deniedLayer)),
     ),
   );
-  expect(Either.isLeft(result) && result.left.message).toBe(
+  expect(Result.isFailure(result) && result.failure.message).toBe(
     "Organization is not allowed",
   );
   expect(testState.installations).toEqual([]);

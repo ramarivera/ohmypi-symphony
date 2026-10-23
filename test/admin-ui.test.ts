@@ -1,5 +1,6 @@
 import { describe, expect, it, test } from "@effect/vitest";
 import { Schema } from "effect";
+import * as fc from "fast-check";
 import {
   type RunDetailModel,
   renderAdminPage,
@@ -430,29 +431,43 @@ describe("renderRunDetailPage", () => {
 });
 
 describe("redaction invariants", () => {
-  it.prop(
-    "redact removes bearer tokens and query/JSON credentials",
-    {
-      secret: Schema.String.pipe(
-        Schema.minLength(1),
-        Schema.pattern(/^[A-Za-z0-9._~+\-/=]+$/u),
+  it("redact removes bearer tokens and query/JSON credentials", () =>
+    fc.assert(
+      fc.property(
+        fc.record({
+          secret: fc
+            .stringMatching(/^[A-Za-z0-9._~+\-/=]+$/)
+            .filter(
+              Schema.is(
+                Schema.String.pipe(
+                  Schema.check(Schema.isMinLength(1)),
+                  Schema.check(Schema.isPattern(/^[A-Za-z0-9._~+\-/=]+$/u)),
+                ),
+              ),
+            ),
+          kind: fc.constantFrom(
+            ...["token", "key", "secret", "signature", "password"],
+          ),
+        }),
+        ({ secret, kind }) => {
+          const bearer = `Authorization: Bearer ${secret}`;
+          const redactedBearer = redact(bearer);
+          expect(redactedBearer).toBe("Authorization: Bearer redacted");
+
+          const redactedQuery = redact(
+            `https://example.test/?${kind}=${secret}`,
+          );
+          const redactedQueryParams = new URL(redactedQuery).searchParams;
+          expect(redactedQueryParams.get(kind)).toBe("redacted");
+          expect(redactedQueryParams.get(kind)).not.toBe(secret);
+
+          const redactedJson = redact(`{"${kind}": "${secret}"}`);
+          expect(JSON.parse(redactedJson)).toStrictEqual({
+            [kind]: "redacted",
+          });
+        },
       ),
-      kind: Schema.Literal("token", "key", "secret", "signature", "password"),
-    },
-    ({ secret, kind }) => {
-      const bearer = `Authorization: Bearer ${secret}`;
-      const redactedBearer = redact(bearer);
-      expect(redactedBearer).toBe("Authorization: Bearer redacted");
-
-      const redactedQuery = redact(`https://example.test/?${kind}=${secret}`);
-      const redactedQueryParams = new URL(redactedQuery).searchParams;
-      expect(redactedQueryParams.get(kind)).toBe("redacted");
-      expect(redactedQueryParams.get(kind)).not.toBe(secret);
-
-      const redactedJson = redact(`{"${kind}": "${secret}"}`);
-      expect(JSON.parse(redactedJson)).toStrictEqual({ [kind]: "redacted" });
-    },
-  );
+    ));
 });
 
 it("hides the shared cache panel and skips its request for tenant admins", () => {

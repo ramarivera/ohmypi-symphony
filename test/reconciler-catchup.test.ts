@@ -1,14 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import {
-  Clock,
-  Deferred,
-  Effect,
-  Fiber,
-  Layer,
-  Option,
-  Schema,
-  TestClock,
-} from "effect";
+import { Clock, Deferred, Effect, Fiber, Layer, Option, Schema } from "effect";
+import { TestClock } from "effect/testing";
 import { LinearApiError } from "../src/domain/errors.js";
 import { OrganizationId, SessionId } from "../src/domain/ids.js";
 import type { AgentRun } from "../src/domain/models.js";
@@ -48,7 +40,7 @@ const run = (
   attempt: 0,
   leaseOwner: Option.none(),
   leaseExpiresAt: Option.none(),
-  lastActivityAt: Option.fromNullable(lastActivityAt),
+  lastActivityAt: Option.fromNullishOr(lastActivityAt),
   terminalReason: Option.none(),
   nextAttemptAt: Option.none(),
   createdAt: 0,
@@ -62,7 +54,7 @@ const authority = {
     Effect.sync(() => {
       processedSessions.push(sessionId);
     }),
-} as unknown as SessionAuthority;
+} as unknown as SessionAuthority["Service"];
 
 const makeLayer = (
   runs: ReadonlyArray<AgentRun>,
@@ -81,7 +73,7 @@ const makeLayer = (
         listCatchupCalls.push({ now });
         return runs;
       }),
-  } as unknown as RunRepo;
+  } as unknown as RunRepo["Service"];
   const runInputRepo = {
     enqueue: (input: { id: string; body?: string; payload?: unknown }) =>
       Effect.sync(() => {
@@ -92,17 +84,17 @@ const makeLayer = (
         payloads.set(input.id, input.payload);
         return true;
       }),
-  } as unknown as RunInputRepo;
+  } as unknown as RunInputRepo["Service"];
   const gateway = {
     listSessionActivities: ({ sessionId }: { sessionId: string }) =>
       activities(sessionId),
-  } as unknown as LinearGateway;
+  } as unknown as LinearGateway["Service"];
   const deps = Layer.mergeAll(
     Layer.succeed(RunRepo, runRepo),
     Layer.succeed(RunInputRepo, runInputRepo),
     Layer.succeed(LinearGateway, gateway),
   );
-  const reconciler = Reconciler.DefaultWithoutDependencies.pipe(
+  const reconciler = Reconciler.layerWithoutDependencies.pipe(
     Layer.provide(Layer.succeed(SessionAuthority, authority)),
   );
   const layer = Layer.mergeAll(reconciler, deps);
@@ -321,7 +313,9 @@ describe("Catchup health progress", () => {
         );
         yield* Effect.gen(function* () {
           yield* TestClock.adjust(600000);
-          const ticking = yield* Effect.fork(Reconciler.tick());
+          const ticking = yield* Effect.forkChild(
+            Reconciler.use((service) => service.tick()),
+          );
           yield* TestClock.adjust(20000);
           yield* TestClock.adjust(20000);
           yield* Deferred.await(thirdEntered);

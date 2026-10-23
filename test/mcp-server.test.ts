@@ -4,11 +4,11 @@ import { it } from "@effect/vitest";
 import {
   ConfigProvider,
   Effect,
-  Either,
-  HashMap,
   Layer,
   Logger,
   Option,
+  References,
+  Result,
 } from "effect";
 import { describe, expect } from "vitest";
 import type {
@@ -42,25 +42,28 @@ const withRepo = <A, E>(
 ) =>
   Effect.gen(function* () {
     const sqlite = SqliteClientLive(":memory:");
-    const token = TokenCrypto.Default.pipe(
+    const token = TokenCrypto.layer.pipe(
       Layer.provide(
-        Layer.setConfigProvider(
-          ConfigProvider.fromMap(
-            new Map([
-              ["LINEAR_CLIENT_ID", "test"],
-              ["LINEAR_CLIENT_SECRET", "test"],
-              ["LINEAR_WEBHOOK_SECRET", "test"],
-              ["PUBLIC_URL", "http://localhost:3000"],
-              [
-                "TOKEN_ENCRYPTION_KEY",
-                Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64"),
-              ],
-            ]),
+        ConfigProvider.layer(
+          ConfigProvider.fromUnknown(
+            Object.fromEntries(
+              new Map([
+                ["LINEAR_CLIENT_ID", "test"],
+                ["LINEAR_CLIENT_SECRET", "test"],
+                ["LINEAR_WEBHOOK_SECRET", "test"],
+                ["PUBLIC_URL", "http://localhost:3000"],
+                [
+                  "TOKEN_ENCRYPTION_KEY",
+                  Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64"),
+                ],
+              ]),
+            ),
+            { preserveEmptyStrings: true },
           ),
         ),
       ),
     );
-    const repoLayer = McpServerRepo.Default.pipe(
+    const repoLayer = McpServerRepo.layer.pipe(
       Layer.provide(Layer.mergeAll(sqlite, token)),
     );
     const layer = Layer.mergeAll(sqlite, token, repoLayer);
@@ -68,7 +71,7 @@ const withRepo = <A, E>(
   });
 
 describe("MCP server storage and worker config", () => {
-  it.scopedLive("round-trips CRUD and scopes servers", () =>
+  it.live("round-trips CRUD and scopes servers", () =>
     withRepo(
       Effect.gen(function* () {
         const servers = yield* McpServerRepo;
@@ -193,72 +196,70 @@ describe("MCP server storage and worker config", () => {
       }),
     ),
   );
-  it.scopedLive(
-    "preserves legacy plaintext and rejects tampered envelopes",
-    () =>
-      withRepo(
-        Effect.gen(function* () {
-          const servers = yield* McpServerRepo;
-          const { db } = yield* SqliteClient;
-          db.query(
-            `INSERT INTO mcp_server
+  it.live("preserves legacy plaintext and rejects tampered envelopes", () =>
+    withRepo(
+      Effect.gen(function* () {
+        const servers = yield* McpServerRepo;
+        const { db } = yield* SqliteClient;
+        db.query(
+          `INSERT INTO mcp_server
             (organization_id, id, name, transport, command, args_json, url, env_json, repository_id, enabled, created_at, updated_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          ).run(
-            org,
-            serverId("legacy"),
-            "legacy",
-            "stdio",
-            "node",
-            "[]",
-            null,
-            JSON.stringify({ TOKEN: "AQlegacy" }),
-            null,
-            1,
-            1,
-            1,
-          );
-          const legacy = yield* servers.getMcpServer(org, serverId("legacy"));
-          expect(Option.isSome(legacy)).toBe(true);
-          expect(Option.isSome(legacy) ? legacy.value.env.TOKEN : null).toBe(
-            "AQlegacy",
-          );
+        ).run(
+          org,
+          serverId("legacy"),
+          "legacy",
+          "stdio",
+          "node",
+          "[]",
+          null,
+          JSON.stringify({ TOKEN: "AQlegacy" }),
+          null,
+          1,
+          1,
+          1,
+        );
+        const legacy = yield* servers.getMcpServer(org, serverId("legacy"));
+        expect(Option.isSome(legacy)).toBe(true);
+        expect(Option.isSome(legacy) ? legacy.value.env.TOKEN : null).toBe(
+          "AQlegacy",
+        );
 
-          yield* servers.createMcpServer({
-            organizationId: org,
-            id: serverId("tampered"),
-            name: "tampered",
-            transport: "stdio",
-            command: "node",
-            env: { TOKEN: "secret" },
-            repositoryId: Option.none(),
-          });
-          const stored = db
-            .query<{ readonly env_json: string }, [string, string]>(
-              "SELECT env_json FROM mcp_server WHERE organization_id=? AND id=?",
-            )
-            .get(org, serverId("tampered"));
-          if (stored === null) throw new Error("tampered row missing");
-          const env = JSON.parse(stored.env_json) as Record<string, string>;
-          const ciphertext = env.TOKEN;
-          if (ciphertext === undefined) throw new Error("TOKEN env missing");
-          const payload = new Uint8Array(
-            Buffer.from(ciphertext.slice("mcpenc:v1:".length), "base64url"),
-          );
-          const last = payload.length - 1;
-          const byte = payload[last];
-          if (byte === undefined) throw new Error("ciphertext is empty");
-          payload[last] = byte ^ 0xff;
-          env.TOKEN = `mcpenc:v1:${Buffer.from(payload).toString("base64url")}`;
-          db.query(
-            "UPDATE mcp_server SET env_json=? WHERE organization_id=? AND id=?",
-          ).run(JSON.stringify(env), org, serverId("tampered"));
-          const tampered = yield* Effect.either(servers.listMcpServers(org));
-          expect(Either.isLeft(tampered)).toBe(true);
-        }),
-      ),
+        yield* servers.createMcpServer({
+          organizationId: org,
+          id: serverId("tampered"),
+          name: "tampered",
+          transport: "stdio",
+          command: "node",
+          env: { TOKEN: "secret" },
+          repositoryId: Option.none(),
+        });
+        const stored = db
+          .query<{ readonly env_json: string }, [string, string]>(
+            "SELECT env_json FROM mcp_server WHERE organization_id=? AND id=?",
+          )
+          .get(org, serverId("tampered"));
+        if (stored === null) throw new Error("tampered row missing");
+        const env = JSON.parse(stored.env_json) as Record<string, string>;
+        const ciphertext = env.TOKEN;
+        if (ciphertext === undefined) throw new Error("TOKEN env missing");
+        const payload = new Uint8Array(
+          Buffer.from(ciphertext.slice("mcpenc:v1:".length), "base64url"),
+        );
+        const last = payload.length - 1;
+        const byte = payload[last];
+        if (byte === undefined) throw new Error("ciphertext is empty");
+        payload[last] = byte ^ 0xff;
+        env.TOKEN = `mcpenc:v1:${Buffer.from(payload).toString("base64url")}`;
+        db.query(
+          "UPDATE mcp_server SET env_json=? WHERE organization_id=? AND id=?",
+        ).run(JSON.stringify(env), org, serverId("tampered"));
+        const tampered = yield* Effect.result(servers.listMcpServers(org));
+        expect(Result.isFailure(tampered)).toBe(true);
+      }),
+    ),
   );
-  it.scopedLive("rejects duplicate MCP names within one scope", () =>
+  it.live("rejects duplicate MCP names within one scope", () =>
     withRepo(
       Effect.gen(function* () {
         const servers = yield* McpServerRepo;
@@ -270,7 +271,7 @@ describe("MCP server storage and worker config", () => {
           command: "node",
           repositoryId: Option.none(),
         });
-        const duplicate = yield* Effect.either(
+        const duplicate = yield* Effect.result(
           servers.createMcpServer({
             organizationId: org,
             id: serverId("wide-2"),
@@ -280,8 +281,8 @@ describe("MCP server storage and worker config", () => {
             repositoryId: Option.none(),
           }),
         );
-        expect(Either.isLeft(duplicate)).toBe(true);
-        const concurrent = yield* Effect.either(
+        expect(Result.isFailure(duplicate)).toBe(true);
+        const concurrent = yield* Effect.result(
           Effect.all(
             [
               servers.createMcpServer({
@@ -304,7 +305,7 @@ describe("MCP server storage and worker config", () => {
             { concurrency: 2 },
           ),
         );
-        expect(Either.isLeft(concurrent)).toBe(true);
+        expect(Result.isFailure(concurrent)).toBe(true);
 
         yield* servers.createMcpServer({
           organizationId: org,
@@ -314,13 +315,13 @@ describe("MCP server storage and worker config", () => {
           command: "node",
           repositoryId: Option.some(repo),
         });
-        const collisionOnUpdate = yield* Effect.either(
+        const collisionOnUpdate = yield* Effect.result(
           servers.updateMcpServer(org, serverId("repo-1"), {
             name: "duplicate",
             repositoryId: Option.none(),
           }),
         );
-        expect(Either.isLeft(collisionOnUpdate)).toBe(true);
+        expect(Result.isFailure(collisionOnUpdate)).toBe(true);
       }),
     ),
   );
@@ -509,17 +510,18 @@ describe("MCP server storage and worker config", () => {
       readonly event: unknown;
       readonly sessionId: unknown;
     }> = [];
-    const logger = Logger.make(({ message, annotations }) => {
+    const logger = Logger.make(({ message, fiber }) => {
+      const annotations = fiber.getRef(References.CurrentLogAnnotations);
       logs.push({
         message: String(message),
-        event: Option.getOrNull(HashMap.get(annotations, "event")),
-        sessionId: Option.getOrNull(HashMap.get(annotations, "sessionId")),
+        event: annotations.event ?? null,
+        sessionId: annotations.sessionId ?? null,
       });
     });
 
     await Effect.runPromise(
       writeOmpMcpConfig(root, [], "tracked-session").pipe(
-        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+        Effect.provide(Logger.layer([logger])),
       ),
     );
 
@@ -551,15 +553,16 @@ describe("MCP server storage and worker config", () => {
     await writeFile(join(foreignRoot, "mcp.json"), foreign);
     const logs: Array<{ readonly message: string; readonly event: unknown }> =
       [];
-    const logger = Logger.make(({ message, annotations }) => {
+    const logger = Logger.make(({ message, fiber }) => {
+      const annotations = fiber.getRef(References.CurrentLogAnnotations);
       logs.push({
         message: String(message),
-        event: Option.getOrNull(HashMap.get(annotations, "event")),
+        event: annotations.event ?? null,
       });
     });
     await Effect.runPromise(
       writeOmpMcpConfig(foreignRoot, [], "foreign-session").pipe(
-        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+        Effect.provide(Logger.layer([logger])),
       ),
     );
     expect(await readFile(join(foreignRoot, "mcp.json"), "utf8")).toBe(foreign);

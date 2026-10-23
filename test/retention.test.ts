@@ -8,9 +8,9 @@ import {
   ConfigProvider,
   Deferred,
   Effect,
-  Either,
   Fiber,
   Layer,
+  Result,
   Schema,
 } from "effect";
 import { afterEach, describe, expect, vi } from "vitest";
@@ -58,7 +58,7 @@ const policy: RetentionPolicy = {
 };
 const now = 1000;
 const insertRun = (
-  db: SqliteClient["Type"]["db"],
+  db: SqliteClient["Service"]["db"],
   id: string,
   state: string,
   path: string | null = null,
@@ -73,7 +73,7 @@ const withDatabase = <A, E>(effect: Effect.Effect<A, E, SqliteClient>) =>
   effect.pipe(Effect.provide(SqliteClientLive(":memory:")));
 
 describe("retention", () => {
-  it.scopedLive(
+  it.live(
     "reclaims a terminal allocation left by a crash with no published workspace",
     () =>
       Effect.gen(function* () {
@@ -111,7 +111,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "keeps a failed identity reserved without aborting other retirement or deleted-workspace records",
     () =>
       Effect.gen(function* () {
@@ -165,7 +165,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "doesn't reopen a retired workspace while its uid serves another session",
     () =>
       Effect.gen(function* () {
@@ -197,7 +197,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "keeps a busy uid fenced even when the retired workspace is missing",
     () =>
       Effect.gen(function* () {
@@ -233,7 +233,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "migrates legacy ownership before worker deletion under the synchronous reopen fence without following symlinks",
     () =>
       Effect.gen(function* () {
@@ -308,7 +308,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "preserves workspace records when legacy ownership migration rejects an external hardlink",
     () =>
       Effect.gen(function* () {
@@ -348,7 +348,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "deletes expired terminal workspaces and data while preserving active runs and recent data",
     () =>
       Effect.gen(function* () {
@@ -469,7 +469,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive("refuses root, external, shared and symlinked workspaces", () =>
+  it.live("refuses root, external, shared and symlinked workspaces", () =>
     Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       const root = testPath("root");
@@ -498,7 +498,7 @@ describe("retention", () => {
     }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "removes nested workspace links without deleting or rewriting their external targets",
     () =>
       Effect.gen(function* () {
@@ -529,7 +529,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "retains projections inside their TTL and delivery payloads inside replay window",
     () =>
       Effect.gen(function* () {
@@ -556,7 +556,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "expires failed projections after their TTL but respects projector leases",
     () =>
       Effect.gen(function* () {
@@ -590,7 +590,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "bounds successful removals without starving candidates behind skipped rows",
     () =>
       Effect.gen(function* () {
@@ -624,7 +624,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "keeps earlier deletion records and continues after a failed workspace removal",
     () =>
       Effect.gen(function* () {
@@ -683,7 +683,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "commits workspace cleanup even if subsequent data cleanup fails",
     () =>
       Effect.gen(function* () {
@@ -697,8 +697,8 @@ describe("retention", () => {
           "INSERT INTO oauth_state VALUES ('expired', 1, 1, NULL)",
         ).run();
         expect(
-          Either.isLeft(
-            yield* Effect.either(
+          Result.isFailure(
+            yield* Effect.result(
               makeRetention({
                 db,
                 workspaceRoot: testPath("root"),
@@ -715,7 +715,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "canonicalizes configured root ancestors but rejects candidate aliases",
     () =>
       Effect.gen(function* () {
@@ -743,7 +743,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "preserves active shared paths reached through symlinks and workspace metadata",
     () =>
       Effect.gen(function* () {
@@ -776,7 +776,7 @@ describe("retention", () => {
       }).pipe(withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "continues enforcing the Nix budget across sweep and budget failures",
     () =>
       Effect.gen(function* () {
@@ -784,7 +784,7 @@ describe("retention", () => {
         db.query("DROP TABLE agent_run").run();
         let calls = 0;
         const retried = yield* Deferred.make<void>();
-        const nix = NixEnvironment.make({
+        const nix = NixEnvironment.of({
           prepare: () => Effect.die("Unexpected build"),
           list: () => Effect.succeed([]),
           prune: () => Effect.succeed(false),
@@ -819,22 +819,27 @@ describe("retention", () => {
           yield* Fiber.interrupt(fiber);
         }).pipe(
           Effect.provide(
-            Retention.DefaultWithoutDependencies.pipe(
+            Retention.layerWithoutDependencies.pipe(
               Layer.provide(
                 Layer.mergeAll(
-                  GatewayConfig.Default,
+                  GatewayConfig.layer,
                   Layer.succeed(NixEnvironment, nix),
                 ),
               ),
             ),
           ),
-          Effect.withConfigProvider(ConfigProvider.fromMap(values)),
+          Effect.provideService(
+            ConfigProvider.ConfigProvider,
+            ConfigProvider.fromUnknown(Object.fromEntries(values), {
+              preserveEmptyStrings: true,
+            }),
+          ),
         );
         expect(calls).toBe(2);
       }).pipe(Effect.scoped, withDatabase),
   );
 
-  it.scopedLive(
+  it.live(
     "deduplicates historical prompts and stops after retention and session resumption",
     () =>
       Effect.gen(function* () {
@@ -894,8 +899,8 @@ describe("retention", () => {
                 createdAt: new Date(1).toISOString(),
               },
             ]),
-        } as unknown as LinearGateway;
-        const authority = SessionAuthority.make({
+        } as unknown as LinearGateway["Service"];
+        const authority = SessionAuthority.of({
           processSession: () => Effect.void,
           processRunnable: () => Effect.void,
           shutdown: () => Effect.void,
@@ -905,7 +910,7 @@ describe("retention", () => {
           yield* (yield* Reconciler).catchup();
         }).pipe(
           Effect.provide(
-            Reconciler.DefaultWithoutDependencies.pipe(
+            Reconciler.layerWithoutDependencies.pipe(
               Layer.provide(
                 Layer.mergeAll(
                   Layer.succeed(SessionAuthority, authority),
@@ -924,7 +929,7 @@ describe("retention", () => {
         });
       }).pipe(
         Effect.provide(
-          Layer.mergeAll(RunInputRepo.Default, RunRepo.Default).pipe(
+          Layer.mergeAll(RunInputRepo.layer, RunRepo.layer).pipe(
             Layer.provideMerge(SqliteClientLive(":memory:")),
           ),
         ),
@@ -934,30 +939,39 @@ describe("retention", () => {
   it("validates retention configuration and provides production defaults", async () => {
     const defaults = await Effect.runPromise(
       Config.unwrap(retentionConfig).pipe(
-        Effect.withConfigProvider(ConfigProvider.fromMap(new Map())),
+        Effect.provideService(
+          ConfigProvider.ConfigProvider,
+          ConfigProvider.fromUnknown(Object.fromEntries(new Map()), {
+            preserveEmptyStrings: true,
+          }),
+        ),
       ),
     );
     expect(defaults.workspaceTtlMs).toBe(86400000);
     expect(defaults.nixStoreMaxBytes).toBe(20 * 1024 ** 3);
     for (const value of ["0", "-1", "1e3", "1.5", "invalid"]) {
       const result = await Effect.runPromise(
-        Effect.either(
+        Effect.result(
           Config.unwrap(retentionConfig).pipe(
-            Effect.withConfigProvider(
-              ConfigProvider.fromMap(
-                new Map([["RETENTION_EVENT_TTL_MS", value]]),
+            Effect.provideService(
+              ConfigProvider.ConfigProvider,
+              ConfigProvider.fromUnknown(
+                Object.fromEntries(
+                  new Map([["RETENTION_EVENT_TTL_MS", value]]),
+                ),
+                { preserveEmptyStrings: true },
               ),
             ),
           ),
         ),
       );
-      expect(Either.isLeft(result)).toBe(true);
+      expect(Result.isFailure(result)).toBe(true);
     }
   });
 });
 
 describe("run event pagination", () => {
-  it.scopedLive(
+  it.live(
     "bounds pages and uses source keys to disambiguate equal timestamps",
     () =>
       Effect.gen(function* () {
@@ -999,7 +1013,7 @@ describe("run event pagination", () => {
         expect(yield* repo.list(sessionId, { limit: 0 })).toHaveLength(1);
       }).pipe(
         Effect.provide(
-          RunEventRepo.Default.pipe(
+          RunEventRepo.layer.pipe(
             Layer.provideMerge(SqliteClientLive(":memory:")),
           ),
         ),

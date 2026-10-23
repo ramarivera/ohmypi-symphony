@@ -63,7 +63,7 @@ describe("Linear host tools", () => {
         yield* worker.onEvent((event) => {
           if (event.type === "host_tool_result_seen") {
             echoed.push(event);
-            if (event.id === "call-1") Deferred.unsafeDone(seen, Effect.void);
+            if (event.id === "call-1") Deferred.doneUnsafe(seen, Effect.void);
           }
         });
         yield* worker.onHostToolCall((request) =>
@@ -93,7 +93,7 @@ describe("Linear host tools", () => {
           }),
         ]);
       }).pipe(Effect.ensuring(worker.stop()));
-    }).pipe(Effect.provide(RpcWorker.Default)),
+    }).pipe(Effect.provide(RpcWorker.layer)),
   );
 
   it("extracts only https PR/MR URLs, deduping and capping", () => {
@@ -133,7 +133,7 @@ describe("Linear host tools", () => {
                 echoed.some((entry) => entry.id === "bad-1") &&
                 echoed.some((entry) => entry.id === "call-2")
               ) {
-                Deferred.unsafeDone(seen, Effect.void);
+                Deferred.doneUnsafe(seen, Effect.void);
               }
             }
           });
@@ -153,6 +153,6 @@ describe("Linear host tools", () => {
           expect(bad?.isError).toBe(true);
           expect(good?.isError).toBe(false);
         }).pipe(Effect.ensuring(worker.stop()));
-      }).pipe(Effect.provide(RpcWorker.Default)),
+      }).pipe(Effect.provide(RpcWorker.layer)),
   );
 });

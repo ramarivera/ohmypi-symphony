@@ -5,13 +5,14 @@ import {
   ConfigProvider,
   Deferred,
   Effect,
-  Either,
   Exit,
   Fiber,
   Layer,
   Option,
+  Result,
   Schema,
 } from "effect";
+import * as fc from "fast-check";
 import { describe, expect } from "vitest";
 import type {
   ActivityId,
@@ -41,14 +42,17 @@ import {
 import { TokenCrypto } from "../src/services/token-crypto.js";
 
 const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
-const configProvider = ConfigProvider.fromMap(
-  new Map([
-    ["LINEAR_CLIENT_ID", "test"],
-    ["LINEAR_CLIENT_SECRET", "test"],
-    ["LINEAR_WEBHOOK_SECRET", "test"],
-    ["PUBLIC_URL", "http://localhost:3000"],
-    ["TOKEN_ENCRYPTION_KEY", testKeyBase64],
-  ]),
+const configProvider = ConfigProvider.fromUnknown(
+  Object.fromEntries(
+    new Map([
+      ["LINEAR_CLIENT_ID", "test"],
+      ["LINEAR_CLIENT_SECRET", "test"],
+      ["LINEAR_WEBHOOK_SECRET", "test"],
+      ["PUBLIC_URL", "http://localhost:3000"],
+      ["TOKEN_ENCRYPTION_KEY", testKeyBase64],
+    ]),
+  ),
+  { preserveEmptyStrings: true },
 );
 
 type RepoServices =
@@ -66,24 +70,24 @@ const withRepos = <A, E>(effect: Effect.Effect<A, E, RepoServices>) =>
     yield* Effect.scope;
     const sqlite = SqliteClientLive(":memory:");
     const repos = Layer.mergeAll(
-      AdminSessionRepo.Default,
-      InstallationRepo.Default,
-      DeliveryRepo.Default,
-      RunRepo.Default,
-      RunInputRepo.Default,
-      RunEventRepo.Default,
-      ProjectionRepo.Default,
-      TokenCrypto.Default,
+      AdminSessionRepo.layer,
+      InstallationRepo.layer,
+      DeliveryRepo.layer,
+      RunRepo.layer,
+      RunInputRepo.layer,
+      RunEventRepo.layer,
+      ProjectionRepo.layer,
+      TokenCrypto.layer,
     ).pipe(
       Layer.provide(
-        Layer.mergeAll(sqlite, Layer.setConfigProvider(configProvider)),
+        Layer.mergeAll(sqlite, ConfigProvider.layer(configProvider)),
       ),
     );
     return yield* effect.pipe(Effect.provide(repos));
   });
 
 describe("SQLite transactions", () => {
-  it.scopedLive("rolls back when the transaction fiber is interrupted", () =>
+  it.live("rolls back when the transaction fiber is interrupted", () =>
     Effect.gen(function* () {
       const db = yield* Effect.acquireRelease(
         Effect.sync(() => new Database(":memory:")),
@@ -91,12 +95,12 @@ describe("SQLite transactions", () => {
       );
       yield* Effect.sync(() => db.exec("CREATE TABLE item (value TEXT)"));
       const entered = yield* Deferred.make<void>();
-      const fiber = yield* Effect.fork(
+      const fiber = yield* Effect.forkChild(
         transact(
           db,
           Effect.gen(function* () {
             yield* Deferred.succeed(entered, undefined);
-            yield* Effect.never;
+            return yield* Effect.never;
           }),
         ),
       );
@@ -141,15 +145,15 @@ const makeInstallation = (
   ...overrides,
 });
 
-const DistinctStrings = Schema.Struct({
+const _DistinctStrings = Schema.Struct({
   first: Schema.String,
   second: Schema.String,
-}).pipe(Schema.filter((s) => s.first !== s.second));
+}).pipe(Schema.check(Schema.makeFilter((s) => s.first !== s.second)));
 
-const NonEmptyDistinctStrings = Schema.Struct({
-  first: Schema.String.pipe(Schema.minLength(1)),
-  second: Schema.String.pipe(Schema.minLength(1)),
-}).pipe(Schema.filter((s) => s.first !== s.second));
+const _NonEmptyDistinctStrings = Schema.Struct({
+  first: Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+  second: Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+}).pipe(Schema.check(Schema.makeFilter((s) => s.first !== s.second)));
 
 it("rolls back after a commit failure so the next write can proceed", async () => {
   const statements: string[] = [];
@@ -179,7 +183,7 @@ it("rolls back after a commit failure so the next write can proceed", async () =
 });
 
 describe("Store repositories", () => {
-  it.scopedLive("encrypts tokens at rest and round-trips installations", () =>
+  it.live("encrypts tokens at rest and round-trips installations", () =>
     withRepos(
       Effect.gen(function* () {
         const repo = yield* InstallationRepo;
@@ -199,7 +203,7 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("consumes OAuth state exactly once before expiry", () =>
+  it.live("consumes OAuth state exactly once before expiry", () =>
     withRepos(
       Effect.gen(function* () {
         const repo = yield* InstallationRepo;
@@ -212,7 +216,7 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("deduplicates webhook delivery IDs", () =>
+  it.live("deduplicates webhook delivery IDs", () =>
     withRepos(
       Effect.gen(function* () {
         const repo = yield* DeliveryRepo;
@@ -228,66 +232,62 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive(
-    "reclaims a delivery interrupted before durable processing",
-    () =>
-      withRepos(
-        Effect.gen(function* () {
-          const repo = yield* DeliveryRepo;
-          const delivery = {
-            id: makeDeliveryId("delivery-1"),
-            organizationId: makeOrganizationId("org-1"),
-            payloadHash: "hash",
-            payload: { type: "AgentSessionEvent" },
-          };
-          expect(yield* repo.claim(delivery)).toBe("claimed");
-          expect(yield* repo.claim(delivery)).toBe("duplicate");
-          expect(yield* repo.recoverPendingDeliveries()).toBe(1);
-          expect(yield* repo.claim(delivery)).toBe("claimed");
-        }),
-      ),
+  it.live("reclaims a delivery interrupted before durable processing", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const repo = yield* DeliveryRepo;
+        const delivery = {
+          id: makeDeliveryId("delivery-1"),
+          organizationId: makeOrganizationId("org-1"),
+          payloadHash: "hash",
+          payload: { type: "AgentSessionEvent" },
+        };
+        expect(yield* repo.claim(delivery)).toBe("claimed");
+        expect(yield* repo.claim(delivery)).toBe("duplicate");
+        expect(yield* repo.recoverPendingDeliveries()).toBe(1);
+        expect(yield* repo.claim(delivery)).toBe("claimed");
+      }),
+    ),
   );
 
-  it.scopedLive(
-    "enforces one lease and permits takeover only after expiry",
-    () =>
-      withRepos(
-        Effect.gen(function* () {
-          const repo = yield* RunRepo;
-          yield* repo.create({
-            sessionId: makeSessionId("session-1"),
-            organizationId: makeOrganizationId("org-1"),
-            issueId: Option.none(),
-            now: 1_000,
-          });
-          expect(
-            yield* repo.claimLease(
-              makeSessionId("session-1"),
-              "worker-a",
-              1_000,
-              1_000,
-            ),
-          ).toBe(true);
-          expect(
-            yield* repo.claimLease(
-              makeSessionId("session-1"),
-              "worker-b",
-              1_000,
-              1_500,
-            ),
-          ).toBe(false);
-          expect(
-            yield* repo.claimLease(
-              makeSessionId("session-1"),
-              "worker-b",
-              1_000,
-              2_001,
-            ),
-          ).toBe(true);
-        }),
-      ),
+  it.live("enforces one lease and permits takeover only after expiry", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const repo = yield* RunRepo;
+        yield* repo.create({
+          sessionId: makeSessionId("session-1"),
+          organizationId: makeOrganizationId("org-1"),
+          issueId: Option.none(),
+          now: 1_000,
+        });
+        expect(
+          yield* repo.claimLease(
+            makeSessionId("session-1"),
+            "worker-a",
+            1_000,
+            1_000,
+          ),
+        ).toBe(true);
+        expect(
+          yield* repo.claimLease(
+            makeSessionId("session-1"),
+            "worker-b",
+            1_000,
+            1_500,
+          ),
+        ).toBe(false);
+        expect(
+          yield* repo.claimLease(
+            makeSessionId("session-1"),
+            "worker-b",
+            1_000,
+            2_001,
+          ),
+        ).toBe(true);
+      }),
+    ),
   );
-  it.scopedLive(
+  it.live(
     "catch-up candidates include live runs despite leases and retry delays",
     () =>
       withRepos(
@@ -313,7 +313,7 @@ describe("Store repositories", () => {
         }),
       ),
   );
-  it.scopedLive("keeps canceled catch-up candidates for seven days", () =>
+  it.live("keeps canceled catch-up candidates for seven days", () =>
     withRepos(
       Effect.gen(function* () {
         const repo = yield* RunRepo;
@@ -342,7 +342,7 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("startup preserves another gateway's live lease", () =>
+  it.live("startup preserves another gateway's live lease", () =>
     withRepos(
       Effect.gen(function* () {
         const repo = yield* RunRepo;
@@ -370,7 +370,7 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("recovers active runs and leases after a process restart", () =>
+  it.live("recovers active runs and leases after a process restart", () =>
     withRepos(
       Effect.gen(function* () {
         const runRepo = yield* RunRepo;
@@ -454,7 +454,7 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "prompts after stop are accepted for resume and revocation cancels all live runs",
     () =>
       withRepos(
@@ -515,7 +515,7 @@ describe("Store repositories", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "updates permission snapshots without rewriting rotating tokens",
     () =>
       withRepos(
@@ -561,7 +561,7 @@ describe("Store repositories", () => {
       ),
   );
 
-  it.scopedLive("reserves each projection and terminal outcome once", () =>
+  it.live("reserves each projection and terminal outcome once", () =>
     withRepos(
       Effect.gen(function* () {
         const runRepo = yield* RunRepo;
@@ -606,67 +606,65 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive(
-    "persist inputs and projections as chronological run events",
-    () =>
-      withRepos(
-        Effect.gen(function* () {
-          const runRepo = yield* RunRepo;
-          const inputRepo = yield* RunInputRepo;
-          const projectionRepo = yield* ProjectionRepo;
-          const eventRepo = yield* RunEventRepo;
+  it.live("persist inputs and projections as chronological run events", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const runRepo = yield* RunRepo;
+        const inputRepo = yield* RunInputRepo;
+        const projectionRepo = yield* ProjectionRepo;
+        const eventRepo = yield* RunEventRepo;
 
-          yield* runRepo.create({
-            sessionId: makeSessionId("session-1"),
-            organizationId: makeOrganizationId("org-1"),
-            issueId: Option.none(),
-          });
+        yield* runRepo.create({
+          sessionId: makeSessionId("session-1"),
+          organizationId: makeOrganizationId("org-1"),
+          issueId: Option.none(),
+        });
 
-          yield* inputRepo.enqueue({
-            id: makeInputId("input-1"),
-            sessionId: makeSessionId("session-1"),
-            kind: "created",
-            body: "Implement the issue",
-            payload: { agentSession: { issue: { teamId: "team" } } },
-            createdAt: 1_000,
-          });
+        yield* inputRepo.enqueue({
+          id: makeInputId("input-1"),
+          sessionId: makeSessionId("session-1"),
+          kind: "created",
+          body: "Implement the issue",
+          payload: { agentSession: { issue: { teamId: "team" } } },
+          createdAt: 1_000,
+        });
 
-          yield* projectionRepo.enqueue({
-            sourceKey: makeSourceKey("event-1"),
-            sessionId: makeSessionId("session-1"),
-            activityType: "thought",
-            payloadHash: "hash",
-            payload: {
-              request: { content: { type: "thought", body: "Thinking..." } },
-            },
-            now: 2_000,
-          });
+        yield* projectionRepo.enqueue({
+          sourceKey: makeSourceKey("event-1"),
+          sessionId: makeSessionId("session-1"),
+          activityType: "thought",
+          payloadHash: "hash",
+          payload: {
+            request: { content: { type: "thought", body: "Thinking..." } },
+          },
+          now: 2_000,
+        });
 
-          const events = yield* eventRepo.list(makeSessionId("session-1"));
-          expect(events.length).toBe(2);
-          expect(events[0]).toMatchObject({
-            sourceKey: makeSourceKey("input:input-1"),
-            sessionId: makeSessionId("session-1"),
-            kind: "input:created",
-            level: "info",
-            text: Option.some("Implement the issue"),
-            status: Option.none(),
-            createdAt: 1_000,
-          });
-          expect(events[1]).toMatchObject({
-            sourceKey: makeSourceKey("event-1"),
-            sessionId: makeSessionId("session-1"),
-            kind: "thought",
-            level: "debug",
-            text: Option.some("Thinking..."),
-            status: Option.some("pending"),
-            createdAt: 2_000,
-          });
-        }),
-      ),
+        const events = yield* eventRepo.list(makeSessionId("session-1"));
+        expect(events.length).toBe(2);
+        expect(events[0]).toMatchObject({
+          sourceKey: makeSourceKey("input:input-1"),
+          sessionId: makeSessionId("session-1"),
+          kind: "input:created",
+          level: "info",
+          text: Option.some("Implement the issue"),
+          status: Option.none(),
+          createdAt: 1_000,
+        });
+        expect(events[1]).toMatchObject({
+          sourceKey: makeSourceKey("event-1"),
+          sessionId: makeSessionId("session-1"),
+          kind: "thought",
+          level: "debug",
+          text: Option.some("Thinking..."),
+          status: Option.some("pending"),
+          createdAt: 2_000,
+        });
+      }),
+    ),
   );
 
-  it.scopedLive("records state transitions with a stable source key", () =>
+  it.live("records state transitions with a stable source key", () =>
     withRepos(
       Effect.gen(function* () {
         const runRepo = yield* RunRepo;
@@ -697,7 +695,7 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive(
+  it.live(
     "deduplicates run events by source key and preserves created at",
     () =>
       withRepos(
@@ -748,7 +746,7 @@ describe("Store repositories", () => {
       ),
   );
 
-  it.scopedLive(
+  it.live(
     "reads one event by source key and seeds RPC sequence numerically within a session",
     () =>
       withRepos(
@@ -756,22 +754,28 @@ describe("Store repositories", () => {
           const sid = makeSessionId("targeted-events-🚀");
           const other = makeSessionId("targeted-events-other");
           for (const sessionId of [sid, other])
-            yield* RunRepo.create({
-              sessionId,
-              organizationId: makeOrganizationId("org-1"),
-              issueId: Option.none(),
-            });
-          expect(yield* RunEventRepo.maxRpcSequence(sid)).toBe(0);
+            yield* RunRepo.use((service) =>
+              service.create({
+                sessionId,
+                organizationId: makeOrganizationId("org-1"),
+                issueId: Option.none(),
+              }),
+            );
+          expect(
+            yield* RunEventRepo.use((service) => service.maxRpcSequence(sid)),
+          ).toBe(0);
           const key = makeSourceKey(`retry:${sid}:3`);
-          yield* RunEventRepo.upsert({
-            sourceKey: key,
-            sessionId: sid,
-            kind: "retry",
-            level: "info",
-            payload: { nextAttemptAt: 900, scheduledAt: 500 },
-          });
+          yield* RunEventRepo.use((service) =>
+            service.upsert({
+              sourceKey: key,
+              sessionId: sid,
+              kind: "retry",
+              level: "info",
+              payload: { nextAttemptAt: 900, scheduledAt: 500 },
+            }),
+          );
           const event = Option.getOrThrow(
-            yield* RunEventRepo.getBySourceKey(key),
+            yield* RunEventRepo.use((service) => service.getBySourceKey(key)),
           );
           expect(event.sourceKey).toBe(key);
           expect(event.payload).toEqual({
@@ -779,7 +783,9 @@ describe("Store repositories", () => {
             scheduledAt: 500,
           });
           expect(
-            yield* RunEventRepo.getBySourceKey(makeSourceKey("absent")),
+            yield* RunEventRepo.use((service) =>
+              service.getBySourceKey(makeSourceKey("absent")),
+            ),
           ).toEqual(Option.none());
           for (const sourceKey of [
             `rpc:${sid}:2:progress`,
@@ -791,25 +797,33 @@ describe("Store repositories", () => {
             `rpc:${sid}:1e4:progress`,
             `rpc:${sid}extra:1000:progress`,
           ])
-            yield* RunEventRepo.upsert({
-              sourceKey: makeSourceKey(sourceKey),
-              sessionId: sid,
+            yield* RunEventRepo.use((service) =>
+              service.upsert({
+                sourceKey: makeSourceKey(sourceKey),
+                sessionId: sid,
+                kind: "progress",
+                level: "info",
+              }),
+            );
+          yield* RunEventRepo.use((service) =>
+            service.upsert({
+              sourceKey: makeSourceKey(`rpc:${other}:2000:progress`),
+              sessionId: other,
               kind: "progress",
               level: "info",
-            });
-          yield* RunEventRepo.upsert({
-            sourceKey: makeSourceKey(`rpc:${other}:2000:progress`),
-            sessionId: other,
-            kind: "progress",
-            level: "info",
-          });
-          expect(yield* RunEventRepo.maxRpcSequence(sid)).toBe(10);
-          expect(yield* RunEventRepo.maxRpcSequence(other)).toBe(2000);
+            }),
+          );
+          expect(
+            yield* RunEventRepo.use((service) => service.maxRpcSequence(sid)),
+          ).toBe(10);
+          expect(
+            yield* RunEventRepo.use((service) => service.maxRpcSequence(other)),
+          ).toBe(2000);
         }),
       ),
   );
 
-  it.scopedLive("tracks projection lifecycle status and errors", () =>
+  it.live("tracks projection lifecycle status and errors", () =>
     withRepos(
       Effect.gen(function* () {
         const runRepo = yield* RunRepo;
@@ -884,7 +898,7 @@ describe("Store repositories", () => {
     ),
   );
 
-  it.scopedLive("does not overwrite completed run events on re-enqueue", () =>
+  it.live("does not overwrite completed run events on re-enqueue", () =>
     withRepos(
       Effect.gen(function* () {
         const runRepo = yield* RunRepo;
@@ -946,492 +960,847 @@ describe("Store repositories", () => {
 });
 
 describe("pure invariants", () => {
-  it.scopedLive.prop(
+  it.live(
     "DeliveryRepo.claim idempotency",
-    {
-      deliveryId: Schema.UUID,
-      organizationId: Schema.UUID,
-      payload: Schema.String,
-      hashes: DistinctStrings,
-    },
-    ({ deliveryId, organizationId, payload, hashes: { first, second } }) =>
-      withRepos(
-        Effect.gen(function* () {
-          const repo = yield* DeliveryRepo;
-          const common = {
-            id: makeDeliveryId(deliveryId),
-            organizationId: makeOrganizationId(organizationId),
-            payload,
-          };
-          expect(yield* repo.claim({ ...common, payloadHash: first })).toBe(
-            "claimed",
-          );
-          expect(yield* repo.claim({ ...common, payloadHash: first })).toBe(
-            "duplicate",
-          );
-          expect(yield* repo.claim({ ...common, payloadHash: second })).toBe(
-            "conflict",
-          );
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
-  );
-
-  it.scopedLive.prop(
-    "RunRepo.claimLease exclusivity",
-    {
-      sessionId: Schema.UUID,
-      organizationId: Schema.UUID,
-      owner: Schema.String.pipe(Schema.minLength(1)),
-      otherOwner: Schema.String.pipe(Schema.minLength(1)),
-      duration: Schema.Number.pipe(Schema.int(), Schema.between(2, 1_000_000)),
-      now: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000)),
-    },
-    ({ sessionId, organizationId, owner, otherOwner, duration, now }) =>
-      withRepos(
-        Effect.gen(function* () {
-          const repo = yield* RunRepo;
-          yield* repo.create({
-            sessionId: makeSessionId(sessionId),
-            organizationId: makeOrganizationId(organizationId),
-            issueId: Option.none(),
-            now,
-          });
-          expect(
-            yield* repo.claimLease(
-              makeSessionId(sessionId),
-              owner,
-              duration,
-              now,
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          deliveryId: fc.uuid(),
+          organizationId: fc.uuid(),
+          payload: fc.string(),
+          hashes: fc.record({ first: fc.string(), second: fc.string() }).filter(
+            Schema.is(
+              Schema.Struct({
+                first: Schema.String,
+                second: Schema.String,
+              }).pipe(
+                Schema.check(Schema.makeFilter((s) => s.first !== s.second)),
+              ),
             ),
-          ).toBe(true);
-          expect(
-            yield* repo.claimLease(
-              makeSessionId(sessionId),
-              owner,
-              duration,
-              now + 1,
-            ),
-          ).toBe(true);
-          const other = yield* repo.claimLease(
-            makeSessionId(sessionId),
-            otherOwner,
-            duration,
-            now + 1,
-          );
-          if (owner === otherOwner) {
-            expect(other).toBe(true);
-          } else {
-            expect(other).toBe(false);
-          }
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
-  );
-
-  it.scopedLive.prop(
-    "RunEventRepo.upsert source-key uniqueness",
-    {
-      sessionId: Schema.UUID,
-      organizationId: Schema.UUID,
-      sourceKey: Schema.UUID,
-      texts: NonEmptyDistinctStrings,
-      bodies: NonEmptyDistinctStrings,
-    },
-    ({
-      sessionId,
-      organizationId,
-      sourceKey,
-      texts: { first: text1, second: text2 },
-      bodies: { first: body1, second: body2 },
-    }) =>
-      withRepos(
-        Effect.gen(function* () {
-          const runRepo = yield* RunRepo;
-          const eventRepo = yield* RunEventRepo;
-
-          yield* runRepo.create({
-            sessionId: makeSessionId(sessionId),
-            organizationId: makeOrganizationId(organizationId),
-            issueId: Option.none(),
-            now: 0,
-          });
-
-          const key = makeSourceKey(sourceKey);
-
-          yield* eventRepo.upsert({
-            sourceKey: key,
-            sessionId: makeSessionId(sessionId),
-            kind: "agent_start",
-            level: "info",
-            text: text1,
-            payload: { body: body1 },
-            status: "pending",
-            now: 1_000,
-          });
-          yield* eventRepo.upsert({
-            sourceKey: key,
-            sessionId: makeSessionId(sessionId),
-            kind: "thought",
-            level: "debug",
-            text: text2,
-            payload: { body: body2 },
-            status: "pending",
-            now: 2_000,
-          });
-
-          const events = yield* eventRepo.list(makeSessionId(sessionId));
-          expect(events.length).toBe(1);
-          expect(events[0]).toMatchObject({
-            sourceKey: key,
-            kind: "thought",
-            level: "debug",
-            text: Option.some(text2),
-            status: Option.some("pending"),
-            createdAt: 1_000,
-            updatedAt: 2_000,
-          });
-
-          yield* eventRepo.upsert({
-            sourceKey: key,
-            sessionId: makeSessionId(sessionId),
-            kind: "thought",
-            level: "debug",
-            text: text2,
-            payload: { body: body2 },
-            status: "completed",
-            now: 3_000,
-          });
-          yield* eventRepo.upsert({
-            sourceKey: key,
-            sessionId: makeSessionId(sessionId),
-            kind: "response",
-            level: "result",
-            text: "overwritten",
-            payload: { body: "overwritten" },
-            status: "pending",
-            now: 4_000,
-          });
-
-          const events2 = yield* eventRepo.list(makeSessionId(sessionId));
-          expect(events2.length).toBe(1);
-          expect(events2[0]).toMatchObject({
-            sourceKey: key,
-            kind: "thought",
-            level: "debug",
-            text: Option.some(text2),
-            status: Option.some("completed"),
-            createdAt: 1_000,
-            updatedAt: 3_000,
-          });
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
-  );
-
-  it.scopedLive.prop(
-    "ProjectionRepo.enqueue firstWriteWins",
-    {
-      sessionId: Schema.UUID,
-      organizationId: Schema.UUID,
-      sourceKey: Schema.UUID,
-      bodies: NonEmptyDistinctStrings,
-      hashes: DistinctStrings,
-      activityId: Schema.UUID,
-    },
-    ({
-      sessionId,
-      organizationId,
-      sourceKey,
-      bodies: { first: body, second: otherBody },
-      hashes: { first: firstHash, second: secondHash },
-      activityId,
-    }) =>
-      withRepos(
-        Effect.gen(function* () {
-          const runRepo = yield* RunRepo;
-          const projectionRepo = yield* ProjectionRepo;
-          const eventRepo = yield* RunEventRepo;
-
-          yield* runRepo.create({
-            sessionId: makeSessionId(sessionId),
-            organizationId: makeOrganizationId(organizationId),
-            issueId: Option.none(),
-            now: 0,
-          });
-
-          const key = makeSourceKey(sourceKey);
-
-          const first = yield* projectionRepo.enqueue({
-            sourceKey: key,
-            sessionId: makeSessionId(sessionId),
-            activityType: "response",
-            payloadHash: firstHash,
-            payload: { request: { content: { type: "response", body } } },
-            now: 1_000,
-          });
-          expect(first).toBe(true);
-
-          const sameHash = yield* projectionRepo.enqueue({
-            sourceKey: key,
-            sessionId: makeSessionId(sessionId),
-            activityType: "response",
-            payloadHash: firstHash,
-            payload: { request: { content: { type: "response", body } } },
-            now: 1_000,
-          });
-          expect(sameHash).toBe(false);
-
-          const job = yield* projectionRepo.claim(key, "owner", 60_000);
-          expect(job).not.toEqual(Option.none());
-
-          yield* projectionRepo.complete(
-            key,
-            "owner",
-            Option.some(makeActivityId(activityId)),
-          );
-
-          const differentHash = yield* projectionRepo.enqueue({
-            sourceKey: key,
-            sessionId: makeSessionId(sessionId),
-            activityType: "response",
-            payloadHash: secondHash,
-            payload: {
-              request: { content: { type: "response", body: otherBody } },
-            },
-            now: 2_000,
-            firstWriteWins: true,
-          });
-          expect(differentHash).toBe(false);
-
-          const events = yield* eventRepo.list(makeSessionId(sessionId));
-          const event = events[0];
-          expect(event?.text).toEqual(Option.some(body));
-          expect(event?.status).toEqual(Option.some("completed"));
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
-  );
-
-  it.scopedLive.prop(
-    "RunRepo.update rejects transitions from terminal states",
-    {
-      sessionId: Schema.UUID,
-      organizationId: Schema.UUID,
-      firstState: RunState,
-      secondState: RunState,
-    },
-    ({ sessionId, organizationId, firstState, secondState }) =>
-      withRepos(
-        Effect.gen(function* () {
-          const repo = yield* RunRepo;
-          const sid = makeSessionId(sessionId);
-          const oid = makeOrganizationId(organizationId);
-
-          yield* repo.create({
-            sessionId: sid,
-            organizationId: oid,
-            issueId: Option.none(),
-            now: 0,
-          });
-
-          yield* repo.update(sid, { state: firstState });
-          const first = yield* repo.get(sid);
-          expect(Option.isSome(first)).toBe(true);
-          if (Option.isSome(first)) {
-            expect(first.value.state).toBe(firstState);
-          }
-
-          const either = yield* Effect.either(
-            repo.update(sid, { state: secondState }),
-          );
-          const terminal = ["succeeded", "failed", "canceled"] as const;
-          const isTerminal = terminal.includes(
-            firstState as (typeof terminal)[number],
-          );
-          const shouldFail = isTerminal && secondState !== firstState;
-
-          if (shouldFail) {
-            expect(Either.isLeft(either)).toBe(true);
-            if (Either.isLeft(either)) {
-              expect(either.left.message).toBe(
-                "Terminal run state is immutable",
+          ),
+        });
+        const check = ({
+          deliveryId,
+          organizationId,
+          payload,
+          hashes: { first, second },
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withRepos(
+            Effect.gen(function* () {
+              const repo = yield* DeliveryRepo;
+              const common = {
+                id: makeDeliveryId(deliveryId),
+                organizationId: makeOrganizationId(organizationId),
+                payload,
+              };
+              expect(yield* repo.claim({ ...common, payloadHash: first })).toBe(
+                "claimed",
               );
-            }
-          } else {
-            expect(Either.isRight(either)).toBe(true);
-            const after = yield* repo.get(sid);
-            expect(Option.isSome(after)).toBe(true);
-            if (Option.isSome(after)) {
-              expect(after.value.state).toBe(secondState);
-            }
-          }
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+              expect(yield* repo.claim({ ...common, payloadHash: first })).toBe(
+                "duplicate",
+              );
+              expect(
+                yield* repo.claim({ ...common, payloadHash: second }),
+              ).toBe("conflict");
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
-  it.scopedLive.prop(
+
+  it.live(
+    "RunRepo.claimLease exclusivity",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          organizationId: fc.uuid(),
+          owner: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          otherOwner: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          duration: fc
+            .integer({ min: 2, max: 1_000_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 2, maximum: 1_000_000 }),
+                  ),
+                ),
+              ),
+            ),
+          now: fc
+            .integer({ min: 0, max: 1_000_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 0, maximum: 1_000_000 }),
+                  ),
+                ),
+              ),
+            ),
+        });
+        const check = ({
+          sessionId,
+          organizationId,
+          owner,
+          otherOwner,
+          duration,
+          now,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withRepos(
+            Effect.gen(function* () {
+              const repo = yield* RunRepo;
+              yield* repo.create({
+                sessionId: makeSessionId(sessionId),
+                organizationId: makeOrganizationId(organizationId),
+                issueId: Option.none(),
+                now,
+              });
+              expect(
+                yield* repo.claimLease(
+                  makeSessionId(sessionId),
+                  owner,
+                  duration,
+                  now,
+                ),
+              ).toBe(true);
+              expect(
+                yield* repo.claimLease(
+                  makeSessionId(sessionId),
+                  owner,
+                  duration,
+                  now + 1,
+                ),
+              ).toBe(true);
+              const other = yield* repo.claimLease(
+                makeSessionId(sessionId),
+                otherOwner,
+                duration,
+                now + 1,
+              );
+              if (owner === otherOwner) {
+                expect(other).toBe(true);
+              } else {
+                expect(other).toBe(false);
+              }
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.live(
+    "RunEventRepo.upsert source-key uniqueness",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          organizationId: fc.uuid(),
+          sourceKey: fc.uuid(),
+          texts: fc
+            .record({
+              first: fc
+                .string()
+                .filter(
+                  Schema.is(
+                    Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+                  ),
+                ),
+              second: fc
+                .string()
+                .filter(
+                  Schema.is(
+                    Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+                  ),
+                ),
+            })
+            .filter(
+              Schema.is(
+                Schema.Struct({
+                  first: Schema.String.pipe(
+                    Schema.check(Schema.isMinLength(1)),
+                  ),
+                  second: Schema.String.pipe(
+                    Schema.check(Schema.isMinLength(1)),
+                  ),
+                }).pipe(
+                  Schema.check(Schema.makeFilter((s) => s.first !== s.second)),
+                ),
+              ),
+            ),
+          bodies: fc
+            .record({
+              first: fc
+                .string()
+                .filter(
+                  Schema.is(
+                    Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+                  ),
+                ),
+              second: fc
+                .string()
+                .filter(
+                  Schema.is(
+                    Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+                  ),
+                ),
+            })
+            .filter(
+              Schema.is(
+                Schema.Struct({
+                  first: Schema.String.pipe(
+                    Schema.check(Schema.isMinLength(1)),
+                  ),
+                  second: Schema.String.pipe(
+                    Schema.check(Schema.isMinLength(1)),
+                  ),
+                }).pipe(
+                  Schema.check(Schema.makeFilter((s) => s.first !== s.second)),
+                ),
+              ),
+            ),
+        });
+        const check = ({
+          sessionId,
+          organizationId,
+          sourceKey,
+          texts: { first: text1, second: text2 },
+          bodies: { first: body1, second: body2 },
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withRepos(
+            Effect.gen(function* () {
+              const runRepo = yield* RunRepo;
+              const eventRepo = yield* RunEventRepo;
+
+              yield* runRepo.create({
+                sessionId: makeSessionId(sessionId),
+                organizationId: makeOrganizationId(organizationId),
+                issueId: Option.none(),
+                now: 0,
+              });
+
+              const key = makeSourceKey(sourceKey);
+
+              yield* eventRepo.upsert({
+                sourceKey: key,
+                sessionId: makeSessionId(sessionId),
+                kind: "agent_start",
+                level: "info",
+                text: text1,
+                payload: { body: body1 },
+                status: "pending",
+                now: 1_000,
+              });
+              yield* eventRepo.upsert({
+                sourceKey: key,
+                sessionId: makeSessionId(sessionId),
+                kind: "thought",
+                level: "debug",
+                text: text2,
+                payload: { body: body2 },
+                status: "pending",
+                now: 2_000,
+              });
+
+              const events = yield* eventRepo.list(makeSessionId(sessionId));
+              expect(events.length).toBe(1);
+              expect(events[0]).toMatchObject({
+                sourceKey: key,
+                kind: "thought",
+                level: "debug",
+                text: Option.some(text2),
+                status: Option.some("pending"),
+                createdAt: 1_000,
+                updatedAt: 2_000,
+              });
+
+              yield* eventRepo.upsert({
+                sourceKey: key,
+                sessionId: makeSessionId(sessionId),
+                kind: "thought",
+                level: "debug",
+                text: text2,
+                payload: { body: body2 },
+                status: "completed",
+                now: 3_000,
+              });
+              yield* eventRepo.upsert({
+                sourceKey: key,
+                sessionId: makeSessionId(sessionId),
+                kind: "response",
+                level: "result",
+                text: "overwritten",
+                payload: { body: "overwritten" },
+                status: "pending",
+                now: 4_000,
+              });
+
+              const events2 = yield* eventRepo.list(makeSessionId(sessionId));
+              expect(events2.length).toBe(1);
+              expect(events2[0]).toMatchObject({
+                sourceKey: key,
+                kind: "thought",
+                level: "debug",
+                text: Option.some(text2),
+                status: Option.some("completed"),
+                createdAt: 1_000,
+                updatedAt: 3_000,
+              });
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.live(
+    "ProjectionRepo.enqueue firstWriteWins",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          organizationId: fc.uuid(),
+          sourceKey: fc.uuid(),
+          bodies: fc
+            .record({
+              first: fc
+                .string()
+                .filter(
+                  Schema.is(
+                    Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+                  ),
+                ),
+              second: fc
+                .string()
+                .filter(
+                  Schema.is(
+                    Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+                  ),
+                ),
+            })
+            .filter(
+              Schema.is(
+                Schema.Struct({
+                  first: Schema.String.pipe(
+                    Schema.check(Schema.isMinLength(1)),
+                  ),
+                  second: Schema.String.pipe(
+                    Schema.check(Schema.isMinLength(1)),
+                  ),
+                }).pipe(
+                  Schema.check(Schema.makeFilter((s) => s.first !== s.second)),
+                ),
+              ),
+            ),
+          hashes: fc.record({ first: fc.string(), second: fc.string() }).filter(
+            Schema.is(
+              Schema.Struct({
+                first: Schema.String,
+                second: Schema.String,
+              }).pipe(
+                Schema.check(Schema.makeFilter((s) => s.first !== s.second)),
+              ),
+            ),
+          ),
+          activityId: fc.uuid(),
+        });
+        const check = ({
+          sessionId,
+          organizationId,
+          sourceKey,
+          bodies: { first: body, second: otherBody },
+          hashes: { first: firstHash, second: secondHash },
+          activityId,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withRepos(
+            Effect.gen(function* () {
+              const runRepo = yield* RunRepo;
+              const projectionRepo = yield* ProjectionRepo;
+              const eventRepo = yield* RunEventRepo;
+
+              yield* runRepo.create({
+                sessionId: makeSessionId(sessionId),
+                organizationId: makeOrganizationId(organizationId),
+                issueId: Option.none(),
+                now: 0,
+              });
+
+              const key = makeSourceKey(sourceKey);
+
+              const first = yield* projectionRepo.enqueue({
+                sourceKey: key,
+                sessionId: makeSessionId(sessionId),
+                activityType: "response",
+                payloadHash: firstHash,
+                payload: { request: { content: { type: "response", body } } },
+                now: 1_000,
+              });
+              expect(first).toBe(true);
+
+              const sameHash = yield* projectionRepo.enqueue({
+                sourceKey: key,
+                sessionId: makeSessionId(sessionId),
+                activityType: "response",
+                payloadHash: firstHash,
+                payload: { request: { content: { type: "response", body } } },
+                now: 1_000,
+              });
+              expect(sameHash).toBe(false);
+
+              const job = yield* projectionRepo.claim(key, "owner", 60_000);
+              expect(job).not.toEqual(Option.none());
+
+              yield* projectionRepo.complete(
+                key,
+                "owner",
+                Option.some(makeActivityId(activityId)),
+              );
+
+              const differentHash = yield* projectionRepo.enqueue({
+                sourceKey: key,
+                sessionId: makeSessionId(sessionId),
+                activityType: "response",
+                payloadHash: secondHash,
+                payload: {
+                  request: { content: { type: "response", body: otherBody } },
+                },
+                now: 2_000,
+                firstWriteWins: true,
+              });
+              expect(differentHash).toBe(false);
+
+              const events = yield* eventRepo.list(makeSessionId(sessionId));
+              const event = events[0];
+              expect(event?.text).toEqual(Option.some(body));
+              expect(event?.status).toEqual(Option.some("completed"));
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.live(
+    "RunRepo.update rejects transitions from terminal states",
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          organizationId: fc.uuid(),
+          firstState: fc.constantFrom(...RunState.literals),
+          secondState: fc.constantFrom(...RunState.literals),
+        });
+        const check = ({
+          sessionId,
+          organizationId,
+          firstState,
+          secondState,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withRepos(
+            Effect.gen(function* () {
+              const repo = yield* RunRepo;
+              const sid = makeSessionId(sessionId);
+              const oid = makeOrganizationId(organizationId);
+
+              yield* repo.create({
+                sessionId: sid,
+                organizationId: oid,
+                issueId: Option.none(),
+                now: 0,
+              });
+
+              yield* repo.update(sid, { state: firstState });
+              const first = yield* repo.get(sid);
+              expect(Option.isSome(first)).toBe(true);
+              if (Option.isSome(first)) {
+                expect(first.value.state).toBe(firstState);
+              }
+
+              const either = yield* Effect.result(
+                repo.update(sid, { state: secondState }),
+              );
+              const terminal = ["succeeded", "failed", "canceled"] as const;
+              const isTerminal = terminal.includes(
+                firstState as (typeof terminal)[number],
+              );
+              const shouldFail = isTerminal && secondState !== firstState;
+
+              if (shouldFail) {
+                expect(Result.isFailure(either)).toBe(true);
+                if (Result.isFailure(either)) {
+                  expect(either.failure.message).toBe(
+                    "Terminal run state is immutable",
+                  );
+                }
+              } else {
+                expect(Result.isSuccess(either)).toBe(true);
+                const after = yield* repo.get(sid);
+                expect(Option.isSome(after)).toBe(true);
+                if (Option.isSome(after)) {
+                  expect(after.value.state).toBe(secondState);
+                }
+              }
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
+  );
+  it.live(
     "InstallationRepo persists generated installation records and replaces them",
-    {
-      organizationId: Schema.UUID,
-      appUserId: Schema.UUID,
-      accessToken: Schema.String.pipe(Schema.minLength(1)),
-      refreshToken: Schema.String.pipe(Schema.minLength(1)),
-      expiresAt: Schema.Number.pipe(
-        Schema.int(),
-        Schema.between(0, 1_000_000_000),
-      ),
-      scopes: Schema.Array(Schema.String),
-      revokedAt: Schema.NullOr(
-        Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
-      ),
-      accessibleTeamIds: Schema.NullOr(Schema.Array(Schema.UUID)),
-      canAccessAllPublicTeams: Schema.NullOr(Schema.Boolean),
-    },
-    (input) =>
-      withRepos(
-        Effect.gen(function* () {
-          const repo = yield* InstallationRepo;
-          const expected: Installation = {
-            organizationId: makeOrganizationId(input.organizationId),
-            appUserId: makeAppUserId(input.appUserId),
-            accessToken: input.accessToken,
-            refreshToken: input.refreshToken,
-            expiresAt: input.expiresAt,
-            scopes: input.scopes,
-            revokedAt:
-              input.revokedAt === null
-                ? Option.none()
-                : Option.some(input.revokedAt),
-            accessibleTeamIds:
-              input.accessibleTeamIds === null
-                ? Option.none()
-                : Option.some(input.accessibleTeamIds.map(makeTeamId)),
-            canAccessAllPublicTeams:
-              input.canAccessAllPublicTeams === null
-                ? Option.none()
-                : Option.some(input.canAccessAllPublicTeams),
-          };
-          yield* repo.put(expected);
-          expect(yield* repo.get(expected.organizationId)).toEqual(
-            Option.some(expected),
-          );
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          organizationId: fc.uuid(),
+          appUserId: fc.uuid(),
+          accessToken: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          refreshToken: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          expiresAt: fc
+            .integer({ min: 0, max: 1_000_000_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 0, maximum: 1_000_000_000 }),
+                  ),
+                ),
+              ),
+            ),
+          scopes: fc.array(fc.string()),
+          revokedAt: fc.option(
+            fc
+              .integer({ min: 0, max: 1_000_000_000 })
+              .filter(
+                Schema.is(
+                  Schema.Number.pipe(
+                    Schema.check(Schema.isInt()),
+                    Schema.check(
+                      Schema.isBetween({ minimum: 0, maximum: 1_000_000_000 }),
+                    ),
+                  ),
+                ),
+              ),
+            { nil: null },
+          ),
+          accessibleTeamIds: fc.option(fc.array(fc.uuid()), { nil: null }),
+          canAccessAllPublicTeams: fc.option(fc.boolean(), { nil: null }),
+        });
+        const check = (
+          input: typeof cases extends fc.Arbitrary<infer A> ? A : never,
+        ) =>
+          withRepos(
+            Effect.gen(function* () {
+              const repo = yield* InstallationRepo;
+              const expected: Installation = {
+                organizationId: makeOrganizationId(input.organizationId),
+                appUserId: makeAppUserId(input.appUserId),
+                accessToken: input.accessToken,
+                refreshToken: input.refreshToken,
+                expiresAt: input.expiresAt,
+                scopes: input.scopes,
+                revokedAt:
+                  input.revokedAt === null
+                    ? Option.none()
+                    : Option.some(input.revokedAt),
+                accessibleTeamIds:
+                  input.accessibleTeamIds === null
+                    ? Option.none()
+                    : Option.some(input.accessibleTeamIds.map(makeTeamId)),
+                canAccessAllPublicTeams:
+                  input.canAccessAllPublicTeams === null
+                    ? Option.none()
+                    : Option.some(input.canAccessAllPublicTeams),
+              };
+              yield* repo.put(expected);
+              expect(yield* repo.get(expected.organizationId)).toEqual(
+                Option.some(expected),
+              );
 
-          const replacement = {
-            ...expected,
-            accessToken: `${input.accessToken}-replacement`,
-          };
-          yield* repo.put(replacement);
-          expect(yield* repo.get(expected.organizationId)).toEqual(
-            Option.some(replacement),
+              const replacement = {
+                ...expected,
+                accessToken: `${input.accessToken}-replacement`,
+              };
+              yield* repo.put(replacement);
+              expect(yield* repo.get(expected.organizationId)).toEqual(
+                Option.some(replacement),
+              );
+            }),
           );
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 
-  it.scopedLive.prop(
+  it.live(
     "RunInputRepo keeps generated inputs pending exactly once until processed",
-    {
-      sessionId: Schema.UUID,
-      organizationId: Schema.UUID,
-      inputId: Schema.UUID,
-      kind: Schema.Literal("created", "prompted", "stop"),
-      body: Schema.String,
-      marker: Schema.String,
-      createdAt: Schema.Number.pipe(
-        Schema.int(),
-        Schema.between(0, 1_000_000_000),
-      ),
-    },
-    ({ sessionId, organizationId, inputId, kind, body, marker, createdAt }) =>
-      withRepos(
-        Effect.gen(function* () {
-          const runRepo = yield* RunRepo;
-          const repo = yield* RunInputRepo;
-          const sid = makeSessionId(sessionId);
-          yield* runRepo.create({
-            sessionId: sid,
-            organizationId: makeOrganizationId(organizationId),
-            issueId: Option.none(),
-            now: createdAt,
-          });
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          sessionId: fc.uuid(),
+          organizationId: fc.uuid(),
+          inputId: fc.uuid(),
+          kind: fc.constantFrom(...(["created", "prompted", "stop"] as const)),
+          body: fc.string(),
+          marker: fc.string(),
+          createdAt: fc
+            .integer({ min: 0, max: 1_000_000_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 0, maximum: 1_000_000_000 }),
+                  ),
+                ),
+              ),
+            ),
+        });
+        const check = ({
+          sessionId,
+          organizationId,
+          inputId,
+          kind,
+          body,
+          marker,
+          createdAt,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withRepos(
+            Effect.gen(function* () {
+              const runRepo = yield* RunRepo;
+              const repo = yield* RunInputRepo;
+              const sid = makeSessionId(sessionId);
+              yield* runRepo.create({
+                sessionId: sid,
+                organizationId: makeOrganizationId(organizationId),
+                issueId: Option.none(),
+                now: createdAt,
+              });
 
-          const input = {
-            id: makeInputId(inputId),
-            sessionId: sid,
-            kind,
-            body,
-            payload: { marker },
-            createdAt,
-          };
-          expect(yield* repo.enqueue(input)).toBe(true);
-          expect(yield* repo.enqueue(input)).toBe(false);
+              const input = {
+                id: makeInputId(inputId),
+                sessionId: sid,
+                kind,
+                body,
+                payload: { marker },
+                createdAt,
+              };
+              expect(yield* repo.enqueue(input)).toBe(true);
+              expect(yield* repo.enqueue(input)).toBe(false);
 
-          const pending = yield* repo.pending(sid);
-          expect(pending).toHaveLength(1);
-          expect(pending[0]).toEqual(input);
-          expect(yield* repo.listSessionsWithPendingInputs()).toContain(sid);
+              const pending = yield* repo.pending(sid);
+              expect(pending).toHaveLength(1);
+              expect(pending[0]).toEqual(input);
+              expect(yield* repo.listSessionsWithPendingInputs()).toContain(
+                sid,
+              );
 
-          const latest = yield* repo.latestActionableInput(sid);
-          if (kind === "stop") {
-            expect(latest).toEqual(Option.none());
-          } else {
-            expect(latest).toEqual(
-              Option.some({ body, kind, payload: { marker } }),
-            );
-          }
+              const latest = yield* repo.latestActionableInput(sid);
+              if (kind === "stop") {
+                expect(latest).toEqual(Option.none());
+              } else {
+                expect(latest).toEqual(
+                  Option.some({ body, kind, payload: { marker } }),
+                );
+              }
 
-          yield* repo.markProcessed(input.id, createdAt + 1);
-          expect(yield* repo.pending(sid)).toEqual([]);
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+              yield* repo.markProcessed(input.id, createdAt + 1);
+              expect(yield* repo.pending(sid)).toEqual([]);
+            }),
+          );
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 
-  it.scopedLive.prop(
+  it.live(
     "AdminSessionRepo enforces inclusive expiry and single deletion",
-    {
-      organizationId: Schema.UUID,
-      tokenHash: Schema.String.pipe(Schema.minLength(1)),
-      csrfTokenHash: Schema.String.pipe(Schema.minLength(1)),
-      now: Schema.Number.pipe(Schema.int(), Schema.between(0, 1_000_000_000)),
-      ttl: Schema.Number.pipe(Schema.int(), Schema.between(1, 1_000_000)),
-    },
-    ({ organizationId, tokenHash, csrfTokenHash, now, ttl }) =>
-      withRepos(
-        Effect.gen(function* () {
-          const repo = yield* AdminSessionRepo;
-          const organization = makeOrganizationId(organizationId);
-          const expiresAt = now + ttl;
-          yield* repo.create({
-            organizationId: organization,
-            tokenHash,
-            csrfTokenHash,
-            expiresAt,
-            now,
-          });
+    () =>
+      Effect.gen(function* () {
+        const cases = fc.record({
+          organizationId: fc.uuid(),
+          tokenHash: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          csrfTokenHash: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          now: fc
+            .integer({ min: 0, max: 1_000_000_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 0, maximum: 1_000_000_000 }),
+                  ),
+                ),
+              ),
+            ),
+          ttl: fc
+            .integer({ min: 1, max: 1_000_000 })
+            .filter(
+              Schema.is(
+                Schema.Number.pipe(
+                  Schema.check(Schema.isInt()),
+                  Schema.check(
+                    Schema.isBetween({ minimum: 1, maximum: 1_000_000 }),
+                  ),
+                ),
+              ),
+            ),
+        });
+        const check = ({
+          organizationId,
+          tokenHash,
+          csrfTokenHash,
+          now,
+          ttl,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          withRepos(
+            Effect.gen(function* () {
+              const repo = yield* AdminSessionRepo;
+              const organization = makeOrganizationId(organizationId);
+              const expiresAt = now + ttl;
+              yield* repo.create({
+                organizationId: organization,
+                tokenHash,
+                csrfTokenHash,
+                expiresAt,
+                now,
+              });
 
-          expect(yield* repo.get(tokenHash, now)).toEqual(
-            Option.some({ organizationId: organization, csrfTokenHash }),
+              expect(yield* repo.get(tokenHash, now)).toEqual(
+                Option.some({ organizationId: organization, csrfTokenHash }),
+              );
+              expect(yield* repo.get(tokenHash, expiresAt)).toEqual(
+                Option.some({ organizationId: organization, csrfTokenHash }),
+              );
+              expect(yield* repo.get(tokenHash, expiresAt + 1)).toEqual(
+                Option.none(),
+              );
+              expect(yield* repo.deleteAdminSession(tokenHash)).toBe(true);
+              expect(yield* repo.deleteAdminSession(tokenHash)).toBe(false);
+              expect(yield* repo.get(tokenHash, now)).toEqual(Option.none());
+            }),
           );
-          expect(yield* repo.get(tokenHash, expiresAt)).toEqual(
-            Option.some({ organizationId: organization, csrfTokenHash }),
-          );
-          expect(yield* repo.get(tokenHash, expiresAt + 1)).toEqual(
-            Option.none(),
-          );
-          expect(yield* repo.deleteAdminSession(tokenHash)).toBe(true);
-          expect(yield* repo.deleteAdminSession(tokenHash)).toBe(false);
-          expect(yield* repo.get(tokenHash, now)).toEqual(Option.none());
-        }),
-      ),
-    { timeout: 15_000, fastCheck: { numRuns: 20 } },
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 15_000 },
   );
 });
 
 describe("Lease-fenced run writes", () => {
-  it.scopedLive(
+  it.live(
     "rejects completion and metadata writes from a replaced lease owner",
     () =>
       withRepos(
@@ -1454,13 +1823,15 @@ describe("Lease-fenced run writes", () => {
           ]) {
             const result = yield* repo
               .update(sid, { ...patch, leaseOwner: "old-owner" })
-              .pipe(Effect.either);
-            expect(Either.isLeft(result)).toBe(true);
+              .pipe(Effect.result);
+            expect(Result.isFailure(result)).toBe(true);
           }
           const run = Option.getOrThrow(yield* repo.get(sid));
           expect(run.state).toBe("queued");
           expect(run.ompSessionId).toEqual(Option.none());
-          expect(yield* RunEventRepo.list(sid)).toEqual([]);
+          expect(
+            yield* RunEventRepo.use((service) => service.list(sid)),
+          ).toEqual([]);
           yield* repo.update(sid, {
             leaseOwner: "new-owner",
             state: "succeeded",
@@ -1472,28 +1843,32 @@ describe("Lease-fenced run writes", () => {
       ),
   );
 
-  it.scopedLive(
-    "rejects writes after expiry even before another owner claims",
-    () =>
-      withRepos(
-        Effect.gen(function* () {
-          const sid = makeSessionId("expired-write");
-          yield* RunRepo.create({
+  it.live("rejects writes after expiry even before another owner claims", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const sid = makeSessionId("expired-write");
+        yield* RunRepo.use((service) =>
+          service.create({
             sessionId: sid,
             organizationId: makeOrganizationId("org"),
             issueId: Option.none(),
-          });
-          const now = yield* Clock.currentTimeMillis;
-          yield* RunRepo.claimLease(sid, "expired-owner", 10, now - 100);
-          expect(
-            Either.isLeft(
-              yield* RunRepo.update(sid, {
+          }),
+        );
+        const now = yield* Clock.currentTimeMillis;
+        yield* RunRepo.use((service) =>
+          service.claimLease(sid, "expired-owner", 10, now - 100),
+        );
+        expect(
+          Result.isFailure(
+            yield* RunRepo.use((service) =>
+              service.update(sid, {
                 leaseOwner: "expired-owner",
                 state: "succeeded",
-              }).pipe(Effect.either),
-            ),
-          ).toBe(true);
-        }),
-      ),
+              }),
+            ).pipe(Effect.result),
+          ),
+        ).toBe(true);
+      }),
+    ),
   );
 });

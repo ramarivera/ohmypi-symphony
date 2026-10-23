@@ -40,7 +40,7 @@ describe("prompt template substitution", () => {
 
 describe("PromptTemplateRepo", () => {
   it("upserts, scopes, lists, and removes templates by organization and kind", async () => {
-    const layer = PromptTemplateRepo.Default.pipe(
+    const layer = PromptTemplateRepo.layer.pipe(
       Layer.provide(SqliteClientLive(":memory:")),
     );
     const result = await Effect.runPromise(

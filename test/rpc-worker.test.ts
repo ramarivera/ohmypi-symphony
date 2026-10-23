@@ -2,14 +2,15 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   Deferred,
   Effect,
-  Either,
   Fiber,
-  HashMap,
+  Layer,
   Logger,
-  LogLevel,
   Option,
+  References,
+  Result,
   Schema,
 } from "effect";
+import * as fc from "fast-check";
 import { RpcWorker } from "../src/services/rpc-worker.js";
 import { testPaths } from "./fixtures/paths.js";
 
@@ -72,18 +73,19 @@ await Bun.sleep(60_000);
 const testPath = testPaths();
 
 describe("RpcWorker", () => {
-  const Live = RpcWorker.Default;
+  const Live = RpcWorker.layer;
 
   it.effect(
     "keeps prepared PATH through spawn without Nix store settings",
     () =>
       Effect.gen(function* () {
         const preparedPath = `/nix/store/prepared-tool/bin:${process.env.PATH ?? ""}`;
-        const worker = yield* RpcWorker.spawn({
-          command: [
-            process.execPath,
-            "-e",
-            `
+        const worker = yield* RpcWorker.use((service) =>
+          service.spawn({
+            command: [
+              process.execPath,
+              "-e",
+              `
             if (process.env.PATH !== ${JSON.stringify(preparedPath)})
               throw new Error("Prepared PATH was lost");
             for (const key of ["NIX_REMOTE", "NIX_CONFIG", "NIX_PATH", "NIX_PROFILES"])
@@ -91,16 +93,17 @@ describe("RpcWorker", () => {
                 throw new Error("Worker inherited " + key);
             await import(${JSON.stringify(fixture)});
           `,
-          ],
-          cwd: process.cwd(),
-          env: {
-            PATH: preparedPath,
-            NIX_REMOTE: "local?read-only=true",
-            NIX_CONFIG: "store = daemon",
-            NIX_PATH: "nixpkgs=/gateway/nixpkgs",
-            NIX_PROFILES: "/gateway/profile",
-          },
-        });
+            ],
+            cwd: process.cwd(),
+            env: {
+              PATH: preparedPath,
+              NIX_REMOTE: "local?read-only=true",
+              NIX_CONFIG: "store = daemon",
+              NIX_PATH: "nixpkgs=/gateway/nixpkgs",
+              NIX_PROFILES: "/gateway/profile",
+            },
+          }),
+        );
         yield* worker.start();
         yield* worker.stop();
       }).pipe(Effect.provide(Live)),
@@ -151,7 +154,7 @@ describe("RpcWorker", () => {
           event.type === "prompt_result" &&
           (event as { agentInvoked?: boolean }).agentInvoked === false
         ) {
-          Deferred.unsafeDone(seen, Effect.void);
+          Deferred.doneUnsafe(seen, Effect.void);
         }
       });
 
@@ -187,7 +190,7 @@ describe("RpcWorker", () => {
       yield* worker.onEvent((event) => {
         events.push(event);
         if (needed.every((type) => events.some((e) => e.type === type))) {
-          Deferred.unsafeDone(seen, Effect.void);
+          Deferred.doneUnsafe(seen, Effect.void);
         }
       });
 
@@ -263,20 +266,22 @@ describe("RpcWorker", () => {
   it.live("refuses start after stop without spawning a process", () =>
     Effect.gen(function* () {
       const marker = testPath("stopped-worker.txt");
-      const worker = yield* RpcWorker.spawn({
-        command: [
-          process.execPath,
-          "-e",
-          `await Bun.write(${JSON.stringify(marker)}, "spawned");`,
-        ],
-        cwd: process.cwd(),
-      });
+      const worker = yield* RpcWorker.use((service) =>
+        service.spawn({
+          command: [
+            process.execPath,
+            "-e",
+            `await Bun.write(${JSON.stringify(marker)}, "spawned");`,
+          ],
+          cwd: process.cwd(),
+        }),
+      );
       yield* worker.stop();
-      const result = yield* Effect.either(worker.start());
-      expect(Either.isLeft(result)).toBe(true);
-      if (Either.isLeft(result)) {
-        expect(result.left._tag).toBe("@Gateway/RpcProtocolError");
-        expect(result.left.message).toBe("RPC worker is stopping");
+      const result = yield* Effect.result(worker.start());
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure._tag).toBe("@Gateway/RpcProtocolError");
+        expect(result.failure.message).toBe("RPC worker is stopping");
       }
       expect(yield* Effect.promise(() => Bun.file(marker).exists())).toBe(
         false,
@@ -307,54 +312,76 @@ describe("RpcWorker", () => {
     }).pipe(Effect.provide(Live)),
   );
 
-  it.scopedLive.prop(
+  it.live(
     "generated UI responses are emitted and acknowledged over the protocol",
-    {
-      requestId: Schema.String.pipe(Schema.minLength(1)),
-      confirmed: Schema.Boolean,
-    },
-    ({ requestId, confirmed }) =>
+    () =>
       Effect.gen(function* () {
-        const rpc = yield* RpcWorker;
-        const worker = yield* rpc.spawn({
-          command: ["bun", "-e", uiResponseFixture],
-          cwd: process.cwd(),
+        const cases = fc.record({
+          requestId: fc
+            .string()
+            .filter(
+              Schema.is(
+                Schema.String.pipe(Schema.check(Schema.isMinLength(1))),
+              ),
+            ),
+          confirmed: fc.boolean(),
         });
-        yield* worker.start();
-        return yield* Effect.gen(function* () {
-          const acknowledged = yield* Deferred.make<{
-            readonly type: string;
-            readonly id: string;
-            readonly confirmed: boolean;
-          }>();
-          yield* worker.onEvent((event) => {
-            if (
-              event.type === "extension_ui_response_ack" &&
-              event.id === requestId &&
-              typeof event.confirmed === "boolean"
-            ) {
-              Deferred.unsafeDone(
-                acknowledged,
-                Effect.succeed(
-                  event as {
-                    readonly type: string;
-                    readonly id: string;
-                    readonly confirmed: boolean;
-                  },
-                ),
-              );
-            }
-          });
-          yield* worker.respondToUi(requestId, { confirmed });
-          const event = yield* Deferred.await(acknowledged);
-          expect(event).toEqual({
-            type: "extension_ui_response_ack",
-            id: requestId,
-            confirmed,
-          });
-        }).pipe(Effect.ensuring(worker.stop()));
-      }).pipe(Effect.provide(Live)),
-    { fastCheck: { numRuns: 20 }, timeout: 120_000 },
+        const check = ({
+          requestId,
+          confirmed,
+        }: typeof cases extends fc.Arbitrary<infer A> ? A : never) =>
+          Effect.gen(function* () {
+            const rpc = yield* RpcWorker;
+            const worker = yield* rpc.spawn({
+              command: ["bun", "-e", uiResponseFixture],
+              cwd: process.cwd(),
+            });
+            yield* worker.start();
+            return yield* Effect.gen(function* () {
+              const acknowledged = yield* Deferred.make<{
+                readonly type: string;
+                readonly id: string;
+                readonly confirmed: boolean;
+              }>();
+              yield* worker.onEvent((event) => {
+                if (
+                  event.type === "extension_ui_response_ack" &&
+                  event.id === requestId &&
+                  typeof event.confirmed === "boolean"
+                ) {
+                  Deferred.doneUnsafe(
+                    acknowledged,
+                    Effect.succeed(
+                      event as {
+                        readonly type: string;
+                        readonly id: string;
+                        readonly confirmed: boolean;
+                      },
+                    ),
+                  );
+                }
+              });
+              yield* worker.respondToUi(requestId, { confirmed });
+              const event = yield* Deferred.await(acknowledged);
+              expect(event).toEqual({
+                type: "extension_ui_response_ack",
+                id: requestId,
+                confirmed,
+              });
+            }).pipe(Effect.ensuring(worker.stop()));
+          }).pipe(Effect.provide(Live));
+        const context =
+          yield* Effect.context<Effect.Services<ReturnType<typeof check>>>();
+        yield* Effect.promise(() =>
+          fc.assert(
+            fc.asyncProperty(cases, (sample) =>
+              Effect.runPromiseWith(context)(check(sample)),
+            ),
+            { numRuns: 20 },
+          ),
+        );
+      }),
+    { timeout: 120_000 },
   );
 });
 
@@ -369,16 +396,16 @@ describe("RPC liveness regressions", () => {
         requestTimeoutMs: 30,
       });
       yield* worker.start();
-      const result = yield* worker.getState().pipe(Effect.either);
-      expect(Either.isLeft(result)).toBe(true);
-      if (Either.isLeft(result)) {
-        expect(result.left).toMatchObject({
+      const result = yield* worker.getState().pipe(Effect.result);
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toMatchObject({
           _tag: "@Gateway/RpcTimeoutError",
           method: "get_state",
         });
       }
       yield* worker.stop();
-    }).pipe(Effect.provide(RpcWorker.Default)),
+    }).pipe(Effect.provide(RpcWorker.layer)),
   );
 
   it.live.each([
@@ -402,18 +429,18 @@ describe("RPC liveness regressions", () => {
       const failed = yield* Deferred.make<void>();
       yield* worker.onEvent((event) => {
         if (event.type === "worker_exited")
-          Deferred.unsafeDone(failed, Effect.void);
+          Deferred.doneUnsafe(failed, Effect.void);
       });
       yield* worker.start();
-      const prompt = yield* Effect.fork(
+      const prompt = yield* Effect.forkChild(
         worker.prompt(message).pipe(Effect.ignore),
       );
       yield* Deferred.await(failed).pipe(Effect.timeout("2 seconds"));
       yield* Fiber.join(prompt);
-      const state = yield* worker.getState().pipe(Effect.either);
-      expect(Either.isLeft(state)).toBe(true);
+      const state = yield* worker.getState().pipe(Effect.result);
+      expect(Result.isFailure(state)).toBe(true);
       yield* worker.stop();
-    }).pipe(Effect.provide(RpcWorker.Default)),
+    }).pipe(Effect.provide(RpcWorker.layer)),
   );
 });
 
@@ -432,7 +459,7 @@ describe("Worker process tree cleanup", () => {
       const child = yield* Deferred.make<number>();
       yield* worker.onEvent((event) => {
         if (event.type === "child_spawned" && typeof event.pid === "number")
-          Deferred.unsafeDone(child, Effect.succeed(event.pid));
+          Deferred.doneUnsafe(child, Effect.succeed(event.pid));
       });
       yield* worker.start();
       const childPid = yield* Deferred.await(child).pipe(
@@ -440,10 +467,10 @@ describe("Worker process tree cleanup", () => {
       );
       yield* worker.stop();
       const alive = yield* Effect.try(() => process.kill(childPid, 0)).pipe(
-        Effect.either,
+        Effect.result,
       );
-      expect(Either.isLeft(alive)).toBe(true);
-    }).pipe(Effect.provide(RpcWorker.Default)),
+      expect(Result.isFailure(alive)).toBe(true);
+    }).pipe(Effect.provide(RpcWorker.layer)),
   );
 
   it.live("logs the gateway session on worker failure", () => {
@@ -451,7 +478,8 @@ describe("Worker process tree cleanup", () => {
     const logger = Logger.make((options) => {
       if (String(options.message).includes("worker.failed"))
         sessionIds.push(
-          Option.getOrNull(HashMap.get(options.annotations, "sessionId")),
+          options.fiber.getRef(References.CurrentLogAnnotations).sessionId ??
+            null,
         );
     });
     return Effect.gen(function* () {
@@ -464,15 +492,14 @@ describe("Worker process tree cleanup", () => {
       const failed = yield* Deferred.make<void>();
       yield* worker.onEvent((event) => {
         if (event.type === "worker_exited")
-          Deferred.unsafeDone(failed, Effect.void);
+          Deferred.doneUnsafe(failed, Effect.void);
       });
       yield* worker.start();
       yield* worker.prompt("crash after ready").pipe(Effect.ignore);
       yield* Deferred.await(failed).pipe(Effect.timeout("1 second"));
       expect(sessionIds).toEqual(["gateway-session"]);
     }).pipe(
-      Effect.provide(RpcWorker.Default),
-      Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+      Effect.provide(Layer.mergeAll(RpcWorker.layer, Logger.layer([logger]))),
     );
   });
 });
@@ -480,15 +507,17 @@ describe("Worker process tree cleanup", () => {
 describe("Worker fiber ownership", () => {
   it.live("keeps worker IO alive after the caller's startup fiber exits", () =>
     Effect.gen(function* () {
-      const worker = yield* RpcWorker.spawn({
-        command: [process.execPath, "run", fixture],
-        cwd: process.cwd(),
-      });
-      const startup = yield* Effect.fork(worker.start());
+      const worker = yield* RpcWorker.use((service) =>
+        service.spawn({
+          command: [process.execPath, "run", fixture],
+          cwd: process.cwd(),
+        }),
+      );
+      const startup = yield* Effect.forkChild(worker.start());
       yield* Fiber.join(startup);
       expect(yield* worker.getState()).toMatchObject({ sessionId: "omp-test" });
       yield* worker.stop();
-    }).pipe(Effect.provide(RpcWorker.Default)),
+    }).pipe(Effect.provide(RpcWorker.layer)),
   );
 });
 
@@ -507,17 +536,19 @@ describe("Bounded worker shutdown registrations", () => {
       return Effect.gen(function* () {
         yield* Effect.gen(function* () {
           for (let i = 0; i < 2; i++) {
-            const worker = yield* RpcWorker.spawn({
-              command: [process.execPath, "-e", ignoresStdinCloseFixture],
-              cwd: process.cwd(),
-            });
+            const worker = yield* RpcWorker.use((service) =>
+              service.spawn({
+                command: [process.execPath, "-e", ignoresStdinCloseFixture],
+                cwd: process.cwd(),
+              }),
+            );
             yield* worker.start();
           }
-        }).pipe(Effect.provide(RpcWorker.Default));
+        }).pipe(Effect.provide(RpcWorker.layer));
         expect(countsAtStop).toEqual([2, 2]);
       }).pipe(
-        Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
-        Logger.withMinimumLogLevel(LogLevel.Debug),
+        Effect.provide(Logger.layer([logger])),
+        Effect.provideService(References.MinimumLogLevel, "Debug"),
       );
     },
     { timeout: 15_000 },
@@ -531,23 +562,27 @@ describe("Bounded worker shutdown registrations", () => {
     return Effect.gen(function* () {
       yield* Effect.gen(function* () {
         for (let i = 0; i < 10; i++) {
-          const worker = yield* RpcWorker.spawn({
-            command: [process.execPath, "run", fixture],
-            cwd: process.cwd(),
-          });
+          const worker = yield* RpcWorker.use((service) =>
+            service.spawn({
+              command: [process.execPath, "run", fixture],
+              cwd: process.cwd(),
+            }),
+          );
           yield* worker.start();
           yield* worker.stop();
         }
-        const active = yield* RpcWorker.spawn({
-          command: [process.execPath, "run", fixture],
-          cwd: process.cwd(),
-        });
+        const active = yield* RpcWorker.use((service) =>
+          service.spawn({
+            command: [process.execPath, "run", fixture],
+            cwd: process.cwd(),
+          }),
+        );
         yield* active.start();
-      }).pipe(Effect.provide(RpcWorker.Default));
+      }).pipe(Effect.provide(RpcWorker.layer));
       expect(scopeCleanups).toBe(1);
     }).pipe(
-      Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
-      Logger.withMinimumLogLevel(LogLevel.Debug),
+      Effect.provide(Logger.layer([logger])),
+      Effect.provideService(References.MinimumLogLevel, "Debug"),
     );
   });
 });
