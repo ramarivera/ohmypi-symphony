@@ -1797,10 +1797,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
         command.push("--extension", deviationExtensionPath);
 
-        const environment = workerEnvironment(
-          process.env,
-          process.env.WORKER_UID,
-        );
+        const environment = workerEnvironment(process.env);
         if (process.env.WORKER_UID) {
           environment.HOME = join(cwd, ".omp-home");
           environment.TMPDIR = join(cwd, ".omp-tmp");

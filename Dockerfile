@@ -43,7 +43,7 @@ RUN apt-get update \
   && su -s /bin/sh bun -c 'HOME=/home/bun /tmp/nix-install --no-daemon' \
   && rm -f /tmp/nix-install \
   && install -d -m 0755 /etc/nix \
-  && printf '%s\n' 'experimental-features = nix-command flakes read-only-local-store' 'sandbox = false' 'build-users-group =' > /etc/nix/nix.conf \
+  && printf '%s\n' 'experimental-features = nix-command flakes' 'sandbox = false' 'build-users-group =' > /etc/nix/nix.conf \
   && ln -s "$(readlink -f /home/bun/.nix-profile)" /opt/nix \
   && apt-get purge -y --auto-remove curl xz-utils \
   && rm -rf /var/lib/apt/lists/*

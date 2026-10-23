@@ -181,7 +181,6 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
             TMPDIR: yield* configWithDefault("TMPDIR", "/tmp"),
             XDG_CONFIG_HOME: yield* configWithDefault("XDG_CONFIG_HOME", ""),
           },
-          workerUid,
         ),
         ...input.injectedEnv,
       };

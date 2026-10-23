@@ -74,6 +74,38 @@ const testPath = testPaths();
 describe("RpcWorker", () => {
   const Live = RpcWorker.Default;
 
+  it.effect(
+    "keeps prepared PATH through spawn without Nix store settings",
+    () =>
+      Effect.gen(function* () {
+        const preparedPath = `/nix/store/prepared-tool/bin:${process.env.PATH ?? ""}`;
+        const worker = yield* RpcWorker.spawn({
+          command: [
+            process.execPath,
+            "-e",
+            `
+            if (process.env.PATH !== ${JSON.stringify(preparedPath)})
+              throw new Error("Prepared PATH was lost");
+            for (const key of ["NIX_REMOTE", "NIX_CONFIG", "NIX_PATH", "NIX_PROFILES"])
+              if (process.env[key] !== undefined)
+                throw new Error("Worker inherited " + key);
+            await import(${JSON.stringify(fixture)});
+          `,
+          ],
+          cwd: process.cwd(),
+          env: {
+            PATH: preparedPath,
+            NIX_REMOTE: "local?read-only=true",
+            NIX_CONFIG: "store = daemon",
+            NIX_PATH: "nixpkgs=/gateway/nixpkgs",
+            NIX_PROFILES: "/gateway/profile",
+          },
+        });
+        yield* worker.start();
+        yield* worker.stop();
+      }).pipe(Effect.provide(Live)),
+  );
+
   it.effect("negotiates v2 and exposes session id/file/state", () =>
     Effect.gen(function* () {
       const rpc = yield* RpcWorker;
