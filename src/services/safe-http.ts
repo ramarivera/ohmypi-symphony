@@ -139,11 +139,12 @@ const pinnedRequest = (
     req.end();
   });
 
-export async function safeOAuthFetch(
+async function safeEndpointFetch(
   input: string | URL | Request,
   init: RequestInit = {},
   policy: NetworkPolicy = {},
   transport = nativeFetch,
+  streaming = false,
 ): Promise<Response> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5000);
@@ -187,7 +188,9 @@ export async function safeOAuthFetch(
       if (!chosen) throw new Error("OAuth endpoint did not resolve");
       const options = {
         ...init,
-        signal: controller.signal,
+        signal: init.signal
+          ? AbortSignal.any([controller.signal, init.signal])
+          : controller.signal,
         redirect: "manual" as const,
       };
       const response =
@@ -196,6 +199,7 @@ export async function safeOAuthFetch(
           : await transport(url, options);
       if ([301, 302, 303, 307, 308].includes(response.status)) {
         await response.body?.cancel();
+        if (streaming) throw new Error("MCP upstream redirects are forbidden");
         const location = response.headers.get("location");
         if (!location || hop === 3)
           throw new Error("OAuth redirect limit reached");
@@ -206,6 +210,7 @@ export async function safeOAuthFetch(
         url = next;
         continue;
       }
+      if (streaming) return response;
       const body = await readBoundedBody(response, MCP_MAX_RESPONSE_BYTES);
       return new Response(
         [204, 205, 304].includes(response.status) ? null : new Uint8Array(body),
@@ -224,3 +229,19 @@ export async function safeOAuthFetch(
     clearTimeout(timeout);
   }
 }
+
+/** OAuth exchanges are bounded, including their response bodies. */
+export const safeOAuthFetch = (
+  input: string | URL | Request,
+  init: RequestInit = {},
+  policy: NetworkPolicy = {},
+  transport = nativeFetch,
+): Promise<Response> => safeEndpointFetch(input, init, policy, transport);
+
+/** MCP streams keep the caller's abort signal after the header deadline. */
+export const safeMcpFetch = (
+  input: string | URL,
+  init: RequestInit,
+  policy: NetworkPolicy,
+): Promise<Response> =>
+  safeEndpointFetch(input, init, policy, nativeFetch, true);

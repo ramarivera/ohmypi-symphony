@@ -71,6 +71,7 @@ import {
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { tokenContext } from "../src/services/token-migration.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const testPath = testPaths();
@@ -663,6 +664,116 @@ describe("SessionAuthority behavior invariants", () => {
     { timeout: 15_000 },
   );
   it.effect(
+    "records proxy renewal failures as run events and revokes its session bearer on shutdown",
+    () =>
+      withAuthority((db) =>
+        Effect.gen(function* () {
+          const authority = yield* SessionAuthority;
+          const repo = yield* McpServerRepo;
+          const cipher = yield* TokenCrypto;
+          const sid = testSessionId;
+          const org = testOrganizationId;
+          const serverId =
+            Schema.decodeUnknownSync(McpServerId)("proxy-events");
+          const url = "https://mcp.example/server";
+          const workspace = testPath("proxy-workspace");
+          yield* InstallationRepo.put(install(org));
+          yield* repo.createMcpServer({
+            organizationId: org,
+            id: serverId,
+            name: "renewal-test",
+            transport: "http",
+            url,
+            now: 1,
+          });
+          const encrypt = (field: string, value: string) =>
+            cipher.encrypt(
+              value,
+              tokenContext("mcp_oauth_credential", org, serverId, field),
+            );
+          const client = yield* encrypt(
+            "client_json",
+            JSON.stringify({
+              clientId: "client",
+              clientSecret: "gateway-client-secret",
+              authorizationEndpoint: "https://mcp.example/authorize",
+              tokenEndpoint: "https://mcp.example/token",
+            }),
+          );
+          const access = yield* encrypt(
+            "access_token",
+            "gateway-access-secret",
+          );
+          // Missing refresh material fails locally without an external request.
+          db.query(
+            "INSERT INTO mcp_oauth_credential (organization_id, server_id, server_url, client_json, access_token, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          ).run(
+            org,
+            serverId,
+            url,
+            `mcpenc:v1:${client}`,
+            `mcpenc:v1:${access}`,
+            0,
+            1,
+            1,
+          );
+          yield* RunRepo.create({
+            sessionId: sid,
+            organizationId: org,
+            issueId: Option.none(),
+          });
+          yield* RunRepo.update(sid, {
+            state: "orphaned",
+            workspacePath: Option.some(workspace),
+            ompSessionFile: Option.some(join(workspace, "session.jsonl")),
+          });
+          yield* authority.processSession(sid);
+          const contents = yield* Effect.promise(() =>
+            readFile(join(workspace, "mcp.json"), "utf8"),
+          );
+          const config = JSON.parse(contents) as {
+            mcpServers: Record<
+              string,
+              { url: string; headers: Record<string, string> }
+            >;
+          };
+          const server = config.mcpServers["renewal-test"];
+          if (server === undefined)
+            throw new Error("Expected gateway MCP proxy configuration");
+          expect(contents).not.toContain("gateway-access-secret");
+          expect(contents).not.toContain("gateway-client-secret");
+          expect(JSON.stringify(workerSpawnInputs)).not.toContain(
+            "gateway-access-secret",
+          );
+          const response = yield* Effect.promise(() =>
+            fetch(server.url, {
+              method: "POST",
+              headers: server.headers,
+              body: "{}",
+            }),
+          );
+          expect(response.status).toBe(502);
+          const events = yield* RunEventRepo.list(sid);
+          expect(
+            events.find((event) => event.kind === "mcp_refresh_failed"),
+          ).toMatchObject({
+            level: "error",
+            text: Option.some(
+              "MCP credential renewal failed for renewal-test. Reconnect this server in the gateway and retry the tool call.",
+            ),
+            payload: { serverId },
+          });
+          expect(JSON.stringify(events)).not.toContain("gateway-client-secret");
+          yield* authority.shutdown();
+          yield* Effect.promise(() =>
+            expect(
+              fetch(server.url, { headers: server.headers }),
+            ).rejects.toThrow(),
+          );
+        }),
+      ),
+  );
+  it.effect(
     "routes MCP decrypt failures through retry handling",
     () =>
       withAuthority((db) =>
@@ -1028,6 +1139,7 @@ const withAuthority = <A, E>(
     | InstallationRepo
     | McpServerRepo
     | McpOAuth
+    | TokenCrypto
     | PromptTemplateRepo
     | WorkspaceRepo
     | NixEnvironment

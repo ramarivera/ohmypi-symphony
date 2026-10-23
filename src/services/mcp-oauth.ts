@@ -9,6 +9,7 @@ import {
   DatabaseError,
   McpOAuthError,
   OAuthStateError,
+  type RowDecodeError,
   type TokenCipherError,
   TokenRefreshError,
 } from "../domain/errors.js";
@@ -708,7 +709,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         string,
         Deferred.Deferred<
           McpOAuthToken,
-          DatabaseError | TokenCipherError | TokenRefreshError
+          DatabaseError | RowDecodeError | TokenCipherError | TokenRefreshError
         >
       >(),
     );
@@ -1266,7 +1267,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       now: number,
     ): Effect.fn.Return<
       McpOAuthToken,
-      DatabaseError | TokenCipherError | TokenRefreshError
+      DatabaseError | RowDecodeError | TokenCipherError | TokenRefreshError
     > {
       const refreshToken = current.token.refreshToken;
       if (refreshToken === undefined) {
@@ -1277,7 +1278,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       const key = `${organizationId}:${serverId}`;
       const mine = yield* Deferred.make<
         McpOAuthToken,
-        DatabaseError | TokenCipherError | TokenRefreshError
+        DatabaseError | RowDecodeError | TokenCipherError | TokenRefreshError
       >();
       const claim = yield* Ref.modify(refreshState, (flights) => {
         const existing = flights.get(key);
@@ -1288,42 +1289,80 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           Option.none<
             Deferred.Deferred<
               McpOAuthToken,
-              DatabaseError | TokenCipherError | TokenRefreshError
+              | DatabaseError
+              | RowDecodeError
+              | TokenCipherError
+              | TokenRefreshError
             >
           >(),
           next,
         ] as const;
       });
       if (Option.isSome(claim)) return yield* Deferred.await(claim.value);
-      const refreshed = yield* refreshAccessToken(
-        current.client,
-        refreshToken,
-        fetch,
-        now,
-        current.serverUrl,
-        { allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp },
-      ).pipe(
-        Effect.tap((token) =>
-          persistRefreshedToken(
-            organizationId,
-            serverId,
-            token,
-            now,
-            current.updatedAt,
-          ).pipe(
-            Effect.flatMap((persisted) =>
-              persisted
-                ? Effect.succeed(undefined)
-                : Effect.fail(
-                    new TokenRefreshError({
-                      organizationId,
-                      message:
-                        "MCP OAuth credential changed while refreshing; discarded refreshed token",
-                    }),
-                  ),
+      // A caller can have read the old row before the previous flight completed.
+      // Re-read after claiming, so rotated refresh tokens are never replayed.
+      const refresh = Effect.gen(function* () {
+        const latest = yield* getCredentialDetails(organizationId, serverId);
+        if (Option.isNone(latest))
+          return yield* Effect.fail(
+            new TokenRefreshError({
+              organizationId,
+              message: "MCP OAuth credential disconnected while refreshing",
+            }),
+          );
+        if (latest.value.serverUrl !== current.serverUrl)
+          return yield* Effect.fail(
+            new TokenRefreshError({
+              organizationId,
+              message: "MCP OAuth credential URL changed while refreshing",
+            }),
+          );
+        if (
+          (latest.value.updatedAt !== current.updatedAt ||
+            latest.value.token.accessToken !== current.token.accessToken) &&
+          latest.value.token.expiresAt > now + 60_000
+        )
+          return latest.value.token;
+        const source = latest.value;
+        if (source.token.refreshToken === undefined)
+          return yield* Effect.fail(
+            new TokenRefreshError({
+              organizationId,
+              message: "MCP OAuth refresh token is missing",
+            }),
+          );
+        return yield* refreshAccessToken(
+          source.client,
+          source.token.refreshToken,
+          fetch,
+          now,
+          source.serverUrl,
+          { allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp },
+        ).pipe(
+          Effect.tap((token) =>
+            persistRefreshedToken(
+              organizationId,
+              serverId,
+              token,
+              now,
+              source.updatedAt,
+            ).pipe(
+              Effect.flatMap((persisted) =>
+                persisted
+                  ? Effect.succeed(undefined)
+                  : Effect.fail(
+                      new TokenRefreshError({
+                        organizationId,
+                        message:
+                          "MCP OAuth credential changed while refreshing; discarded refreshed token",
+                      }),
+                    ),
+              ),
             ),
           ),
-        ),
+        );
+      });
+      const refreshed = yield* refresh.pipe(
         Effect.tap((token) => Deferred.succeed(mine, token)),
         Effect.tapError((error) => Deferred.fail(mine, error)),
         Effect.onExit((exit) => Deferred.done(mine, exit)),
@@ -1341,12 +1380,30 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
     const mintCredential = Effect.fn("McpOAuth.mintCredential")(function* (
       organizationId: OrganizationId,
       serverId: McpServerId,
+      options: {
+        readonly rejectedAccessToken?: string;
+        readonly serverUrl?: string;
+      } = {},
     ) {
       const details = yield* getCredentialDetails(organizationId, serverId);
       if (Option.isNone(details)) return Option.none<McpOAuthToken>();
       const now = yield* Clock.currentTimeMillis;
       const current = details.value;
-      if (current.token.expiresAt > now + 60_000)
+      if (
+        options.serverUrl !== undefined &&
+        options.serverUrl !== current.serverUrl
+      )
+        return yield* Effect.fail(
+          new TokenRefreshError({
+            organizationId,
+            message:
+              "MCP OAuth credential URL no longer matches the worker server",
+          }),
+        );
+      if (
+        current.token.expiresAt > now + 60_000 &&
+        current.token.accessToken !== options.rejectedAccessToken
+      )
         return Option.some(current.token);
       if (current.token.refreshToken === undefined) {
         return yield* Effect.fail(

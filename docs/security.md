@@ -59,9 +59,11 @@ paths and doesn't depend on the helper's cwd.
 
 MCP configuration is projected to its generated `mcpServers` fields before helper
 stdin is serialized. OAuth client records and renewal fields never cross that uid
-boundary. Agent database inputs contain only server URLs and short-lived access
-tokens with expirations. Git persistence sends only the repository-scoped header
-string on stdin, never argv; cleanup operations carry no credential payload.
+boundary. Agent database inputs are empty for gateway-managed OAuth servers.
+Generated MCP configuration contains only a loopback URL and the worker session's
+proxy bearer; upstream access tokens stay in the gateway. Git persistence sends
+only the repository-scoped header string on stdin, never argv; cleanup operations
+carry no credential payload.
 
 Retention removes workspace contents as the worker uid while holding its synchronous
 SQLite reopen fence. Before delegation, the gateway migrates legacy ownership with
@@ -104,12 +106,47 @@ redirects fail. Responses are bounded while streaming and have a five-second
 request timeout. `MCP_OAUTH_ALLOW_LOOPBACK_HTTP=true` explicitly enables local
 HTTP development. It doesn't allow private LAN or metadata endpoints.
 
-Workers receive only access tokens expiring within one hour. Refresh tokens,
-OAuth client secrets and token endpoints stay in the gateway. Providers issuing
-non-expiring or longer-lived access tokens fail worker startup; configure a
-shorter token lifetime at the provider. A running worker can't renew its own MCP
-token. Long-running sessions may need a gateway-managed restart/reconnect after
-expiry; this change doesn't add live token delivery to an already-running omp.
+Gateway-managed OAuth servers use a per-worker MCP proxy listening on IPv4
+loopback at an ephemeral port. Each worker gets a random 256-bit bearer scoped to
+its configured OAuth servers. No upstream access token, refresh token, OAuth
+client secret or token endpoint crosses the worker boundary. The agent database
+is still created through the worker-uid helper, with no OAuth rows. A tracked or
+foreign `mcp.json` causes startup to fail when a proxy is required, so a skipped
+write can't silently bypass renewal.
+
+The gateway checks credentials before every proxied request, refreshing within
+60 seconds of expiry and retrying one upstream 401 with a renewed token. Refreshes
+single-flight per organization/server credential, including simultaneous requests
+from different sessions. A second credential read after claiming the flight
+prevents replay of a rotated refresh token from a stale reader. Refresh failures
+return a generic 502 and persist an `mcp_refresh_failed` run event naming the
+server and asking the operator to reconnect it. Provider response bodies and
+credential values never enter those events. A subsequent request can retry after
+repair; a missing or changed credential fails closed.
+
+The proxy forwards MCP HTTP requests and streams, session/protocol headers, and
+legacy SSE endpoint events. Legacy endpoints become opaque local routes and must
+retain the configured upstream origin. Workers can't supply arbitrary targets or
+upstream authorization. Upstream DNS is validated and pinned, redirects are
+rejected, request bodies and legacy SSE events are bounded, and only protocol
+response headers reach workers. Closing or canceling a worker, losing its lease,
+failed startup, or gateway shutdown stops its listener and aborts its streams.
+The main HTTP listener has no new public route. Existing same-uid and peer-worker
+filesystem limitations still apply to session bearers.
+
+The runtime is pinned to OMP 17.1.8 in `package.json` and `Dockerfile`. Its
+`pi-ai/src/auth-storage.ts` caches credentials in `#data`, while
+`pi-coding-agent/src/mcp/manager.ts` resolves OAuth on connection and auth failure
+and retains resolved transport headers. Auth resolution can re-read SQLite rows,
+but it doesn't poll the file per request; the existing materializer replaces the
+database file instead of updating the open database. A file-based approach would
+need safe in-place updates and auth-failure/reconnect coordination.
+`config/resolve-config-value.ts` caches successful `!command` output for the
+process lifetime. The proxy keeps OMP's bearer stable while rotating upstream
+credentials. OMP's MCP refresh callback requires local refresh material and
+explicitly rejects its remote-broker refresh sentinel, so its model auth broker
+isn't a drop-in MCP renewal path here. This per-session bearer pattern overlaps with `sym-gmy.6`; hosting Linear
+tools for T3 remains separate work.
 
 ## Encryption rotation
 
