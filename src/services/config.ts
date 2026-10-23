@@ -7,8 +7,10 @@ import {
   Layer,
   Option,
   Redacted,
+  Result,
 } from "effect";
 import type { LogLevel } from "../domain/models.js";
+import { RUNTIME_MODES, type RuntimeMode } from "../drivers/driver.js";
 import { modelProvider } from "./worker-profile.js";
 export const LOG_FILE_FREQUENCIES = ["daily", "hourly"] as const;
 export type LogFileFrequency = (typeof LOG_FILE_FREQUENCIES)[number];
@@ -22,6 +24,53 @@ export interface LogFileConfig {
   readonly size: string;
   readonly limit: number;
 }
+export type T3TokenSource =
+  | { readonly _tag: "Inline"; readonly token: Redacted.Redacted<string> }
+  /** Re-read on every connect so a rotated token file is picked up. */
+  | { readonly _tag: "File"; readonly path: string };
+
+/** Settings for the gateway-owned per-session `t3 serve` launcher. */
+export interface T3LaunchConfig {
+  readonly _tag: "Launch";
+  readonly cliPath: string;
+  /** First loopback port; a session's port is portBase + its slot. */
+  readonly portBase: number;
+  readonly portCount: number;
+  readonly launchTimeoutMs: number;
+  readonly codexExecutable: string;
+  readonly claudeExecutable: string;
+  readonly codexModel: string;
+  readonly codexReasoningEffort: string;
+  readonly textGenerationModel: string;
+}
+
+/**
+ * Remote: one externally managed daemon shared by every T3 session. Launch:
+ * the gateway starts a private daemon per session under its worker uid.
+ */
+export type T3Connection =
+  | {
+      readonly _tag: "Remote";
+      readonly baseUrl: URL;
+      readonly token: T3TokenSource;
+    }
+  | T3LaunchConfig;
+
+export interface T3DriverConfig {
+  readonly connection: T3Connection;
+  readonly projectId?: string;
+  readonly providerInstanceId: string;
+  readonly model: string;
+  readonly modelOptions: ReadonlyArray<{
+    readonly id: string;
+    readonly value: string | boolean;
+  }>;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: "default" | "plan";
+  /** Prefix for every id the driver derives (threads, commands, messages). */
+  readonly idNamespace: string;
+}
+
 export interface GatewayConfigShape {
   readonly allowedOrganizationIds?: ReadonlySet<string> | undefined;
   readonly gatewayAdminOrganizationIds?: ReadonlySet<string> | undefined;
@@ -70,6 +119,8 @@ export interface GatewayConfigShape {
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
   readonly workerExtensionPaths?: ReadonlyArray<string>;
   readonly workerClaudeExecutable?: string;
+  /** Present only when T3_MODE or T3_BASE_URL is set. */
+  readonly t3Driver?: T3DriverConfig;
 }
 
 const positiveInteger = (name: string, fallback: number) =>
@@ -456,6 +507,235 @@ const workerModelRouting = Effect.fn("GatewayConfig.workerModelRouting")(
   },
 );
 
+const isRuntimeMode = (value: string): value is RuntimeMode =>
+  RUNTIME_MODES.some((mode) => mode === value);
+
+const t3ModelOptions = (
+  raw: string | undefined,
+): Result.Result<T3DriverConfig["modelOptions"], Config.ConfigError> => {
+  if (raw === undefined) return Result.succeed([]);
+  const invalid = Result.fail(
+    new Config.ConfigError(
+      new ConfigProvider.SourceError({
+        message:
+          'T3_MODEL_OPTIONS must be a JSON object of string or boolean values, e.g. {"effort":"high"}',
+      }),
+    ),
+  );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return invalid;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return invalid;
+  }
+  const options: Array<{ id: string; value: string | boolean }> = [];
+  for (const [id, value] of Object.entries(parsed)) {
+    if (id.trim().length === 0) return invalid;
+    if (typeof value === "boolean") {
+      options.push({ id: id.trim(), value });
+    } else if (typeof value === "string" && value.trim().length > 0) {
+      options.push({ id: id.trim(), value: value.trim() });
+    } else {
+      return invalid;
+    }
+  }
+  return Result.succeed(options);
+};
+
+const configFailure = (message: string) =>
+  Effect.fail(
+    new Config.ConfigError(new ConfigProvider.SourceError({ message })),
+  );
+
+const t3RemoteConnection = Effect.fn("GatewayConfig.t3RemoteConnection")(
+  function* (
+    baseUrlValue: string | undefined,
+  ): Effect.fn.Return<T3Connection, Config.ConfigError> {
+    if (baseUrlValue === undefined)
+      return yield* configFailure("T3_MODE=remote requires T3_BASE_URL");
+    const baseUrl = yield* Effect.try({
+      try: () => new URL(baseUrlValue),
+      catch: () =>
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: "T3_BASE_URL must be a valid URL",
+          }),
+        ),
+    });
+    if (
+      (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") ||
+      baseUrl.username !== "" ||
+      baseUrl.password !== "" ||
+      baseUrl.search !== "" ||
+      baseUrl.hash !== ""
+    )
+      return yield* configFailure(
+        "T3_BASE_URL must use http(s) without credentials, query, or fragment",
+      );
+    const allowPrivateNetworkHttp = yield* Config.Boolean(
+      "T3_ALLOW_PRIVATE_NETWORK_HTTP",
+    ).pipe(Config.withDefault(false));
+    if (baseUrl.protocol === "http:" && !allowPrivateNetworkHttp)
+      return yield* configFailure(
+        "T3_BASE_URL requires HTTPS unless T3_ALLOW_PRIVATE_NETWORK_HTTP=true on a trusted private network",
+      );
+    const tokenFile = yield* Config.option(Config.String("T3_TOKEN_FILE"));
+    const directToken = yield* Config.option(Config.String("T3_TOKEN"));
+    const hasDirectToken =
+      Option.isSome(directToken) && directToken.value.trim().length > 0;
+    // requiredValue validates that the file (or variable) yields a token now.
+    const token = yield* requiredValue("T3_TOKEN");
+    return {
+      _tag: "Remote",
+      baseUrl,
+      token:
+        !hasDirectToken &&
+        Option.isSome(tokenFile) &&
+        tokenFile.value.trim().length > 0
+          ? { _tag: "File", path: tokenFile.value.trim() }
+          : { _tag: "Inline", token: Redacted.make(token) },
+    };
+  },
+);
+
+const T3_SIMPLE_VALUE = /^[A-Za-z0-9._/-]{1,200}$/u;
+
+/** The only provider instances a launched daemon defines; both use CLIProxyAPI. */
+export const T3_LAUNCH_INSTANCES: ReadonlySet<string> = new Set([
+  "codex-cliproxy",
+  "claude-cliproxy",
+]);
+
+const t3LaunchConnection = Effect.fn("GatewayConfig.t3LaunchConnection")(
+  function* (
+    baseUrlValue: string | undefined,
+  ): Effect.fn.Return<T3Connection, Config.ConfigError> {
+    // A shared daemon endpoint or bearer would bypass per-session isolation.
+    if (
+      baseUrlValue !== undefined ||
+      (yield* optionalValue("T3_TOKEN")) !== undefined
+    )
+      return yield* configFailure(
+        "T3_MODE=launch starts a daemon per session; unset T3_BASE_URL, T3_TOKEN and T3_TOKEN_FILE",
+      );
+    const portBase = yield* positiveInteger("T3_PORT_BASE", 47100);
+    const portCount = yield* positiveInteger(
+      "T3_PORT_COUNT",
+      yield* positiveInteger("WORKER_UID_COUNT", 64),
+    );
+    if (
+      !Number.isSafeInteger(portBase) ||
+      !Number.isSafeInteger(portCount) ||
+      portBase < 1024 ||
+      portCount < 1 ||
+      portBase + portCount - 1 > 65535
+    )
+      return yield* configFailure(
+        "T3_PORT_BASE and T3_PORT_COUNT must describe unprivileged TCP ports",
+      );
+    const launchTimeoutMs = yield* timeoutMilliseconds(
+      "T3_LAUNCH_TIMEOUT_MS",
+      60_000,
+    );
+    const value = (name: string, fallback: string) =>
+      optionalValue(name).pipe(
+        Effect.map((raw) => raw ?? fallback),
+        Effect.filterOrElse(
+          (raw) => T3_SIMPLE_VALUE.test(raw),
+          () => configFailure(`${name} must be a plain path or identifier`),
+        ),
+      );
+    return {
+      _tag: "Launch",
+      cliPath: yield* value("T3_CLI_PATH", "t3"),
+      portBase,
+      portCount,
+      launchTimeoutMs,
+      codexExecutable: yield* value("T3_CODEX_EXECUTABLE", "codex"),
+      claudeExecutable: yield* value(
+        "T3_CLAUDE_EXECUTABLE",
+        (yield* optionalValue("WORKER_CLAUDE_EXECUTABLE")) ?? "claude-cliproxy",
+      ),
+      codexModel: yield* value("T3_CODEX_MODEL", "gpt-6-sol"),
+      codexReasoningEffort: yield* value("T3_CODEX_REASONING_EFFORT", "high"),
+      textGenerationModel: yield* value(
+        "T3_TEXT_GENERATION_MODEL",
+        "gpt-6-luna",
+      ),
+    };
+  },
+);
+
+const t3DriverConfig = Effect.fn("GatewayConfig.t3Driver")(
+  function* (): Effect.fn.Return<
+    T3DriverConfig | undefined,
+    Config.ConfigError
+  > {
+    const modeValue = yield* optionalValue("T3_MODE");
+    const baseUrlValue = yield* optionalValue("T3_BASE_URL");
+    if (modeValue === undefined && baseUrlValue === undefined) return undefined;
+    const mode = modeValue ?? "remote";
+    if (mode !== "launch" && mode !== "remote") {
+      return yield* configFailure("T3_MODE must be launch or remote");
+    }
+    const connection: T3Connection =
+      mode === "launch"
+        ? yield* t3LaunchConnection(baseUrlValue)
+        : yield* t3RemoteConnection(baseUrlValue);
+    const runtimeModeValue =
+      (yield* optionalValue("T3_RUNTIME_MODE")) ?? "auto";
+    if (!isRuntimeMode(runtimeModeValue)) {
+      return yield* Effect.fail(
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: `T3_RUNTIME_MODE must be one of ${RUNTIME_MODES.join(", ")}`,
+          }),
+        ),
+      );
+    }
+    const interactionMode =
+      (yield* optionalValue("T3_INTERACTION_MODE")) ?? "default";
+    if (interactionMode !== "default" && interactionMode !== "plan") {
+      return yield* Effect.fail(
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: "T3_INTERACTION_MODE must be default or plan",
+          }),
+        ),
+      );
+    }
+    const idNamespace = (yield* optionalValue("T3_ID_NAMESPACE")) ?? "symphony";
+    if (!/^[A-Za-z0-9_-]{1,32}$/u.test(idNamespace)) {
+      return yield* Effect.fail(
+        new Config.ConfigError(
+          new ConfigProvider.SourceError({
+            message: "T3_ID_NAMESPACE must be 1-32 letters, digits, '_' or '-'",
+          }),
+        ),
+      );
+    }
+    const modelOptions = t3ModelOptions(
+      yield* optionalValue("T3_MODEL_OPTIONS"),
+    );
+    if (Result.isFailure(modelOptions))
+      return yield* Effect.fail(modelOptions.failure);
+    const projectId = yield* optionalValue("T3_PROJECT_ID");
+    return {
+      connection,
+      ...(projectId === undefined ? {} : { projectId }),
+      providerInstanceId: yield* requiredValue("T3_PROVIDER_INSTANCE"),
+      model: yield* requiredValue("T3_MODEL"),
+      modelOptions: modelOptions.success,
+      runtimeMode: runtimeModeValue,
+      interactionMode,
+      idNamespace,
+    };
+  },
+);
+
 export class GatewayConfig extends Context.Service<GatewayConfig>()(
   "GatewayConfig",
   {
@@ -581,6 +861,18 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
         );
       }
       const routing = yield* workerModelRouting();
+      const t3Driver = yield* t3DriverConfig();
+      if (t3Driver?.connection._tag === "Launch") {
+        // Launched daemons only get the proxy client key, like OMP workers.
+        if (routing.cliproxyApiBaseUrl === undefined)
+          return yield* configFailure(
+            "T3_MODE=launch requires CLIPROXYAPI_BASE_URL and CLIPROXYAPI_API_KEY",
+          );
+        if (!T3_LAUNCH_INSTANCES.has(t3Driver.providerInstanceId))
+          return yield* configFailure(
+            `T3_MODE=launch supports T3_PROVIDER_INSTANCE ${[...T3_LAUNCH_INSTANCES].join(" or ")}`,
+          );
+      }
       return {
         ...values,
         ...routing,
@@ -589,6 +881,8 @@ export class GatewayConfig extends Context.Service<GatewayConfig>()(
         githubAppAllowedOwners,
         tokenEncryptionPreviousKeys:
           previousKeys === undefined ? undefined : Redacted.make(previousKeys),
+        // Spread so the service type keeps t3Driver optional.
+        ...(t3Driver === undefined ? {} : { t3Driver }),
         linearClientId,
         githubAppId,
         githubAppPrivateKey:

@@ -180,6 +180,7 @@ interface RepositoryPayload {
   readonly projectIds: ReadonlyArray<string>;
   readonly labels: ReadonlyArray<string>;
   readonly isDefault: boolean | undefined;
+  readonly defaultDriver: "omp" | "t3" | undefined;
   readonly nixPackages: ReadonlyArray<NixPackageName>;
 }
 
@@ -373,10 +374,18 @@ function repositoryPayload(
   if (Result.isFailure(labels)) return Result.fail(labels.failure);
   const nixPackages = optionalNixPackageArray(body.nixPackages);
   if (Result.isFailure(nixPackages)) return Result.fail(nixPackages.failure);
+  if (
+    body.defaultDriver !== undefined &&
+    body.defaultDriver !== "omp" &&
+    body.defaultDriver !== "t3"
+  ) {
+    return Result.fail("defaultDriver must be omp or t3");
+  }
   return Result.succeed({
     id,
     url,
     ref,
+    defaultDriver: body.defaultDriver,
     teamIds: teamIds.success,
     projectIds: projectIds.success,
     labels: labels.success,
@@ -396,6 +405,7 @@ export function toApiRepository(repository: RepositoryRecord) {
     projectIds: [...repository.projectIds],
     labels: [...repository.labels],
     isDefault: repository.isDefault,
+    defaultDriver: repository.defaultDriver ?? "omp",
     createdAt: repository.createdAt,
     updatedAt: repository.updatedAt,
   };
@@ -2088,6 +2098,7 @@ export const createAdminHandle = (deps: AdminDeps) =>
           labels: payload.labels,
           nixPackages: payload.nixPackages,
           isDefault: payload.isDefault ?? false,
+          defaultDriver: payload.defaultDriver ?? "omp",
           now,
         });
         return Option.some(
@@ -2157,6 +2168,9 @@ export const createAdminHandle = (deps: AdminDeps) =>
               projectIds,
               labels: payload.labels,
               nixPackages: payload.nixPackages,
+              ...(payload.defaultDriver === undefined
+                ? {}
+                : { defaultDriver: payload.defaultDriver }),
               ...(payload.isDefault !== undefined
                 ? { isDefault: payload.isDefault }
                 : {}),

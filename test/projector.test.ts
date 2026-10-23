@@ -5,6 +5,7 @@ import * as fc from "fast-check";
 import { describe, expect } from "vitest";
 import { LinearApiError } from "../src/domain/errors.js";
 import type { SessionId, SourceKey } from "../src/domain/ids.js";
+import { agentEventToRpc } from "../src/drivers/events.js";
 import { LinearGateway } from "../src/services/linear-gateway.js";
 import { redactStringValues } from "../src/services/linear-helpers.js";
 import {
@@ -234,6 +235,44 @@ describe("ActivityProjector", () => {
           body: "Completed",
         });
       }),
+    );
+
+    it.effect(
+      "deduplicates replayed driver actions across authority sequences",
+      () =>
+        Effect.gen(function* () {
+          resetMock();
+          const projector = yield* ActivityProjector;
+          const runRepo = yield* RunRepo;
+          yield* runRepo.create({
+            sessionId: makeSessionId("driver-replay"),
+            organizationId: "org" as never,
+            issueId: Option.none(),
+            now: 0,
+          });
+          const event = agentEventToRpc({
+            _tag: "ToolStarted",
+            key: "t3:thread:tool-1:started",
+            cursor: "cursor-1",
+            turnId: "turn-1",
+            toolCallId: "tool-1",
+            name: "bash",
+            input: "git status",
+          });
+          yield* projector.projectRpcEvent("driver-replay", 1, event);
+          yield* projector.projectRpcEvent("driver-replay", 99, event);
+          expect(mockState.activities).toEqual([
+            {
+              sessionId: "driver-replay",
+              content: {
+                type: "action",
+                action: "bash",
+                parameter: "git status",
+                ephemeral: true,
+              },
+            },
+          ]);
+        }),
     );
 
     it.effect(

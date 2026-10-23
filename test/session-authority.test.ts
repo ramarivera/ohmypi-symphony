@@ -1,5 +1,6 @@
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "@effect/vitest";
 import {
   Clock,
@@ -11,6 +12,7 @@ import {
   Layer,
   Option,
   Result,
+  Schedule,
   Schema,
 } from "effect";
 import { TestClock } from "effect/testing";
@@ -74,6 +76,7 @@ import {
 import { WorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { tokenContext } from "../src/services/token-migration.js";
+import { FakeT3Server } from "./fixtures/fake-t3.js";
 import { testPaths } from "./fixtures/paths.js";
 
 const testPath = testPaths();
@@ -1022,6 +1025,7 @@ const toolExternalUrlCalls: Array<{
     readonly url: string;
   }>;
 }> = [];
+let linearIssueLabels: ReadonlyArray<string> = [];
 let linearIssueLookupFails = false;
 let linearIssueStateType = "started";
 let elicitationWaiter: Deferred.Deferred<void, never> | undefined;
@@ -1215,7 +1219,7 @@ const mockToolsGateway = LinearGateway.of({
           delegateId: "authority-app-user",
           url: null,
           teamId: null,
-          labels: [],
+          labels: linearIssueLabels,
         }),
   updateIssue: () => Effect.void,
   addSessionExternalUrls: (input: {
@@ -1260,12 +1264,14 @@ const withAuthority = <A, E>(
     readonly config?: ReadonlyArray<readonly [string, string]>;
     readonly withLinearGateway?: boolean;
     readonly githubApp?: GitHubAppTokenService;
+    readonly workerUid?: string;
   },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
       authorityTestRoot = testPath("temporary");
       linearIssueLookupFails = false;
+      linearIssueLabels = [];
       linearIssueStateType = "started";
       toolExternalUrlCalls.length = 0;
       terminalFailure = undefined;
@@ -1312,7 +1318,12 @@ const withAuthority = <A, E>(
         RunInputRepo.layer,
         RunRepo.layer,
         WorkspaceRepo.layer,
-        WorkerIdentityRepo.layer,
+        options?.workerUid === undefined
+          ? WorkerIdentityRepo.layer
+          : Layer.succeed(WorkerIdentityRepo, {
+              acquire: () => Effect.succeed(options.workerUid),
+              release: () => Effect.void,
+            }),
         GitHubApp.layer,
         githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
@@ -3264,5 +3275,698 @@ describe("Recovery review regressions", () => {
           ).toBe("running");
         }),
       ),
+  );
+});
+
+const seedDriverRun = (
+  defaultDriver: "omp" | "t3",
+  labels: ReadonlyArray<string> = [],
+) =>
+  Effect.gen(function* () {
+    const installations = yield* InstallationRepo;
+    const repositories = yield* WorkspaceRepo;
+    const runs = yield* RunRepo;
+    const inputs = yield* RunInputRepo;
+    yield* installations.put(install(testOrganizationId));
+    const id = Schema.decodeUnknownSync(WorkspaceId)("driver-repo");
+    yield* repositories.createRepository({
+      organizationId: testOrganizationId,
+      id,
+      url: "https://github.com/org/repo.git",
+      ref: "main",
+      defaultDriver,
+    });
+    const cwd = testPath("driver-workspace");
+    const configPath = testPath("driver-workspace/.git/config");
+    yield* Effect.promise(() =>
+      writeFile(
+        configPath,
+        '[core]\nrepositoryformatversion = 0\n[http "https://github.com/"]\nextraheader = AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46c2VjcmV0\n',
+      ),
+    );
+    yield* runs.create({
+      sessionId: testSessionId,
+      organizationId: testOrganizationId,
+      issueId: Option.some(testIssueId),
+    });
+    yield* runs.update(testSessionId, {
+      repositoryId: Option.some(id),
+      workspacePath: Option.some(cwd),
+    });
+    yield* inputs.enqueue({
+      id: Schema.decodeUnknownSync(InputId)("driver-input"),
+      sessionId: testSessionId,
+      kind: "created",
+      body: "Fix the test and open a PR",
+      payload: { agentSession: { issue: { labels } } },
+    });
+    return { cwd, configPath };
+  });
+const awaitState = (state: string) =>
+  Effect.gen(function* () {
+    const runs = yield* RunRepo;
+    yield* runs.get(testSessionId).pipe(
+      Effect.repeat({
+        while: (run) => Option.isNone(run) || run.value.state !== state,
+        schedule: Schedule.spaced(5),
+      }),
+      Effect.timeoutOrElse({
+        duration: 3_000,
+        orElse: () => Effect.die(new Error(`Run did not reach ${state}`)),
+      }),
+    );
+  });
+const withT3Authority = <A, E>(
+  task: Parameters<typeof withAuthority<A, E>>[0],
+  server: FakeT3Server,
+  workerUid?: string,
+) =>
+  withAuthority(task, {
+    withLinearGateway: true,
+    ...(workerUid === undefined ? {} : { workerUid }),
+    config: [
+      ["T3_BASE_URL", server.baseUrl.toString()],
+      ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
+      ["T3_TOKEN", server.token],
+      ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+      ["T3_MODEL", "gpt-6-sol"],
+    ],
+  });
+const t3Server = Effect.acquireRelease(
+  Effect.sync(() => new FakeT3Server()),
+  (server) => Effect.sync(() => server.stop()),
+);
+
+describe("AgentDriver authority integration", () => {
+  it.live(
+    "stops both drivers when persisting their session fails before registration",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        for (const driver of ["omp", "t3"] as const) {
+          yield* withAuthority(
+            (db) =>
+              Effect.gen(function* () {
+                yield* seedDriverRun(driver);
+                yield* Effect.sync(() =>
+                  db.exec(
+                    "CREATE TRIGGER fail_driver_session BEFORE INSERT ON driver_session BEGIN SELECT RAISE(ABORT, 'persistence failed'); END",
+                  ),
+                );
+                const authority = yield* SessionAuthority;
+                const result = yield* authority
+                  .processSession(testSessionId)
+                  .pipe(Effect.result);
+                expect(Result.isFailure(result)).toBe(true);
+                expect(yield* authority.activeWorkerCount()).toBe(0);
+                if (driver === "omp")
+                  expect(orderEvents).toContain("worker-stopped");
+                else {
+                  yield* Effect.sync(() => server.activeSocketCount()).pipe(
+                    Effect.repeat({
+                      while: (count) => count > 0,
+                      schedule: Schedule.spaced(5),
+                    }),
+                    Effect.timeout(1000),
+                  );
+                  expect(server.activeSocketCount()).toBe(0);
+                }
+              }),
+            {
+              withLinearGateway: true,
+              config: [
+                ["T3_BASE_URL", server.baseUrl.toString()],
+                ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
+                ["T3_TOKEN", server.token],
+                ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+                ["T3_MODEL", "gpt-6-sol"],
+              ],
+            },
+          );
+        }
+      }),
+  );
+  it.live(
+    "rejects remote T3 repository Nix packages instead of omitting them",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              yield* (yield* WorkspaceRepo).updateRepository(
+                testOrganizationId,
+                Schema.decodeUnknownSync(WorkspaceId)("driver-repo"),
+                {
+                  nixPackages: [
+                    Schema.decodeUnknownSync(NixPackageName)("nodejs"),
+                  ],
+                },
+              );
+              const result = yield* (yield* SessionAuthority)
+                .processSession(testSessionId)
+                .pipe(Effect.result);
+              expect(Result.isFailure(result)).toBe(true);
+              if (Result.isFailure(result))
+                expect(result.failure.message).toContain(
+                  "Remote T3 cannot receive repository Nix packages",
+                );
+              expect(server.projectMutations).toEqual([]);
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "denies retained non-gateway Git credentials before remote T3 opens the workspace",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        for (const config of [
+          '[http "https://github.com/"]\nextraheader = AUTHORIZATION: bearer retained-secret\n',
+          "[credential]\nhelper = store\n",
+          '[remote "origin"]\nurl = https://user:retained-secret@github.com/org/repo\n',
+          "[include]\npath = /secret/config\n",
+        ])
+          yield* withT3Authority(
+            () =>
+              Effect.gen(function* () {
+                const { configPath } = yield* seedDriverRun("t3");
+                yield* Effect.promise(() => writeFile(configPath, config));
+                const result = yield* (yield* SessionAuthority)
+                  .processSession(testSessionId)
+                  .pipe(Effect.result);
+                expect(Result.isFailure(result)).toBe(true);
+                if (Result.isFailure(result)) {
+                  expect(result.failure.message).toContain(
+                    "T3 refused non-gateway workspace Git credentials",
+                  );
+                  expect(result.failure.message).not.toContain(
+                    "retained-secret",
+                  );
+                }
+                expect(server.projectMutations).toEqual([]);
+              }),
+            server,
+          );
+      }),
+  );
+  it.live(
+    "denies non-gateway Git credentials before the private daemon starts",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const { configPath } = yield* seedDriverRun("t3");
+            yield* Effect.promise(() =>
+              writeFile(
+                configPath,
+                '[http "https://github.com/"]\nextraheader = AUTHORIZATION: bearer retained-secret\n',
+              ),
+            );
+            const result = yield* (yield* SessionAuthority)
+              .processSession(testSessionId)
+              .pipe(Effect.result);
+            expect(Result.isFailure(result)).toBe(true);
+            if (Result.isFailure(result))
+              expect(result.failure.message).toBe(
+                "T3 refused non-gateway workspace Git credentials or config includes",
+              );
+            expect(workerSpawnInputs).toHaveLength(0);
+          }),
+        {
+          withLinearGateway: true,
+          config: [
+            ["T3_MODE", "launch"],
+            ["T3_CLI_PATH", "/must-not-execute-t3"],
+            ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+            ["T3_MODEL", "gpt-6-sol"],
+            ["CLIPROXYAPI_BASE_URL", "https://cliproxyapi.example.test"],
+            ["CLIPROXYAPI_API_KEY", "proxy-client-key"],
+          ],
+        },
+      ),
+  );
+  it.live(
+    "runs T3 with the same projection/terminal lifecycle and persists its native ref",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              const authority = yield* SessionAuthority;
+              const repositories = yield* WorkspaceRepo;
+              const { cwd, configPath } = yield* seedDriverRun("t3");
+              yield* (yield* PromptTemplateRepo).upsert({
+                organizationId: testOrganizationId,
+                kind: "contract",
+                body: "Org OMP contract: use linear_get_issue, linear_create_comment, linear_add_external_url and rromp_report_deviation, then push.",
+                updatedAt: 0,
+              });
+              yield* authority.processSession(testSessionId);
+              const ref = Option.getOrThrow(
+                yield* repositories.getDriverSession(testSessionId),
+              );
+              expect(ref.driver).toBe("t3");
+              expect(workerSpawnInputs).toHaveLength(0);
+              expect(server.projects.size).toBe(1);
+              expect([...server.projects.values()][0]?.workspaceRoot).toBe(cwd);
+              expect(
+                yield* Effect.promise(() => readFile(configPath, "utf8")),
+              ).not.toContain("AUTHORIZATION");
+              const command = server.commandsOf("message.dispatch")[0];
+              const prompt = JSON.stringify(command);
+              expect(prompt).toContain("No Git or GitHub credential");
+              expect(prompt).toContain("don't try to push");
+              expect(prompt).not.toContain("Org OMP contract");
+              expect(prompt).not.toContain("rromp_report_deviation");
+              expect(prompt).not.toContain("linear_get_issue");
+              expect(command?.messageId).toBe(
+                `symphony:${ref.nativeId}:message:driver-input`,
+              );
+              expect(JSON.stringify(server.requests)).not.toContain(
+                "access-token",
+              );
+              server.updateRun(ref.nativeId, "run-1", { status: "running" });
+              server.upsertItem(ref.nativeId, {
+                id: "tool-1",
+                type: "command_execution",
+                runId: "run-1",
+                status: "running",
+                ordinal: 1,
+                input: "bun test",
+              });
+              server.upsertItem(ref.nativeId, {
+                id: "todo-1",
+                type: "todo_list",
+                runId: "run-1",
+                status: "completed",
+                ordinal: 2,
+                steps: [
+                  { id: "step-1", text: "Tests passed", status: "completed" },
+                ],
+              });
+              server.upsertItem(ref.nativeId, {
+                id: "message-1",
+                type: "assistant_message",
+                runId: "run-1",
+                status: "completed",
+                ordinal: 3,
+                messageId: "assistant-1",
+                text: "Fixed. https://github.com/org/repo/pull/12",
+                streaming: false,
+              });
+              server.updateRun(ref.nativeId, "run-1", { status: "completed" });
+              yield* awaitState("succeeded");
+              expect(
+                projectorEvents.some(
+                  ({ event }) => event.type === "tool_execution_start",
+                ),
+              ).toBe(true);
+              expect(
+                projectorEvents.some(({ event }) => event.type === "agent_end"),
+              ).toBe(true);
+              expect(toolExternalUrlCalls).toContainEqual({
+                sessionId: testSessionId,
+                urls: [
+                  {
+                    label: "Pull request",
+                    url: "https://github.com/org/repo/pull/12",
+                  },
+                ],
+              });
+              expect(
+                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                  .ompSessionFile,
+              ).toEqual(Option.none());
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "auto-approves T3 requests through the cancellation mutation gate",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              const authority = yield* SessionAuthority;
+              yield* authority.processSession(testSessionId);
+              const ref = Option.getOrThrow(
+                yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+              );
+              server.upsertItem(ref.nativeId, {
+                id: "approval",
+                type: "approval_request",
+                runId: "run-1",
+                status: "waiting",
+                ordinal: 1,
+                requestId: "approval-1",
+                requestKind: "command",
+                prompt: "Run tests?",
+                options: [{ decision: "accept", label: "Allow once" }],
+              });
+              server.upsertRequest(ref.nativeId, {
+                id: "approval-1",
+                kind: "command",
+                status: "pending",
+              });
+              yield* Effect.repeat(
+                Effect.sync(
+                  () => server.commandsOf("runtime-request.respond").length,
+                ),
+                {
+                  while: (count) => count === 0,
+                  schedule: Schedule.spaced(5),
+                },
+              ).pipe(
+                Effect.timeoutOrElse({
+                  duration: 3_000,
+                  orElse: () => Effect.die(new Error("approval not handled")),
+                }),
+              );
+              expect(
+                server.commandsOf("runtime-request.respond")[0],
+              ).toMatchObject({ requestId: "approval-1", decision: "accept" });
+              const inputs = yield* RunInputRepo;
+              yield* inputs.enqueue({
+                id: Schema.decodeUnknownSync(InputId)("driver-stop"),
+                sessionId: testSessionId,
+                kind: "stop",
+                body: "stop",
+                payload: {},
+              });
+              yield* authority.processSession(testSessionId);
+              expect(
+                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                  .state,
+              ).toBe("canceled");
+              expect(yield* authority.activeWorkerCount()).toBe(0);
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "falls back to webhook driver labels when Linear is unavailable",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        for (const t3Configured of [false, true]) {
+          for (const webhookOverride of [false, true]) {
+            yield* withAuthority(
+              () =>
+                Effect.gen(function* () {
+                  yield* seedDriverRun(
+                    webhookOverride ? "t3" : "omp",
+                    webhookOverride ? ["driver:omp"] : [],
+                  );
+                  linearIssueLookupFails = true;
+                  yield* (yield* PromptTemplateRepo).upsert({
+                    organizationId: testOrganizationId,
+                    kind: "contract",
+                    body: "Stored OMP contract",
+                    updatedAt: 0,
+                  });
+                  yield* (yield* SessionAuthority).processSession(
+                    testSessionId,
+                  );
+                  expect(workerSpawnInputs).toHaveLength(1);
+                  expect(workerPrompts[0]).toContain("Stored OMP contract");
+                  expect(server.threads.size).toBe(0);
+                  expect(
+                    Option.getOrThrow(
+                      yield* (yield* WorkspaceRepo).getDriverSession(
+                        testSessionId,
+                      ),
+                    ).driver,
+                  ).toBe("omp");
+                }),
+              {
+                withLinearGateway: true,
+                config: t3Configured
+                  ? [
+                      ["T3_BASE_URL", server.baseUrl.toString()],
+                      ["T3_ALLOW_PRIVATE_NETWORK_HTTP", "true"],
+                      ["T3_TOKEN", server.token],
+                      ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+                      ["T3_MODEL", "gpt-6-sol"],
+                    ]
+                  : [],
+              },
+            );
+          }
+        }
+      }),
+  );
+
+  it.live(
+    "reads Linear's current driver label over the stored repository default",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              linearIssueLabels = ["driver:omp"];
+              yield* (yield* SessionAuthority).processSession(testSessionId);
+              expect(workerSpawnInputs).toHaveLength(1);
+              expect(server.threads.size).toBe(0);
+              expect(
+                Option.getOrThrow(
+                  yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+                ).driver,
+              ).toBe("omp");
+            }),
+          server,
+        );
+      }),
+  );
+  it.live(
+    "fails closed before contacting T3 when per-session uid isolation is active",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              const result = yield* (yield* SessionAuthority)
+                .processSession(testSessionId)
+                .pipe(Effect.result);
+              expect(Result.isFailure(result)).toBe(true);
+              if (Result.isFailure(result))
+                expect(result.failure.message).toContain(
+                  "shared T3 daemon cannot serve isolated worker workspaces",
+                );
+              expect(server.threads.size).toBe(0);
+              expect(server.projectMutations).toHaveLength(0);
+              expect(workerSpawnInputs).toHaveLength(0);
+              expect(
+                Option.getOrThrow(yield* (yield* RunRepo).get(testSessionId))
+                  .state,
+              ).toBe("orphaned");
+            }),
+          server,
+          "10001",
+        );
+      }),
+  );
+  it.live(
+    "launches a private T3 daemon per session with the OMP Git credential path",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        const cli = testPath("bin/t3-proxy.sh");
+        const fakeCli = fileURLToPath(
+          new URL("./fixtures/fake-t3-cli.ts", import.meta.url),
+        );
+        yield* Effect.promise(() =>
+          writeFile(
+            cli,
+            `#!/bin/sh\nexec ${process.execPath} ${fakeCli} proxy ${server.baseUrl.port} ${server.token} "$@"\n`,
+            { mode: 0o755 },
+          ),
+        );
+        const portBase = 20_000 + ((process.pid * 11) % 20_000);
+        yield* withAuthority(
+          () =>
+            Effect.gen(function* () {
+              const { cwd, configPath } = yield* seedDriverRun("t3");
+              yield* (yield* PromptTemplateRepo).upsert({
+                organizationId: testOrganizationId,
+                kind: "contract",
+                body: "Org OMP contract: use linear_get_issue, linear_create_comment, linear_add_external_url and rromp_report_deviation, then push.",
+                updatedAt: 0,
+              });
+              nixPathEntries = ["/nix/store/repository-toolchain/bin"];
+              yield* (yield* WorkspaceRepo).updateRepository(
+                testOrganizationId,
+                Schema.decodeUnknownSync(WorkspaceId)("driver-repo"),
+                {
+                  nixPackages: [
+                    Schema.decodeUnknownSync(NixPackageName)("nodejs"),
+                  ],
+                },
+              );
+              yield* (yield* SessionAuthority).processSession(testSessionId);
+              expect(nixPreparedRepositories).toContain("driver-repo");
+              const launchEnv = JSON.parse(
+                yield* Effect.promise(() =>
+                  readFile(`${cwd}/.omp-home/t3/serve-env.json`, "utf8"),
+                ),
+              ) as { path: string };
+              expect(launchEnv.path.split(":")[0]).toBe(
+                "/nix/store/repository-toolchain/bin",
+              );
+              const ref = Option.getOrThrow(
+                yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+              );
+              expect(ref.driver).toBe("t3");
+              expect(ref.locator.origin).toBe(`http://127.0.0.1:${portBase}`);
+              expect(workerSpawnInputs).toHaveLength(0);
+              expect([...server.projects.values()][0]?.workspaceRoot).toBe(cwd);
+              // Same repo-scoped, re-minted credential OMP workers get. It
+              // stays in the session's Git config and never crosses the API.
+              const minted = Buffer.from("x-access-token:ghs_launch").toString(
+                "base64",
+              );
+              expect(
+                yield* Effect.promise(() => readFile(configPath, "utf8")),
+              ).toContain(`AUTHORIZATION: basic ${minted}`);
+              expect(JSON.stringify(server.requests)).not.toContain(minted);
+              expect(JSON.stringify(server.requests)).not.toContain(
+                "ghs_launch",
+              );
+              const prompt = JSON.stringify(
+                server.commandsOf("message.dispatch")[0],
+              );
+              expect(prompt).toContain("GitHub REST API");
+              expect(prompt).not.toContain("Org OMP contract");
+              expect(prompt).not.toContain("linear_get_issue");
+              expect(prompt).not.toContain("rromp_report_deviation");
+              const t3Home = join(cwd, ".omp-home", "t3");
+              const serveEnv = JSON.parse(
+                yield* Effect.promise(() =>
+                  readFile(join(t3Home, "serve-env.json"), "utf8"),
+                ),
+              );
+              expect(serveEnv.home).toBe(join(cwd, ".omp-home"));
+              expect(serveEnv.keys).toContain("CLIPROXYAPI_API_KEY");
+              expect(serveEnv.keys).not.toContain("LINEAR_CLIENT_SECRET");
+              const settings = yield* Effect.promise(() =>
+                readFile(join(t3Home, "userdata", "settings.json"), "utf8"),
+              );
+              expect(settings).toContain("codex-cliproxy");
+              expect(settings).not.toContain("proxy-client-key");
+              const provider = Number(
+                yield* Effect.promise(() =>
+                  readFile(join(t3Home, "provider.pid"), "utf8"),
+                ),
+              );
+              server.updateRun(ref.nativeId, "run-1", { status: "running" });
+              server.upsertItem(ref.nativeId, {
+                id: "message-1",
+                type: "assistant_message",
+                runId: "run-1",
+                status: "completed",
+                ordinal: 1,
+                messageId: "assistant-1",
+                text: "Opened https://github.com/org/repo/pull/7",
+                streaming: false,
+              });
+              server.updateRun(ref.nativeId, "run-1", { status: "completed" });
+              yield* awaitState("succeeded");
+              expect(toolExternalUrlCalls).toContainEqual({
+                sessionId: testSessionId,
+                urls: [
+                  {
+                    label: "Pull request",
+                    url: "https://github.com/org/repo/pull/7",
+                  },
+                ],
+              });
+              // Run end stops the daemon and its provider children.
+              const stopped = yield* Effect.sync(() => {
+                try {
+                  process.kill(provider, 0);
+                  return false;
+                } catch {
+                  return true;
+                }
+              }).pipe(
+                Effect.repeat({
+                  until: (done) => done,
+                  schedule: Schedule.spaced(25),
+                }),
+                Effect.timeoutOrElse({
+                  duration: 5_000,
+                  orElse: () => Effect.succeed(false),
+                }),
+              );
+              expect(stopped).toBe(true);
+            }),
+          {
+            withLinearGateway: true,
+            githubApp: {
+              getInstallationToken: () => Effect.succeed("ghs_launch"),
+            },
+            config: [
+              ["T3_MODE", "launch"],
+              ["T3_CLI_PATH", cli],
+              ["T3_PORT_BASE", String(portBase)],
+              ["T3_PORT_COUNT", "4"],
+              ["T3_PROVIDER_INSTANCE", "codex-cliproxy"],
+              ["T3_MODEL", "gpt-6-sol"],
+              ["CLIPROXYAPI_BASE_URL", "https://cliproxyapi.example.test"],
+              ["CLIPROXYAPI_API_KEY", "proxy-client-key"],
+            ],
+          },
+        );
+      }),
+    20_000,
+  );
+  it.live(
+    "reuses the T3 thread after restart while a new attempt ignores old terminal events",
+    () =>
+      Effect.gen(function* () {
+        const server = yield* t3Server;
+        yield* withT3Authority(
+          () =>
+            Effect.gen(function* () {
+              yield* seedDriverRun("t3");
+              const authority = yield* SessionAuthority;
+              const runs = yield* RunRepo;
+              yield* authority.processSession(testSessionId);
+              const ref = Option.getOrThrow(
+                yield* (yield* WorkspaceRepo).getDriverSession(testSessionId),
+              );
+              yield* authority.shutdown();
+              yield* runs.update(testSessionId, {
+                state: "orphaned",
+                nextAttemptAt: Option.none(),
+              });
+              yield* authority.processSession(testSessionId);
+              expect(
+                server.requestsFor("orchestration.launchThread"),
+              ).toHaveLength(1);
+              expect(server.projects.size).toBe(1);
+              expect(server.commandsOf("message.dispatch")).toHaveLength(2);
+              expect(server.commandsOf("message.dispatch")[1]?.threadId).toBe(
+                ref.nativeId,
+              );
+              expect(
+                Option.getOrThrow(yield* runs.get(testSessionId)).state,
+              ).toBe("running");
+            }),
+          server,
+        );
+      }),
   );
 });

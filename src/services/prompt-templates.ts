@@ -11,6 +11,23 @@ export const LINEAR_WORKER_CONTRACT = `Linear integration:
 - Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
 - If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
 
+const T3_CONTRACT_HEADER = `Linear integration:
+- Your plan, tool activity, questions and replies are projected to the Linear agent session automatically. Do not call Linear directly to report progress.`;
+const T3_CONTRACT_FOOTER = `- Write the final response for the Linear user: state the outcome, include relevant artifact URLs, and name any required user action.
+- If the run is stopped, cease work immediately; the gateway handles the terminal Linear response.`;
+
+/** T3 Code agents have no OMP extensions or inline Linear host tools. */
+export const T3_WORKER_CONTRACT = `${T3_CONTRACT_HEADER}
+- Work in the repository checkout that is your working directory. Git is preconfigured with a short-lived credential scoped to this repository: commit on a new branch and push it with \`git push -u origin <branch>\`.
+- Open the pull request with the GitHub REST API (POST https://api.github.com/repos/<owner>/<repo>/pulls). Authenticate with the same short-lived credential Git uses: \`git config --get http.https://github.com/.extraheader\` holds it as HTTP Basic auth for the user x-access-token. Never commit it or write it to files.
+- Include the pull request URL in your final response; the gateway links it to the Linear issue.
+${T3_CONTRACT_FOOTER}`;
+
+/** A shared remote daemon gets no repository credential. */
+export const T3_SHARED_WORKER_CONTRACT = `${T3_CONTRACT_HEADER}
+- No Git or GitHub credential is available in this workspace. Leave your changes in the working directory and describe them; don't try to push.
+${T3_CONTRACT_FOOTER}`;
+
 export type PromptTemplateValues = Readonly<Record<string, string>>;
 
 export const substitutePromptTemplate = (

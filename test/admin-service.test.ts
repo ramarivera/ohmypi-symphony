@@ -164,6 +164,8 @@ const deps: AdminDeps = {
   },
   workspaceRepo: WorkspaceRepo.of({
     setWorkspace: unreachable,
+    getDriverSession: unreachable,
+    setDriverSession: unreachable,
     createRepository: unreachable,
     getRepository: unreachable,
     listRepositories: unreachable,
@@ -278,8 +280,22 @@ describe("service Admin request validation", () => {
     expect(await invalid.text()).toBe("Invalid Nix package name");
   });
 
+  it("rejects invalid repository drivers before persistence", async () => {
+    const response = await run(
+      request("/api/admin/repositories", {
+        id: "repo-driver",
+        url: "https://github.com/test/repo.git",
+        ref: "main",
+        defaultDriver: "shell",
+      }),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toBe("defaultDriver must be omp or t3");
+  });
+
   it("updates repository packages as normalized values", async () => {
     let updatedPackages: ReadonlyArray<string> = [];
+    let updatedDriver: string | undefined;
     const repository = Schema.decodeUnknownSync(RepositoryRecord)({
       id: "repo-nix",
       organizationId,
@@ -297,11 +313,14 @@ describe("service Admin request validation", () => {
       ...deps,
       workspaceRepo: WorkspaceRepo.of({
         setWorkspace: unreachable,
+        getDriverSession: unreachable,
+        setDriverSession: unreachable,
         createRepository: unreachable,
         getRepository: unreachable,
         listRepositories: () => Effect.succeed([]),
         updateRepository: (_organizationId, _id, update) => {
           updatedPackages = (update.nixPackages ?? []).map(String);
+          updatedDriver = update.defaultDriver;
           return Effect.succeed(repository);
         },
         deleteRepository: unreachable,
@@ -325,6 +344,7 @@ describe("service Admin request validation", () => {
               url: "https://github.com/test/repo.git",
               ref: "main",
               nixPackages: ["nodejs_22", "git", "nodejs_22"],
+              defaultDriver: "t3",
             }),
           },
         ),
@@ -332,6 +352,7 @@ describe("service Admin request validation", () => {
     );
     expect(Option.getOrElse(result, () => null)?.status).toBe(200);
     expect(updatedPackages).toEqual(["git", "nodejs_22"]);
+    expect(updatedDriver).toBe("t3");
   });
 
   it("requires an admin session for the cache list", async () => {

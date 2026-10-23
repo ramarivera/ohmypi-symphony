@@ -185,6 +185,12 @@ Summary only. `docs/security.md` is authoritative.
   `CLIPROXYAPI_BASE_URL`. Codex/OpenAI models use the curated profile's
   CLIProxyAPI provider; Claude uses pi-claude-cli and `claude-cliproxy` to
   route Claude Code through CLIProxyAPI. See `docs/worker-profile.md`.
+- T3 (`T3_MODE=launch`): the gateway starts one `t3 serve` per session under
+  that session's uid, state in `<workspace>/.omp-home/t3`, loopback port from
+  `T3_PORT_BASE`, bearer issued per launch. The bearer is sent only after
+  `/proc/net/tcp{,6}` shows the session uid owns the port. A shared T3 daemon
+  (`T3_MODE=remote`) is refused under uid isolation. See
+  `docs/agent-drivers.md`.
 - MCP: `startWorkerMcpProxy` binds one `127.0.0.1` listener per worker with a
   random bearer. Generated MCP config holds only the loopback URL and that
   bearer; upstream tokens and OAuth client records stay in the gateway. Only a

@@ -14,6 +14,7 @@ import {
   Redacted,
   Ref,
   Schedule,
+  Scope,
   Semaphore,
 } from "effect";
 import {
@@ -38,7 +39,23 @@ import {
   isDeferredNotificationStopPayload,
   type McpServerRecord,
 } from "../domain/models.js";
-import { GatewayConfig } from "./config.js";
+import type { AgentDriver } from "../drivers/driver.js";
+import { rpcAssistantText } from "../drivers/events.js";
+import { makeOmpDriver } from "../drivers/omp/driver.js";
+import { selectDriver } from "../drivers/selection.js";
+import {
+  makeT3Driver,
+  remoteT3Endpoint,
+  t3DriverOptionsFromConfig,
+} from "../drivers/t3/driver.js";
+import {
+  launchedT3Driver,
+  launchT3Daemon,
+  renderT3LaunchSettings,
+  T3PortPool,
+} from "../drivers/t3/launcher.js";
+import { openDriverWorker } from "../drivers/worker-adapter.js";
+import { GatewayConfig, type T3LaunchConfig } from "./config.js";
 import { GitHubApp } from "./github-app.js";
 import { LinearGateway } from "./linear-gateway.js";
 import {
@@ -56,6 +73,8 @@ import { ActivityProjector } from "./projector.js";
 import {
   LINEAR_WORKER_CONTRACT,
   substitutePromptTemplate,
+  T3_SHARED_WORKER_CONTRACT,
+  T3_WORKER_CONTRACT,
 } from "./prompt-templates.js";
 import type {
   RpcEvent,
@@ -85,12 +104,15 @@ import {
 import {
   prepareWorkerWorkspace,
   sessionWorkerEnvironment,
+  stopWorkerUidProcessesSync,
   workerEnvironment,
 } from "./worker-security.js";
 import {
+  assertT3GitCredentials,
   makeWorkspace,
   parseRepositorySuggestionCandidate,
   type RepositoryResolution,
+  removeGitHubExtraHeaders,
 } from "./workspace.js";
 import { workspaceProcess } from "./workspace-process.js";
 
@@ -131,11 +153,24 @@ export const linearWorkerPrompt = (
 ): string =>
   kind === "created" ? `${contract}\n\nLinear task:\n${body}` : body;
 
+/** The built-in contract names tools and credentials the runtime really has. */
+export const workerContractFor = (
+  worker: RpcWorkerHandle,
+  t3Connection: "Launch" | "Remote" | undefined,
+): string =>
+  worker.driverSession?.ref.driver !== "t3"
+    ? LINEAR_WORKER_CONTRACT
+    : t3Connection === "Launch"
+      ? T3_WORKER_CONTRACT
+      : T3_SHARED_WORKER_CONTRACT;
+
 const linearWorkerPromptWithTemplate = (
   repo: PromptTemplateRepo["Service"],
   organizationId: string,
   kind: "created" | "prompted" | "stop",
   body: string,
+  defaultContract = LINEAR_WORKER_CONTRACT,
+  allowOrganizationContract = true,
 ): Effect.Effect<string, DatabaseError | RowDecodeError> => {
   if (kind === "prompted") {
     return repo.get(organizationId, "prompted").pipe(
@@ -148,6 +183,8 @@ const linearWorkerPromptWithTemplate = (
       ),
     );
   }
+  if (!allowOrganizationContract)
+    return Effect.succeed(linearWorkerPrompt(kind, body, defaultContract));
   return kind !== "created"
     ? Effect.succeed(linearWorkerPrompt(kind, body))
     : repo
@@ -159,7 +196,7 @@ const linearWorkerPromptWithTemplate = (
               body,
               Option.isSome(template)
                 ? substitutePromptTemplate(template.value.body, {})
-                : LINEAR_WORKER_CONTRACT,
+                : defaultContract,
             ),
           ),
         );
@@ -190,25 +227,7 @@ export const extractPullRequestUrls = (
   }
   return [...urls];
 };
-export const assistantResponseTextFromRpcEvent = (event: RpcEvent): string => {
-  const collect = (value: unknown): string => {
-    if (typeof value === "string") return value;
-    if (Array.isArray(value))
-      return value.map(collect).filter(Boolean).join("\n");
-    if (!record(value)) return "";
-    if (typeof value.text === "string") return value.text;
-    return collect(value.content ?? value.message ?? value.messages);
-  };
-  const candidates = [
-    ...(Array.isArray(event.messages) ? event.messages : []),
-    event.message,
-  ];
-  return candidates
-    .filter((candidate) => !record(candidate) || candidate.role === "assistant")
-    .map(collect)
-    .filter(Boolean)
-    .join("\n");
-};
+export const assistantResponseTextFromRpcEvent = rpcAssistantText;
 
 export const deviationFromRpcEvent = (event: RpcEvent): string | null => {
   if (event.type !== "tool_execution_start") return null;
@@ -351,6 +370,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
       const runtime = yield* Effect.context<never>();
       const runPromise = Effect.runPromiseWith(runtime);
       const mcpProxies = new Map<SessionId, () => void>();
+      // One pool per gateway: launched T3 daemons never share a port.
+      let t3PortPool: T3PortPool | undefined;
+      const t3Ports = (launch: T3LaunchConfig): T3PortPool => {
+        t3PortPool ??= new T3PortPool(launch.portBase, launch.portCount);
+        return t3PortPool;
+      };
       const stopMcpProxy = (sessionId: SessionId) => {
         mcpProxies.get(sessionId)?.();
         mcpProxies.delete(sessionId);
@@ -925,7 +950,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           event: RpcEvent,
         ): Effect.fn.Return<void, DatabaseError> {
           const type = event.type;
-          let sourceKey = `rpc:${sessionId}:${sequence}:${type}`;
+          let sourceKey =
+            typeof event.driverEventKey === "string"
+              ? event.driverEventKey
+              : `rpc:${sessionId}:${sequence}:${type}`;
           let kind = type;
           let level: "debug" | "info" | "warn" | "result" | "error" = "info";
           let text: string | null = type;
@@ -1024,6 +1052,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         void,
         DatabaseError | RowDecodeError | RpcProtocolError | RpcTimeoutError
       > {
+        if (worker.driverSession?.ref.driver === "t3") return;
         const state = yield* worker.getState();
         const fromStateSessionId = isString(state.sessionId)
           ? Option.some(state.sessionId)
@@ -1337,6 +1366,39 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             );
           }
         }
+        if (event.type === "driver_approval" && typeof event.id === "string") {
+          const requestId = event.id;
+          yield* withSessionMutationGate(
+            sessionId,
+            Effect.gen(function* () {
+              const latest = yield* runRepo.get(sessionId);
+              if (
+                Option.isNone(latest) ||
+                latest.value.desiredState === "canceled" ||
+                ["canceled", "failed", "succeeded"].includes(latest.value.state)
+              )
+                return;
+              const worker = yield* getWorker(sessionId);
+              if (
+                Option.isSome(worker) &&
+                worker.value.worker.driverSession !== undefined
+              ) {
+                yield* worker.value.worker.driverSession
+                  .respond(requestId, { _tag: "Approve", scope: "once" })
+                  .pipe(
+                    Effect.mapError(
+                      (error) =>
+                        new RpcProtocolError({
+                          method: "approve",
+                          message: error.message,
+                        }),
+                    ),
+                  );
+              }
+            }),
+          );
+          return;
+        }
         if (event.type === "extension_ui_request") {
           const id = event.id;
           const method = event.method;
@@ -1394,6 +1456,27 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             }),
           );
         }
+        if (event.type === "driver_plan") {
+          yield* projector.plan(
+            sessionId,
+            typeof event.driverEventKey === "string"
+              ? event.driverEventKey
+              : `plan:${sessionId}:${sequence}`,
+            planItems(event.items),
+          );
+          return;
+        }
+        if (
+          event.type === "driver_request_resolved" &&
+          typeof event.id === "string"
+        ) {
+          yield* Ref.update(pendingUiRef, (pending) => {
+            if (pending.get(sessionId)?.id !== event.id) return pending;
+            const next = new Map(pending);
+            next.delete(sessionId);
+            return next;
+          });
+        }
         const worker = yield* getWorker(sessionId);
         const terminalAgentEnd =
           event.type === "agent_end" && event.willContinue !== true;
@@ -1420,7 +1503,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         if (terminalAgentEnd) {
           const savedDraft = (yield* Ref.get(assistantDraftRef)).get(sessionId);
           const finalText =
-            savedDraft ?? assistantResponseTextFromRpcEvent(event);
+            typeof event.driverEventKey === "string"
+              ? assistantResponseTextFromRpcEvent(event)
+              : (savedDraft ?? assistantResponseTextFromRpcEvent(event));
           const discovered = extractPullRequestUrls(finalText);
           if (discovered.length > 0 && Option.isSome(linearOption)) {
             const existing = yield* Ref.get(reportedPullRequestUrlsRef);
@@ -1494,6 +1579,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         run: AgentRun,
         worker: RpcWorkerHandle,
       ): Effect.fn.Return<void, RpcProtocolError | RpcTimeoutError> {
+        if (
+          worker.driverSession?.capabilities.hostTools !== undefined &&
+          worker.driverSession.capabilities.hostTools !== "inline"
+        )
+          return;
         if (
           typeof worker.onHostToolCall !== "function" ||
           typeof worker.setHostTools !== "function"
@@ -1786,73 +1876,98 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         yield* worker.setHostTools(definitions);
       });
 
-      const openWorker = Effect.fn("SessionAuthority.startWorker")(function* (
-        run: AgentRun,
-        cwd: string,
-        refreshWorkspaceCredentials = false,
-      ): Effect.fn.Return<
-        RpcWorkerHandle,
-        | DatabaseError
-        | RowDecodeError
-        | RpcProtocolError
-        | RpcSpawnError
-        | RpcTimeoutError
-        | NixEnvironmentError
-        | WorkspaceError
-        | TokenCipherError
-        | TokenRefreshError
-      > {
-        if (!existsSync(cwd)) {
-          const error = new RpcSpawnError({
-            message: `Persisted workspace does not exist: ${cwd}`,
-          });
-          return yield* Effect.fail(error);
-        }
-        const command: string[] = [config.ompCliPath];
-        if (Option.isSome(run.ompSessionFile)) {
-          command.push("--session", run.ompSessionFile.value);
-        }
+      const attachWorker = Effect.fn("SessionAuthority.attachWorker")(
+        function* (run: AgentRun, worker: RpcWorkerHandle) {
+          const queue = yield* Queue.unbounded<RpcEvent>();
 
-        const deviationExtensionPath = resolveDeviationExtensionPath();
-        if (deviationExtensionPath === null) {
-          return yield* Effect.fail(
-            new RpcSpawnError({
-              message: "Deviation reporting extension is missing",
+          const unsubscribe = yield* worker.onEvent((event) => {
+            Queue.offerUnsafe(queue, event);
+          });
+
+          const consumer = yield* Effect.forkIn(
+            Effect.forever(
+              Queue.take(queue).pipe(
+                Effect.flatMap((event) =>
+                  withSessionProcessing(
+                    run.sessionId,
+                    handleEvent(run.sessionId, event).pipe(
+                      Effect.catchCause((cause) =>
+                        Cause.hasInterruptsOnly(cause)
+                          ? Effect.failCause(cause)
+                          : handleFailure(run.sessionId, {
+                              message: failureMessage(cause),
+                            }).pipe(
+                              Effect.ensuring(releaseIfNoWorker(run.sessionId)),
+                            ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            scope,
+          );
+
+          yield* Ref.update(workersRef, (workers) => {
+            const next = new Map(workers);
+            next.set(run.sessionId, {
+              worker,
+              queue,
+              consumer,
+              unsubscribe,
+            });
+            return next;
+          });
+
+          yield* worker.start();
+          yield* registerLinearHostTools(run, worker).pipe(
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                // Registration happens after the worker is started and indexed;
+                // tear down that state before propagating the contract failure.
+                yield* Fiber.interrupt(consumer);
+                yield* unsubscribe();
+                yield* worker.stop();
+                yield* Ref.update(workersRef, (workers) => {
+                  const next = new Map(workers);
+                  next.delete(run.sessionId);
+                  return next;
+                });
+                return yield* Effect.fail(error);
+              }),
+            ),
+          );
+          yield* updateRun(run.sessionId, { state: "running" });
+          yield* captureWorkerState(run.sessionId, worker);
+
+          const ompSessionId = yield* worker.sessionId;
+          const ompSessionFile = yield* worker.sessionFile;
+
+          yield* Effect.logInfo("work.ready").pipe(
+            Effect.annotateLogs({
+              event: "work.ready",
+              sessionId: run.sessionId,
+              attempt: run.attempt,
+              cwd: Option.getOrNull(run.workspacePath),
+              ompSessionId: Option.getOrElse(ompSessionId, () => null),
+              ompSessionFile: Option.getOrElse(ompSessionFile, () => null),
             }),
           );
-        }
-        command.push("--extension", deviationExtensionPath);
-        for (const extensionPath of config.workerExtensionPaths ?? []) {
-          if (!existsSync(extensionPath))
-            return yield* Effect.fail(
-              new RpcSpawnError({
-                message: `Worker extension is missing: ${extensionPath}`,
-              }),
-            );
-          command.push("--extension", extensionPath);
-        }
-        command.push(
-          ...workerModelArguments(
-            config.workerDefaultModel,
-            Option.isSome(run.ompSessionFile),
-          ),
-        );
+        },
+      );
 
-        const workerUid = yield* workerIdentities.acquire(
-          run.sessionId,
-          config.workspaceRoot,
-        );
-        yield* Effect.tryPromise({
-          try: () => prepareWorkerWorkspace(cwd, workerUid),
-          catch: () =>
-            new RpcSpawnError({
-              message: "Could not prepare isolated worker workspace",
-            }),
-        });
-        const environment =
-          workerUid === undefined
-            ? workerEnvironment(process.env)
-            : sessionWorkerEnvironment(cwd, process.env);
+      /** Repository Nix PATH and, on resume, a fresh repo-scoped Git credential. */
+      const applyRepositoryEnvironment = Effect.fn(
+        "SessionAuthority.applyRepositoryEnvironment",
+      )(function* (
+        run: AgentRun,
+        cwd: string,
+        environment: Record<string, string>,
+        refreshWorkspaceCredentials: boolean,
+      ): Effect.fn.Return<
+        void,
+        DatabaseError | RowDecodeError | NixEnvironmentError | WorkspaceError
+      > {
         if (Option.isSome(run.repositoryId)) {
           const repository = yield* workspaceRepo.getRepository(
             run.organizationId,
@@ -1903,6 +2018,272 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             }
           }
         }
+      });
+
+      const openWorker = Effect.fn("SessionAuthority.startWorker")(function* (
+        run: AgentRun,
+        cwd: string,
+        refreshWorkspaceCredentials = false,
+      ): Effect.fn.Return<
+        RpcWorkerHandle,
+        | DatabaseError
+        | RowDecodeError
+        | RpcProtocolError
+        | RpcSpawnError
+        | RpcTimeoutError
+        | NixEnvironmentError
+        | WorkspaceError
+        | TokenCipherError
+        | TokenRefreshError
+      > {
+        if (!existsSync(cwd)) {
+          const error = new RpcSpawnError({
+            message: `Persisted workspace does not exist: ${cwd}`,
+          });
+          return yield* Effect.fail(error);
+        }
+        const saved = yield* workspaceRepo.getDriverSession(run.sessionId);
+        const latestInput = yield* runInputRepo.latestActionableInput(
+          run.sessionId,
+        );
+        let labels = Option.isSome(latestInput)
+          ? inputContext(latestInput.value.payload).issueLabels
+          : [];
+        if (
+          Option.isNone(saved) &&
+          Option.isSome(run.issueId) &&
+          Option.isSome(linearOption)
+        ) {
+          labels = yield* linearOption.value
+            .getIssue({ sessionId: run.sessionId, issueId: run.issueId.value })
+            .pipe(
+              Effect.map((issue) => issue.labels),
+              Effect.catch(() => Effect.succeed(labels)),
+            );
+        }
+        const repository = Option.isSome(run.repositoryId)
+          ? yield* workspaceRepo.getRepository(
+              run.organizationId,
+              run.repositoryId.value,
+            )
+          : Option.none();
+        const kind = Option.isSome(saved)
+          ? saved.value.driver
+          : yield* selectDriver(
+              Option.isSome(repository)
+                ? (repository.value.defaultDriver ?? "omp")
+                : "omp",
+              labels,
+            ).pipe(
+              Effect.mapError(
+                (error) => new RpcSpawnError({ message: error.message }),
+              ),
+            );
+        if (kind === "t3") {
+          const t3Config = config.t3Driver;
+          if (t3Config === undefined)
+            return yield* new RpcSpawnError({
+              message:
+                "T3 driver is selected but T3_MODE/T3_BASE_URL is not configured",
+            });
+          const uid = yield* workerIdentities.acquire(
+            run.sessionId,
+            config.workspaceRoot,
+          );
+          let driver: AgentDriver;
+          if (t3Config.connection._tag === "Remote") {
+            // One shared daemon can't reach mode-0700 per-uid workspaces
+            // without collapsing session isolation.
+            if (uid !== undefined)
+              return yield* new RpcSpawnError({
+                message:
+                  "A shared T3 daemon cannot serve isolated worker workspaces; set T3_MODE=launch",
+              });
+            if (
+              Option.isSome(repository) &&
+              repository.value.nixPackages.length > 0
+            )
+              return yield* new RpcSpawnError({
+                message:
+                  "Remote T3 cannot receive repository Nix packages; set T3_MODE=launch",
+              });
+            // Clone credentials can already be present on a newly materialized workspace.
+            yield* removeGitHubExtraHeaders(
+              cwd,
+              run.sessionId,
+              config.gitTimeoutMs ?? 120_000,
+            );
+            yield* assertT3GitCredentials(
+              cwd,
+              run.sessionId,
+              config.gitTimeoutMs ?? 120_000,
+            );
+            // A shared daemon gets no GitHub, Linear or upstream MCP tokens.
+            driver = makeT3Driver(
+              t3DriverOptionsFromConfig(
+                t3Config,
+                remoteT3Endpoint(t3Config.connection),
+              ),
+            );
+          } else {
+            const launch = t3Config.connection;
+            if (config.cliproxyApiBaseUrl === undefined)
+              return yield* new RpcSpawnError({
+                message: "T3_MODE=launch requires CLIPROXYAPI_BASE_URL",
+              });
+            yield* Effect.tryPromise({
+              try: () => prepareWorkerWorkspace(cwd, uid),
+              catch: () =>
+                new RpcSpawnError({
+                  message: "Could not prepare isolated worker workspace",
+                }),
+            });
+            // Always a private HOME: the daemon's state must never be shared.
+            const environment = sessionWorkerEnvironment(cwd, process.env);
+            // Same repo-scoped, short-lived Git credential path as OMP workers.
+            yield* applyRepositoryEnvironment(
+              run,
+              cwd,
+              environment,
+              refreshWorkspaceCredentials,
+            );
+            yield* Effect.tryPromise({
+              try: () => workspaceProcess(cwd, "tool-directories", null),
+              catch: () =>
+                new RpcSpawnError({
+                  message: "Could not prepare worker tool directories",
+                }),
+            });
+            // Inspect as the session uid before any T3 process can read the tree.
+            yield* Effect.tryPromise({
+              try: () => workspaceProcess(cwd, "check-t3-git", true),
+              catch: () =>
+                new RpcSpawnError({
+                  message:
+                    "T3 refused non-gateway workspace Git credentials or config includes",
+                }),
+            });
+            // A daemon or provider left by an earlier attempt would own the
+            // T3 state directory; this uid belongs to this session only.
+            if (uid !== undefined)
+              yield* Effect.try({
+                try: () => stopWorkerUidProcessesSync(Number(uid)),
+                catch: () =>
+                  new RpcSpawnError({
+                    message: "Stale T3 processes for this session did not exit",
+                  }),
+              });
+            const modelSelection = {
+              instanceId: t3Config.providerInstanceId,
+              model: t3Config.model,
+            };
+            const modelEnvironment = workerModelEnvironment({
+              cliproxyApiBaseUrl: config.cliproxyApiBaseUrl,
+              cliproxyApiKey:
+                config.cliproxyApiKey === undefined
+                  ? undefined
+                  : Redacted.value(config.cliproxyApiKey),
+              claudeExecutable: launch.claudeExecutable,
+            });
+            const cliproxyApiBaseUrl = config.cliproxyApiBaseUrl;
+            // Preparation may outlive a lease. Fence again before creating a process.
+            yield* updateRun(run.sessionId, {});
+            driver = launchedT3Driver(
+              launchT3Daemon({
+                sessionId: run.sessionId,
+                cwd,
+                workerUid: uid,
+                launch,
+                ports: t3Ports(launch),
+                environment,
+                modelEnvironment: Object.fromEntries(
+                  Object.entries(modelEnvironment).filter(([name]) =>
+                    name.startsWith("CLIPROXYAPI_"),
+                  ),
+                ),
+                settings: renderT3LaunchSettings({
+                  cwd,
+                  cliproxyApiBaseUrl,
+                  launch,
+                  runtimeMode: t3Config.runtimeMode,
+                  defaultModel: modelSelection,
+                }),
+                writeSettings: (settings) =>
+                  workspaceProcess(cwd, "t3-config", settings).then(
+                    () => undefined,
+                  ),
+              }),
+              (endpoint) => t3DriverOptionsFromConfig(t3Config, endpoint),
+            );
+          }
+          const worker = yield* openDriverWorker(driver, {
+            sessionKey: run.sessionId,
+            title: `Linear ${Option.getOrElse(run.issueId, () => run.sessionId)}`,
+            workspace: { _tag: "Directory", path: cwd },
+            ...(Option.isSome(saved) ? { resume: { ref: saved.value } } : {}),
+          }).pipe(Effect.provideService(Scope.Scope, scope));
+          yield* Effect.gen(function* () {
+            yield* workspaceRepo.setDriverSession(
+              run.sessionId,
+              worker.driverSession.ref,
+            );
+            // A gateway restart must not leave two turns operating in a workspace.
+            if (Option.isSome(saved)) yield* worker.abort();
+            yield* attachWorker(run, worker);
+          }).pipe(Effect.onError(() => worker.stop()));
+          return worker;
+        }
+        const command: string[] = [config.ompCliPath];
+        if (Option.isSome(run.ompSessionFile)) {
+          command.push("--session", run.ompSessionFile.value);
+        }
+
+        const deviationExtensionPath = resolveDeviationExtensionPath();
+        if (deviationExtensionPath === null) {
+          return yield* Effect.fail(
+            new RpcSpawnError({
+              message: "Deviation reporting extension is missing",
+            }),
+          );
+        }
+        command.push("--extension", deviationExtensionPath);
+        for (const extensionPath of config.workerExtensionPaths ?? []) {
+          if (!existsSync(extensionPath))
+            return yield* Effect.fail(
+              new RpcSpawnError({
+                message: `Worker extension is missing: ${extensionPath}`,
+              }),
+            );
+          command.push("--extension", extensionPath);
+        }
+        command.push(
+          ...workerModelArguments(
+            config.workerDefaultModel,
+            Option.isSome(run.ompSessionFile),
+          ),
+        );
+
+        const workerUid = yield* workerIdentities.acquire(
+          run.sessionId,
+          config.workspaceRoot,
+        );
+        yield* Effect.tryPromise({
+          try: () => prepareWorkerWorkspace(cwd, workerUid),
+          catch: () =>
+            new RpcSpawnError({
+              message: "Could not prepare isolated worker workspace",
+            }),
+        });
+        const environment =
+          workerUid === undefined
+            ? workerEnvironment(process.env)
+            : sessionWorkerEnvironment(cwd, process.env);
+        yield* applyRepositoryEnvironment(
+          run,
+          cwd,
+          environment,
+          refreshWorkspaceCredentials,
+        );
         const listMcp: Effect.Effect<
           ReadonlyArray<McpServerRecord>,
           DatabaseError | RowDecodeError | TokenCipherError
@@ -2097,83 +2478,26 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           sessionId: run.sessionId,
           requestTimeoutMs: config.rpcRequestTimeoutMs ?? 30_000,
         });
-        const queue = yield* Queue.unbounded<RpcEvent>();
-
-        const unsubscribe = yield* worker.onEvent((event) => {
-          Queue.offerUnsafe(queue, event);
-        });
-
-        const consumer = yield* Effect.forkIn(
-          Effect.forever(
-            Queue.take(queue).pipe(
-              Effect.flatMap((event) =>
-                withSessionProcessing(
-                  run.sessionId,
-                  handleEvent(run.sessionId, event).pipe(
-                    Effect.catchCause((cause) =>
-                      Cause.hasInterruptsOnly(cause)
-                        ? Effect.failCause(cause)
-                        : handleFailure(run.sessionId, {
-                            message: failureMessage(cause),
-                          }).pipe(
-                            Effect.ensuring(releaseIfNoWorker(run.sessionId)),
-                          ),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ),
-          scope,
+        const adapted = yield* openDriverWorker(
+          makeOmpDriver(worker),
+          {
+            sessionKey: run.sessionId,
+            title: `Linear ${run.sessionId}`,
+            workspace: { _tag: "Directory", path: cwd },
+          },
+          worker,
+        ).pipe(
+          Effect.provideService(Scope.Scope, scope),
+          Effect.onError(() => worker.stop()),
         );
-
-        yield* Ref.update(workersRef, (workers) => {
-          const next = new Map(workers);
-          next.set(run.sessionId, {
-            worker,
-            queue,
-            consumer,
-            unsubscribe,
-          });
-          return next;
-        });
-
-        yield* worker.start();
-        yield* registerLinearHostTools(run, worker).pipe(
-          Effect.catch((error) =>
-            Effect.gen(function* () {
-              // Registration happens after the worker is started and indexed;
-              // tear down that state before propagating the contract failure.
-              yield* Fiber.interrupt(consumer);
-              yield* unsubscribe();
-              yield* worker.stop();
-              yield* Ref.update(workersRef, (workers) => {
-                const next = new Map(workers);
-                next.delete(run.sessionId);
-                return next;
-              });
-              return yield* Effect.fail(error);
-            }),
-          ),
-        );
-        yield* updateRun(run.sessionId, { state: "running" });
-        yield* captureWorkerState(run.sessionId, worker);
-
-        const ompSessionId = yield* worker.sessionId;
-        const ompSessionFile = yield* worker.sessionFile;
-
-        yield* Effect.logInfo("work.ready").pipe(
-          Effect.annotateLogs({
-            event: "work.ready",
-            sessionId: run.sessionId,
-            attempt: run.attempt,
-            cwd,
-            ompSessionId: Option.getOrElse(ompSessionId, () => null),
-            ompSessionFile: Option.getOrElse(ompSessionFile, () => null),
-          }),
-        );
-
-        return worker;
+        yield* Effect.gen(function* () {
+          yield* workspaceRepo.setDriverSession(
+            run.sessionId,
+            adapted.driverSession.ref,
+          );
+          yield* attachWorker(run, adapted);
+        }).pipe(Effect.onError(() => adapted.stop()));
+        return adapted;
       });
 
       const startWorker = (...args: Parameters<typeof openWorker>) =>
@@ -2471,7 +2795,12 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                       Option.isSome(input) ? input.value.payload : null,
                     ),
                   );
-                let retryPrompt: string | undefined;
+                let retryInput:
+                  | {
+                      readonly kind: "created" | "prompted" | "stop";
+                      readonly body: string;
+                    }
+                  | undefined;
                 if (Option.isNone(resumed.ompSessionFile)) {
                   const latestActionable =
                     yield* runInputRepo.latestActionableInput(sessionId);
@@ -2484,12 +2813,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                       }),
                     );
                   }
-                  retryPrompt = yield* linearWorkerPromptWithTemplate(
-                    promptTemplateRepo,
-                    resumed.organizationId,
-                    latestActionable.value.kind,
-                    latestActionable.value.body,
-                  );
+                  retryInput = latestActionable.value;
                 }
                 yield* ensureIssueLifecycle(
                   resumed,
@@ -2517,9 +2841,10 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 if (Option.isSome(resumed.ompSessionFile)) {
                   yield* worker.followUp(
                     "Continue the interrupted Linear task from the saved session state.",
+                    `retry:${resumed.attempt}`,
                   );
                 } else {
-                  if (retryPrompt === undefined) {
+                  if (retryInput === undefined) {
                     return yield* Effect.fail(
                       new InterruptedRunNoActionableInputError({
                         sessionId,
@@ -2528,7 +2853,18 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                       }),
                     );
                   }
-                  const agentInvoked = yield* worker.prompt(retryPrompt);
+                  const retryPrompt = yield* linearWorkerPromptWithTemplate(
+                    promptTemplateRepo,
+                    resumed.organizationId,
+                    retryInput.kind,
+                    retryInput.body,
+                    workerContractFor(worker, config.t3Driver?.connection._tag),
+                    worker.driverSession?.ref.driver !== "t3",
+                  );
+                  const agentInvoked = yield* worker.prompt(
+                    retryPrompt,
+                    `retry:${resumed.attempt}`,
+                  );
                   if (!agentInvoked) {
                     yield* finishLocalCommand(
                       sessionId,
@@ -2573,15 +2909,6 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   ? reopenedOption.value
                   : latest;
               }
-              const initialPrompt =
-                input.kind === "created"
-                  ? yield* linearWorkerPromptWithTemplate(
-                      promptTemplateRepo,
-                      latest.organizationId,
-                      input.kind,
-                      input.body,
-                    )
-                  : undefined;
               if (worker === undefined) {
                 if (runUrlForSession !== null) {
                   yield* projector.externalUrls(
@@ -2700,13 +3027,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   );
                 }
                 const agentInvoked = yield* worker.prompt(
-                  initialPrompt ??
-                    (yield* linearWorkerPromptWithTemplate(
-                      promptTemplateRepo,
-                      latest.organizationId,
-                      input.kind,
-                      input.body,
-                    )),
+                  yield* linearWorkerPromptWithTemplate(
+                    promptTemplateRepo,
+                    latest.organizationId,
+                    input.kind,
+                    input.body,
+                    workerContractFor(worker, config.t3Driver?.connection._tag),
+                    worker.driverSession?.ref.driver !== "t3",
+                  ),
+                  input.id,
                 );
                 if (!agentInvoked) {
                   yield* finishLocalCommand(sessionId, worker, input.id);
@@ -2741,9 +3070,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     input.body,
                   );
                   if (yield* worker.isStreaming) {
-                    yield* worker.steer(rendered);
+                    yield* worker.steer(rendered, input.id);
                   } else {
-                    yield* worker.followUp(rendered);
+                    yield* worker.followUp(rendered, input.id);
                   }
                 }
                 yield* updateRun(sessionId, { state: "running" });

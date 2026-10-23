@@ -356,6 +356,15 @@ const migrate = (db: Database): void => {
       "ALTER TABLE repository ADD COLUMN nix_packages_json TEXT NOT NULL DEFAULT '[]'",
     );
   }
+  if (!repositoryColumns.includes("default_driver")) {
+    db.exec(
+      "ALTER TABLE repository ADD COLUMN default_driver TEXT NOT NULL DEFAULT 'omp' CHECK (default_driver IN ('omp', 't3'))",
+    );
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS driver_session (
+    session_id TEXT PRIMARY KEY REFERENCES agent_run(session_id) ON DELETE CASCADE,
+    ref_json TEXT NOT NULL
+  )`);
   const mcpServerColumns = db
     .query<{ name: string }, []>('PRAGMA table_info("mcp_server")')
     .all()

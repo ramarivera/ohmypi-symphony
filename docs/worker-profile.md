@@ -107,9 +107,9 @@ copy of the CLIProxyAPI key in the gateway's own environment.
 ## Image
 
 `deploy/agent-clis/install-agent-clis.sh` installs pinned, checksum-verified
-Claude Code and Codex builds under `/opt`. The gateway image installs Claude
-Code 2.1.304, matching the T3 sidecar's selected build. Both images can use the
-shared installer and its checksums. pi-claude-cli 0.5.1 supports Claude Code
+Claude Code, Codex and T3 builds under `/opt`. The gateway image installs
+Claude Code 2.1.304, Codex 0.156.1 and T3 0.1.2; launched T3 daemons drive the
+same Claude Code build through `claude-cliproxy`. pi-claude-cli 0.5.1 supports Claude Code
 `>=2.1.285 <2.2.0`, Pi `>=0.99.1 <0.100.0`, and omp `^18.8.6`. Claude Code
 versions above the supported range warn by default;
 `PI_CLAUDE_CLI_STRICT_VERSION=1` makes that check strict. `deploy/worker-extensions`
