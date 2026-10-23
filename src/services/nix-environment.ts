@@ -198,7 +198,9 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
       >
     >();
     const inflightMutex = yield* Effect.makeSemaphore(1);
-    const cacheMutex = yield* Effect.makeSemaphore(1);
+    // Builds share the lock; pruning and GC acquire every permit exclusively.
+    const cachePermits = Number.MAX_SAFE_INTEGER;
+    const cacheMutex = yield* Effect.makeSemaphore(cachePermits);
 
     const rootFor = Effect.fn("NixEnvironment.rootFor")(function* (
       cacheKey: string,
@@ -513,7 +515,7 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
     });
 
     const enforceBudget = (maxBytes: number) =>
-      cacheMutex.withPermits(1)(
+      cacheMutex.withPermits(cachePermits)(
         Effect.gen(function* () {
           if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
             return yield* Effect.fail(
@@ -528,6 +530,16 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
           );
           let sizeBytes = yield* storeSize;
           let removed = 0;
+          const collectUntilStable = Effect.gen(function* () {
+            while (sizeBytes > maxBytes) {
+              const previous = sizeBytes;
+              yield* collectGarbage;
+              sizeBytes = yield* storeSize;
+              if (sizeBytes >= previous) break;
+            }
+          });
+          // Drain already-unrooted paths first, even if all entries are protected.
+          yield* collectUntilStable;
           for (const entry of entries) {
             if (sizeBytes <= maxBytes) break;
             const protectedKeys =
@@ -543,12 +555,8 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
             yield* pruneUnlocked(entry.cacheKey);
             removed++;
             sizeBytes = yield* storeSize;
-          }
-          // Retry collection of already-unrooted garbage, including a previous
-          // prune whose GC failed after its metadata was removed.
-          if (entries.length === 0 && sizeBytes > maxBytes) {
-            yield* collectGarbage;
-            sizeBytes = yield* storeSize;
+            // Each GC pass is bounded. Drain this eviction before dropping another root.
+            yield* collectUntilStable;
           }
           const result = {
             removed,
@@ -569,7 +577,7 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
       );
 
     const prune = (cacheKey: string) =>
-      cacheMutex.withPermits(1)(pruneUnlocked(cacheKey));
+      cacheMutex.withPermits(cachePermits)(pruneUnlocked(cacheKey));
     return { prepare, list, prune, enforceBudget };
   });
 

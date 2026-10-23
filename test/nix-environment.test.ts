@@ -1,5 +1,5 @@
 import { it } from "@effect/vitest";
-import { Effect, Either, Fiber, Option, Schema } from "effect";
+import { Deferred, Effect, Either, Fiber, Option, Schema } from "effect";
 import * as fc from "effect/FastCheck";
 import { describe, expect } from "vitest";
 import { OrganizationId, WorkspaceId } from "../src/domain/ids.js";
@@ -208,6 +208,138 @@ describe("NixEnvironment", () => {
     });
   });
 
+  it.scopedLive(
+    "builds different keys concurrently while budget collection waits for every build",
+    () =>
+      Effect.gen(function* () {
+        const state = fixture();
+        const bothStarted = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let builds = 0;
+        let measurements = 0;
+        const service = yield* makeNixEnvironment({
+          ...state.dependencies,
+          run: async (argv) => {
+            if (argv[1] === "build") {
+              builds++;
+              if (builds === 2)
+                await Effect.runPromise(
+                  Deferred.succeed(bothStarted, undefined),
+                );
+              await Effect.runPromise(Deferred.await(release));
+            }
+            if (argv.includes("--all")) {
+              measurements++;
+              return {
+                exitCode: 0,
+                stdout: JSON.stringify([{ narSize: 50 }]),
+                stderr: "",
+              };
+            }
+            return state.dependencies.run(argv);
+          },
+        });
+        yield* Effect.gen(function* () {
+          const first = yield* Effect.fork(
+            service.prepare(repository(["git"])),
+          );
+          const second = yield* Effect.fork(
+            service.prepare(repository(["nodejs"])),
+          );
+          yield* Deferred.await(bothStarted);
+          const budget = yield* Effect.fork(service.enforceBudget(100));
+          yield* Effect.yieldNow();
+          expect(measurements).toBe(0);
+          expect(state.removals).toEqual([]);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(first);
+          yield* Fiber.join(second);
+          expect(yield* Fiber.join(budget)).toEqual({
+            removed: 0,
+            sizeBytes: 50,
+            withinBudget: true,
+          });
+          expect(builds).toBe(2);
+          expect(measurements).toBe(1);
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)));
+      }),
+  );
+
+  it("drains bounded garbage passes before evicting another cache entry", async () => {
+    const state = fixture();
+    let size = 500;
+    let gcCalls = 0;
+    const service = await Effect.runPromise(
+      makeNixEnvironment({
+        ...state.dependencies,
+        nixGcMaxBytes: 100,
+        run: async (argv) => {
+          if (argv.includes("--all"))
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify([{ narSize: size }]),
+              stderr: "",
+            };
+          if (argv[1] === "store") {
+            gcCalls++;
+            if (state.removals.length > 0) size = Math.max(100, size - 100);
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return state.dependencies.run(argv);
+        },
+      }),
+    );
+    const oldest = await Effect.runPromise(
+      service.prepare(repository(["git"])),
+    );
+    const newest = await Effect.runPromise(
+      service.prepare(repository(["nodejs"])),
+    );
+    expect(await Effect.runPromise(service.enforceBudget(100))).toEqual({
+      removed: 1,
+      sizeBytes: 100,
+      withinBudget: true,
+    });
+    expect(state.removals).toEqual([`/roots/${oldest.cacheKey}`]);
+    expect(state.entries.has(newest.cacheKey)).toBe(true);
+    expect(gcCalls).toBe(5);
+  });
+
+  it("collects already-unrooted garbage without evicting protected entries", async () => {
+    const state = fixture();
+    let size = 300;
+    let gcCalls = 0;
+    const service = await Effect.runPromise(
+      makeNixEnvironment({
+        ...state.dependencies,
+        protectedCacheKeys: () => Effect.succeed(new Set(state.entries.keys())),
+        run: async (argv) => {
+          if (argv.includes("--all"))
+            return {
+              exitCode: 0,
+              stdout: JSON.stringify([{ narSize: size }]),
+              stderr: "",
+            };
+          if (argv[1] === "store") {
+            gcCalls++;
+            size = Math.max(50, size - 100);
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return state.dependencies.run(argv);
+        },
+      }),
+    );
+    await Effect.runPromise(service.prepare(repository(["git"])));
+    expect(await Effect.runPromise(service.enforceBudget(100))).toEqual({
+      removed: 0,
+      sizeBytes: 100,
+      withinBudget: true,
+    });
+    expect(gcCalls).toBe(2);
+    expect(state.removals).toEqual([]);
+    expect(state.entries.size).toBe(1);
+  });
+
   it("rejects unsafe package names in the typed error channel", async () => {
     const state = fixture();
     const service = await Effect.runPromise(
@@ -297,7 +429,8 @@ describe("NixEnvironment", () => {
             };
           if (argv[1] === "store") {
             state.commands.push([...argv]);
-            size -= 100;
+            // Each removed root makes only its own 100 bytes collectible.
+            size = Math.max(300 - state.removals.length * 100, size - 100);
             return { exitCode: 0, stdout: "", stderr: "" };
           }
           return state.dependencies.run(argv);
@@ -320,10 +453,15 @@ describe("NixEnvironment", () => {
       `/roots/${newest.cacheKey}`,
     ]);
     expect(state.entries.has(active.cacheKey)).toBe(true);
-    expect(state.commands.filter((argv) => argv[1] === "store")).toEqual([
-      ["nix", "store", "gc", "--max-freed", "1234"],
-      ["nix", "store", "gc", "--max-freed", "1234"],
-    ]);
+    expect(state.commands.filter((argv) => argv[1] === "store")).toEqual(
+      Array.from({ length: 4 }, () => [
+        "nix",
+        "store",
+        "gc",
+        "--max-freed",
+        "1234",
+      ]),
+    );
   });
 
   it("does not evict below budget and reports budgets held by active roots", async () => {
@@ -430,50 +568,69 @@ describe("NixEnvironment", () => {
     expect(state.removals).toEqual([]);
     expect(state.commands).toEqual([]);
   });
-  it("retries failed GC even after the last out-link and metadata were removed", async () => {
-    const state = fixture();
-    let gcCalls = 0;
-    let size = 300;
-    const service = await Effect.runPromise(
-      makeNixEnvironment({
-        ...state.dependencies,
-        run: async (argv) => {
-          if (argv.includes("--all"))
-            return {
-              exitCode: 0,
-              stdout: JSON.stringify([{ narSize: size }]),
-              stderr: "",
-            };
-          if (argv[1] === "store") {
-            gcCalls++;
-            if (gcCalls === 1)
+  it.each([false, true])(
+    "retries failed GC with protected entries remaining: %s",
+    async (keepProtected) => {
+      const state = fixture();
+      let gcCalls = 0;
+      let size = 300;
+      const service = await Effect.runPromise(
+        makeNixEnvironment({
+          ...state.dependencies,
+          protectedCacheKeys: () =>
+            Effect.succeed(
+              new Set(
+                keepProtected
+                  ? [
+                      nixCacheKey(state.dependencies.nixpkgsFlakeRef, [
+                        "nodejs",
+                      ]),
+                    ]
+                  : [],
+              ),
+            ),
+          run: async (argv) => {
+            if (argv.includes("--all"))
               return {
-                exitCode: 1,
-                stdout: "",
-                stderr: "GC temporarily unavailable",
+                exitCode: 0,
+                stdout: JSON.stringify([{ narSize: size }]),
+                stderr: "",
               };
-            size = 50;
-            return { exitCode: 0, stdout: "", stderr: "" };
-          }
-          return state.dependencies.run(argv);
-        },
-      }),
-    );
-    const prepared = await Effect.runPromise(
-      service.prepare(repository(["git"])),
-    );
-    expect(
-      Either.isLeft(
-        await Effect.runPromise(Effect.either(service.enforceBudget(100))),
-      ),
-    ).toBe(true);
-    expect(state.entries.size).toBe(0);
-    expect(await Effect.runPromise(service.enforceBudget(100))).toEqual({
-      removed: 0,
-      sizeBytes: 50,
-      withinBudget: true,
-    });
-    expect(state.removals).toEqual([`/roots/${prepared.cacheKey}`]);
-    expect(gcCalls).toBe(2);
-  });
+            if (argv[1] === "store") {
+              gcCalls++;
+              if (state.removals.length === 0)
+                return { exitCode: 0, stdout: "", stderr: "" };
+              if (gcCalls === 2)
+                return {
+                  exitCode: 1,
+                  stdout: "",
+                  stderr: "GC temporarily unavailable",
+                };
+              size = 50;
+              return { exitCode: 0, stdout: "", stderr: "" };
+            }
+            return state.dependencies.run(argv);
+          },
+        }),
+      );
+      const prepared = await Effect.runPromise(
+        service.prepare(repository(["git"])),
+      );
+      if (keepProtected)
+        await Effect.runPromise(service.prepare(repository(["nodejs"])));
+      expect(
+        Either.isLeft(
+          await Effect.runPromise(Effect.either(service.enforceBudget(100))),
+        ),
+      ).toBe(true);
+      expect(state.entries.size).toBe(keepProtected ? 1 : 0);
+      expect(await Effect.runPromise(service.enforceBudget(100))).toEqual({
+        removed: 0,
+        sizeBytes: 50,
+        withinBudget: true,
+      });
+      expect(state.removals).toEqual([`/roots/${prepared.cacheKey}`]);
+      expect(gcCalls).toBe(3);
+    },
+  );
 });

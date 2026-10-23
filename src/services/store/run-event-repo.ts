@@ -230,9 +230,14 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
         DatabaseError | RowDecodeError
       > {
         yield* Effect.annotateCurrentSpan("sessionId", sessionId);
-        const limit = Number.isFinite(options.limit)
-          ? Math.max(1, Math.min(1000, Math.floor(options.limit ?? 100)))
-          : 100;
+        // Existing detail callers require the full history until routes expose cursors.
+        // SQLite LIMIT -1 is unbounded; explicitly requested pages remain capped.
+        const limit =
+          options.limit === undefined
+            ? -1
+            : Number.isFinite(options.limit)
+              ? Math.max(1, Math.min(1000, Math.floor(options.limit)))
+              : 100;
         const cursor = options.cursor;
         const rows = yield* tryDb(
           () =>

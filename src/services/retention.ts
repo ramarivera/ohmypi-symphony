@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync, rmSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { Config, ConfigError, Effect, Either, Schedule } from "effect";
 import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
@@ -34,24 +34,80 @@ export const retentionConfig = Config.all({
 });
 export type RetentionPolicy = Config.Config.Success<typeof retentionConfig>;
 
+export const MAX_WORKSPACES_PER_SWEEP = 25;
+
 const terminal = "state IN ('succeeded','failed','canceled')";
+
+const canonicalReference = (path: string): string | undefined => {
+  // Resolve existing ancestors as well: a not-yet-created child under an alias
+  // still references the canonical parent's workspace.
+  const suffix: string[] = [];
+  let current = path;
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...suffix);
+    } catch (error) {
+      if (
+        !(
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "ENOENT"
+        ) ||
+        dirname(current) === current
+      )
+        return undefined;
+      suffix.unshift(basename(current));
+      current = dirname(current);
+    }
+  }
+};
 
 export const makeRetention = (input: {
   readonly db: import("bun:sqlite").Database;
   readonly workspaceRoot: string;
   readonly policy: RetentionPolicy;
   readonly webhookReplayWindowMs: number;
+  readonly removeWorkspace?: (path: string) => void;
 }) => {
   const { db, policy } = input;
   const sweep = (now: number) =>
     tryDb(() => {
       // One synchronous SQLite transaction fences reopening and shared-path checks
       // against deletion. Never await between checking a run and removing its files.
-      return db
+      const workspaceResult = db
         .transaction(() => {
           let workspaces = 0;
           let skippedWorkspaces = 0;
-          const root = resolve(input.workspaceRoot);
+          // Match Workspace.materialize, which persists canonical paths. A missing
+          // root means there is no workspace to remove, but data may still expire.
+          let root: string | undefined;
+          try {
+            root = realpathSync(resolve(input.workspaceRoot));
+          } catch {
+            root = undefined;
+          }
+          const references = db
+            .query<
+              {
+                session_id: string;
+                workspace_path: string | null;
+                canonical_path: string | null;
+              },
+              []
+            >(
+              `SELECT r.session_id, r.workspace_path, w.canonical_path FROM agent_run r LEFT JOIN workspace w ON w.session_id=r.session_id`,
+            )
+            .all();
+          const referencePaths = references.map((reference) => ({
+            sessionId: reference.session_id,
+            paths: [reference.workspace_path, reference.canonical_path].flatMap(
+              (path) => {
+                if (path === null) return [];
+                const absolute = resolve(path);
+                return [absolute, canonicalReference(absolute)];
+              },
+            ),
+          }));
           const candidates = db.query<
             { session_id: string; workspace_path: string },
             [number, number]
@@ -64,26 +120,19 @@ export const makeRetention = (input: {
           const rows = candidates.all(now - policy.workspaceTtlMs, now);
           for (const row of rows) {
             const path = resolve(row.workspace_path);
-            const references = db
-              .query<
-                {
-                  workspace_path: string | null;
-                  canonical_path: string | null;
-                },
-                [string]
-              >(
-                `SELECT r.workspace_path, w.canonical_path FROM agent_run r LEFT JOIN workspace w ON w.session_id=r.session_id WHERE r.session_id<>?`,
-              )
-              .all(row.session_id);
-            const shared = references.some((reference) =>
-              [reference.workspace_path, reference.canonical_path].some(
-                (other) =>
-                  other !== null &&
-                  (isWithin(path, resolve(other)) ||
-                    isWithin(resolve(other), path)),
-              ),
+            if (workspaces >= MAX_WORKSPACES_PER_SWEEP) break;
+            const shared = referencePaths.some(
+              (reference) =>
+                reference.sessionId !== row.session_id &&
+                reference.paths.some(
+                  (other) =>
+                    other === undefined ||
+                    isWithin(path, other) ||
+                    isWithin(other, path),
+                ),
             );
             if (
+              root === undefined ||
               !isAbsolute(row.workspace_path) ||
               path === root ||
               !isWithin(root, path) ||
@@ -94,18 +143,19 @@ export const makeRetention = (input: {
             }
             try {
               const stat = lstatSync(path);
-              const canonicalRoot = realpathSync(root);
               if (
                 !stat.isDirectory() ||
                 stat.isSymbolicLink() ||
                 realpathSync(path) !== path ||
-                !isWithin(canonicalRoot, path) ||
-                canonicalRoot === path
+                !isWithin(root, path) ||
+                root === path
               ) {
                 skippedWorkspaces++;
                 continue;
               }
-              rmSync(path, { recursive: true, force: true });
+              if (input.removeWorkspace === undefined)
+                rmSync(path, { recursive: true, force: true });
+              else input.removeWorkspace(path);
             } catch (error) {
               if (
                 !(
@@ -113,8 +163,10 @@ export const makeRetention = (input: {
                   "code" in error &&
                   error.code === "ENOENT"
                 )
-              )
-                throw error;
+              ) {
+                skippedWorkspaces++;
+                continue;
+              }
             }
             db.query("DELETE FROM workspace WHERE session_id=?").run(
               row.session_id,
@@ -124,6 +176,13 @@ export const makeRetention = (input: {
             ).run(row.session_id);
             workspaces++;
           }
+          return { workspaces, skippedWorkspaces };
+        })
+        .immediate();
+      // Commit workspace records before unrelated data cleanup, which can fail
+      // without bringing already-deleted workspace paths back into the database.
+      return db
+        .transaction(() => {
           const terminalSessions = `SELECT session_id FROM agent_run WHERE ${terminal} AND updated_at<? AND (lease_expires_at IS NULL OR lease_expires_at<=?)`;
           // Retryable projections have a longer TTL than raw events. Once that
           // TTL expires for a terminal run, expire them too, unless a projector
@@ -158,11 +217,10 @@ export const makeRetention = (input: {
          AND NOT EXISTS (SELECT 1 FROM projection_outbox o WHERE o.source_key=run_event.source_key AND o.status<>'completed')`,
             )
             .run(now - policy.eventTtlMs, now, now - policy.eventTtlMs).changes;
-          const inputs = db
-            .query(
-              `DELETE FROM run_input WHERE session_id IN (${terminalSessions}) AND processed_at IS NOT NULL AND processed_at<?`,
-            )
-            .run(now - policy.eventTtlMs, now, now - policy.eventTtlMs).changes;
+          // Catch-up replays the entire Linear history. Keep processed input
+          // identities and their original resume context until a durable catch-up
+          // watermark exists; deleting them would execute historical prompts again.
+          const inputs = 0;
           // Preserve delivery identities for deduplication. Drop their large raw payloads.
           const deliveries = db
             .query(
@@ -182,8 +240,7 @@ export const makeRetention = (input: {
               .run(now - policy.authGraceMs).changes;
           }
           return {
-            workspaces,
-            skippedWorkspaces,
+            ...workspaceResult,
             events,
             projections,
             inputs,
@@ -209,20 +266,29 @@ export class Retention extends Effect.Service<Retention>()("Retention", {
       policy,
       webhookReplayWindowMs: config.webhookReplayWindowMs,
     });
-    const tick = Effect.gen(function* () {
+    const sweepTick = Effect.gen(function* () {
       const result = yield* sweep(Date.now());
       yield* Effect.logInfo("Retention sweep finished").pipe(
         Effect.annotateLogs({ event: "retention.swept", ...result }),
       );
-      yield* nix.enforceBudget(policy.nixStoreMaxBytes);
     }).pipe(
       Effect.catchAllCause((cause) =>
         Effect.logError("Retention sweep failed", cause),
       ),
     );
+    const budgetTick = nix
+      .enforceBudget(policy.nixStoreMaxBytes)
+      .pipe(
+        Effect.catchAllCause((cause) =>
+          Effect.logError("Nix store budget enforcement failed", cause),
+        ),
+      );
     return {
       sweep,
-      run: Effect.repeat(tick, Schedule.spaced(policy.intervalMs)),
+      run: Effect.repeat(
+        Effect.zipRight(sweepTick, budgetTick),
+        Schedule.spaced(policy.intervalMs),
+      ),
     };
   }),
 }) {}

@@ -1,16 +1,9 @@
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeEach } from "vitest";
 
-const createRoot = () => {
-  const scratch = join(
-    homedir(),
-    "dev/agentic-scratchpads/ohmypi-symphony/hygiene/tests",
-  );
-  mkdirSync(scratch, { recursive: true });
-  return mkdtempSync(join(scratch, "case-"));
-};
+const createRoot = () => mkdtempSync(join(tmpdir(), "ohmypi-gateway-case-"));
 const pathIn = (root: string, name: string) => {
   const path = join(root, name);
   mkdirSync(name.includes(".") ? dirname(path) : path, { recursive: true });
