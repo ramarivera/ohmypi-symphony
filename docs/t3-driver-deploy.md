@@ -1,320 +1,180 @@
-# T3 Code sidecar for the gateway's T3 driver
+# T3 sidecar deployment contract
 
-The gateway's T3 driver doesn't run agents itself. It talks to a T3 Code
-server (`t3 serve`) in a sidecar container, and T3 runs the Codex and Claude
-Code CLIs. Both CLIs send model traffic to CLIProxyAPI, configured the same
-way as the `claude-cliproxy` and `codex-cliproxy` provider instances in
-Ramiro's workbench T3 install.
+Beads `sym-gmy.2`, `sym-gmy.4`, `sym-gmy.5`. The gateway driver uses T3's
+WebSocket orchestration API. T3 starts Codex and Claude Code, whose model
+requests go to CLIProxyAPI. This PR doesn't deploy the stack.
 
-Files:
+## Image
 
-| Path | What it is |
-| --- | --- |
-| `deploy/t3/Dockerfile` | Image with pinned, checksum-verified `t3`, `codex`, and `claude` |
-| `deploy/t3/docker-entrypoint.sh` | Renders T3 settings and the Codex config from env, then runs `t3 serve` |
-| `deploy/t3/issue-gateway-token.sh` | One-shot auth bootstrap that mints the gateway's bearer token |
+Build from the repository root:
 
-Tracking: bead `sym-gmy.2` (this sidecar), `sym-gmy.4` (toolbox stack wiring),
-epic `sym-gmy`.
-
-## Architecture
-
-```text
-            private stack network (not edge-proxy-published)
- gateway ──────────── HTTP + WS RPC :3773 ──────────────▶ t3 sidecar
- (root, workers 1001)       Bearer → /api/auth/websocket-ticket   t3 serve (uid 1001)
-   │                   → /ws?wsTicket=…&orchestrationProtocol=2   ├─ codex app-server ─┐
-   │                                                              └─ claude (SDK)    ─┤
-   │  /app/workspaces  ◀──── shared volume, same path ────▶  /app/workspaces          │
-   │  /run/secrets/t3-gateway-token ◀── root-owned 0400 copy (ro)                   │
-   ▼                                                                                  ▼
- Linear                                               https://cliproxyapi.ai.roxasroot.net
-                                                       (/v1 for Codex, root for Claude)
+```sh
+docker build -f deploy/t3/Dockerfile -t ohmypi-symphony-t3:local .
 ```
 
-- The gateway uses the WebSocket RPC surface (protocol 2): `orchestration.launchThread`,
-  `orchestration.dispatchCommand`, `orchestration.subscribeThread`,
-  `orchestration.getThreadProjection`, `server.getConfig`, and `projects.*`. A token
-  with `orchestration:read` + `orchestration:operate` covers all of these, including
-  project creation without project scripts.
-- `/mcp` is a separate audience. T3 only accepts `mcp-client` sessions there, so the
-  gateway token gets a 401 on `/mcp`. That's expected.
-- Workspaces live on a volume mounted at `/app/workspaces` in both containers. T3
-  projects are registered by path, so the path has to match. T3 and gateway workers
-  run as uid/gid 1001, so their workspace files stay writable by either worker
-  implementation. The gateway control plane stays root. See
-  [gateway security](security.md) for the capability policy and uid boundary.
-  Never mount gateway data, logs, or secrets into T3.
-
-## Image contents and pins
-
-| Component | Pinned version | Source | Integrity check |
-| --- | --- | --- | --- |
-| `t3` server | 0.1.2 | GitHub release `pingdotgg/t3code` `v0.1.2`, asset `t3-0.1.2-linux-{x64,arm64}.tar.gz` | SHA-256 from the release's `SHA256SUMS` |
-| `codex` | 0.156.1 | GitHub release `openai/codex` `rust-v0.156.1`, `codex-package-*-unknown-linux-musl.tar.gz` | SHA-256 that T3 0.1.2 itself pins in `apps/server/src/provider/CodexInstallation.ts` |
-| `claude` | 2.1.304 | Anthropic's release bucket, `claude-code-releases/2.1.304/linux-{x64,arm64}/claude` | SHA-256 from that release's `manifest.json` |
-
-Why these versions:
-
-- **t3 0.1.2 stable, not 0.1.2-nightly.20261021.3473.** arch-cachy's host service runs
-  that nightly. The stable 0.1.2 tag was cut a day later from the same 0.1.2 line, has
-  a `SHA256SUMS` asset, is the npm `latest` dist-tag, and won't be pruned the way old
-  nightlies are. It has everything the driver needs: WS protocol 2,
-  `t3 auth session issue --scope`, and `t3 thread`.
-- **codex 0.156.1.** It's the build T3 0.1.2 installs when it manages Codex itself, so
-  it's the version this T3 release was tested against. arch-cachy has 0.159.0 and
-  workbench has 0.163.0; neither is needed for T3 0.1.2.
-- **claude 2.1.304.** The same build that runs on workbench and arch-cachy today.
-
-The base image is `debian:trixie-slim` (glibc; the `t3` binary isn't musl-compatible).
-It adds `libatomic1` (the one extra library `t3` links against), `git`,
-`openssh-client`, `ripgrep`, and `procps` for the agents' tool calls, `jq` for config
-rendering, and `tini` as PID 1 to reap agent subprocesses. No secrets are in the image.
-
-## Environment variables
-
-| Variable | Required | Default | Purpose |
-| --- | --- | --- | --- |
-| `CLIPROXYAPI_BASE_URL` | yes | none | CLIProxyAPI origin, e.g. `https://cliproxyapi.ai.roxasroot.net`. Claude uses it as is; Codex gets `<url>/v1` |
-| `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE` | one of them | none | CLIProxyAPI client bearer. Setting both is an error |
-| `T3_CODEX_MODEL` | no | `gpt-6-sol` | Codex default model in the generated `config.toml` |
-| `T3_CODEX_REASONING_EFFORT` | no | `medium` | Codex `model_reasoning_effort` |
-| `T3_CODEX_CONFIG_EXTRA_FILE` | no | none | TOML appended to the generated Codex config, e.g. `[mcp_servers.*]` for the gateway's Linear host tools |
-| `T3_DEFAULT_PROVIDER_INSTANCE` | no | `claude-cliproxy` | T3 `defaultModelSelection.instanceId` |
-| `T3_DEFAULT_MODEL` | no | `claude-opus-5-5` | T3 `defaultModelSelection.model` |
-| `T3_CODEX_HOME` | no | `$T3CODE_HOME/codex-cliproxy` | `CODEX_HOME` for the codex-cliproxy instance |
-| `T3_CLAUDE_CONFIG_DIR` | no | `$T3CODE_HOME/claude-cliproxy` | `CLAUDE_CONFIG_DIR` for the claude-cliproxy instance |
-| `T3_WORKSPACE_ROOT` | no | `/app/workspaces` | Working directory passed to `t3 serve` |
-| `T3CODE_HOME` | set in image | `/data/t3` | T3 data dir (SQLite DBs, settings, secrets) |
-| `T3CODE_HOST` / `T3CODE_PORT` | set in image | `0.0.0.0` / `3773` | Listen address. Publish only on a private network |
-| `T3_GATEWAY_TOKEN_FILE` | no | `/data/gateway-auth/t3-gateway-token` | Where `t3-issue-gateway-token` writes |
-
-The CLIProxyAPI bearer is a placeholder today: `cliproxyapi.yaml` sets `api-keys: []`,
-and the owner-only Tailscale ACL `tag:svc-cliproxyapi` is the real auth boundary (see
-the header of the toolbox's `home/dot_codex-cliproxy/modify_private_config.toml.nu.tmpl`).
-Treat it as a secret anyway and pass it through `_FILE`, so nothing changes if
-CLIProxyAPI starts enforcing keys.
-
-## What the entrypoint renders
-
-On every start, before `t3 serve`:
-
-1. **`$T3_CODEX_HOME/config.toml`** (0600), fully regenerated. It matches workbench's
-   `~/.codex-cliproxy/config.toml`: `model_provider = "cliproxyapi"`,
-   `approval_policy = "never"`, `sandbox_mode = "danger-full-access"`, and
-   `[model_providers.cliproxyapi]` with `base_url = "<CLIPROXYAPI_BASE_URL>/v1"` and
-   `wire_api = "responses"`. One deliberate difference: it uses
-   `env_key = "CLIPROXYAPI_API_KEY"` instead of an inline `experimental_bearer_token`,
-   so the key stays off disk. The entrypoint exports `CLIPROXYAPI_API_KEY`, and every
-   agent T3 spawns inherits it. Codex appends `[projects."…"] trust_level` entries at
-   runtime; a restart drops them, which doesn't matter with `approval_policy = "never"`.
-   Workbench's Remnic plugin and marketplace entries are left out.
-2. **`$T3CODE_HOME/userdata/settings.json`** (0600), merged with `jq`. Managed keys get
-   overwritten; everything else (UI changes, other instances) is kept:
-   - `providerInstances["claude-cliproxy"]`: driver `claudeAgent`, environment
-     `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` (marked `sensitive`, so T3 redacts it
-     in client responses), and `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (as in
-     toolbox's `claudex` wrapper). `config.homePath` is set to a dir on the data volume
-     so Claude session transcripts survive restarts; workbench leaves it at `~/.claude`.
-   - `providerInstances["codex-cliproxy"]`: driver `codex`, `config.homePath` set to
-     `$T3_CODEX_HOME`.
-   - `providerInstances.codex` and `.claudeAgent` (T3's built-in instances) are set to
-     `enabled: false` if settings.json doesn't mention them yet. They have no login in
-     the container and would only report errors.
-   - `defaultModelSelection` from `T3_DEFAULT_PROVIDER_INSTANCE` / `T3_DEFAULT_MODEL`.
-
-`ANTHROPIC_API_KEY` is unset before T3 starts, so a stray key can't route Claude
-around the proxy.
-
-Container commands: `serve [flags]` (default) renders and runs `t3 serve --no-browser`;
-`render` only renders and exits; anything else runs as given (`bash`, `t3 doctor`, …).
-
-## Volumes
-
-| Mount | Contents | Notes |
+| Component | Version | Verification |
 | --- | --- | --- |
-| `/data/t3` | `T3CODE_HOME`: `userdata/state*.sqlite`, `settings.json`, T3 `secrets/`, `codex-cliproxy/`, `claude-cliproxy/` | Persistent. Grows with thread history (workbench's `statev2.sqlite` is 1.47 GB), so back it up and watch disk |
-| `/data/gateway-auth` | `t3-gateway-token` (0400) and `t3-gateway-token.json` (session id, expiry, no token) | Token staging only; never mount this worker-owned volume into the gateway |
-| `/app/workspaces` | Shared with the gateway, same path | Must be git repos or worktrees for T3 projects |
+| T3 | 0.1.2 | Release SHA256SUMS, amd64 and arm64 |
+| Codex | 0.156.1 | Main's shared `deploy/agent-clis/install-agent-clis.sh` checksums |
+| Claude Code | 2.1.304 | Same shared installer and version as the gateway |
 
-Existing sidecar volumes from the uid 1000 image need a stopped-container backup
-and an operator-managed ownership migration to uid/gid 1001 before starting this
-image. Do not reuse them unchanged or recursively chown gateway data or secrets.
+The shared installer is the only CLI download/checksum implementation. Codex
+0.156.1 is the version main's installer supports and T3 0.1.2 pins for managed
+installs. Update both architectures in that installer when changing CLI pins.
+T3's own tarball checksums remain in its Dockerfile. Recheck the T3 provider
+settings and WS protocol against the new release before upgrading T3.
 
-## Auth bootstrap
+The Debian trixie image includes git, SSH, ripgrep, jq, curl, libatomic1 and
+tini. Claude's executable uses main's `claude-cliproxy` wrapper. Auto updates
+are disabled. No direct provider credential is required or installed.
 
-`t3 serve` prints a startup pairing token, URL, and QR code to the container log.
-That credential is one-time, expires after 5 minutes, and grants the standard
-client scopes (`issueStartupPairingCredential` in `EnvironmentAuth.ts`). `t3 start`
-announces a pairing URL too, so there's no flag to avoid it. Reading `docker logs`
-needs Docker access, which is root-equivalent anyway; the real exposure is a log
-shipper that forwards container stdout somewhere wider. If the stack ships logs,
-filter `Token:` and `Pairing URL:` lines from this container. To pair a browser later, run `t3 auth pairing create` in the container.
-To clear an unused one, run `t3 auth pairing list` and `t3 auth pairing revoke <id>`.
+## Driver contract
 
-The gateway gets a scoped bearer session instead:
+| Setting | Value |
+| --- | --- |
+| Sidecar service and container | `t3`, `ohmypi-symphony-t3` |
+| Gateway `T3_BASE_URL` | `http://t3:3773` |
+| Gateway `T3_TOKEN_FILE` | `/run/secrets/t3-gateway-token` |
+| Compose auth secret | `t3-gateway-token`, host `./secrets/t3-gateway-token` |
+| Default `T3_RUNTIME_MODE` | `auto`, `full-access` requires explicit opt-in |
+| Workspace path, both containers | `/app/workspaces` |
+| Sidecar uid/gid | `2001:2001`, reserved outside OMP slots `1001..1064` |
+| Provider instances | `codex-cliproxy`, `claude-cliproxy` |
+| WebSocket protocol | `2` |
 
-```bash
-docker compose exec t3 t3-issue-gateway-token            # 30-day TTL
-docker compose exec t3 t3-issue-gateway-token --ttl 7d   # shorter
+The gateway exchanges its bearer at `POST /api/auth/websocket-ticket`, then
+connects to `/ws?wsTicket=...&orchestrationProtocol=2`. Issue the bearer with
+`orchestration:read` and `orchestration:operate`. These scopes permit project
+registration, `orchestration.launchThread`, dispatch, subscribe and projection.
+The token isn't an `mcp-client` session, so `/mcp` rejects it. The healthcheck
+uses `/.well-known/t3/environment`; it doesn't prove provider readiness.
+
+## Workspace permissions and isolation
+
+Main allocates a different worker uid for each session and uses mode-0700
+workspace directories. A shared mount doesn't grant T3 access to them. T3 must
+not reuse the first worker uid, run as root, gain DAC_OVERRIDE, or relax every
+workspace to group/world access.
+
+The sidecar has a dedicated uid/gid 2001, no Linux capabilities and
+`no-new-privileges`. The driver must grant that identity access only to the
+checkout prepared for a T3 session, and revoke access after stopping all work
+on it. For example, the gateway can transfer ownership of a checkout that is
+exclusively reserved for T3, and then reclaim it after the T3 thread exits.
+Don't transfer an active OMP workspace or reuse its uid reservation. A source
+change to the driver/allocator is still required; this image doesn't implement
+it and deliberately leaves mode-0700 OMP directories inaccessible.
+
+All threads inside one T3 daemon share uid 2001 and its T3 data. This doesn't
+provide isolation between simultaneous T3 sessions. Don't enable mutually
+untrusted T3 sessions until the driver has per-session sidecars/identities.
+Toolbox defaults `ohmypi_symphony_t3_enabled` to false pending this integration
+and the token bootstrap. This is an acceptance blocker, not a working
+per-session isolation claim. Coordinate it with PR #16.
+
+Mount only `gateway-workspaces:/app/workspaces`, `t3-data:/data/t3`, and
+`t3-gateway-auth:/data/gateway-auth` in T3. Never mount gateway data, logs,
+secrets, worker profiles, Nix roots or a host Docker socket. Existing sidecar
+volumes from uid 1000/1001 require a stopped backup and an explicit ownership
+migration to uid 2001. Don't recursively chown the shared workspace volume.
+
+## Proxy configuration
+
+Supply `CLIPROXYAPI_BASE_URL=https://cliproxyapi.ai.roxasroot.net` and exactly
+one of `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE`. The deployed stack
+uses the latter, with a separate mode-0400, uid-2001 proxy file. The gateway
+keeps its own root-owned copy. The proxy is currently keyless; the existing
+fnox deploy credential is still passed as a bearer so future key enforcement
+doesn't require changing this contract. No live proxy configuration changes
+are part of this PR.
+
+Every startup renders private mode-0600 configuration:
+
+- `$T3CODE_HOME/codex-cliproxy/config.toml` sets the Responses provider to
+  `<proxy>/v1`, reads the bearer from `CLIPROXYAPI_API_KEY`, and defaults to
+  `gpt-6-sol` with `high` effort. `T3_CODEX_MODEL` and
+  `T3_CODEX_REASONING_EFFORT` override those defaults. The CLI config sets
+  approval policy `never` and sandbox `danger-full-access`; the driver still
+  selects the T3 runtime mode explicitly.
+- `$T3CODE_HOME/userdata/settings.json` enables only the two proxy instances,
+  disables all persisted other instances, clears project provider overrides,
+  and routes text generation to `codex-cliproxy`. The default thread model is
+  `claude-opus-5-5`; select it with `T3_DEFAULT_PROVIDER_INSTANCE` and
+  `T3_DEFAULT_MODEL`. Only the two proxy instance ids are accepted.
+- Claude's sensitive bearer is in that private settings file. T3 redacts it
+  in API responses. Its home is `$T3CODE_HOME/claude-cliproxy`.
+
+The entrypoint drops inherited OpenAI/Anthropic credentials and Claude OAuth
+or alternate cloud-provider selectors. Main's Claude wrapper enforces the
+proxy again at CLI launch. The managed allowlist is reapplied on restart;
+an authenticated T3 operator can change live settings, so this isn't a
+network egress firewall. Trust the orchestration bearer accordingly.
+`T3_CODEX_CONFIG_EXTRA_FILE` is a trusted operator TOML extension, not a
+workspace-provided file. No host login directories are mounted.
+
+## Linear MCP stub, sym-gmy.5
+
+Main at `26efcab` has no gateway endpoint exporting `linear_*` host tools.
+`src/http/router.ts` has the MCP OAuth callback but no MCP server route;
+`src/services/worker-mcp-proxy.ts` proxies configured external MCP servers on
+worker loopback and isn't an export of gateway Linear host tools.
+
+Consequently no Claude MCP endpoint, guessed URL, or shared Linear token is
+rendered. The future integration must use the gateway's authenticated MCP
+endpoint and the single shared Linear token chosen in `sym-gmy.6`. Render a
+Claude-supported MCP configuration when that server contract exists, and test
+an actual Linear tool call through it. Codex's trusted extra-TOML hook remains
+available. This documented stub satisfies the fallback for `sym-gmy.5`; it
+doesn't establish Claude Linear host-tool acceptance.
+
+## Stack wiring and token lifecycle
+
+The Toolbox PR adds an isolated `t3-backend` bridge shared with the gateway,
+without a host port or edge route. It permits outbound HTTPS to CLIProxyAPI.
+T3 has a container memory limit because no systemd user bus is installed;
+T3 falls back to ordinary child processes without per-thread cgroup limits.
+
+The parent deploys via Toolbox's normal Chezmoi and `mise run stacks:up`
+workflow. Pre-up writes a separate uid-2001 proxy credential and an empty
+root-owned mode-0400 gateway token placeholder on first boot. It preserves
+issued gateway tokens on rerun. It doesn't enable T3 automatically.
+
+After starting the sidecar, run the managed Toolbox script:
+
+```nu
+nu ~/stacks/ohmypi-symphony/rotate-t3-token.nu
 ```
 
-The script runs
-`t3 auth session issue --scope orchestration:read --scope orchestration:operate --ttl <ttl> --label "ohmypi-symphony gateway" --json`
-against the server's data dir. It writes only the token to
-`/data/gateway-auth/t3-gateway-token` (mode 0400, uid 1001, atomic rename) and the
-non-secret metadata to `t3-gateway-token.json`. It works while the server is running,
-because it talks to the same SQLite auth store.
+This runs `t3-issue-gateway-token` in the container, which stages a 30-day
+bearer and non-secret session metadata in `/data/gateway-auth`. The Toolbox
+script copies the bearer into a separate root-owned mode-0400 file for the
+gateway. T3 can't replace that root-owned file through the mounted secret.
+It doesn't restart services. After installing the token, explicitly enable
+the registry setting only once workspace access is implemented, apply the
+Compose target, and recreate the gateway to pick up the new secret inode:
 
-An operator must copy the staged token into a separate root-owned file with mode
-0400 and mount that file read-only at `/run/secrets/t3-gateway-token` in the
-gateway. Its parent directory must also be root-owned and unwritable by workers.
-Do not mount the T3-owned staging volume into the gateway: uid 1001 must not
-control gateway secret paths. For example, copy the file out with `docker cp`,
-then use `sudo install -o root -g root -m 0400` to install it in the deployment
-secret directory. Apply the same root-owned 0400 policy to every gateway secret,
-including Docker secrets, as required by [gateway security](security.md).
-
-The gateway reads the installed token as a `_FILE` secret, POSTs it as a bearer to
-`/api/auth/websocket-ticket`, and connects to
-`/ws?wsTicket=<ticket>&orchestrationProtocol=2`.
-
-Rotation: run the script again, install the new root-owned 0400 copy, restart the
-gateway, then revoke the old session.
-The script prints the exact `t3 auth session revoke <id>` command. Sessions expire
-at the TTL and there's no refresh, so schedule rotation before expiry (lane C2).
-
-## Agents and systemd-run in a container
-
-T3 on Linux tries to start each agent in a transient `systemd-run --user --scope`
-unit (`apps/server/src/process/agentScope.ts`). It does that only when
-`XDG_RUNTIME_DIR` is set and both `systemd-run` and `systemctl` resolve on `PATH`,
-and when a probe scope starts successfully. Otherwise `AgentScope.wrap` falls back
-to `/bin/sh -c '<raise oom_score_adj>; exec "$@"'`, a plain child process.
-
-The image has no systemd and doesn't set `XDG_RUNTIME_DIR`, so agents run as direct
-children of `t3`. That's verified: the process tree shows `codex app-server` and
-`claude --output-format stream-json …` under `t3 serve`, and both answered prompts.
-What's lost compared with the host install:
-
-- No per-agent cgroup memory limits (`MemoryHigh`/`MemoryMax` on the agents slice) and
-  no OOM attribution per thread. Set a container-level `mem_limit` instead.
-- No cleanup of leftover agents from a killed server by slice. Container restarts
-  kill every process anyway.
-
-Don't install systemd or mount the host's user bus to get this back.
-
-## Earlier verification (2026-10-23, workbench, image `ohmypi-symphony-t3:dev`)
-
-These receipts predate the uid 1001 image change. They prove the original uid 1000
-image behavior; rebuild and rerun them before claiming runtime acceptance of this
-revision. The gateway driver defaults to `auto`; the earlier explicit full-access
-probe below does not change that default.
-
-Evidence lives in `~/dev/agentic-scratchpads/ohmypi-symphony/t3-sidecar/`:
-
-- `build.log`: image builds and every checksum passes.
-- `versions.log`: `t3 v0.1.2`, `codex-cli 0.156.1`, `2.1.304 (Claude Code)`; uid 1000;
-  no `systemd-run`.
-- Container became `healthy` (healthcheck: `GET /.well-known/t3/environment`, which
-  reports `serverVersion 0.1.2`, `orchestrationProtocolVersion 2`).
-- `token-issue.log`: token written with mode 0400; scopes `orchestration:read`,
-  `orchestration:operate`; 30-day expiry.
-- `getconfig.json`, `providers-after-restart.log`: `server.getConfig` over WS with the
-  gateway token. `claude-cliproxy` is `ready` (auth `authenticated`, apiKey) and
-  `codex-cliproxy` is `ready`, with its model list (`gpt-6-sol`, `gpt-6-luna`, …)
-  fetched through CLIProxyAPI. After a restart on the same volume, only those two
-  instances are enabled and the token still works.
-- `probe-prompts.log`: `t3 thread start … "Reply with exactly PROBE-OK" --wait` per
-  provider. Both returned `PROBE-OK` (codex-cliproxy/gpt-6-sol and
-  claude-cliproxy/claude-opus-5-5).
-- `ws-launch.json`, `ws-projection.json`: `orchestration.launchThread` with the gateway
-  token (`runtimeMode: "full-access"`, codex-cliproxy) completed with `PROBE-OK`.
-- `mcp-reject.log`: the gateway token gets 401 on `/mcp`, as designed.
-- `negative-tests.log`: missing URL, missing key, and both key forms set each fail
-  fast with exit 64.
-
-Smoke run. Prepare the CLIProxyAPI key file as uid/gid 1001, mode 0400, so the
-non-root T3 process can read it. Gateway secret files use root ownership instead.
-
-```bash
-docker build -f deploy/t3/Dockerfile -t ohmypi-symphony-t3:dev deploy/t3
-docker run -d --name t3-sidecar-smoke -p 127.0.0.1:37730:3773 \
-  -v t3-sidecar-smoke-data:/data/t3 -v t3-sidecar-smoke-auth:/data/gateway-auth \
-  --security-opt no-new-privileges:true --cap-drop ALL \
-  -v "$PWD/cliproxy-key:/run/secrets/cliproxyapi-key:ro" \
-  -e CLIPROXYAPI_BASE_URL=https://cliproxyapi.ai.roxasroot.net \
-  -e CLIPROXYAPI_API_KEY_FILE=/run/secrets/cliproxyapi-key \
-  ohmypi-symphony-t3:dev
-docker exec t3-sidecar-smoke t3-issue-gateway-token
+```nu
+mise run stacks:up ohmypi-symphony -d --force-recreate gateway
 ```
 
-## Upgrade and pin procedure
+Rotate before the metadata's expiry, recreate the gateway and verify its
+connection, then revoke the prior session. Save the old session id before
+issuance; issuance metadata is replaced. There's no automatic renewal.
+T3 prints a one-time pairing credential on startup. Keep logs local, or
+filter pairing credential lines before forwarding them.
 
-Bump one component at a time, in `deploy/t3/Dockerfile`:
+## Verification boundary
 
-1. **t3.** Pick a stable tag (`gh release list -R pingdotgg/t3code`). Take both Linux
-   checksums from the tag's `SHA256SUMS`
-   (`gh release download v<X> -R pingdotgg/t3code -p SHA256SUMS -O -`). Update
-   `T3_VERSION` and both `t3_sum` values. Then read the T3 diff for
-   `packages/contracts/src/orchestrationV2.ts`, `rpc.ts`, and
-   `apps/server/src/auth/RpcAuthorization.ts`. The WS contract is internal and
-   unversioned, so the gateway driver's vendored schema has to move with it.
-2. **codex.** Prefer the version the new T3 tag pins in
-   `apps/server/src/provider/CodexInstallation.ts`, and copy its Linux musl checksums.
-3. **claude.** Read
-   `https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/<version>/manifest.json`
-   and copy `platforms["linux-x64"].checksum` and `["linux-arm64"].checksum`.
-4. Rebuild, rerun the smoke steps above (health, token, `server.getConfig`, one
-   PROBE-OK per provider), and update the pin table in this doc.
+The refreshed image built on workbench. All download checksums passed, and
+the CLIs report T3 0.1.2, Codex 0.156.1 and Claude Code 2.1.304 as uid 2001.
+`mise exec -- bun run check` passed with 772 tests, including real entrypoint
+render tests for proxy enforcement, private modes, inherited credential
+removal and invalid input failures. Toolbox's focused tests cover Compose
+exposure, shared paths, secret provisioning and token rotation.
 
-`t3 update` and Claude's autoupdater must not run in the container
-(`DISABLE_AUTOUPDATER=1` is set). The image is the pin.
-
-## What lane C2 adds to the toolbox stack (bead `sym-gmy.4`)
-
-The ohmypi-symphony compose stack on arch-cachy (`home/stacks/…`, registered in
-`home/.chezmoidata/stacks.yaml`) needs:
-
-1. **A `t3` service** built from this repo's `deploy/t3/Dockerfile` with context
-   `deploy/t3`, or from a published image tag. Settings:
-   - `restart: unless-stopped`, `init` not needed (tini is PID 1), and a `mem_limit`
-     (no per-agent cgroups, see above).
-   - `security_opt: ["no-new-privileges:true"]` and `cap_drop: ["ALL"]`.
-     Keep the image's uid/gid 1001; never run T3 as root. The gateway retains the
-     six capabilities documented in [gateway security](security.md).
-   - Networks: a private stack network shared with the gateway. Don't publish 3773
-     on the host or route it through the edge proxy. The container must resolve and
-     reach `cliproxyapi.ai.roxasroot.net` over Tailscale, the same way the gateway
-     container already does on `edge-proxy`.
-2. **Environment:** `CLIPROXYAPI_BASE_URL=https://cliproxyapi.ai.<root_domain>`
-   (resolve it from `roxasroot_net_edge.vpn_services`, as the codex template does) and
-   `CLIPROXYAPI_API_KEY_FILE` pointing at a mounted secret. Keep the placeholder's
-   source of truth where it lives today, and don't commit it to fnox or the stack dir
-   in plaintext.
-3. **Volumes:** a named `t3-data` volume at `/data/t3`; a named `t3-gateway-auth`
-   volume at `/data/gateway-auth` for T3 staging only; and the gateway's
-   existing workspaces volume at `/app/workspaces` in both.
-4. **Gateway env** (the client lane defines the exact names): T3 URL `http://t3:3773`
-   and `T3_TOKEN_FILE=/run/secrets/t3-gateway-token`, pointing to the separate
-   root-owned mode-0400 secret copy mounted read-only into the gateway.
-5. **Bootstrap and rotation:** a mise or stack task that runs
-   `docker compose exec t3 t3-issue-gateway-token` after first deploy, installs the
-   root-owned mode-0400 gateway copy, and restarts the gateway, plus a reminder
-   or timer to rotate before the 30-day expiry and revoke the previous session.
-6. **Optional:** `T3_CODEX_CONFIG_EXTRA_FILE` with `[mcp_servers.*]` once the gateway
-   exposes Linear host tools as an MCP server. The Claude side needs its own MCP
-   config, which this sidecar doesn't render yet.
-
-## Known limitations
-
-- The WS RPC contract is internal to T3 and changes between releases. The pin keeps
-  it stable; read the upgrade procedure before bumping.
-- The gateway token isn't an `mcp-client` session, so it can't use `/mcp`. That's
-  fine for the WS driver.
-- WS `orchestration.launchThread` accepted `runtimeMode: "full-access"` from this
-  token. The MCP path's runtime-mode ceiling doesn't apply to the WS path, so
-  `orchestration:operate` is effectively full-access. Guard the token file.
-- Codex fetches its plugin marketplace (`github.com/openai/plugins`) into
-  `CODEX_HOME/.tmp` at session start. That's harmless but needs outbound GitHub
-  access.
+No deployment to arch-cachy, Linear agent session, remote model prompt, or
+end-to-end PR creation was performed by this lane. Earlier PROBE-OK receipts
+under `~/dev/agentic-scratchpads/ohmypi-symphony/t3-sidecar/` used uid 1000 and
+aren't runtime acceptance of this revision. Parent acceptance must exercise
+both providers, gateway workspace access, token rotation and the real Linear
+session-to-PR flow with the merged driver.

@@ -9,8 +9,8 @@
 # restart: the claude-cliproxy and codex-cliproxy entries in
 # $T3CODE_HOME/userdata/settings.json, defaultModelSelection, and the
 # codex-cliproxy config.toml. The built-in codex and claudeAgent instances are
-# disabled when settings.json doesn't mention them yet. Other settings written
-# through the T3 UI or API are kept. Reference: docs/t3-driver-deploy.md.
+# disabled on every boot, along with other non-proxy instances and project
+# provider overrides. Unrelated UI settings are kept. Reference: docs/t3-driver-deploy.md.
 set -euo pipefail
 
 die() {
@@ -55,14 +55,28 @@ render_config() {
   unset CLIPROXYAPI_API_KEY_FILE
   # Claude Code prefers ANTHROPIC_API_KEY over ANTHROPIC_AUTH_TOKEN; keep a
   # stray one from bypassing the proxy (same as toolbox's claudex wrapper).
-  unset ANTHROPIC_API_KEY
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL \
+    CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_API_KEY_HELPER \
+    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY \
+    OPENAI_API_KEY OPENAI_BASE_URL OPENAI_ACCESS_TOKEN
+  export CLIPROXYAPI_BASE_URL="$base_url"
 
   local codex_home="${T3_CODEX_HOME:-${T3CODE_HOME}/codex-cliproxy}"
   local claude_home="${T3_CLAUDE_CONFIG_DIR:-${T3CODE_HOME}/claude-cliproxy}"
   local codex_model="${T3_CODEX_MODEL:-gpt-6-sol}"
-  local codex_effort="${T3_CODEX_REASONING_EFFORT:-medium}"
+  local codex_effort="${T3_CODEX_REASONING_EFFORT:-high}"
   local default_instance="${T3_DEFAULT_PROVIDER_INSTANCE:-claude-cliproxy}"
   local default_model="${T3_DEFAULT_MODEL:-claude-opus-5-5}"
+
+  case "$default_instance" in
+    claude-cliproxy|codex-cliproxy) ;;
+    *) die "T3_DEFAULT_PROVIDER_INSTANCE must be claude-cliproxy or codex-cliproxy" ;;
+  esac
+  local runtime_mode="${T3_RUNTIME_MODE:-auto}"
+  case "$runtime_mode" in
+    auto|full-access) ;;
+    *) die "T3_RUNTIME_MODE must be auto or full-access" ;;
+  esac
 
   umask 077
   mkdir -p "${T3CODE_HOME}/userdata" "$codex_home" "$claude_home"
@@ -106,8 +120,9 @@ render_config() {
     --arg claude_home "$claude_home" \
     --arg default_instance "$default_instance" \
     --arg default_model "$default_model" \
+    --arg runtime_mode "$runtime_mode" \
     '
-    .providerInstances = ((.providerInstances // {}) + {
+    .providerInstances = (((.providerInstances // {}) | with_entries(.value.enabled = false)) + {
       "claude-cliproxy": {
         driver: "claudeAgent",
         displayName: "Claude (CLIProxyAPI)",
@@ -126,10 +141,14 @@ render_config() {
         config: { homePath: $codex_home }
       }
     })
-    # The built-in instances have no login here and would only report errors.
-    # Kept off unless an operator configured them through T3.
-    | .providerInstances.codex //= { driver: "codex", enabled: false }
-    | .providerInstances.claudeAgent //= { driver: "claudeAgent", enabled: false }
+    | .providerInstances.codex = { driver: "codex", enabled: false }
+    | .providerInstances.claudeAgent = { driver: "claudeAgent", enabled: false }
+    | .defaultRuntimeMode = $runtime_mode
+    | .textGenerationModelSelection = { instanceId: "codex-cliproxy", model: "gpt-6-luna" }
+    | .sourceControlWriterModelSelection = null
+    | .reviewGuideModelSelection = null
+    | .projectProviderInstanceOverrides = {}
+    | .projectSettingsOverrides = {}
     | .defaultModelSelection = { instanceId: $default_instance, model: $default_model }
     ' <<<"$current" >"${settings}.tmp"
   mv -f "${settings}.tmp" "$settings"
