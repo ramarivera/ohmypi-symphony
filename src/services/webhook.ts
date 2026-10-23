@@ -1,4 +1,9 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  randomUUID,
+  timingSafeEqual,
+} from "node:crypto";
 import {
   Cause,
   Context,
@@ -6,6 +11,7 @@ import {
   Layer,
   Option,
   Redacted,
+  Schedule,
   Schema,
 } from "effect";
 import {
@@ -436,7 +442,7 @@ const handleAgentSessionEvent = (
     const projectIdOption = yield* decodeOptionalBrand(projectId, ProjectId);
     const persistedPayload = automationDelegatedPayload(event, rawAgentSession);
 
-    yield* runRepo.create({
+    const run = yield* runRepo.create({
       sessionId,
       organizationId,
       issueId,
@@ -444,6 +450,12 @@ const handleAgentSessionEvent = (
       projectId: projectIdOption,
       now: timestamp,
     });
+
+    if (run.organizationId !== organizationId) {
+      return yield* Effect.fail(
+        new WebhookIdentityError({ message: "Session organization mismatch" }),
+      );
+    }
 
     if (event.action === "created") {
       const configured = yield* promptTemplateRepo.get(
@@ -904,30 +916,33 @@ const handleAppUserNotification = (
       issueId: issueId.value,
     });
     const stopId = payload.notification.id || payload.webhookId;
-    yield* Effect.forEach(runs, (run) =>
-      Schema.decodeUnknownEffect(InputId)(
-        `${run.sessionId}:stop:${stopId}`,
-      ).pipe(
-        Effect.catchTag(
-          "SchemaError",
-          () =>
-            new WebhookPayloadError({
-              message: "Invalid AppUserNotification stop input id",
-              status: 400,
+    // The signed event time bounds both delayed ingress and startup replay.
+    yield* Effect.forEach(
+      runs.filter((run) => run.createdAt <= timestamp),
+      (run) =>
+        Schema.decodeUnknownEffect(InputId)(
+          `${run.sessionId}:stop:${stopId}`,
+        ).pipe(
+          Effect.catchTag(
+            "SchemaError",
+            () =>
+              new WebhookPayloadError({
+                message: "Invalid AppUserNotification stop input id",
+                status: 400,
+              }),
+          ),
+          Effect.flatMap((id) =>
+            runInputRepo.enqueue({
+              id,
+              sessionId: run.sessionId,
+              kind: "stop",
+              body: `Stopped by Linear notification ${payload.action}.`,
+              payload: persistedPayload,
+              createdAt: timestamp,
             }),
+          ),
+          Effect.asVoid,
         ),
-        Effect.flatMap((id) =>
-          runInputRepo.enqueue({
-            id,
-            sessionId: run.sessionId,
-            kind: "stop",
-            body: `Stopped by Linear notification ${payload.action}.`,
-            payload: persistedPayload,
-            createdAt: timestamp,
-          }),
-        ),
-        Effect.asVoid,
-      ),
     );
   });
 
@@ -955,18 +970,263 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
       const runInputRepo = yield* RunInputRepo;
       const deliveryRepo = yield* DeliveryRepo;
       const promptTemplateRepo = yield* PromptTemplateRepo;
-      const failedCleanup = new Set<DeliveryId>();
+      // Only authenticated ingress and validated persisted envelopes call this
+      // boundary. Timestamp freshness belongs to ingress, tenant and event
+      // identity validation is shared and runs again during replay.
+      const processAuthenticatedEvent = Effect.fn(
+        "WebhookPipeline.processAuthenticatedEvent",
+      )(function* (
+        parsed: Record<string, unknown>,
+        id: DeliveryId,
+        token: string,
+      ): Effect.fn.Return<boolean, WebhookProcessingError> {
+        const {
+          organizationId,
+          type: eventType,
+          webhookTimestamp: timestamp,
+        } = parsed;
+        if (
+          !isString(organizationId) ||
+          !isString(eventType) ||
+          !isString(parsed.webhookId) ||
+          !isNumber(timestamp) ||
+          !Number.isSafeInteger(timestamp) ||
+          timestamp <= 0
+        ) {
+          return yield* Effect.fail(
+            new WebhookPayloadError({
+              message: "Stored webhook envelope is invalid",
+              status: 400,
+            }),
+          );
+        }
+        if (!organizationAllowed(config, organizationId)) {
+          return yield* Effect.fail(
+            new WebhookIdentityError({
+              message: "Organization is not allowed",
+            }),
+          );
+        }
+        const processing = Effect.gen(function* () {
+          switch (eventType) {
+            case "AgentSessionEvent": {
+              const rawAgentSession = isRecord(parsed.agentSession)
+                ? parsed.agentSession
+                : undefined;
+              const event = yield* Schema.decodeUnknownEffect(
+                AgentSessionEvent,
+              )(parsed).pipe(
+                Effect.catchTag(
+                  "SchemaError",
+                  (error) =>
+                    new WebhookPayloadError({
+                      message: "AgentSessionEvent payload is invalid",
+                      status: 400,
+                      cause: String(error),
+                    }),
+                ),
+              );
+              yield* validateAgentSessionIdentity(
+                event,
+                config,
+                installationRepo,
+              );
+              return yield* handleAgentSessionEvent(
+                event,
+                rawAgentSession,
+                timestamp,
+                runRepo,
+                runInputRepo,
+                promptTemplateRepo,
+              );
+            }
+            case "OAuthApp": {
+              const { action, organizationId: orgId } =
+                yield* validateOAuthAppPayload(parsed, config);
+              return yield* handleOAuthAppRevoked(
+                action,
+                orgId,
+                installationRepo,
+                timestamp,
+              );
+            }
+            case "AppUserNotification": {
+              const {
+                payload,
+                organizationId: orgId,
+                issueId,
+              } = yield* validateAppUserNotification(
+                parsed,
+                config,
+                installationRepo,
+              );
+              return yield* handleAppUserNotification(
+                payload,
+                orgId,
+                issueId,
+                runRepo,
+                runInputRepo,
+                timestamp,
+              );
+            }
+            case "PermissionChange": {
+              const {
+                action,
+                organizationId: orgId,
+                appUserId,
+                addedTeamIds,
+                removedTeamIds,
+                canAccessAllPublicTeams,
+              } = yield* validatePermissionChangePayload(parsed, config);
+
+              const installation = yield* installationRepo.get(orgId);
+              if (Option.isNone(installation)) {
+                return yield* Effect.fail(
+                  new WebhookIdentityError({
+                    message: "No installation for organization",
+                  }),
+                );
+              }
+              if (Option.isSome(installation.value.revokedAt)) {
+                return yield* Effect.fail(
+                  new WebhookIdentityError({
+                    message: "Installation is revoked",
+                  }),
+                );
+              }
+              if (installation.value.appUserId !== appUserId) {
+                return yield* Effect.fail(
+                  new WebhookIdentityError({
+                    message: "App user mismatch",
+                  }),
+                );
+              }
+
+              return yield* handlePermissionChange(
+                action,
+                orgId,
+                appUserId,
+                addedTeamIds,
+                removedTeamIds,
+                canAccessAllPublicTeams,
+                installationRepo,
+                timestamp,
+              );
+            }
+            default:
+              return;
+          }
+        });
+        return yield* deliveryRepo.processClaim(id, token, processing);
+      });
+
+      const recoverPendingDeliveries = Effect.fn(
+        "WebhookPipeline.recoverPendingDeliveries",
+      )(function* () {
+        const pending = yield* deliveryRepo.pendingIds();
+        for (const row of pending) {
+          const token = randomUUID();
+          let acquired = false;
+          const replay = Effect.gen(function* () {
+            const id = yield* decodeDeliveryId(row.delivery_id);
+            const claimed = yield* deliveryRepo.claimReplay(id, token);
+            if (Option.isNone(claimed)) return;
+            acquired = true;
+            const stored = claimed.value;
+            if (
+              stored.payload_version !== 1 ||
+              !deliveryRepo.verifyReplay(stored)
+            ) {
+              return yield* Effect.fail(
+                new WebhookPayloadError({
+                  message: "Stored webhook integrity check failed",
+                  status: 400,
+                }),
+              );
+            }
+            const parsed: unknown = yield* Effect.try({
+              try: () => JSON.parse(stored.payload_json) as unknown,
+              catch: () =>
+                new WebhookPayloadError({
+                  message: "Stored webhook JSON is invalid",
+                  status: 400,
+                }),
+            });
+            if (
+              !isRecord(parsed) ||
+              parsed.organizationId !== stored.organization_id
+            ) {
+              return yield* Effect.fail(
+                new WebhookIdentityError({
+                  message: "Stored webhook organization mismatch",
+                }),
+              );
+            }
+            const processed = yield* processAuthenticatedEvent(
+              parsed,
+              id,
+              token,
+            );
+            yield* Effect.logInfo(
+              processed ? "webhook.replayed" : "webhook.replay_superseded",
+            ).pipe(Effect.annotateLogs({ deliveryId: id }));
+          }).pipe(
+            Effect.retry({
+              times: 2,
+              schedule: Schedule.exponential("25 millis"),
+              while: (error) => error._tag === "@Gateway/DatabaseError",
+            }),
+          );
+          yield* replay.pipe(
+            Effect.catchCause((cause) =>
+              Cause.hasInterrupts(cause)
+                ? Effect.failCause(cause)
+                : Effect.gen(function* () {
+                    // Never log schema causes, SQL errors, tokens, or stored payloads.
+                    yield* Effect.logWarning("webhook.replay_failed").pipe(
+                      Effect.annotateLogs({
+                        deliveryId: row.delivery_id,
+                        maxAttempts: 3,
+                      }),
+                    );
+                    const id = yield* decodeDeliveryId(row.delivery_id).pipe(
+                      Effect.option,
+                    );
+                    if (Option.isSome(id)) {
+                      // Recovery must fail startup if storage cannot make an
+                      // abandoned delivery retryable. Request cleanup can defer.
+                      yield* acquired
+                        ? deliveryRepo.mark(
+                            id.value,
+                            "failed",
+                            "Stored webhook replay failed",
+                            token,
+                          )
+                        : deliveryRepo.failReplayClaim(
+                            id.value,
+                            row.claim_token,
+                          );
+                    }
+                  }),
+            ),
+            Effect.ensuring(deliveryRepo.releaseClaim(row.delivery_id, token)),
+          );
+        }
+      });
+
+      const failedCleanup = new Map<DeliveryId, string>();
       const markClaimFailed = (
         id: DeliveryId,
+        token: string,
         reason = "Webhook processing interrupted or failed",
       ) =>
-        deliveryRepo.mark(id, "failed", reason).pipe(
+        deliveryRepo.mark(id, "failed", reason, token).pipe(
           Effect.tap(() => Effect.sync(() => failedCleanup.delete(id))),
-          Effect.catch((error) =>
+          Effect.catch(() =>
             Effect.gen(function* () {
-              failedCleanup.add(id);
+              failedCleanup.set(id, token);
               yield* Effect.logError("webhook.delivery_cleanup_failed").pipe(
-                Effect.annotateLogs({ deliveryId: id, error: String(error) }),
+                Effect.annotateLogs({ deliveryId: id }),
               );
             }),
           ),
@@ -977,6 +1237,7 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
       ): Effect.fn.Return<Response, never> {
         let deliveryId: DeliveryId | undefined;
         let claimedDelivery = false;
+        const claimToken = randomUUID();
 
         const process: Effect.Effect<Response, WebhookProcessingError, never> =
           Effect.gen(function* () {
@@ -1159,19 +1420,24 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
 
             // Retry a failed cleanup on redelivery before consulting the durable
             // dedupe status. Only this process's completed, failed claims enter
-            // this set; an actively processing request is never reset here.
+            // this map; an actively processing request is never reset here.
             yield* Effect.uninterruptible(
               Effect.gen(function* () {
-                if (failedCleanup.delete(decodedDeliveryId)) {
+                const failedToken = failedCleanup.get(decodedDeliveryId);
+                if (failedToken !== undefined) {
+                  failedCleanup.delete(decodedDeliveryId);
                   yield* deliveryRepo
                     .mark(
                       decodedDeliveryId,
                       "failed",
                       "Retry failed webhook cleanup",
+                      failedToken,
                     )
                     .pipe(
                       Effect.onError(() =>
-                        Effect.sync(() => failedCleanup.add(decodedDeliveryId)),
+                        Effect.sync(() =>
+                          failedCleanup.set(decodedDeliveryId, failedToken),
+                        ),
                       ),
                     );
                 }
@@ -1187,6 +1453,8 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
                 payloadHash: hash,
                 payload: parsed,
                 receivedAt,
+                claimToken,
+                payloadVersion: 1,
               })
               .pipe(
                 Effect.tap((result) =>
@@ -1229,120 +1497,14 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
               }),
             );
 
-            switch (eventType) {
-              case "AgentSessionEvent": {
-                const rawAgentSession = isRecord(parsed.agentSession)
-                  ? parsed.agentSession
-                  : undefined;
-                const event = yield* Schema.decodeUnknownEffect(
-                  AgentSessionEvent,
-                )(parsed).pipe(
-                  Effect.catchTag(
-                    "SchemaError",
-                    (error) =>
-                      new WebhookPayloadError({
-                        message: "AgentSessionEvent payload is invalid",
-                        status: 400,
-                        cause: String(error),
-                      }),
-                  ),
-                );
-                yield* validateAgentSessionIdentity(
-                  event,
-                  config,
-                  installationRepo,
-                );
-                yield* handleAgentSessionEvent(
-                  event,
-                  rawAgentSession,
-                  timestamp,
-                  runRepo,
-                  runInputRepo,
-                  promptTemplateRepo,
-                );
-                break;
-              }
-              case "OAuthApp": {
-                const { action, organizationId: orgId } =
-                  yield* validateOAuthAppPayload(parsed, config);
-                yield* handleOAuthAppRevoked(
-                  action,
-                  orgId,
-                  installationRepo,
-                  timestamp,
-                );
-                break;
-              }
-              case "AppUserNotification": {
-                const {
-                  payload,
-                  organizationId: orgId,
-                  issueId,
-                } = yield* validateAppUserNotification(
-                  parsed,
-                  config,
-                  installationRepo,
-                );
-                yield* handleAppUserNotification(
-                  payload,
-                  orgId,
-                  issueId,
-                  runRepo,
-                  runInputRepo,
-                  timestamp,
-                );
-                break;
-              }
-              case "PermissionChange": {
-                const {
-                  action,
-                  organizationId: orgId,
-                  appUserId,
-                  addedTeamIds,
-                  removedTeamIds,
-                  canAccessAllPublicTeams,
-                } = yield* validatePermissionChangePayload(parsed, config);
+            const processed = yield* processAuthenticatedEvent(
+              parsed,
+              decodedDeliveryId,
+              claimToken,
+            );
+            if (!processed)
+              return new Response("Delivery claim superseded", { status: 503 });
 
-                const installation = yield* installationRepo.get(orgId);
-                if (Option.isNone(installation)) {
-                  return yield* Effect.fail(
-                    new WebhookIdentityError({
-                      message: "No installation for organization",
-                    }),
-                  );
-                }
-                if (Option.isSome(installation.value.revokedAt)) {
-                  return yield* Effect.fail(
-                    new WebhookIdentityError({
-                      message: "Installation is revoked",
-                    }),
-                  );
-                }
-                if (installation.value.appUserId !== appUserId) {
-                  return yield* Effect.fail(
-                    new WebhookIdentityError({
-                      message: "App user mismatch",
-                    }),
-                  );
-                }
-
-                yield* handlePermissionChange(
-                  action,
-                  orgId,
-                  appUserId,
-                  addedTeamIds,
-                  removedTeamIds,
-                  canAccessAllPublicTeams,
-                  installationRepo,
-                  timestamp,
-                );
-                break;
-              }
-              default:
-                break;
-            }
-
-            yield* deliveryRepo.mark(deliveryId, "processed");
             yield* Effect.logInfo("webhook.processed").pipe(
               Effect.annotateLogs({
                 deliveryId,
@@ -1354,6 +1516,13 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
           });
 
         return yield* process.pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              deliveryId === undefined
+                ? Effect.void
+                : deliveryRepo.releaseClaim(deliveryId, claimToken),
+            ),
+          ),
           Effect.onError((cause) => {
             const failure = Cause.findErrorOption(cause);
             const reason =
@@ -1375,7 +1544,7 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
                     )
                 : "Webhook processing interrupted or failed";
             return claimedDelivery && deliveryId !== undefined
-              ? markClaimFailed(deliveryId, reason)
+              ? markClaimFailed(deliveryId, claimToken, reason)
               : Effect.void;
           }),
           Effect.catchTags({
@@ -1401,7 +1570,7 @@ export class WebhookPipeline extends Context.Service<WebhookPipeline>()(
         );
       });
 
-      return { handle };
+      return { handle, recoverPendingDeliveries };
     }),
   },
 ) {

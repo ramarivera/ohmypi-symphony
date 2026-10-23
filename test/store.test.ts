@@ -36,10 +36,16 @@ import {
   RunRepo,
 } from "../src/services/store/repositories.js";
 import {
+  SqliteClient,
   SqliteClientLive,
   transact,
+  tryDb,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+
+import { suitePaths } from "./fixtures/paths.js";
+
+const storeSuitePath = suitePaths();
 
 const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 const configProvider = ConfigProvider.fromUnknown(
@@ -1872,3 +1878,95 @@ describe("Lease-fenced run writes", () => {
     ),
   );
 });
+
+it.live(
+  "nested repository writes roll back together and exclude unrelated fibers",
+  () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.acquireRelease(
+        Effect.sync(() => new Database(":memory:")),
+        (database) => Effect.sync(() => database.close()),
+      );
+      db.exec("CREATE TABLE atomic_write (value TEXT)");
+      const entered = yield* Deferred.make<void>();
+      const outsideStarted = yield* Deferred.make<void>();
+      const inside = yield* Effect.forkChild(
+        transact(
+          db,
+          Effect.gen(function* () {
+            yield* transact(
+              db,
+              tryDb(
+                () =>
+                  db.exec("INSERT INTO atomic_write VALUES ('rolled-back')"),
+                "nested insert",
+              ),
+            );
+            yield* Deferred.succeed(entered, undefined);
+            return yield* Effect.never;
+          }),
+        ),
+      );
+      yield* Deferred.await(entered);
+      const outside = yield* Effect.forkChild(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(outsideStarted, undefined);
+          yield* tryDb(
+            () => db.exec("INSERT INTO atomic_write VALUES ('survived')"),
+            "outside insert",
+          );
+        }),
+      );
+      yield* Deferred.await(outsideStarted);
+      yield* Fiber.interrupt(inside);
+      yield* Fiber.join(outside);
+      expect(
+        db.query<{ value: string }, []>("SELECT value FROM atomic_write").all(),
+      ).toEqual([{ value: "survived" }]);
+    }),
+);
+
+it.live(
+  "additive delivery migration preserves legacy rows and is safe to reopen",
+  () =>
+    Effect.gen(function* () {
+      const path = storeSuitePath("legacy-webhook.db");
+      const legacy = new Database(path, { create: true, strict: true });
+      legacy.exec(`
+      CREATE TABLE webhook_delivery (
+        delivery_id TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+        received_at INTEGER NOT NULL, payload_hash TEXT NOT NULL,
+        payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', error TEXT
+      );
+      INSERT INTO webhook_delivery VALUES ('legacy', 'org', 1, 'original-hash', '{"type":"AgentSessionEvent"}', 'pending', NULL);
+    `);
+      legacy.close();
+      for (let open = 0; open < 2; open++) {
+        yield* Effect.gen(function* () {
+          const { db } = yield* SqliteClient;
+          expect(
+            db
+              .query<
+                {
+                  payload_hash: string;
+                  payload_json: string;
+                  payload_version: number;
+                  replay_hash: string | null;
+                  claim_token: string | null;
+                },
+                []
+              >(
+                "SELECT payload_hash, payload_json, payload_version, replay_hash, claim_token FROM webhook_delivery",
+              )
+              .get(),
+          ).toEqual({
+            payload_hash: "original-hash",
+            payload_json: '{"type":"AgentSessionEvent"}',
+            payload_version: 0,
+            replay_hash: null,
+            claim_token: null,
+          });
+        }).pipe(Effect.provide(SqliteClientLive(path)));
+      }
+    }),
+);

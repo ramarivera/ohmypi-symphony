@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { chmod, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Context, Effect, Exit, Layer, Schema } from "effect";
+import { Context, Effect, Exit, Layer, Schema, Semaphore } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 
 export interface SqliteClientShape {
@@ -13,58 +13,78 @@ export class SqliteClient extends Context.Service<
   SqliteClientShape
 >()("SqliteClient") {}
 
+// SQLite operations share a gate. A transaction carries its
+// ownership through Effect context, so nested repository transactions join it
+// and unrelated fibers cannot accidentally write into its rollback scope.
+const databaseGate = Semaphore.makeUnsafe(1);
+const ActiveTransactions = Context.Reference<ReadonlySet<Database>>(
+  "SqliteClient/ActiveTransactions",
+  { defaultValue: () => new Set() },
+);
+
 export const tryDb = <A>(
   f: () => A,
   operation: string,
 ): Effect.Effect<A, DatabaseError> =>
-  Effect.try({
-    try: f,
-    catch: (error) =>
-      new DatabaseError({
-        message: `${operation} failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-        cause: error instanceof Error ? error.stack : String(error),
-      }),
+  Effect.flatMap(ActiveTransactions, (active) => {
+    const operationEffect = Effect.try({
+      try: f,
+      catch: (error) =>
+        new DatabaseError({
+          message: `${operation} failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          cause: error instanceof Error ? error.stack : String(error),
+        }),
+    });
+    return active.size > 0
+      ? operationEffect
+      : databaseGate.withPermits(1)(operationEffect);
   });
 
 export const transact = <A, E, R>(
   db: Database,
   effect: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E | DatabaseError, R> =>
-  Effect.uninterruptibleMask((restore) =>
-    Effect.gen(function* () {
-      const begin = () => db.exec("BEGIN IMMEDIATE");
-      const commit = () => db.exec("COMMIT");
-      const rollback = () => db.exec("ROLLBACK");
+  Effect.flatMap(ActiveTransactions, (active) => {
+    if (active.has(db)) return effect;
+    const transaction = Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const begin = () => db.exec("BEGIN IMMEDIATE");
+        const commit = () => db.exec("COMMIT");
+        const rollback = () => db.exec("ROLLBACK");
 
-      // Keep the begin operation interruptible, then mask the hand-off to the
-      // use/release section so an interrupt cannot land between BEGIN and the
-      // finalizer that rolls it back.
-      yield* restore(tryDb(begin, "BEGIN"));
-      const result = yield* Effect.exit(restore(effect));
+        // Keep the begin operation interruptible, then mask the hand-off to the
+        // use/release section so an interrupt cannot land between BEGIN and the
+        // finalizer that rolls it back.
+        yield* restore(tryDb(begin, "BEGIN"));
+        const result = yield* Effect.exit(restore(effect));
 
-      return yield* Exit.match(result, {
-        onSuccess: (value) =>
-          tryDb(commit, "COMMIT").pipe(
-            Effect.catchTag("@Gateway/DatabaseError", (error) =>
-              Effect.gen(function* () {
-                yield* tryDb(rollback, "ROLLBACK").pipe(
-                  Effect.catch(() => Effect.void),
-                );
-                return yield* Effect.fail(error);
-              }),
+        return yield* Exit.match(result, {
+          onSuccess: (value) =>
+            tryDb(commit, "COMMIT").pipe(
+              Effect.catchTag("@Gateway/DatabaseError", (error) =>
+                Effect.gen(function* () {
+                  yield* tryDb(rollback, "ROLLBACK").pipe(
+                    Effect.catch(() => Effect.void),
+                  );
+                  return yield* Effect.fail(error);
+                }),
+              ),
+              Effect.map(() => value),
             ),
-            Effect.map(() => value),
-          ),
-        onFailure: (cause) =>
-          tryDb(rollback, "ROLLBACK").pipe(
-            Effect.catch(() => Effect.void),
-            Effect.andThen(Effect.failCause(cause)),
-          ),
-      });
-    }),
-  );
+          onFailure: (cause) =>
+            tryDb(rollback, "ROLLBACK").pipe(
+              Effect.catch(() => Effect.void),
+              Effect.andThen(Effect.failCause(cause)),
+            ),
+        });
+      }),
+    ).pipe(Effect.provideService(ActiveTransactions, new Set([...active, db])));
+    return active.size > 0
+      ? transaction
+      : databaseGate.withPermits(1)(transaction);
+  });
 
 export const decodeRow = <A, I, R>(
   schema: Schema.Codec<A, I, R>,
@@ -310,6 +330,22 @@ const migrate = (db: Database): void => {
       PRIMARY KEY (organization_id, server_id)
     );
   `);
+
+  // Additive replay envelope. Version zero denotes legacy rows that must be
+  // reclaimed by authenticated ingress because their integrity cannot be checked.
+  const deliveryColumns = db
+    .query<{ name: string }, []>('PRAGMA table_info("webhook_delivery")')
+    .all()
+    .map((column) => column.name);
+  for (const [name, definition] of [
+    ["payload_version", "INTEGER NOT NULL DEFAULT 0"],
+    ["replay_hash", "TEXT"],
+    ["claim_token", "TEXT"],
+  ] as const) {
+    if (!deliveryColumns.includes(name)) {
+      db.exec(`ALTER TABLE webhook_delivery ADD COLUMN ${name} ${definition}`);
+    }
+  }
 
   const repositoryColumns = db
     .query<{ name: string }, []>('PRAGMA table_info("repository")')

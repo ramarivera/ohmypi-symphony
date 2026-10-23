@@ -1,24 +1,29 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { Writable } from "node:stream";
 import { it } from "@effect/vitest";
 import {
+  Cause,
   Clock,
   ConfigProvider,
   Deferred,
   Effect,
+  Exit,
   Fiber,
   Layer,
   Logger,
   Option,
   Redacted,
+  References,
   Schema,
 } from "effect";
 import * as fc from "fast-check";
 import pino from "pino";
 import { describe, expect, vi } from "vitest";
+import { recoverGateway } from "../src/conductor.js";
 import { DatabaseError } from "../src/domain/errors.js";
 import {
   AppUserId,
+  DeliveryId,
   IssueId,
   OrganizationId,
   ProjectId,
@@ -31,6 +36,7 @@ import {
   type GatewayConfigShape,
 } from "../src/services/config.js";
 import { makePinoEffectLogger } from "../src/services/logger.js";
+import { deliveryReplayMac } from "../src/services/store/delivery-repo.js";
 import {
   DeliveryRepo,
   InstallationRepo,
@@ -39,9 +45,16 @@ import {
   RunInputRepo,
   RunRepo,
 } from "../src/services/store/repositories.js";
-import { SqliteClientLive } from "../src/services/store/sqlite-client.js";
+import {
+  SqliteClient,
+  SqliteClientLive,
+} from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
-import { verifySignature, WebhookPipeline } from "../src/services/webhook.js";
+import {
+  payloadHash,
+  verifySignature,
+  WebhookPipeline,
+} from "../src/services/webhook.js";
 import { suitePaths } from "./fixtures/paths.js";
 
 const suitePath = suitePaths();
@@ -131,9 +144,9 @@ const makeLayer = (gatewayConfig: GatewayConfigShape) =>
     RunInputRepo.layer,
     WebhookPipeline.layer,
   ).pipe(
-    Layer.provide(
+    Layer.provideMerge(
       Layer.mergeAll(
-        SqliteClientLive(":memory:"),
+        SqliteClientLive(gatewayConfig.databasePath),
         ConfigProvider.layer(configProviderFor(gatewayConfig)),
       ),
     ),
@@ -149,6 +162,7 @@ const withWebhook = <A, E>(
     | RunInputRepo
     | DeliveryRepo
     | PromptTemplateRepo
+    | SqliteClient
   >,
   gatewayConfig = config,
 ) =>
@@ -1918,6 +1932,7 @@ describe("Webhook claim-owned failure marking", () => {
             kind === "identity"
               ? "OAuth client identity mismatch"
               : "AgentSessionEvent payload is invalid",
+            expect.any(String),
           ]);
         }).pipe(Effect.scoped),
       ),
@@ -2010,3 +2025,984 @@ describe("Webhook claim-owned failure marking", () => {
     ),
   );
 });
+
+const crashDeliveryId = Schema.decodeUnknownSync(DeliveryId)("crash-delivery");
+const replayStatus = (db: import("bun:sqlite").Database) => {
+  const row = db
+    .query<{ status: string; error: string | null }, []>(
+      "SELECT status, error FROM webhook_delivery WHERE delivery_id='crash-delivery'",
+    )
+    .get();
+  if (row === null) throw new Error("Missing crash delivery");
+  return row;
+};
+const auditCounts = (db: import("bun:sqlite").Database) =>
+  db
+    .query<{ operation: string; count: number }, []>(
+      "SELECT operation, COUNT(*) AS count FROM replay_audit GROUP BY operation ORDER BY operation",
+    )
+    .all();
+const setupReplayAudit = (db: import("bun:sqlite").Database) =>
+  db.exec(`
+  CREATE TABLE replay_audit (operation TEXT NOT NULL);
+  CREATE TRIGGER replay_installation AFTER UPDATE ON installation BEGIN
+    INSERT INTO replay_audit VALUES ('installation');
+  END;
+  CREATE TRIGGER replay_input AFTER INSERT ON run_input BEGIN
+    INSERT INTO replay_audit VALUES ('input');
+  END;
+`);
+const crashWebhookProcess = (
+  databasePath: string,
+  checkpoint: string,
+  payload: Record<string, unknown>,
+) =>
+  Effect.promise(async () => {
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "run",
+        new URL("./fixtures/webhook-crash.ts", import.meta.url).pathname,
+        databasePath,
+        checkpoint,
+        JSON.stringify(payload),
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    expect({ code, stdout, stderr }).toEqual({
+      code: 86,
+      stdout: "",
+      stderr: "",
+    });
+  });
+
+// Closing and reopening file-backed layers plus abrupt child process exits
+// exercise WAL recovery, not request-fiber finalizers or in-memory mock state.
+describe("Durable authenticated webhook replay", () => {
+  it.live.each(["claim", "run", "enqueue", "processed"] as const)(
+    "replays a process crash after %s exactly once before reconciliation",
+    (checkpoint) =>
+      Effect.gen(function* () {
+        const databasePath = suitePath(`replay-${checkpoint}.db`);
+        const fileConfig = { ...config, databasePath };
+        yield* withWebhook(
+          Effect.gen(function* () {
+            yield* install();
+            const { db } = yield* SqliteClient;
+            setupReplayAudit(db);
+          }),
+          fileConfig,
+        );
+        const payload = createdPayload(yield* Clock.currentTimeMillis);
+        yield* crashWebhookProcess(databasePath, checkpoint, payload);
+        yield* withWebhook(
+          Effect.gen(function* () {
+            const { db } = yield* SqliteClient;
+            expect(replayStatus(db).status).toBe("pending");
+            const pipeline = yield* WebhookPipeline;
+            const ingress = vi.spyOn(pipeline, "handle");
+            yield* recoverGateway;
+            yield* pipeline.recoverPendingDeliveries();
+            expect(ingress).not.toHaveBeenCalled();
+            ingress.mockRestore();
+            const inputs = yield* RunInputRepo.use((repo) =>
+              repo.pending(sessionId("session-1")),
+            );
+            expect(inputs).toHaveLength(1);
+            expect(inputs[0]?.id).toBe("session-1:created");
+            expect(inputs[0]?.body).toContain("Implement the issue");
+            expect(replayStatus(db)).toEqual({
+              status: "processed",
+              error: null,
+            });
+            expect(auditCounts(db)).toEqual([{ operation: "input", count: 1 }]);
+            // The stored timestamp is now older than ingress permits. Replay must
+            // not synthesize a request or reapply the ingress freshness window.
+          }),
+          { ...fileConfig, webhookReplayWindowMs: 1 },
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.live.each(["enqueue", "processed"] as const)(
+    "replays notification crash at %s without duplicated or cross-tenant stops",
+    (checkpoint) =>
+      Effect.gen(function* () {
+        const databasePath = suitePath(`notification-${checkpoint}.db`);
+        const fileConfig = { ...config, databasePath };
+        yield* withWebhook(
+          Effect.gen(function* () {
+            yield* install();
+            const runs = yield* RunRepo;
+            for (const [sid, org] of [
+              ["session-1", "org"],
+              ["session-2", "org"],
+              ["foreign-session", "other-org"],
+            ]) {
+              if (sid === undefined || org === undefined)
+                throw new Error("Missing run fixture");
+              yield* runs.create({
+                sessionId: sessionId(sid),
+                organizationId: organizationId(org),
+                issueId: Option.some(issueId("issue-1")),
+              });
+            }
+            setupReplayAudit((yield* SqliteClient).db);
+          }),
+          fileConfig,
+        );
+        yield* crashWebhookProcess(
+          databasePath,
+          checkpoint,
+          appUserNotificationPayload(
+            yield* Clock.currentTimeMillis,
+            "issueUnassignedFromYou",
+          ),
+        );
+        yield* withWebhook(
+          Effect.gen(function* () {
+            const pipeline = yield* WebhookPipeline;
+            yield* pipeline.recoverPendingDeliveries();
+            yield* pipeline.recoverPendingDeliveries();
+            const inputs = yield* RunInputRepo;
+            expect(yield* inputs.pending(sessionId("session-1"))).toHaveLength(
+              1,
+            );
+            expect(yield* inputs.pending(sessionId("session-2"))).toHaveLength(
+              1,
+            );
+            expect(
+              yield* inputs.pending(sessionId("foreign-session")),
+            ).toHaveLength(0);
+            const { db } = yield* SqliteClient;
+            expect(replayStatus(db).status).toBe("processed");
+            expect(auditCounts(db)).toEqual([{ operation: "input", count: 2 }]);
+          }),
+          fileConfig,
+        );
+      }),
+    { timeout: 15_000 },
+  );
+
+  it.live.each(["installation", "processed"] as const)(
+    "replays permission crash at %s with one committed installation update",
+    (checkpoint) =>
+      Effect.gen(function* () {
+        const databasePath = suitePath(`permission-${checkpoint}.db`);
+        const fileConfig = { ...config, databasePath };
+        yield* withWebhook(
+          Effect.gen(function* () {
+            yield* install();
+            setupReplayAudit((yield* SqliteClient).db);
+          }),
+          fileConfig,
+        );
+        yield* crashWebhookProcess(databasePath, checkpoint, {
+          type: "PermissionChange",
+          action: "teamAccessChanged",
+          organizationId: "org",
+          appUserId: "app-user",
+          oauthClientId: "client",
+          webhookId: "permissions",
+          webhookTimestamp: yield* Clock.currentTimeMillis,
+          addedTeamIds: ["team-b"],
+          removedTeamIds: ["team-a"],
+          canAccessAllPublicTeams: false,
+        });
+        yield* withWebhook(
+          Effect.gen(function* () {
+            const pipeline = yield* WebhookPipeline;
+            yield* pipeline.recoverPendingDeliveries();
+            yield* pipeline.recoverPendingDeliveries();
+            const installation = Option.getOrThrow(
+              yield* InstallationRepo.use((repo) =>
+                repo.get(organizationId("org")),
+              ),
+            );
+            expect(installation.accessibleTeamIds).toEqual(
+              Option.some([teamId("team-b")]),
+            );
+            const { db } = yield* SqliteClient;
+            expect(replayStatus(db).status).toBe("processed");
+            expect(auditCounts(db)).toEqual([
+              { operation: "installation", count: 1 },
+            ]);
+          }),
+          fileConfig,
+        );
+      }),
+    { timeout: 15_000 },
+  );
+});
+
+const storeReplay = (
+  payload: Record<string, unknown>,
+  token = "original-owner",
+) =>
+  DeliveryRepo.use((repo) =>
+    repo.claim({
+      id: crashDeliveryId,
+      organizationId: "org",
+      payload,
+      payloadHash: payloadHash(
+        new TextEncoder().encode(JSON.stringify(payload)),
+      ),
+      payloadVersion: 1,
+      claimToken: token,
+    }),
+  );
+
+describe("Webhook replay integrity and fencing", () => {
+  it.live.each(["organization", "hash", "version", "json"] as const)(
+    "rejects stored %s tampering and still replays the next delivery",
+    (field) =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const payload = createdPayload(yield* Clock.currentTimeMillis);
+          yield* storeReplay(payload);
+          const deliveries = yield* DeliveryRepo;
+          const next = createdPayload(yield* Clock.currentTimeMillis, {
+            agentSession: agentSessionBase({ id: "next-session" }),
+          });
+          yield* deliveries.claim({
+            id: Schema.decodeUnknownSync(DeliveryId)("next-delivery"),
+            organizationId: "org",
+            payload: next,
+            payloadHash: payloadHash(
+              new TextEncoder().encode(JSON.stringify(next)),
+            ),
+            payloadVersion: 1,
+          });
+          const { db } = yield* SqliteClient;
+          switch (field) {
+            case "organization": {
+              const altered = JSON.stringify({
+                ...payload,
+                organizationId: "other-org",
+              });
+              // A valid checksum alone cannot authorize a tenant mismatch.
+              const hash = payloadHash(
+                new TextEncoder().encode(JSON.stringify(payload)),
+              );
+              db.query(
+                "UPDATE webhook_delivery SET payload_json=?, replay_hash=? WHERE delivery_id=?",
+              ).run(
+                altered,
+                deliveryReplayMac(
+                  Redacted.make(secret),
+                  "org",
+                  hash,
+                  altered,
+                  1,
+                ),
+                crashDeliveryId,
+              );
+              break;
+            }
+            case "hash":
+              db.query(
+                "UPDATE webhook_delivery SET payload_hash='tampered' WHERE delivery_id=?",
+              ).run(crashDeliveryId);
+              break;
+            case "version":
+              db.query(
+                "UPDATE webhook_delivery SET payload_version=99 WHERE delivery_id=?",
+              ).run(crashDeliveryId);
+              break;
+            case "json":
+              db.query(
+                "UPDATE webhook_delivery SET payload_json='not JSON', replay_hash=? WHERE delivery_id=?",
+              ).run(
+                deliveryReplayMac(
+                  Redacted.make(secret),
+                  "org",
+                  payloadHash(
+                    new TextEncoder().encode(JSON.stringify(payload)),
+                  ),
+                  "not JSON",
+                  1,
+                ),
+                crashDeliveryId,
+              );
+              break;
+          }
+          const messages: string[] = [];
+          const logger = Logger.make((options) =>
+            messages.push(
+              JSON.stringify({
+                message: options.message,
+                cause:
+                  options.cause === undefined
+                    ? undefined
+                    : Cause.pretty(options.cause),
+                annotations: options.fiber.getRef(
+                  References.CurrentLogAnnotations,
+                ),
+              }),
+            ),
+          );
+          yield* WebhookPipeline.use((pipeline) =>
+            pipeline.recoverPendingDeliveries(),
+          ).pipe(Effect.provide(Logger.layer([logger])));
+          expect(replayStatus(db)).toEqual({
+            status: "failed",
+            error: "Stored webhook replay failed",
+          });
+          expect(
+            yield* RunInputRepo.use((repo) =>
+              repo.pending(sessionId("session-1")),
+            ),
+          ).toHaveLength(0);
+          expect(
+            yield* RunInputRepo.use((repo) =>
+              repo.pending(sessionId("next-session")),
+            ),
+          ).toHaveLength(1);
+          expect(messages.join("\n")).toContain("webhook.replay_failed");
+          expect(messages.join("\n")).not.toContain("Implement the issue");
+          expect(messages.join("\n")).not.toContain(secret);
+          expect(messages.join("\n")).not.toContain("client-secret");
+          expect(messages.join("\n")).not.toContain("original-owner");
+        }),
+      ),
+  );
+
+  it.live.each([
+    "unadmitted",
+    "revoked",
+    "app-user",
+    "client",
+    "nested-org",
+    "existing-run",
+  ] as const)("rechecks %s identity on replay", (failure) =>
+    withWebhook(
+      Effect.gen(function* () {
+        yield* install({
+          revokedAt: failure === "revoked" ? Option.some(1) : Option.none(),
+        });
+        const payload = createdPayload(yield* Clock.currentTimeMillis, {
+          ...(failure === "app-user"
+            ? {
+                appUserId: "wrong-user",
+                agentSession: agentSessionBase({ appUserId: "wrong-user" }),
+              }
+            : {}),
+          ...(failure === "client" ? { oauthClientId: "wrong-client" } : {}),
+          ...(failure === "nested-org"
+            ? {
+                agentSession: agentSessionBase({ organizationId: "other-org" }),
+              }
+            : {}),
+        });
+        if (failure === "existing-run") {
+          yield* RunRepo.use((repo) =>
+            repo.create({
+              sessionId: sessionId("session-1"),
+              organizationId: organizationId("other-org"),
+              issueId: Option.none(),
+            }),
+          );
+        }
+        yield* storeReplay(payload);
+        yield* recoverGateway;
+        expect(replayStatus((yield* SqliteClient).db).status).toBe("failed");
+        expect(
+          yield* RunInputRepo.use((repo) =>
+            repo.pending(sessionId("session-1")),
+          ),
+        ).toHaveLength(0);
+      }),
+      failure === "unadmitted"
+        ? { ...config, allowedOrganizationIds: new Set(["other-org"]) }
+        : config,
+    ),
+  );
+
+  it.live(
+    "fences both stale writes and stale failure cleanup after replay takes ownership",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          yield* storeReplay(createdPayload(yield* Clock.currentTimeMillis));
+          const deliveries = yield* DeliveryRepo;
+          const takeover = yield* deliveries.claimReplay(
+            crashDeliveryId,
+            "recovery-owner",
+          );
+          expect(Option.isSome(takeover)).toBe(true);
+          let staleEffectRan = false;
+          expect(
+            yield* deliveries.processClaim(
+              crashDeliveryId,
+              "original-owner",
+              Effect.sync(() => {
+                staleEffectRan = true;
+              }),
+            ),
+          ).toBe(false);
+          yield* deliveries.mark(
+            crashDeliveryId,
+            "failed",
+            "stale cleanup",
+            "original-owner",
+          );
+          expect(staleEffectRan).toBe(false);
+          expect(replayStatus((yield* SqliteClient).db).status).toBe("pending");
+          yield* recoverGateway;
+          yield* deliveries.mark(
+            crashDeliveryId,
+            "failed",
+            "stale cleanup",
+            "recovery-owner",
+          );
+          expect(replayStatus((yield* SqliteClient).db)).toEqual({
+            status: "processed",
+            error: null,
+          });
+          expect(
+            yield* RunInputRepo.use((repo) =>
+              repo.pending(sessionId("session-1")),
+            ),
+          ).toHaveLength(1);
+        }),
+      ),
+  );
+
+  it.live.each(["run", "enqueued", "consumed"] as const)(
+    "repairs a preexisting partial %s write without omitting or reactivating the input",
+    (partial) =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const timestamp = yield* Clock.currentTimeMillis;
+          yield* storeReplay(createdPayload(timestamp));
+          yield* RunRepo.use((repo) =>
+            repo.create({
+              sessionId: sessionId("session-1"),
+              organizationId: organizationId("org"),
+              issueId: Option.none(),
+            }),
+          );
+          const { db } = yield* SqliteClient;
+          if (partial !== "run") {
+            db.query(
+              "INSERT INTO run_input (id, session_id, kind, body, payload_json, created_at, processed_at) VALUES (?, ?, 'created', 'original input', '{}', ?, ?)",
+            ).run(
+              "session-1:created",
+              "session-1",
+              timestamp,
+              partial === "consumed" ? timestamp : null,
+            );
+          }
+          yield* recoverGateway;
+          yield* recoverGateway;
+          expect(replayStatus(db).status).toBe("processed");
+          expect(
+            db
+              .query<{ count: number }, []>(
+                "SELECT COUNT(*) AS count FROM run_input WHERE session_id='session-1'",
+              )
+              .get()?.count,
+          ).toBe(1);
+          const inputs = yield* RunInputRepo.use((repo) =>
+            repo.pending(sessionId("session-1")),
+          );
+          expect(inputs).toHaveLength(partial === "consumed" ? 0 : 1);
+          if (partial === "enqueued")
+            expect(inputs[0]?.body).toBe("original input");
+        }),
+      ),
+  );
+});
+
+it.live.each([false, true])(
+  "uses bounded replay backoff and signed retry recovery, exhausted=%s",
+  (exhausted) =>
+    withWebhook(
+      Effect.gen(function* () {
+        yield* install();
+        const payload = createdPayload(yield* Clock.currentTimeMillis);
+        yield* storeReplay(payload);
+        const deliveries = yield* DeliveryRepo;
+        const processClaim = deliveries.processClaim;
+        const times: number[] = [];
+        const spy = vi
+          .spyOn(deliveries, "processClaim")
+          .mockImplementation((id, token, effect) =>
+            Effect.gen(function* () {
+              times.push(yield* Clock.currentTimeMillis);
+              if (exhausted || times.length <= 2)
+                return yield* Effect.fail(
+                  new DatabaseError({ message: "sensitive storage details" }),
+                );
+              return yield* processClaim(id, token, effect);
+            }),
+          );
+        yield* WebhookPipeline.use((pipeline) =>
+          pipeline.recoverPendingDeliveries(),
+        );
+        spy.mockRestore();
+        expect(times).toHaveLength(3);
+        const [first, second, third] = times;
+        if (first === undefined || second === undefined || third === undefined)
+          throw new Error("Missing retry attempts");
+        expect(second - first).toBeGreaterThanOrEqual(25);
+        expect(third - second).toBeGreaterThanOrEqual(50);
+        const { db } = yield* SqliteClient;
+        expect(replayStatus(db).status).toBe(
+          exhausted ? "failed" : "processed",
+        );
+        if (exhausted) {
+          const response = yield* WebhookPipeline.use((pipeline) =>
+            pipeline.handle(
+              signedRequest(payload, { delivery: "crash-delivery" }),
+            ),
+          );
+          expect(response.status).toBe(200);
+          expect(yield* Effect.promise(() => response.text())).toBe("OK");
+        }
+        expect(replayStatus(db)).toEqual({ status: "processed", error: null });
+        expect(
+          yield* RunInputRepo.use((repo) =>
+            repo.pending(sessionId("session-1")),
+          ),
+        ).toHaveLength(1);
+      }),
+    ),
+);
+
+it.live("concurrent startup recoveries commit only one actionable input", () =>
+  withWebhook(
+    Effect.gen(function* () {
+      yield* install();
+      yield* storeReplay(createdPayload(yield* Clock.currentTimeMillis));
+      const pipeline = yield* WebhookPipeline;
+      yield* Effect.all(
+        [
+          pipeline.recoverPendingDeliveries(),
+          pipeline.recoverPendingDeliveries(),
+        ],
+        { concurrency: 2 },
+      );
+      expect(replayStatus((yield* SqliteClient).db).status).toBe("processed");
+      expect(
+        yield* RunInputRepo.use((repo) => repo.pending(sessionId("session-1"))),
+      ).toHaveLength(1);
+    }),
+  ),
+);
+
+it.live(
+  "replays an OAuth revocation crash atomically with cancellation and admin-session invalidation",
+  () =>
+    Effect.gen(function* () {
+      const databasePath = suitePath("oauth-replay.db");
+      const fileConfig = { ...config, databasePath };
+      yield* withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          yield* RunRepo.use((repo) =>
+            repo.create({
+              sessionId: sessionId("session-1"),
+              organizationId: organizationId("org"),
+              issueId: Option.none(),
+            }),
+          );
+          const { db } = yield* SqliteClient;
+          db.exec(
+            "INSERT INTO admin_session VALUES ('admin-token-hash', 'org', 'csrf-hash', 9999999999999, 1)",
+          );
+          setupReplayAudit(db);
+        }),
+        fileConfig,
+      );
+      yield* crashWebhookProcess(
+        databasePath,
+        "processed",
+        oauthAppPayload(yield* Clock.currentTimeMillis),
+      );
+      yield* withWebhook(
+        Effect.gen(function* () {
+          const { db } = yield* SqliteClient;
+          expect(
+            db
+              .query<{ count: number }, []>(
+                "SELECT COUNT(*) AS count FROM admin_session",
+              )
+              .get()?.count,
+          ).toBe(1);
+          yield* recoverGateway;
+          yield* recoverGateway;
+          expect(replayStatus(db).status).toBe("processed");
+          expect(
+            db
+              .query<{ count: number }, []>(
+                "SELECT COUNT(*) AS count FROM admin_session",
+              )
+              .get()?.count,
+          ).toBe(0);
+          const run = Option.getOrThrow(
+            yield* RunRepo.use((repo) => repo.get(sessionId("session-1"))),
+          );
+          expect(run.desiredState).toBe("canceled");
+          const installation = Option.getOrThrow(
+            yield* InstallationRepo.use((repo) =>
+              repo.get(organizationId("org")),
+            ),
+          );
+          expect(Option.isSome(installation.revokedAt)).toBe(true);
+          expect(auditCounts(db)).toEqual([
+            { operation: "installation", count: 1 },
+          ]);
+        }),
+        fileConfig,
+      );
+    }),
+  { timeout: 15_000 },
+);
+
+it.live(
+  "replays normalized header-only timestamps while preserving raw-byte dedupe",
+  () =>
+    Effect.gen(function* () {
+      const databasePath = suitePath("header-timestamp-replay.db");
+      const fileConfig = { ...config, databasePath };
+      yield* withWebhook(install(), fileConfig);
+      const payload = createdPayload(yield* Clock.currentTimeMillis);
+      delete payload.webhookTimestamp;
+      yield* crashWebhookProcess(databasePath, "claim", payload);
+      yield* withWebhook(
+        Effect.gen(function* () {
+          const { db } = yield* SqliteClient;
+          const stored = db
+            .query<{ payload_hash: string; payload_json: string }, []>(
+              "SELECT payload_hash, payload_json FROM webhook_delivery",
+            )
+            .get();
+          if (stored === null) throw new Error("Missing stored envelope");
+          expect(stored.payload_hash).toBe(
+            payloadHash(new TextEncoder().encode(JSON.stringify(payload))),
+          );
+          expect(stored.payload_json).toContain("webhookTimestamp");
+          yield* recoverGateway;
+          expect(replayStatus(db).status).toBe("processed");
+          expect(
+            yield* RunInputRepo.use((repo) =>
+              repo.pending(sessionId("session-1")),
+            ),
+          ).toHaveLength(1);
+          const request = signedRequest(payload, {
+            delivery: "crash-delivery",
+          });
+          request.headers.set(
+            "linear-timestamp",
+            String(yield* Clock.currentTimeMillis),
+          );
+          const retry = yield* WebhookPipeline.use((pipeline) =>
+            pipeline.handle(request),
+          );
+          expect(retry.status).toBe(200);
+          expect(yield* Effect.promise(() => retry.text())).toBe(
+            "Duplicate delivery",
+          );
+        }),
+        fileConfig,
+      );
+    }),
+  { timeout: 15_000 },
+);
+
+it.live("completion cannot be demoted even by its former claim owner", () =>
+  withWebhook(
+    Effect.gen(function* () {
+      yield* install();
+      yield* storeReplay(createdPayload(yield* Clock.currentTimeMillis));
+      const deliveries = yield* DeliveryRepo;
+      expect(
+        yield* deliveries.processClaim(
+          crashDeliveryId,
+          "original-owner",
+          Effect.void,
+        ),
+      ).toBe(true);
+      yield* deliveries.mark(
+        crashDeliveryId,
+        "failed",
+        "late cleanup",
+        "original-owner",
+      );
+      expect(replayStatus((yield* SqliteClient).db)).toEqual({
+        status: "processed",
+        error: null,
+      });
+    }),
+  ),
+);
+
+it.live(
+  "returns a retryable response when recovery supersedes fresh ingress",
+  () =>
+    withWebhook(
+      Effect.gen(function* () {
+        yield* install();
+        const deliveries = yield* DeliveryRepo;
+        const processClaim = vi
+          .spyOn(deliveries, "processClaim")
+          .mockImplementation((id) =>
+            deliveries.claimReplay(id, "takeover-owner").pipe(Effect.as(false)),
+          );
+        const payload = createdPayload(yield* Clock.currentTimeMillis);
+        const response = yield* WebhookPipeline.use((pipeline) =>
+          pipeline.handle(
+            signedRequest(payload, { delivery: "crash-delivery" }),
+          ),
+        );
+        processClaim.mockRestore();
+        expect(response.status).toBe(503);
+        expect(yield* Effect.promise(() => response.text())).toBe(
+          "Delivery claim superseded",
+        );
+        expect(replayStatus((yield* SqliteClient).db).status).toBe("pending");
+        yield* recoverGateway;
+        expect(replayStatus((yield* SqliteClient).db).status).toBe("processed");
+        expect(
+          yield* RunInputRepo.use((repo) =>
+            repo.pending(sessionId("session-1")),
+          ),
+        ).toHaveLength(1);
+      }),
+    ),
+);
+
+it.live.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+] as const)(
+  "claim acquisition write failure is retryable or fails startup, cleanup blocked=%s, null token=%s",
+  ([cleanupBlocked, nullToken]) =>
+    Effect.gen(function* () {
+      const databasePath = suitePath(
+        `claim-write-failure-${cleanupBlocked}-${nullToken}.db`,
+      );
+      const fileConfig = { ...config, databasePath };
+      const payload = createdPayload(yield* Clock.currentTimeMillis);
+      yield* withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          yield* storeReplay(payload);
+          const { db } = yield* SqliteClient;
+          if (nullToken)
+            db.query(
+              "UPDATE webhook_delivery SET claim_token=NULL WHERE delivery_id=?",
+            ).run(crashDeliveryId);
+          db.exec(
+            `CREATE TRIGGER fail_replay_write BEFORE UPDATE ${cleanupBlocked ? "" : "OF claim_token"} ON webhook_delivery BEGIN SELECT RAISE(ABORT, 'simulated unavailable storage'); END;`,
+          );
+        }),
+        fileConfig,
+      );
+      // A new service layer models restart: the original request no longer owns
+      // the durable token. Real SQLite writes fail, not just a mock claim call.
+      yield* withWebhook(
+        Effect.gen(function* () {
+          const deliveries = yield* DeliveryRepo;
+          const attempts = vi.spyOn(deliveries, "claimReplay");
+          const recovered = yield* Effect.exit(recoverGateway);
+          expect(Exit.isFailure(recovered)).toBe(cleanupBlocked);
+          expect(attempts).toHaveBeenCalledTimes(3);
+          attempts.mockRestore();
+          const { db } = yield* SqliteClient;
+          expect(replayStatus(db).status).toBe(
+            cleanupBlocked ? "pending" : "failed",
+          );
+          db.exec("DROP TRIGGER fail_replay_write");
+          const pipeline = yield* WebhookPipeline;
+          const request = () =>
+            signedRequest(payload, { delivery: "crash-delivery" });
+          const response = yield* pipeline.handle(request());
+          expect(response.status).toBe(200);
+          expect(yield* Effect.promise(() => response.text())).toBe("OK");
+          expect(replayStatus(db)).toEqual({
+            status: "processed",
+            error: null,
+          });
+          const duplicate = yield* pipeline.handle(request());
+          expect(yield* Effect.promise(() => duplicate.text())).toBe(
+            "Duplicate delivery",
+          );
+          expect(
+            yield* RunInputRepo.use((repo) =>
+              repo.pending(sessionId("session-1")),
+            ),
+          ).toHaveLength(1);
+        }),
+        fileConfig,
+      );
+    }),
+);
+
+it.live("signed redelivery preserves a genuinely in-flight claim", () =>
+  withWebhook(
+    Effect.gen(function* () {
+      yield* install();
+      const deliveries = yield* DeliveryRepo;
+      const pipeline = yield* WebhookPipeline;
+      const entered = yield* Deferred.make<void>();
+      const resume = yield* Deferred.make<void>();
+      const processClaim = deliveries.processClaim;
+      const paused = vi
+        .spyOn(deliveries, "processClaim")
+        .mockImplementation((id, token, effect) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(resume);
+            return yield* processClaim(id, token, effect);
+          }),
+        );
+      const payload = createdPayload(yield* Clock.currentTimeMillis);
+      const request = () =>
+        signedRequest(payload, { delivery: "crash-delivery" });
+      const original = yield* pipeline.handle(request()).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const duplicate = yield* pipeline.handle(request());
+      expect(yield* Effect.promise(() => duplicate.text())).toBe(
+        "Duplicate delivery",
+      );
+      expect(paused).toHaveBeenCalledTimes(1);
+      yield* Deferred.succeed(resume, undefined);
+      expect((yield* Fiber.join(original)).status).toBe(200);
+      paused.mockRestore();
+      expect(
+        yield* RunInputRepo.use((repo) => repo.pending(sessionId("session-1"))),
+      ).toHaveLength(1);
+    }),
+  ),
+);
+
+it.live.each(["replay", "delayed ingress"] as const)(
+  "old stop excludes newer runs on %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const databasePath = suitePath(`stop-cutoff-${mode}.db`);
+      const fileConfig = { ...config, databasePath };
+      const notificationAt = (yield* Clock.currentTimeMillis) - 200;
+      const payload = appUserNotificationPayload(
+        notificationAt,
+        "issueUnassignedFromYou",
+      );
+      yield* withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const runs = yield* RunRepo;
+          yield* runs.create({
+            sessionId: sessionId("old-session"),
+            organizationId: organizationId("org"),
+            issueId: Option.some(issueId("issue-1")),
+            now: notificationAt,
+          });
+          if (mode === "replay") yield* storeReplay(payload);
+          yield* runs.create({
+            sessionId: sessionId("new-session"),
+            organizationId: organizationId("org"),
+            issueId: Option.some(issueId("issue-1")),
+            now: notificationAt + 100,
+          });
+        }),
+        fileConfig,
+      );
+      yield* withWebhook(
+        Effect.gen(function* () {
+          const pipeline = yield* WebhookPipeline;
+          if (mode === "replay") {
+            yield* recoverGateway;
+            yield* recoverGateway;
+          } else {
+            expect(
+              (yield* pipeline.handle(signedRequest(payload))).status,
+            ).toBe(200);
+          }
+          const inputs = yield* RunInputRepo;
+          expect(yield* inputs.pending(sessionId("old-session"))).toHaveLength(
+            1,
+          );
+          expect(yield* inputs.pending(sessionId("new-session"))).toHaveLength(
+            0,
+          );
+          const runs = yield* RunRepo;
+          expect(
+            Option.getOrThrow(yield* runs.get(sessionId("old-session")))
+              .desiredState,
+          ).toBe("canceled");
+          expect(
+            Option.getOrThrow(yield* runs.get(sessionId("new-session")))
+              .desiredState,
+          ).toBe("running");
+        }),
+        fileConfig,
+      );
+    }),
+);
+
+it.live(
+  "rejects a forged payload with a recomputed unkeyed hash and accepts signed retry",
+  () =>
+    withWebhook(
+      Effect.gen(function* () {
+        yield* install();
+        const payload = createdPayload(yield* Clock.currentTimeMillis);
+        yield* storeReplay(payload);
+        const forged = JSON.stringify({
+          ...payload,
+          type: "OAuthApp",
+          action: "revoked",
+        });
+        const ingressHash = payloadHash(
+          new TextEncoder().encode(JSON.stringify(payload)),
+        );
+        const unkeyedHash = createHash("sha256")
+          .update(JSON.stringify([1, "org", ingressHash, forged]))
+          .digest("hex");
+        const { db } = yield* SqliteClient;
+        db.query(
+          "UPDATE webhook_delivery SET payload_json=?, replay_hash=? WHERE delivery_id=?",
+        ).run(forged, unkeyedHash, crashDeliveryId);
+        const pipeline = yield* WebhookPipeline;
+        yield* pipeline.recoverPendingDeliveries();
+        expect(replayStatus(db)).toEqual({
+          status: "failed",
+          error: "Stored webhook replay failed",
+        });
+        const installation = Option.getOrThrow(
+          yield* InstallationRepo.use((repo) =>
+            repo.get(organizationId("org")),
+          ),
+        );
+        expect(Option.isNone(installation.revokedAt)).toBe(true);
+        expect(
+          yield* RunInputRepo.use((repo) =>
+            repo.pending(sessionId("session-1")),
+          ),
+        ).toHaveLength(0);
+        const response = yield* pipeline.handle(
+          signedRequest(payload, { delivery: "crash-delivery" }),
+        );
+        expect(yield* Effect.promise(() => response.text())).toBe("OK");
+        expect(replayStatus(db).status).toBe("processed");
+        expect(
+          yield* RunInputRepo.use((repo) =>
+            repo.pending(sessionId("session-1")),
+          ),
+        ).toHaveLength(1);
+      }),
+    ),
+);
