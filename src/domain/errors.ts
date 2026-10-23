@@ -18,13 +18,13 @@ export class NixEnvironmentError extends Schema.TaggedError<NixEnvironmentError>
   "@Gateway/NixEnvironmentError",
   {
     ...message,
-    reason: Schema.Literal(
+    reason: Schema.Literals([
       "invalid_package",
       "root_escape",
       "process_failed",
       "metadata_failed",
       "gc_failed",
-    ),
+    ]),
     cause: Schema.optional(Schema.String),
   },
 ) {}
@@ -32,14 +32,14 @@ export class TokenCipherError extends Schema.TaggedError<TokenCipherError>()(
   "@Gateway/TokenCipherError",
   {
     ...message,
-    reason: Schema.Literal(
+    reason: Schema.Literals([
       "key_import",
       "invalid_key",
       "encrypt",
       "decrypt",
       "version_mismatch",
       "truncate",
-    ),
+    ]),
   },
 ) {}
 export class LinearApiError extends Schema.TaggedError<LinearApiError>()(
@@ -99,7 +99,7 @@ export class WorkspaceError extends Schema.TaggedError<WorkspaceError>()(
   {
     ...message,
     sessionId: Schema.String,
-    reason: Schema.Literal(
+    reason: Schema.Literals([
       "root_not_directory",
       "root_is_symlink",
       "path_escapes_root",
@@ -107,7 +107,7 @@ export class WorkspaceError extends Schema.TaggedError<WorkspaceError>()(
       "target_not_directory",
       "marker_mismatch",
       "git_failed",
-    ),
+    ]),
   },
 ) {}
 export class OAuthStateError extends Schema.TaggedError<OAuthStateError>()(
