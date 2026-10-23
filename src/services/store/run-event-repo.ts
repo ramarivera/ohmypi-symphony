@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import { type DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type { SessionId, SourceKey } from "../../domain/ids.js";
 import { RunEvent } from "../../domain/models.js";
@@ -9,11 +9,11 @@ const RunEventRow = Schema.Struct({
   source_key: Schema.String,
   session_id: Schema.String,
   kind: Schema.String,
-  level: Schema.Literal("debug", "info", "warn", "result", "error"),
+  level: Schema.Literals(["debug", "info", "warn", "result", "error"]),
   text: Schema.NullOr(Schema.String),
   payload_json: Schema.String,
   status: Schema.NullOr(
-    Schema.Literal("observed", "pending", "completed", "failed"),
+    Schema.Literals(["observed", "pending", "completed", "failed"]),
   ),
   error: Schema.NullOr(Schema.String),
   created_at: Schema.Number,
@@ -151,11 +151,10 @@ export const runEventCursor = (event: RunEvent): RunEventCursor => ({
   sourceKey: event.sourceKey,
 });
 
-export class RunEventRepo extends Effect.Service<RunEventRepo>()(
+export class RunEventRepo extends Context.Service<RunEventRepo>()(
   "RunEventRepo",
   {
-    accessors: true,
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
 
       const upsert = Effect.fn("RunEventRepo.upsert")(function* (input: {
@@ -326,4 +325,7 @@ export class RunEventRepo extends Effect.Service<RunEventRepo>()(
       return { upsert, list, getBySourceKey, maxRpcSequence };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies;
+}

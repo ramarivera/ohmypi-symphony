@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import { DatabaseError, RowDecodeError } from "../../domain/errors.js";
 import type { InputId } from "../../domain/ids.js";
 import { SessionId, SourceKey } from "../../domain/ids.js";
@@ -29,7 +29,7 @@ const RunInputRow = Schema.Struct({
 type RunInputRow = Schema.Schema.Type<typeof RunInputRow>;
 
 const RunRowState = Schema.Struct({
-  state: Schema.Literal(
+  state: Schema.Literals([
     "queued",
     "starting",
     "running",
@@ -39,8 +39,8 @@ const RunRowState = Schema.Struct({
     "failed",
     "canceled",
     "orphaned",
-  ),
-  desired_state: Schema.Literal("running", "canceled"),
+  ]),
+  desired_state: Schema.Literals(["running", "canceled"]),
 });
 
 type RunRowState = Schema.Schema.Type<typeof RunRowState>;
@@ -72,12 +72,10 @@ const rowToRunInput = (
     );
   });
 
-export class RunInputRepo extends Effect.Service<RunInputRepo>()(
+export class RunInputRepo extends Context.Service<RunInputRepo>()(
   "RunInputRepo",
   {
-    accessors: true,
-    dependencies: [RunEventRepo.Default],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       const runEventRepo = yield* RunEventRepo;
 
@@ -319,4 +317,9 @@ export class RunInputRepo extends Effect.Service<RunInputRepo>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([RunEventRepo.layer]),
+  );
+}

@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import type {
   DatabaseError,
   RowDecodeError,
@@ -30,7 +30,7 @@ export interface ExecutorInstance {
 }
 
 const rowToInstance = (
-  crypto: TokenCrypto,
+  crypto: TokenCrypto["Service"],
   row: ExecutorInstanceRow,
 ): Effect.Effect<ExecutorInstance, RowDecodeError | TokenCipherError> =>
   Effect.gen(function* () {
@@ -58,12 +58,10 @@ const rowToInstance = (
     };
   });
 
-export class ExecutorInstanceRepo extends Effect.Service<ExecutorInstanceRepo>()(
+export class ExecutorInstanceRepo extends Context.Service<ExecutorInstanceRepo>()(
   "ExecutorInstanceRepo",
   {
-    accessors: true,
-    dependencies: [TokenCrypto.Default],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       const crypto = yield* TokenCrypto;
 
@@ -148,4 +146,9 @@ export class ExecutorInstanceRepo extends Effect.Service<ExecutorInstanceRepo>()
       return { get, put, remove };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([TokenCrypto.layer]),
+  );
+}

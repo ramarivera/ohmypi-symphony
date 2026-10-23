@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import {
   DatabaseError,
   RowDecodeError,
@@ -134,7 +134,11 @@ const normalizeOAuthClient = (value: unknown): McpOAuthClientConfig | null => {
     candidate.tokenEndpointAuthMethod === null
       ? undefined
       : Schema.decodeUnknownSync(
-          Schema.Literal("none", "client_secret_basic", "client_secret_post"),
+          Schema.Literals([
+            "none",
+            "client_secret_basic",
+            "client_secret_post",
+          ]),
         )(candidate.tokenEndpointAuthMethod);
   if (clientId === undefined && scope === undefined) {
     throw new Error("oauthClient requires a clientId or scope");
@@ -237,7 +241,7 @@ const isEncrypted = (value: string): boolean =>
   value.startsWith(MCP_ENCRYPTED_PREFIX);
 
 const rowToRecord = (
-  tokenCrypto: TokenCrypto,
+  tokenCrypto: TokenCrypto["Service"],
   row: McpServerRow,
 ): Effect.Effect<McpServerRecordType, RowDecodeError | TokenCipherError> =>
   Effect.gen(function* () {
@@ -255,12 +259,12 @@ const rowToRecord = (
       "McpServerRecord.args",
     );
     const validEnv = yield* decodeRow(
-      Schema.Record({ key: Schema.String, value: Schema.String }),
+      Schema.Record(Schema.String, Schema.String),
       env,
       "McpServerRecord.env",
     );
     const validHeaders = yield* decodeRow(
-      Schema.Record({ key: Schema.String, value: Schema.String }),
+      Schema.Record(Schema.String, Schema.String),
       headers,
       "McpServerRecord.headers",
     );
@@ -337,7 +341,7 @@ const rowToRecord = (
     );
   });
 const encryptEnv = (
-  tokenCrypto: TokenCrypto,
+  tokenCrypto: TokenCrypto["Service"],
   env: Readonly<Record<string, string>>,
   context: (key: string) => string,
 ): Effect.Effect<Record<string, string>, TokenCipherError> =>
@@ -352,7 +356,7 @@ const encryptEnv = (
   ).pipe(Effect.map(Object.fromEntries));
 
 const encryptOAuthClient = (
-  tokenCrypto: TokenCrypto,
+  tokenCrypto: TokenCrypto["Service"],
   value: McpOAuthClientConfig | null,
   context: string,
 ): Effect.Effect<string | null, TokenCipherError> =>
@@ -361,12 +365,10 @@ const encryptOAuthClient = (
     : tokenCrypto
         .encrypt(JSON.stringify(value), context)
         .pipe(Effect.map((encrypted) => `${MCP_ENCRYPTED_PREFIX}${encrypted}`));
-export class McpServerRepo extends Effect.Service<McpServerRepo>()(
+export class McpServerRepo extends Context.Service<McpServerRepo>()(
   "McpServerRepo",
   {
-    accessors: true,
-    dependencies: [TokenCrypto.Default],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       const tokenCrypto = yield* TokenCrypto;
 
@@ -693,4 +695,9 @@ export class McpServerRepo extends Effect.Service<McpServerRepo>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([TokenCrypto.layer]),
+  );
+}

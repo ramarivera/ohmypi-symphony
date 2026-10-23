@@ -1,5 +1,5 @@
 import type { Database } from "bun:sqlite";
-import { Effect } from "effect";
+import { Context, Effect, Layer } from "effect";
 import {
   sealWorkerUidWorkspacesSync,
   stopWorkerUidProcessesSync,
@@ -138,12 +138,15 @@ export const makeWorkerIdentityRepo = (db: Database) => {
   return { acquire, release };
 };
 
-export class WorkerIdentityRepo extends Effect.Service<WorkerIdentityRepo>()(
+export class WorkerIdentityRepo extends Context.Service<WorkerIdentityRepo>()(
   "WorkerIdentityRepo",
   {
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       return makeWorkerIdentityRepo(db);
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies;
+}

@@ -1,4 +1,4 @@
-import { Clock, Effect, Option, Schema } from "effect";
+import { Clock, Context, Effect, Layer, Option, Schema } from "effect";
 import {
   DatabaseError,
   RowDecodeError,
@@ -35,7 +35,7 @@ type ProjectionJobRow = Schema.Schema.Type<typeof ProjectionJobRow>;
 const ProjectionIdentityRow = Schema.Struct({
   source_key: Schema.String,
   payload_hash: Schema.String,
-  status: Schema.Literal("pending", "completed", "failed"),
+  status: Schema.Literals(["pending", "completed", "failed"]),
 });
 
 type ProjectionIdentityRow = Schema.Schema.Type<typeof ProjectionIdentityRow>;
@@ -72,12 +72,10 @@ const rowToProjectionJob = (
     );
   });
 
-export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
+export class ProjectionRepo extends Context.Service<ProjectionRepo>()(
   "ProjectionRepo",
   {
-    accessors: true,
-    dependencies: [RunEventRepo.Default],
-    effect: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const { db } = yield* SqliteClient;
       const runEventRepo = yield* RunEventRepo;
 
@@ -542,4 +540,9 @@ export class ProjectionRepo extends Effect.Service<ProjectionRepo>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([RunEventRepo.layer]),
+  );
+}
