@@ -157,6 +157,13 @@ const migrate = (db: Database): void => {
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS worker_identity (
+      session_id TEXT PRIMARY KEY REFERENCES agent_run(session_id) ON DELETE CASCADE,
+      uid INTEGER NOT NULL CHECK(uid > 0),
+      active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS worker_identity_active_uid
+      ON worker_identity(uid) WHERE active=1;
     CREATE TABLE IF NOT EXISTS run_input (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL REFERENCES agent_run(session_id) ON DELETE CASCADE,

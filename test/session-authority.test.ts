@@ -70,6 +70,7 @@ import {
   SqliteClientLive,
   type SqliteClientShape,
 } from "../src/services/store/sqlite-client.js";
+import { WorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { tokenContext } from "../src/services/token-migration.js";
 import { testPaths } from "./fixtures/paths.js";
@@ -1222,6 +1223,7 @@ const withAuthority = <A, E>(
         RunInputRepo.Default,
         RunRepo.Default,
         WorkspaceRepo.Default,
+        WorkerIdentityRepo.Default,
         GitHubApp.Default,
         githubAppOverride,
         Layer.succeed(ActivityProjector, mockProjector),
@@ -1308,6 +1310,34 @@ describe("SessionAuthority team-access gate", () => {
           }
         }),
       ),
+  );
+
+  it.scopedLive("releases the persisted worker uid after cancellation", () =>
+    withAuthority((db) =>
+      Effect.gen(function* () {
+        const authority = yield* SessionAuthority;
+        const installationRepo = yield* InstallationRepo;
+        const runRepo = yield* RunRepo;
+        yield* installationRepo.put(install(testOrganizationId));
+        yield* runRepo.create({
+          sessionId: testSessionId,
+          organizationId: testOrganizationId,
+          issueId: Option.some(testIssueId),
+        });
+        db.query(
+          "INSERT INTO worker_identity(session_id, uid, active) VALUES (?, 21001, 1)",
+        ).run(testSessionId);
+        db.query(
+          "UPDATE agent_run SET desired_state='canceled' WHERE session_id=?",
+        ).run(testSessionId);
+        yield* authority.processSession(testSessionId);
+        expect(
+          db
+            .query("SELECT active FROM worker_identity WHERE session_id=?")
+            .get(testSessionId),
+        ).toEqual({ active: 0 });
+      }),
+    ),
   );
 
   it.scopedLive("cancels when a known snapshot excludes the run's team", () =>

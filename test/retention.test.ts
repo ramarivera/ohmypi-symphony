@@ -35,6 +35,7 @@ import {
   SqliteClient,
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
+import * as workerSecurity from "../src/services/worker-security.js";
 import { testPaths } from "./fixtures/paths.js";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -72,6 +73,166 @@ const withDatabase = <A, E>(effect: Effect.Effect<A, E, SqliteClient>) =>
   effect.pipe(Effect.provide(SqliteClientLive(":memory:")));
 
 describe("retention", () => {
+  it.scopedLive(
+    "reclaims a terminal allocation left by a crash with no published workspace",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        insertRun(db, "failed-clone", "failed");
+        insertRun(db, "leased", "failed");
+        insertRun(db, "running", "running");
+        db.query(
+          "UPDATE agent_run SET lease_expires_at=2000 WHERE session_id='leased'",
+        ).run();
+        for (const [id, uid] of [
+          ["failed-clone", 21001],
+          ["leased", 21002],
+          ["running", 21003],
+        ] as const)
+          db.query("INSERT INTO worker_identity VALUES (?, ?, 1)").run(id, uid);
+        yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+        }).sweep(now);
+        expect(
+          db
+            .query(
+              "SELECT session_id, active FROM worker_identity ORDER BY session_id",
+            )
+            .all(),
+        ).toEqual([
+          { session_id: "failed-clone", active: 0 },
+          { session_id: "leased", active: 1 },
+          { session_id: "running", active: 1 },
+        ]);
+      }).pipe(withDatabase),
+  );
+
+  it.scopedLive(
+    "keeps a failed identity reserved without aborting other retirement or deleted-workspace records",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        insertRun(db, "failed", "failed", expired);
+        insertRun(db, "healthy", "failed");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('failed', 21001, 1), ('healthy', 21002, 1)",
+        ).run();
+        const seal = workerSecurity.sealWorkerUidWorkspacesSync;
+        vi.spyOn(
+          workerSecurity,
+          "sealWorkerUidWorkspacesSync",
+        ).mockImplementation((path, uid) => {
+          if (uid === 21001) throw new Error("injected seal failure");
+          seal(path, uid);
+        });
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          removeWorkspace: (path) => rmSync(path, { recursive: true }),
+        }).sweep(now);
+        expect(result.skippedWorkspaces).toBe(1);
+        expect(existsSync(expired)).toBe(false);
+        expect(
+          db
+            .query(
+              "SELECT session_id, active FROM worker_identity ORDER BY session_id",
+            )
+            .all(),
+        ).toEqual([
+          { session_id: "failed", active: 1 },
+          { session_id: "healthy", active: 0 },
+        ]);
+        expect(
+          db
+            .query(
+              "SELECT workspace_path FROM agent_run WHERE session_id='failed'",
+            )
+            .get(),
+        ).toEqual({ workspace_path: expired });
+        expect(
+          db
+            .query("SELECT kind FROM run_event WHERE session_id='failed'")
+            .get(),
+        ).toEqual({ kind: "worker_uid_quarantined" });
+      }).pipe(withDatabase),
+  );
+
+  it.scopedLive(
+    "doesn't reopen a retired workspace while its uid serves another session",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        insertRun(db, "expired", "succeeded", expired);
+        insertRun(db, "active", "running");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('expired', 21001, 0), ('active', 21001, 1)",
+        ).run();
+        const removeWorkspace = vi.fn();
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+          removeWorkspace,
+        }).sweep(now);
+        expect(result.skippedWorkspaces).toBe(1);
+        expect(removeWorkspace).not.toHaveBeenCalled();
+        expect(
+          db
+            .query(
+              "SELECT workspace_path FROM agent_run WHERE session_id='expired'",
+            )
+            .get(),
+        ).toEqual({ workspace_path: expired });
+      }).pipe(withDatabase),
+  );
+
+  it.scopedLive(
+    "keeps a busy uid fenced even when the retired workspace is missing",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const missing = join(root, "missing");
+        insertRun(db, "expired", "succeeded", missing);
+        insertRun(db, "active", "running");
+        db.query(
+          "INSERT INTO worker_identity VALUES ('expired', 21001, 0), ('active', 21001, 1)",
+        ).run();
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+        }).sweep(now);
+        expect(result.skippedWorkspaces).toBe(1);
+        expect(
+          db
+            .query(
+              "SELECT workspace_path FROM agent_run WHERE session_id='expired'",
+            )
+            .get(),
+        ).toEqual({ workspace_path: missing });
+        expect(
+          db
+            .query(
+              "SELECT active FROM worker_identity WHERE session_id='active'",
+            )
+            .get(),
+        ).toEqual({ active: 1 });
+      }).pipe(withDatabase),
+  );
+
   it.scopedLive(
     "migrates legacy ownership before worker deletion under the synchronous reopen fence without following symlinks",
     () =>

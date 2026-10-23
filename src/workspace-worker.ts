@@ -11,6 +11,7 @@ import {
   removeMcpAgentDbFile,
 } from "./services/mcp-oauth.js";
 import { workerMcpCredential } from "./services/worker-security.js";
+import { cleanupWorkerSharedDirectoriesSync } from "./services/worker-shared-cleanup.js";
 import {
   persistGitHubExtraHeader,
   removeGitHubExtraHeaders,
@@ -22,6 +23,9 @@ if (cwd === undefined || !isAbsolute(cwd))
 const action = process.argv[2];
 const input: unknown = await Bun.stdin.json();
 switch (action) {
+  case "cleanup-shared":
+    cleanupWorkerSharedDirectoriesSync();
+    break;
   case "agent-db": {
     const credentials = input as Parameters<typeof materializeMcpAgentDb>[1];
     process.stdout.write(

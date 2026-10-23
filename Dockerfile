@@ -51,15 +51,16 @@ COPY --from=omp /usr/local/bin/omp /usr/local/bin/omp
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json /app/bun.lock* ./
 RUN bun install --production --frozen-lockfile
-# The gateway owns its database/secrets. RPC workers drop to uid 1001 with
-# no capabilities and no privilege escalation. Never run the gateway as worker.
-RUN useradd --uid 1001 --user-group --no-create-home --shell /usr/sbin/nologin worker \
+# The gateway owns shared executable inputs. Workers use numeric session ids
+# with no capabilities or privilege escalation; no passwd entry is required.
+RUN chown -Rh root:root /home/bun /app \
+  && chmod -R go-w /home/bun /app \
   && chown root:root /app/data /app/logs /app/nix-roots /app/workspaces \
   && chmod 0700 /app/data /app/logs \
   && chmod 0755 /app/nix-roots /app/workspaces
 COPY docker-entrypoint.sh /usr/local/bin/gateway-entrypoint
 RUN chmod 0755 /usr/local/bin/gateway-entrypoint
-ENV WORKER_UID=1001
+# Entrypoint defaults to a 64-slot range, or one slot for legacy WORKER_UID.
 ENV HOME=/root
 ENV WORKSPACE_ROOT=/app/workspaces
 USER root

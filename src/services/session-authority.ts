@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   Cause,
@@ -71,9 +70,11 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
+import { WorkerIdentityRepo } from "./store/worker-identity-repo.js";
 import { startWorkerMcpProxy } from "./worker-mcp-proxy.js";
 import {
   prepareWorkerWorkspace,
+  sessionWorkerEnvironment,
   workerEnvironment,
 } from "./worker-security.js";
 import {
@@ -350,6 +351,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       GatewayConfig.Default,
       GitHubApp.Default,
       RpcWorker.Default,
+      WorkerIdentityRepo.Default,
       NixEnvironment.Default,
     ],
     scoped: Effect.gen(function* () {
@@ -375,6 +377,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       const workspaceRepo = yield* WorkspaceRepo;
       const projector = yield* ActivityProjector;
       const rpc = yield* RpcWorker;
+      const workerIdentities = yield* WorkerIdentityRepo;
       const nixEnvironment = yield* NixEnvironment;
       const config = yield* GatewayConfig;
       const mcpOAuth = yield* McpOAuth;
@@ -890,6 +893,22 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Effect.gen(function* () {
           const workers = yield* Ref.get(workersRef);
           if (!workers.has(sessionId)) {
+            yield* bestEffort(
+              "release terminal worker uid",
+              Effect.gen(function* () {
+                const current = yield* runRepo.get(sessionId);
+                if (
+                  Option.isSome(current) &&
+                  ["succeeded", "failed", "canceled"].includes(
+                    current.value.state,
+                  )
+                )
+                  yield* workerIdentities.release(
+                    sessionId,
+                    config.workspaceRoot,
+                  );
+              }),
+            );
             yield* Ref.update(workerSlots, (slots) => {
               const next = new Set(slots);
               next.delete(sessionId);
@@ -1812,11 +1831,21 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
         command.push("--extension", deviationExtensionPath);
 
-        const environment = workerEnvironment(process.env);
-        if (process.env.WORKER_UID) {
-          environment.HOME = join(cwd, ".omp-home");
-          environment.TMPDIR = join(cwd, ".omp-tmp");
-        }
+        const workerUid = yield* workerIdentities.acquire(
+          run.sessionId,
+          config.workspaceRoot,
+        );
+        yield* Effect.tryPromise({
+          try: () => prepareWorkerWorkspace(cwd, workerUid),
+          catch: () =>
+            new RpcSpawnError({
+              message: "Could not prepare isolated worker workspace",
+            }),
+        });
+        const environment =
+          workerUid === undefined
+            ? workerEnvironment(process.env)
+            : sessionWorkerEnvironment(cwd, process.env);
         if (Option.isSome(run.repositoryId)) {
           const repository = yield* workspaceRepo.getRepository(
             run.organizationId,
@@ -1955,14 +1984,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             (server) => byId.get(server.id) ?? server,
           );
         }
-        yield* Effect.tryPromise({
-          try: () => prepareWorkerWorkspace(cwd, process.env.WORKER_UID),
-          catch: () =>
-            new RpcSpawnError({
-              message: "Could not prepare isolated worker workspace",
-            }),
-        });
-        if (process.env.WORKER_UID)
+        if (workerUid)
           yield* Effect.tryPromise({
             try: () => workspaceProcess(cwd, "tool-directories", null),
             catch: () =>
@@ -2016,6 +2038,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         yield* updateRun(run.sessionId, {});
         const worker = yield* rpc.spawn({
           command,
+          ...(workerUid === undefined ? {} : { workerUid }),
           cwd,
           env: { ...environment, PI_CODING_AGENT_DIR: agentDir },
           sessionId: run.sessionId,
@@ -2601,6 +2624,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   const workspacePath = yield* workspace.materialize(
                     sessionId,
                     resolution.repository,
+                    yield* workerIdentities.acquire(
+                      sessionId,
+                      config.workspaceRoot,
+                    ),
                   );
                   yield* updateRun(sessionId, {
                     state: "starting",

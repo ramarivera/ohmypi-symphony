@@ -1,8 +1,35 @@
 #!/bin/sh
 set -eu
-case "${WORKER_UID:-}" in
-  ""|0|*[!0-9]*) echo "WORKER_UID must be a non-root numeric uid" >&2; exit 1 ;;
-esac
+# WORKER_UID alone retains its one-slot legacy meaning. Explicit range wins.
+WORKER_UID_COUNT=${WORKER_UID_COUNT:-$(if [ -n "${WORKER_UID_BASE:-}" ] || [ -z "${WORKER_UID:-}" ]; then echo 64; else echo 1; fi)}
+WORKER_UID_BASE=${WORKER_UID_BASE:-${WORKER_UID:-1001}}
+for value in "$WORKER_UID_BASE" "$WORKER_UID_COUNT"; do
+  case "$value" in
+    ""|0*|*[!0-9]*) echo "Worker uid base/count must be positive integers" >&2; exit 1 ;;
+  esac
+  if [ "${#value}" -gt 10 ]; then
+    echo "Worker uid base/count exceeds Linux uid/gid values" >&2; exit 1
+  fi
+done
+if [ "$WORKER_UID_BASE" -gt 4294967294 ] || [ "$WORKER_UID_COUNT" -gt 4294967294 ] ||
+   [ "$((WORKER_UID_BASE + WORKER_UID_COUNT))" -gt 4294967295 ]; then
+  echo "Worker uid range exceeds Linux uid/gid values" >&2; exit 1
+fi
+export WORKER_UID_BASE WORKER_UID_COUNT
+unset WORKER_UID
+# Legacy volumes were writable by bun or the old worker. Shared executable
+# inputs belong to root, with no group/other writes; each worker has private caches.
+for shared in /home/bun /app/node_modules /app/dist /app/nix-roots; do
+  chown -Rh root:root "$shared"
+  chmod -R go-w "$shared"
+done
+# Startup requires the previous gateway/workers stopped. Seal legacy roots before
+# any uid can be allocated; otherwise an unresumed old session could be exposed.
+workspace_root=${WORKSPACE_ROOT:-/app/workspaces}
+mkdir -p "$workspace_root"
+chown root:root "$workspace_root"
+chmod 0755 "$workspace_root"
+find "$workspace_root" -mindepth 1 -maxdepth 1 -type d -exec chown root:root {} + -exec chmod 0700 {} +
 # Named volumes may predate uid isolation. Lock gateway state before startup.
 for path in /app/data /app/logs; do
   if [ -L "$path" ] || [ ! -d "$path" ]; then

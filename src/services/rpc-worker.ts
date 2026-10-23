@@ -6,7 +6,11 @@ import {
   RpcTimeoutError,
 } from "../domain/errors.js";
 import { detachedProcessGroup, signalProcessTree } from "./process.js";
-import { workerEnvironment, workerIdentityCommand } from "./worker-security.js";
+import {
+  workerEnvironment,
+  workerIdentityCommand,
+  workerUidRange,
+} from "./worker-security.js";
 
 export interface RpcEvent {
   readonly type: string;
@@ -153,16 +157,26 @@ export class RpcWorker extends Effect.Service<RpcWorker>()("RpcWorker", {
       readonly startTimeoutMs?: number;
       readonly requestTimeoutMs?: number;
       readonly sessionId?: string;
+      readonly workerUid?: string;
     }): Effect.fn.Return<RpcWorkerHandle, RpcSpawnError> {
       if (input.command.length === 0) {
         return yield* Effect.fail(
           new RpcSpawnError({ message: "RPC command cannot be empty" }),
         );
       }
-      const workerUid = yield* configWithDefault("WORKER_UID", "");
+      const workerUid = input.workerUid;
       const command = yield* Effect.try({
-        try: () =>
-          workerIdentityCommand([...input.command, "--mode", "rpc"], workerUid),
+        try: () => {
+          if (
+            workerUidRange(process.env) !== undefined &&
+            workerUid === undefined
+          )
+            throw new Error("Missing per-session worker uid");
+          return workerIdentityCommand(
+            [...input.command, "--mode", "rpc"],
+            workerUid,
+          );
+        },
         catch: () =>
           new RpcSpawnError({
             message: "Invalid worker identity configuration",
