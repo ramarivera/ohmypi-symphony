@@ -1,10 +1,11 @@
-import { lstatSync, realpathSync, rmSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { Config, ConfigError, Effect, Either, Schedule } from "effect";
 import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
 import { NixEnvironment } from "./nix-environment.js";
 import { SqliteClient, tryDb } from "./store/sqlite-client.js";
+import { removeWorkerWorkspaceSync } from "./workspace-process.js";
 
 const positiveInteger = (name: string, fallback: number) =>
   Config.string(name).pipe(
@@ -154,7 +155,7 @@ export const makeRetention = (input: {
                 continue;
               }
               if (input.removeWorkspace === undefined)
-                rmSync(path, { recursive: true, force: true });
+                removeWorkerWorkspaceSync(path, root);
               else input.removeWorkspace(path);
             } catch (error) {
               if (

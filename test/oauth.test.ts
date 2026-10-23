@@ -443,3 +443,35 @@ describe("OAuth", () => {
     { fastCheck: { numRuns: 50 } },
   );
 });
+
+it("rejects OAuth admission before persisting an installation for an unallowed organization", async () => {
+  fetchMock.mockResolvedValue(
+    new Response(JSON.stringify(tokenResponse()), { status: 200 }),
+  );
+  const authorization = await Effect.runPromise(startAuthorization());
+  const deniedDependencies = Layer.mergeAll(
+    Layer.succeed(
+      GatewayConfig,
+      GatewayConfig.make({
+        ...testConfig,
+        allowedOrganizationIds: new Set(["other-org"]),
+      }),
+    ),
+    Layer.succeed(InstallationRepo, installationRepo),
+    Layer.succeed(TokenCrypto, tokenCrypto),
+  );
+  const deniedLayer = OAuth.DefaultWithoutDependencies.pipe(
+    Layer.provide(deniedDependencies),
+  );
+  const result = await Effect.runPromise(
+    Effect.either(
+      OAuth.completeAuthorization(callbackUrl(authorization.state)).pipe(
+        Effect.provide(deniedLayer),
+      ),
+    ),
+  );
+  expect(Either.isLeft(result) && result.left.message).toBe(
+    "Organization is not allowed",
+  );
+  expect(testState.installations).toEqual([]);
+});

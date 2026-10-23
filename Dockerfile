@@ -33,7 +33,7 @@ ENV NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 # Install a pinned single-user Nix while building the image. Docker copies the
 # populated /nix into gateway-nix when it initializes the named volume.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates curl git openssh-client xz-utils \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl git openssh-client xz-utils util-linux \
   && install -d -m 0755 -o bun -g bun /nix /app/data /app/logs /app/nix-roots /app/workspaces /home/bun/.omp/natives /home/bun/.config/nix \
   && curl --fail --location --retry 3 --output /tmp/nix-install https://releases.nixos.org/nix/nix-2.30.3/install \
   && echo "8ff029ac2a49134441dc14c9168abb04506710834d7390039a8c1800dd998cd9  /tmp/nix-install" | sha256sum --check --strict \
@@ -48,6 +48,18 @@ COPY --from=omp /usr/local/bin/omp /usr/local/bin/omp
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json /app/bun.lock* ./
 RUN bun install --production --frozen-lockfile
-USER bun
+# The gateway owns its database/secrets. RPC workers drop to uid 1001 with
+# no capabilities and no privilege escalation. Never run the gateway as worker.
+RUN useradd --uid 1001 --user-group --no-create-home --shell /usr/sbin/nologin worker \
+  && chown root:root /app/data /app/logs /app/nix-roots /app/workspaces \
+  && chmod 0700 /app/data /app/logs \
+  && chmod 0755 /app/nix-roots /app/workspaces
+COPY docker-entrypoint.sh /usr/local/bin/gateway-entrypoint
+RUN chmod 0755 /usr/local/bin/gateway-entrypoint
+ENV WORKER_UID=1001
+ENV HOME=/home/bun
+ENV WORKSPACE_ROOT=/app/workspaces
+USER root
+ENTRYPOINT ["/usr/local/bin/gateway-entrypoint"]
 EXPOSE 3000
 CMD ["bun", "dist/index.js"]

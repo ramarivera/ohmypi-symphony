@@ -2,6 +2,12 @@ import { chmod, mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect, Option } from "effect";
 import type { McpServerRecord } from "../domain/models.js";
+import {
+  cleanupWorkspaceProcess,
+  gitEnvironment,
+  needsWorkspaceIdentity,
+  workspaceProcess,
+} from "./workspace-process.js";
 
 const isTrackedMcpConfig = async (cwd: string): Promise<boolean> => {
   try {
@@ -9,6 +15,7 @@ const isTrackedMcpConfig = async (cwd: string): Promise<boolean> => {
       ["git", "ls-files", "--error-unmatch", "mcp.json"],
       {
         cwd,
+        env: gitEnvironment(globalThis.process.env),
         stdout: "ignore",
         stderr: "ignore",
       },
@@ -36,22 +43,38 @@ const isGatewayMcpConfig = (value: unknown): boolean => {
   );
 };
 
-/**
- * Best-effort removal of a generated mcp.json. Repository-tracked files are
- * never removed: only the generated, untracked workspace copy is eligible.
- */
+/** Strict worker-side removal lets the gateway observe failed cleanup over IPC. */
+export const removeMcpConfigFile = async (cwd: string): Promise<void> => {
+  if (await isTrackedMcpConfig(cwd)) return;
+  try {
+    await unlink(join(cwd, "mcp.json"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+};
+
+/** Best-effort removal preserves tracked files and the terminal state of the run. */
 export const removeMcpConfig = (
   cwd: string,
 ): Effect.Effect<void, never, never> =>
-  Effect.promise(async () => {
-    if (await isTrackedMcpConfig(cwd)) return;
-    try {
-      await unlink(join(cwd, "mcp.json"));
-    } catch {
-      // Cleanup is deliberately best effort: a missing or locked config must
-      // not mask the terminal state of the run.
-    }
-  });
+  needsWorkspaceIdentity()
+    ? cleanupWorkspaceProcess(
+        cwd,
+        "remove-mcp-config",
+        "mcp.config.cleanup_failed",
+      )
+    : Effect.tryPromise({
+        try: () => removeMcpConfigFile(cwd),
+        catch: (error) => String(error),
+      }).pipe(
+        Effect.catchAll((error) =>
+          Effect.logWarning("mcp.config.cleanup_failed").pipe(
+            Effect.annotateLogs({ cwd, error }),
+          ),
+        ),
+      );
 
 /**
  * Resolve the servers visible to one worker. Repository-scoped entries have
@@ -114,7 +137,24 @@ export const writeOmpMcpConfig = (
   servers: ReadonlyArray<McpServerRecord>,
   sessionId?: string,
 ): Effect.Effect<void, Error> => {
-  const contents = `${JSON.stringify(toOmpMcpConfig(servers), null, 2)}\n`;
+  if (needsWorkspaceIdentity())
+    return Effect.tryPromise({
+      try: async () => {
+        await workspaceProcess(cwd, "mcp-config", toOmpMcpConfig(servers));
+      },
+      catch: (error) =>
+        error instanceof Error ? error : new Error(String(error)),
+    });
+  return writeOmpMcpConfigFile(cwd, toOmpMcpConfig(servers), sessionId);
+};
+
+/** Accept only the already-projected worker config across the uid boundary. */
+export const writeOmpMcpConfigFile = (
+  cwd: string,
+  config: ReturnType<typeof toOmpMcpConfig>,
+  sessionId?: string,
+): Effect.Effect<void, Error> => {
+  const contents = `${JSON.stringify(config, null, 2)}\n`;
   return Effect.gen(function* () {
     if (yield* Effect.promise(() => isTrackedMcpConfig(cwd))) {
       yield* Effect.logWarning("mcp.config.tracked_skip").pipe(

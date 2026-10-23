@@ -103,13 +103,13 @@ export function renderLandingPage(): string {
  * repository list, then drives CRUD and preview operations against the
  * documented /api/admin/* endpoints.
  */
-export function renderAdminPage(): string {
+export function renderAdminPage(gatewayAdmin = false): string {
   return renderDocument({
     title: "OhMyPi ↔ Linear — Console",
     body: ADMIN_BODY,
     script: `${THEME_SCRIPT}
 ${ADMIN_SCRIPT}`,
-    extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,
+    extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}${gatewayAdmin ? 'document.documentElement.setAttribute("data-gateway-admin", "");' : ""}</script>`,
     pageClass: "admin-shell",
   });
 }

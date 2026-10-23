@@ -39,7 +39,11 @@ import type {
   RunEvent,
 } from "../domain/models.js";
 import { normalizeNixPackages, TERMINAL_RUN_STATES } from "../domain/models.js";
-import { GatewayConfig, type GatewayConfigShape } from "./config.js";
+import {
+  GatewayConfig,
+  type GatewayConfigShape,
+  organizationAllowed,
+} from "./config.js";
 import {
   Executor,
   type ExecutorRequestError,
@@ -64,7 +68,11 @@ import {
   RunRepo,
   WorkspaceRepo,
 } from "./store/repositories.js";
-import { type RepositoryResolution, Workspace } from "./workspace.js";
+import {
+  isHttpsGitHubRepositoryUrl,
+  type RepositoryResolution,
+  Workspace,
+} from "./workspace.js";
 
 const ADMIN_COOKIE = "omp_gateway_admin";
 const CSRF_SALT = "omp-gateway-admin-csrf";
@@ -72,26 +80,36 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 const HTTP_TOKEN_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
 // Linear exposes no public session-delete API, so preventing duplicate reruns
 // before creating a session is the only way to avoid orphaned sessions.
-const rerunIssueGates = new Map<string, Effect.Semaphore>();
+const rerunIssueGates = new Map<
+  string,
+  { semaphore: Effect.Semaphore; users: number }
+>();
 
-const rerunIssueGate = (
-  organizationId: OrganizationId,
-  issueId: string,
-): Effect.Semaphore => {
-  const key = `${organizationId}:${issueId}`;
-  const existing = rerunIssueGates.get(key);
-  if (existing !== undefined) return existing;
-  const created = Effect.unsafeMakeSemaphore(1);
-  rerunIssueGates.set(key, created);
-  return created;
-};
-
-const withRerunIssueGate = <A, E, R>(
+export const withRerunIssueGate = <A, E, R>(
   organizationId: OrganizationId,
   issueId: string,
   effect: Effect.Effect<A, E, R>,
 ): Effect.Effect<A, E, R> =>
-  rerunIssueGate(organizationId, issueId).withPermits(1)(effect);
+  Effect.acquireUseRelease(
+    Effect.sync(() => {
+      const key = `${organizationId}:${issueId}`;
+      const entry = rerunIssueGates.get(key) ?? {
+        semaphore: Effect.unsafeMakeSemaphore(1),
+        users: 0,
+      };
+      entry.users += 1;
+      rerunIssueGates.set(key, entry);
+      return { key, entry };
+    }),
+    ({ entry }) => entry.semaphore.withPermits(1)(effect),
+    ({ key, entry }) =>
+      Effect.sync(() => {
+        entry.users -= 1;
+        if (entry.users === 0 && rerunIssueGates.get(key) === entry)
+          rerunIssueGates.delete(key);
+      }),
+  );
+export const rerunIssueGateCount = (): number => rerunIssueGates.size;
 
 const SECURITY_HEADERS: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
@@ -216,7 +234,11 @@ function findCookieValue(request: Request, name: string): string | null {
   const pattern = new RegExp(`(?:^|;\\s*)${name}=([^;]*)`, "u");
   const match = pattern.exec(header);
   if (!match) return null;
-  return match[1] ? decodeURIComponent(match[1]) : null;
+  try {
+    return match[1] ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
 }
 
 function validateOrigin(config: GatewayConfigShape, request: Request): boolean {
@@ -307,7 +329,11 @@ function repositoryPayload(
   const ref = optionalString(body.ref);
   if (id === null) return Either.left("id is required");
   if (url === null) return Either.left("url is required");
+  if (!isHttpsGitHubRepositoryUrl(url))
+    return Either.left("url must be https://github.com/<owner>/<repo>");
   if (ref === null) return Either.left("ref is required");
+  if (ref.startsWith("-") || /[\r\n\0]/u.test(ref))
+    return Either.left("Invalid repository ref");
   const teamIds = optionalStringArray(body.teamIds, "teamIds");
   if (Either.isLeft(teamIds)) return Either.left(teamIds.left);
   const projectIds = optionalStringArray(body.projectIds, "projectIds");
@@ -877,7 +903,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
             tokenHash(rawToken),
             now,
           );
-          if (Option.isNone(session)) {
+          if (
+            Option.isNone(session) ||
+            !organizationAllowed(deps.config, session.value.organizationId)
+          ) {
             return yield* Effect.fail(
               new AdminError({ message: "Unauthorized", status: 401 }),
             );
@@ -919,6 +948,27 @@ export const createAdminHandle = (deps: AdminDeps) =>
         return Option.some(html(renderLandingPage()));
       }
 
+      if (url.pathname !== "/") {
+        const authenticated = yield* requireSession(request).pipe(
+          Effect.either,
+        );
+        if (Either.isLeft(authenticated)) {
+          if (
+            request.method === "GET" &&
+            !url.pathname.endsWith(".json") &&
+            !url.pathname.startsWith("/api/") &&
+            !request.headers.get("accept")?.includes("application/json")
+          ) {
+            return Option.some(
+              redirect(
+                `/oauth/start?returnTo=${encodeURIComponent(url.pathname + url.search)}`,
+              ),
+            );
+          }
+          return Option.some(text("Unauthorized", 401));
+        }
+      }
+
       if (url.pathname === "/admin" && request.method === "GET") {
         const rawToken = findCookieValue(request, ADMIN_COOKIE);
         if (rawToken === null) {
@@ -931,7 +981,15 @@ export const createAdminHandle = (deps: AdminDeps) =>
         if (Option.isNone(session)) {
           return Option.some(redirect("/"));
         }
-        return Option.some(html(renderAdminPage()));
+        return Option.some(
+          html(
+            renderAdminPage(
+              deps.config.gatewayAdminOrganizationIds?.has(
+                session.value.organizationId,
+              ) === true,
+            ),
+          ),
+        );
       }
 
       if (url.pathname.startsWith("/runs/") && request.method === "GET") {
@@ -954,7 +1012,10 @@ export const createAdminHandle = (deps: AdminDeps) =>
         if (Option.isNone(runOption)) {
           return Option.some(text("Not found", 404));
         }
+        const session = yield* requireSession(request);
         const run = runOption.value;
+        if (run.organizationId !== session.organizationId)
+          return Option.some(text("Not found", 404));
         const events = yield* deps.runEventRepo.list(sessionId);
         const model = runDetailModel(run, events);
 
@@ -1838,7 +1899,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
       }
 
       if (url.pathname === "/api/admin/nix-cache" && request.method === "GET") {
-        yield* requireSession(request);
+        const session = yield* requireSession(request);
+        if (
+          !deps.config.gatewayAdminOrganizationIds?.has(session.organizationId)
+        )
+          return Option.some(text("Forbidden", 403));
         const entries = yield* deps.nixEnvironment.list();
         return Option.some(json({ entries: entries.map(toApiNixCache) }));
       }
@@ -1850,7 +1915,11 @@ export const createAdminHandle = (deps: AdminDeps) =>
         if (cacheKey === undefined) {
           return Option.some(text("Invalid Nix cache key", 400));
         }
-        yield* requireMutation(request);
+        const session = yield* requireMutation(request);
+        if (
+          !deps.config.gatewayAdminOrganizationIds?.has(session.organizationId)
+        )
+          return Option.some(text("Forbidden", 403));
         const pruned = yield* deps.nixEnvironment.prune(cacheKey);
         return Option.some(json({ pruned }));
       }

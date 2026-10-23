@@ -22,7 +22,12 @@ import {
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
+import { tokenContext } from "../src/services/token-migration.js";
 import { testPaths } from "./fixtures/paths.js";
+
+vi.mock("node:dns/promises", () => ({
+  lookup: async () => [{ address: "93.184.216.34", family: 4 }],
+}));
 
 const hash = (value: string) =>
   createHash("sha256").update(value).digest("base64url");
@@ -263,8 +268,22 @@ describe("MCP OAuth primitives", () => {
                 authorizationEndpoint: "https://issuer.example/authorize",
                 tokenEndpoint: "https://issuer.example/token",
               }),
+              tokenContext(
+                "mcp_oauth_state",
+                organizationId,
+                hash(state),
+                "client_json",
+              ),
             );
-            const encryptedVerifier = yield* crypto.encrypt(verifier);
+            const encryptedVerifier = yield* crypto.encrypt(
+              verifier,
+              tokenContext(
+                "mcp_oauth_state",
+                organizationId,
+                hash(state),
+                "code_verifier",
+              ),
+            );
             const now = Date.now();
             db.query(
               "INSERT INTO mcp_oauth_state (state_hash, organization_id, server_id, server_url, admin_session_hash, code_verifier, redirect_uri, client_json, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -523,7 +542,7 @@ describe("MCP OAuth primitives", () => {
     db.close();
     await rm(workspace, { recursive: true, force: true });
   });
-  it("materializes refresh material for a live MCP connection", async () => {
+  it("only materializes access tokens even if a caller supplies refresh material", async () => {
     const workspace = testPath(`mcp-oauth-refresh-${crypto.randomUUID()}`);
     const agentDir = await materializeMcpAgentDb(workspace, [
       {
@@ -541,10 +560,10 @@ describe("MCP OAuth primitives", () => {
       .get();
     expect(JSON.parse(row?.data ?? "{}")).toMatchObject({
       access: "access-token",
-      refresh: "refresh-token",
-      tokenUrl: "https://issuer.example/token",
-      clientId: "client-1",
+      expires: 1_700_000_000_000,
     });
+    expect(row?.data).not.toContain("refresh-token");
+    expect(row?.data).not.toContain("clientSecret");
     db.close();
     await rm(workspace, { recursive: true, force: true });
   });
@@ -628,9 +647,31 @@ describe("MCP OAuth primitives", () => {
                 authorizationEndpoint: "https://mcp.example/authorize",
                 tokenEndpoint: "https://mcp.example/token",
               }),
+              tokenContext(
+                "mcp_oauth_credential",
+                organizationId,
+                serverId,
+                "client_json",
+              ),
             );
-            const accessToken = yield* crypto.encrypt("old-access");
-            const refreshToken = yield* crypto.encrypt("old-refresh");
+            const accessToken = yield* crypto.encrypt(
+              "old-access",
+              tokenContext(
+                "mcp_oauth_credential",
+                organizationId,
+                serverId,
+                "access_token",
+              ),
+            );
+            const refreshToken = yield* crypto.encrypt(
+              "old-refresh",
+              tokenContext(
+                "mcp_oauth_credential",
+                organizationId,
+                serverId,
+                "refresh_token",
+              ),
+            );
             db.query(
               "INSERT INTO mcp_oauth_credential (organization_id, server_id, server_url, client_json, access_token, refresh_token, expires_at, token_type, scope, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ).run(

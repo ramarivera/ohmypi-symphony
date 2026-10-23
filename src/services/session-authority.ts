@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Clock, Duration, Effect, Fiber, Option, Queue, Ref } from "effect";
 import {
@@ -60,10 +61,16 @@ import {
   WorkspaceRepo,
 } from "./store/repositories.js";
 import {
+  prepareWorkerWorkspace,
+  workerEnvironment,
+  workerMcpCredential,
+} from "./worker-security.js";
+import {
   makeWorkspace,
   parseRepositorySuggestionCandidate,
   type RepositoryResolution,
 } from "./workspace.js";
+import { workspaceProcess } from "./workspace-process.js";
 
 interface InputContext {
   readonly organizationId: string | null;
@@ -1676,7 +1683,11 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         }
         command.push("--extension", deviationExtensionPath);
 
-        const environment = { ...process.env };
+        const environment = workerEnvironment(process.env);
+        if (process.env.WORKER_UID) {
+          environment.HOME = join(cwd, ".omp-home");
+          environment.TMPDIR = join(cwd, ".omp-tmp");
+        }
         if (Option.isSome(run.repositoryId)) {
           const repository = yield* workspaceRepo.getRepository(
             run.organizationId,
@@ -1762,34 +1773,20 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 run.organizationId,
                 server.id,
               );
-              const details = yield* mcpOAuth.getCredentialDetails(
-                run.organizationId,
-                server.id,
-              );
+              const credential = yield* Effect.try({
+                try: () =>
+                  Option.isNone(token)
+                    ? null
+                    : workerMcpCredential(token.value),
+                catch: () =>
+                  new RpcSpawnError({
+                    message:
+                      "MCP access token must expire within one hour; gateway renewal credentials cannot be sent to workers",
+                  }),
+              });
               return {
                 server,
-                credential: Option.match(token, {
-                  onNone: () => null,
-                  onSome: (value) => {
-                    const detail = Option.getOrUndefined(details);
-                    return {
-                      accessToken: value.accessToken,
-                      expiresAt: value.expiresAt,
-                      ...(value.refreshToken !== undefined
-                        ? { refreshToken: value.refreshToken }
-                        : {}),
-                      ...(detail?.client.tokenEndpoint !== undefined
-                        ? { tokenEndpoint: detail.client.tokenEndpoint }
-                        : {}),
-                      ...(detail?.client.clientId !== undefined
-                        ? { clientId: detail.client.clientId }
-                        : {}),
-                      ...(detail?.client.clientSecret !== undefined
-                        ? { clientSecret: detail.client.clientSecret }
-                        : {}),
-                    };
-                  },
-                }),
+                credential,
               };
             }),
           { concurrency: "unbounded" },
@@ -1807,22 +1804,25 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                   serverUrl: entry.server.url.value,
                   accessToken: entry.credential.accessToken,
                   expiresAt: entry.credential.expiresAt,
-                  ...(entry.credential.refreshToken !== undefined
-                    ? { refreshToken: entry.credential.refreshToken }
-                    : {}),
-                  ...(entry.credential.tokenEndpoint !== undefined
-                    ? { tokenEndpoint: entry.credential.tokenEndpoint }
-                    : {}),
-                  ...(entry.credential.clientId !== undefined
-                    ? { clientId: entry.credential.clientId }
-                    : {}),
-                  ...(entry.credential.clientSecret !== undefined
-                    ? { clientSecret: entry.credential.clientSecret }
-                    : {}),
                 },
               ]
             : [],
         );
+        yield* Effect.tryPromise({
+          try: () => prepareWorkerWorkspace(cwd, process.env.WORKER_UID),
+          catch: () =>
+            new RpcSpawnError({
+              message: "Could not prepare isolated worker workspace",
+            }),
+        });
+        if (process.env.WORKER_UID)
+          yield* Effect.tryPromise({
+            try: () => workspaceProcess(cwd, "tool-directories", null),
+            catch: () =>
+              new RpcSpawnError({
+                message: "Could not prepare worker tool directories",
+              }),
+          });
         const agentDir = yield* Effect.tryPromise({
           try: () => materializeMcpAgentDb(cwd, credentials),
           catch: (error) =>

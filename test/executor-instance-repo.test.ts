@@ -11,7 +11,13 @@ import { TokenCrypto } from "../src/services/token-crypto.js";
 const org = Schema.decodeUnknownSync(OrganizationId)("org_executor");
 const key = Buffer.from(new Uint8Array(32).fill(0x42)).toString("base64");
 const configProvider = ConfigProvider.fromMap(
-  new Map<string, string>([["TOKEN_ENCRYPTION_KEY", key]]),
+  new Map<string, string>([
+    ["LINEAR_CLIENT_ID", "test"],
+    ["LINEAR_CLIENT_SECRET", "test"],
+    ["LINEAR_WEBHOOK_SECRET", "test"],
+    ["PUBLIC_URL", "http://localhost:3000"],
+    ["TOKEN_ENCRYPTION_KEY", key],
+  ]),
 );
 const sqlite = SqliteClientLive(":memory:");
 const tokenLayer = TokenCrypto.Default.pipe(

@@ -42,7 +42,13 @@ import { TokenCrypto } from "../src/services/token-crypto.js";
 
 const testKeyBase64 = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=";
 const configProvider = ConfigProvider.fromMap(
-  new Map([["TOKEN_ENCRYPTION_KEY", testKeyBase64]]),
+  new Map([
+    ["LINEAR_CLIENT_ID", "test"],
+    ["LINEAR_CLIENT_SECRET", "test"],
+    ["LINEAR_WEBHOOK_SECRET", "test"],
+    ["PUBLIC_URL", "http://localhost:3000"],
+    ["TOKEN_ENCRYPTION_KEY", testKeyBase64],
+  ]),
 );
 
 type RepoServices =

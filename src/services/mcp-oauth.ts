@@ -14,6 +14,7 @@ import {
 } from "../domain/errors.js";
 import type { McpServerId, OrganizationId } from "../domain/ids.js";
 import { GatewayConfig } from "./config.js";
+import { type NetworkPolicy, safeOAuthFetch } from "./safe-http.js";
 import { McpServerRepo } from "./store/repositories.js";
 import {
   decodeRow,
@@ -24,13 +25,20 @@ import {
   tryDb,
 } from "./store/sqlite-client.js";
 import { TokenCrypto } from "./token-crypto.js";
+import { tokenContext } from "./token-migration.js";
+import { workerMcpCredential } from "./worker-security.js";
+
+import {
+  cleanupWorkspaceProcess,
+  needsWorkspaceIdentity,
+  workspaceProcess,
+} from "./workspace-process.js";
 
 export const MCP_OAUTH_PROVIDER_PREFIX = "mcp_oauth:profile:default:";
 export const MCP_OAUTH_ENCRYPTED_PREFIX = "mcpenc:v1:";
 export const MCP_OAUTH_CALLBACK_PATH = "/oauth/mcp/callback";
 export const MCP_OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const PKCE_BYTES = 32;
-const FETCH_TIMEOUT_MS = 5_000;
 const NON_EXPIRING_TOKEN_EXPIRES_AT = Number.MAX_SAFE_INTEGER;
 
 type FetchLike = typeof fetch;
@@ -166,9 +174,20 @@ const discoveryUrl = (base: URL, suffix: string): URL => {
   return value;
 };
 
-const validateEndpoint = (endpoint: string, base: URL): string => {
+const validateEndpoint = (
+  endpoint: string,
+  base: URL,
+  policy: NetworkPolicy = {},
+): string => {
   const value = new URL(endpoint);
-  if (value.protocol !== "https:")
+  if (
+    value.protocol !== "https:" &&
+    !(
+      policy.allowLoopbackHttp &&
+      value.protocol === "http:" &&
+      isLoopbackHost(value.hostname)
+    )
+  )
     throw new Error("MCP OAuth endpoint must use HTTPS");
   if (value.username || value.password)
     throw new Error("MCP OAuth endpoint must not contain credentials");
@@ -187,28 +206,12 @@ export const isLoopbackHost = (hostname: string): boolean => {
   return isIP(normalized) === 4 && normalized.split(".")[0] === "127";
 };
 
-const fetchWithTimeout = async (
+const fetchWithTimeout = (
   fetchImpl: FetchLike,
   input: Parameters<FetchLike>[0],
   init?: Parameters<FetchLike>[1],
-): Promise<Response> => {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetchImpl(input, {
-      ...init,
-      signal: controller.signal,
-    });
-    const body = await response.arrayBuffer();
-    return new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers,
-    });
-  } finally {
-    clearTimeout(timeout);
-  }
-};
+  policy: NetworkPolicy = {},
+): Promise<Response> => safeOAuthFetch(input, init, policy, fetchImpl);
 
 const decodeJsonResponse = <A, I, R>(
   schema: Schema.Schema<A, I, R>,
@@ -258,6 +261,7 @@ const decodeStoredJson = <A, I, R>(
 const discoverMcpOAuthMetadataEffect = (
   serverUrl: string,
   fetchImpl: FetchLike,
+  policy: NetworkPolicy = {},
 ): Effect.Effect<McpOAuthMetadata, DatabaseError | McpOAuthError> =>
   Effect.gen(function* () {
     const base = new URL(serverUrl);
@@ -266,7 +270,8 @@ const discoverMcpOAuthMetadataEffect = (
       base,
     );
     const resourceResponse = yield* Effect.tryPromise({
-      try: () => fetchWithTimeout(fetchImpl, protectedResource),
+      try: () =>
+        fetchWithTimeout(fetchImpl, protectedResource, undefined, policy),
       catch: (error) => new DatabaseError({ message: String(error) }),
     });
     if (!resourceResponse.ok) {
@@ -308,7 +313,12 @@ const discoverMcpOAuthMetadataEffect = (
     try {
       authServerUrl = new URL(issuer);
       if (
-        authServerUrl.protocol !== "https:" ||
+        (authServerUrl.protocol !== "https:" &&
+          !(
+            policy.allowLoopbackHttp &&
+            authServerUrl.protocol === "http:" &&
+            isLoopbackHost(authServerUrl.hostname)
+          )) ||
         authServerUrl.username ||
         authServerUrl.password
       )
@@ -328,7 +338,7 @@ const discoverMcpOAuthMetadataEffect = (
       authServerUrl,
     );
     const authResponse = yield* Effect.tryPromise({
-      try: () => fetchWithTimeout(fetchImpl, metadataUrl),
+      try: () => fetchWithTimeout(fetchImpl, metadataUrl, undefined, policy),
       catch: (error) => new DatabaseError({ message: String(error) }),
     });
     if (!authResponse.ok) {
@@ -369,12 +379,21 @@ const discoverMcpOAuthMetadataEffect = (
       authorizationEndpoint = validateEndpoint(
         metadata.authorization_endpoint,
         authServerUrl,
+        policy,
       );
-      tokenEndpoint = validateEndpoint(metadata.token_endpoint, authServerUrl);
+      tokenEndpoint = validateEndpoint(
+        metadata.token_endpoint,
+        authServerUrl,
+        policy,
+      );
       registrationEndpoint =
         metadata.registration_endpoint === undefined
           ? undefined
-          : validateEndpoint(metadata.registration_endpoint, authServerUrl);
+          : validateEndpoint(
+              metadata.registration_endpoint,
+              authServerUrl,
+              policy,
+            );
     } catch (error) {
       return yield* Effect.fail(
         new McpOAuthError({
@@ -430,6 +449,7 @@ const registerClient = (
   redirectUri: string,
   fetchImpl: FetchLike,
   scope?: string,
+  policy: NetworkPolicy = {},
 ): Effect.Effect<McpOAuthClientMetadata, DatabaseError | McpOAuthError> =>
   Effect.gen(function* () {
     const registrationEndpoint = metadata.registrationEndpoint;
@@ -442,21 +462,26 @@ const registerClient = (
     }
     const response = yield* Effect.tryPromise({
       try: () =>
-        fetchWithTimeout(fetchImpl, registrationEndpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            accept: "application/json",
+        fetchWithTimeout(
+          fetchImpl,
+          registrationEndpoint,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json",
+            },
+            body: JSON.stringify({
+              redirect_uris: [redirectUri],
+              token_endpoint_auth_method: "none",
+              grant_types: ["authorization_code", "refresh_token"],
+              response_types: ["code"],
+              client_name: "Oh My Pi Linear Gateway",
+              ...(scope !== undefined ? { scope } : {}),
+            }),
           },
-          body: JSON.stringify({
-            redirect_uris: [redirectUri],
-            token_endpoint_auth_method: "none",
-            grant_types: ["authorization_code", "refresh_token"],
-            response_types: ["code"],
-            client_name: "Oh My Pi Linear Gateway",
-            ...(scope !== undefined ? { scope } : {}),
-          }),
-        }),
+          policy,
+        ),
       catch: (error) => new DatabaseError({ message: String(error) }),
     });
     if (!response.ok) {
@@ -540,6 +565,7 @@ const redeemCode = (
   fetchImpl: FetchLike,
   now: number,
   resource: string,
+  policy: NetworkPolicy = {},
 ): Effect.Effect<McpOAuthToken, DatabaseError> =>
   Effect.gen(function* () {
     const params = new URLSearchParams({
@@ -553,15 +579,20 @@ const redeemCode = (
     const authHeaders = yield* tokenEndpointAuth(client, params);
     const response = yield* Effect.tryPromise({
       try: () =>
-        fetchWithTimeout(fetchImpl, client.tokenEndpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/x-www-form-urlencoded",
-            accept: "application/json",
-            ...authHeaders,
+        fetchWithTimeout(
+          fetchImpl,
+          client.tokenEndpoint,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              accept: "application/json",
+              ...authHeaders,
+            },
+            body: params.toString(),
           },
-          body: params.toString(),
-        }),
+          policy,
+        ),
       catch: (error) => new DatabaseError({ message: String(error) }),
     });
     if (!response.ok) {
@@ -596,6 +627,7 @@ const refreshAccessToken = (
   fetchImpl: FetchLike,
   now: number,
   resource: string,
+  policy: NetworkPolicy = {},
 ): Effect.Effect<McpOAuthToken, DatabaseError> =>
   Effect.gen(function* () {
     const params = new URLSearchParams({
@@ -607,15 +639,20 @@ const refreshAccessToken = (
     const authHeaders = yield* tokenEndpointAuth(client, params);
     const response = yield* Effect.tryPromise({
       try: () =>
-        fetchWithTimeout(fetchImpl, client.tokenEndpoint, {
-          method: "POST",
-          headers: {
-            "content-type": "application/x-www-form-urlencoded",
-            accept: "application/json",
-            ...authHeaders,
+        fetchWithTimeout(
+          fetchImpl,
+          client.tokenEndpoint,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              accept: "application/json",
+              ...authHeaders,
+            },
+            body: params.toString(),
           },
-          body: params.toString(),
-        }),
+          policy,
+        ),
       catch: (error) => new DatabaseError({ message: String(error) }),
     });
     if (!response.ok) {
@@ -647,9 +684,10 @@ const encrypted = (value: string): string =>
 const decryptValue = (
   crypto: TokenCrypto,
   value: string,
+  context: string,
 ): Effect.Effect<string, TokenCipherError> =>
   value.startsWith(MCP_OAUTH_ENCRYPTED_PREFIX)
-    ? crypto.decrypt(value.slice(MCP_OAUTH_ENCRYPTED_PREFIX.length))
+    ? crypto.decrypt(value.slice(MCP_OAUTH_ENCRYPTED_PREFIX.length), context)
     : Effect.succeed(value);
 
 export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
@@ -726,6 +764,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
           resourceUrl.protocol !== "https:" &&
           !(
             resourceUrl.protocol === "http:" &&
+            config.mcpOAuthAllowLoopbackHttp === true &&
             isLoopbackHost(resourceUrl.hostname)
           )
         ) {
@@ -742,6 +781,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         const discovered = yield* discoverMcpOAuthMetadataEffect(
           serverUrl,
           fetch,
+          { allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp },
         );
         const client = preRegisteredClient
           ? {
@@ -752,14 +792,30 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
                 ? { registrationEndpoint: discovered.registrationEndpoint }
                 : {}),
             }
-          : yield* registerClient(discovered, redirectUri, fetch, scope);
+          : yield* registerClient(discovered, redirectUri, fetch, scope, {
+              allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp,
+            });
         const state = randomBytes(32).toString("base64url");
         const verifier = createPkceVerifier();
         const now = yield* Clock.currentTimeMillis;
         const encryptedClient = yield* tokenCrypto.encrypt(
           JSON.stringify(client),
+          tokenContext(
+            "mcp_oauth_state",
+            organizationId,
+            hash(state),
+            "client_json",
+          ),
         );
-        const encryptedVerifier = yield* tokenCrypto.encrypt(verifier);
+        const encryptedVerifier = yield* tokenCrypto.encrypt(
+          verifier,
+          tokenContext(
+            "mcp_oauth_state",
+            organizationId,
+            hash(state),
+            "code_verifier",
+          ),
+        );
         yield* tryDb(
           () =>
             db
@@ -890,10 +946,28 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       }
       const client = yield* decodeStoredJson(
         McpOAuthClientMetadataSchema,
-        yield* decryptValue(tokenCrypto, row.client_json),
+        yield* decryptValue(
+          tokenCrypto,
+          row.client_json,
+          tokenContext(
+            "mcp_oauth_state",
+            row.organization_id,
+            row.state_hash,
+            "client_json",
+          ),
+        ),
         "McpOAuth.completeMcpAuthorization.client",
       );
-      const verifier = yield* decryptValue(tokenCrypto, row.code_verifier);
+      const verifier = yield* decryptValue(
+        tokenCrypto,
+        row.code_verifier,
+        tokenContext(
+          "mcp_oauth_state",
+          row.organization_id,
+          row.state_hash,
+          "code_verifier",
+        ),
+      );
       yield* transact(
         db,
         Effect.gen(function* () {
@@ -936,6 +1010,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         fetch,
         now,
         row.server_url,
+        { allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp },
       );
       const result = yield* transact(
         db,
@@ -959,10 +1034,37 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
               }),
             );
           }
-          const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
+          const accessToken = yield* tokenCrypto.encrypt(
+            token.accessToken,
+            tokenContext(
+              "mcp_oauth_credential",
+              row.organization_id,
+              row.server_id,
+              "access_token",
+            ),
+          );
           const refreshToken = token.refreshToken
-            ? yield* tokenCrypto.encrypt(token.refreshToken)
+            ? yield* tokenCrypto.encrypt(
+                token.refreshToken,
+                tokenContext(
+                  "mcp_oauth_credential",
+                  row.organization_id,
+                  row.server_id,
+                  "refresh_token",
+                ),
+              )
             : null;
+          const encryptedClient = encrypted(
+            yield* tokenCrypto.encrypt(
+              JSON.stringify(client),
+              tokenContext(
+                "mcp_oauth_credential",
+                row.organization_id,
+                row.server_id,
+                "client_json",
+              ),
+            ),
+          );
           yield* tryDb(
             () =>
               db
@@ -973,7 +1075,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
                   row.organization_id,
                   row.server_id,
                   row.server_url,
-                  row.client_json,
+                  encryptedClient,
                   encrypted(accessToken),
                   refreshToken ? encrypted(refreshToken) : null,
                   token.expiresAt,
@@ -1048,9 +1150,24 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         const accessToken = yield* decryptValue(
           tokenCrypto,
           decoded.access_token,
+          tokenContext(
+            "mcp_oauth_credential",
+            organizationId,
+            serverId,
+            "access_token",
+          ),
         );
         const refreshToken = decoded.refresh_token
-          ? yield* decryptValue(tokenCrypto, decoded.refresh_token)
+          ? yield* decryptValue(
+              tokenCrypto,
+              decoded.refresh_token,
+              tokenContext(
+                "mcp_oauth_credential",
+                organizationId,
+                serverId,
+                "refresh_token",
+              ),
+            )
           : undefined;
         const token: McpOAuthToken = {
           accessToken,
@@ -1061,7 +1178,16 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         };
         const client = yield* decodeStoredJson(
           McpOAuthClientMetadataSchema,
-          yield* decryptValue(tokenCrypto, decoded.client_json),
+          yield* decryptValue(
+            tokenCrypto,
+            decoded.client_json,
+            tokenContext(
+              "mcp_oauth_credential",
+              organizationId,
+              serverId,
+              "client_json",
+            ),
+          ),
           "McpOAuth.getCredentialDetails.client",
         );
         return Option.some({
@@ -1089,9 +1215,25 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
       expectedUpdatedAt: number,
     ): Effect.Effect<boolean, DatabaseError | TokenCipherError> =>
       Effect.gen(function* () {
-        const accessToken = yield* tokenCrypto.encrypt(token.accessToken);
+        const accessToken = yield* tokenCrypto.encrypt(
+          token.accessToken,
+          tokenContext(
+            "mcp_oauth_credential",
+            organizationId,
+            serverId,
+            "access_token",
+          ),
+        );
         const refreshToken = token.refreshToken
-          ? yield* tokenCrypto.encrypt(token.refreshToken)
+          ? yield* tokenCrypto.encrypt(
+              token.refreshToken,
+              tokenContext(
+                "mcp_oauth_credential",
+                organizationId,
+                serverId,
+                "refresh_token",
+              ),
+            )
           : null;
         const result = yield* tryDb(
           () =>
@@ -1159,6 +1301,7 @@ export class McpOAuth extends Effect.Service<McpOAuth>()("McpOAuth", {
         fetch,
         now,
         current.serverUrl,
+        { allowLoopbackHttp: config.mcpOAuthAllowLoopbackHttp },
       ).pipe(
         Effect.tap((token) =>
           persistRefreshedToken(
@@ -1289,6 +1432,15 @@ export const materializeMcpAgentDb = async (
     readonly clientSecret?: string | undefined;
   }>,
 ): Promise<string> => {
+  if (needsWorkspaceIdentity())
+    return workspaceProcess(
+      workspace,
+      "agent-db",
+      credentials.map((credential) => ({
+        serverUrl: credential.serverUrl,
+        ...workerMcpCredential(credential),
+      })),
+    );
   const providers = new Set<string>();
   for (const credential of credentials) {
     const provider = mcpProviderForServerUrl(credential.serverUrl);
@@ -1333,18 +1485,6 @@ export const materializeMcpAgentDb = async (
             JSON.stringify({
               access: credential.accessToken,
               expires: credential.expiresAt,
-              ...(credential.refreshToken !== undefined
-                ? { refresh: credential.refreshToken }
-                : {}),
-              ...(credential.tokenEndpoint !== undefined
-                ? { tokenUrl: credential.tokenEndpoint }
-                : {}),
-              ...(credential.clientId !== undefined
-                ? { clientId: credential.clientId }
-                : {}),
-              ...(credential.clientSecret !== undefined
-                ? { clientSecret: credential.clientSecret }
-                : {}),
             }),
           );
         }
@@ -1401,14 +1541,38 @@ export const materializeMcpAgentDb = async (
   }
 };
 
+/** Strict worker-side removal lets the gateway observe failed cleanup over IPC. */
+export const removeMcpAgentDbFile = async (
+  workspace: string,
+): Promise<void> => {
+  try {
+    await unlink(join(workspace, ".omp-gateway", "agent.db"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+};
+
 export const removeMcpAgentDb = (
   workspace: string,
 ): Effect.Effect<void, never, never> =>
-  Effect.promise(async () => {
-    try {
-      await unlink(join(workspace, ".omp-gateway", "agent.db"));
-    } catch {}
-  });
+  needsWorkspaceIdentity()
+    ? cleanupWorkspaceProcess(
+        workspace,
+        "remove-agent-db",
+        "mcp.agent_db.cleanup_failed",
+      )
+    : Effect.tryPromise({
+        try: () => removeMcpAgentDbFile(workspace),
+        catch: (error) => String(error),
+      }).pipe(
+        Effect.catchAll((error) =>
+          Effect.logWarning("mcp.agent_db.cleanup_failed").pipe(
+            Effect.annotateLogs({ cwd: workspace, error }),
+          ),
+        ),
+      );
 
 export const mcpProviderForServerUrl = (serverUrl: string): string =>
   `${MCP_OAUTH_PROVIDER_PREFIX}${serverUrl}`;

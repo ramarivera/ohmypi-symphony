@@ -1,6 +1,15 @@
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Exit, Logger, Option, Redacted, Schema } from "effect";
+import {
+  ConfigProvider,
+  Effect,
+  Exit,
+  Layer,
+  Logger,
+  Option,
+  Redacted,
+  Schema,
+} from "effect";
 import { OAuthStateError } from "../src/domain/errors.js";
 import { AppUserId, OrganizationId, type TeamId } from "../src/domain/ids.js";
 import {
@@ -8,6 +17,7 @@ import {
   oauthCallback,
   oauthStart,
   router,
+  safeReturnTo,
   webhook,
 } from "../src/http/router.js";
 import { GatewayConfig } from "../src/services/config.js";
@@ -189,13 +199,41 @@ describe("HTTP router parity", () => {
     };
     const response = await Effect.runPromise(
       oauthStart.pipe(
+        Effect.provideService(
+          HttpServerRequest.HttpServerRequest,
+          request("GET", "/oauth/start?returnTo=%2Fruns%2Fabc"),
+        ),
         Effect.provideService(OAuth, oauth),
+        Effect.provide(
+          GatewayConfig.Default.pipe(
+            Layer.provide(
+              Layer.setConfigProvider(
+                ConfigProvider.fromMap(
+                  new Map([
+                    ["LINEAR_CLIENT_ID", "test"],
+                    ["LINEAR_CLIENT_SECRET", "test"],
+                    ["LINEAR_WEBHOOK_SECRET", "test"],
+                    [
+                      "TOKEN_ENCRYPTION_KEY",
+                      Buffer.alloc(32).toString("base64"),
+                    ],
+                    ["PUBLIC_URL", "http://localhost:3000"],
+                  ]),
+                ),
+              ),
+            ),
+          ),
+        ),
         Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
       ),
     );
 
     const webResponse = HttpServerResponse.toWeb(response);
 
+    expect(webResponse.headers.get("set-cookie")).toContain(
+      "omp_gateway_return=%2Fruns%2Fabc",
+    );
+    expect(webResponse.headers.get("set-cookie")).not.toContain("Secure");
     expect(webResponse.status).toBe(302);
     expect(webResponse.headers.get("location")).toBe(
       "https://linear.example/authorize",
@@ -438,4 +476,18 @@ describe("HTTP router parity", () => {
       "/base/admin?mcp=connected",
     );
   });
+});
+
+it.each([
+  "/\t/evil.example",
+  "/\r/evil.example",
+  "/\n/evil.example",
+  "//evil.example",
+  "/\\evil.example",
+  "/\u0000/evil.example",
+])("rejects unsafe return destination %s", (value) => {
+  expect(safeReturnTo(value)).toBe("/admin");
+});
+it("preserves local run paths and queries", () => {
+  expect(safeReturnTo("/runs/abc?tab=events")).toBe("/runs/abc?tab=events");
 });

@@ -11,7 +11,7 @@ import {
   setAdminCookie,
   tokenHash,
 } from "../services/admin.js";
-import { GatewayConfig } from "../services/config.js";
+import { GatewayConfig, organizationAllowed } from "../services/config.js";
 import { McpOAuth } from "../services/mcp-oauth.js";
 import { OAuth } from "../services/oauth.js";
 import { Reconciler } from "../services/reconciler.js";
@@ -63,10 +63,18 @@ export const oauthStart = Effect.gen(function* () {
       path: "/oauth/start",
     }),
   );
+  const request = yield* HttpServerRequest.HttpServerRequest;
+  const returnTo = safeReturnTo(
+    new URL(request.url, "http://localhost").searchParams.get("returnTo"),
+  );
+  const config = yield* GatewayConfig;
   const { url } = yield* OAuth.startAuthorization();
   return HttpServerResponse.redirect(url, {
     status: 302,
-    headers: SECURITY_HEADERS,
+    headers: {
+      ...SECURITY_HEADERS,
+      "set-cookie": `omp_gateway_return=${encodeURIComponent(returnTo)}; HttpOnly; SameSite=Lax; Path=/oauth; Max-Age=600${config.publicUrl.protocol === "https:" ? "; Secure" : ""}`,
+    },
   });
 });
 
@@ -90,7 +98,13 @@ export const oauthCallback = Effect.gen(function* () {
       installation.organizationId,
       now,
     );
-    return HttpServerResponse.redirect("/admin", {
+    const returnCookie = BunHttpServerRequest.toRequest(request)
+      .headers.get("cookie")
+      ?.match(/(?:^|;\s*)omp_gateway_return=([^;]*)/u)?.[1];
+    const returnTo = safeReturnTo(
+      returnCookie === undefined ? null : safeDecode(returnCookie),
+    );
+    return HttpServerResponse.redirect(returnTo, {
       status: 302,
       headers: {
         ...SECURITY_HEADERS,
@@ -139,10 +153,13 @@ export const mcpOauthCallback = Effect.gen(function* () {
       }),
     ),
     Effect.catchAll((error) =>
-      Effect.succeed(
-        HttpServerResponse.redirect(
-          `${adminUrl.pathname}?mcp=error&message=${encodeURIComponent(error instanceof Error ? error.message : String(error))}`,
-          { status: 302, headers: SECURITY_HEADERS },
+      Effect.logError("mcp.oauth_callback_failed").pipe(
+        Effect.annotateLogs({ error: String(error) }),
+        Effect.as(
+          HttpServerResponse.redirect(
+            `${adminUrl.pathname}?mcp=error&message=OAuth%20connection%20failed`,
+            { status: 302, headers: SECURITY_HEADERS },
+          ),
         ),
       ),
     ),
@@ -157,6 +174,65 @@ const admin = Effect.gen(function* () {
     : HttpServerResponse.text("Not found", { status: 404 });
 });
 
+export const safeDecode = (value: string): string => {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return "";
+  }
+};
+export const safeReturnTo = (value: string | null): string =>
+  value !== null &&
+  /^\/(?!\/)/u.test(value) &&
+  !value.includes("\\") &&
+  [...value].every(
+    (character) =>
+      character.charCodeAt(0) > 32 && character.charCodeAt(0) !== 127,
+  )
+    ? value
+    : "/admin";
+export const publicRoute = (method: string, path: string): boolean =>
+  (method === "GET" &&
+    ["/", "/health", "/oauth/start", "/oauth/callback"].includes(path)) ||
+  (method === "POST" && path === "/webhooks/linear");
+
+export const authenticateRoutes = <E, R>(
+  app: Effect.Effect<HttpServerResponse.HttpServerResponse, E, R>,
+) =>
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const path = new URL(request.url, "http://localhost").pathname;
+    if (publicRoute(request.method, path)) return yield* app;
+    const raw = BunHttpServerRequest.toRequest(request)
+      .headers.get("cookie")
+      ?.match(/(?:^|;\s*)omp_gateway_admin=([^;]*)/u)?.[1];
+    const repo = yield* AdminSessionRepo;
+    const config = yield* GatewayConfig;
+    const now = yield* Clock.currentTimeMillis;
+    const session =
+      raw === undefined
+        ? Option.none()
+        : yield* repo.get(tokenHash(safeDecode(raw)), now);
+    if (
+      Option.isNone(session) ||
+      !organizationAllowed(config, session.value.organizationId)
+    ) {
+      return request.method === "GET" &&
+        !path.endsWith(".json") &&
+        !path.startsWith("/api/") &&
+        !request.headers.accept?.includes("application/json")
+        ? HttpServerResponse.redirect(
+            `/oauth/start?returnTo=${encodeURIComponent(new URL(request.url, "http://localhost").pathname + new URL(request.url, "http://localhost").search)}`,
+            { status: 302, headers: SECURITY_HEADERS },
+          )
+        : HttpServerResponse.text("Unauthorized", {
+            status: 401,
+            headers: SECURITY_HEADERS,
+          });
+    }
+    return yield* app;
+  });
+
 export const router = HttpRouter.empty.pipe(
   HttpRouter.get("/health", health),
   HttpRouter.all("/webhooks/linear", webhook),
@@ -169,6 +245,7 @@ export const router = HttpRouter.empty.pipe(
   HttpRouter.get("/runs/:id.json", admin),
   HttpRouter.all("/admin/*", admin),
   HttpRouter.all("/api/admin/*", admin),
+  HttpRouter.use(authenticateRoutes),
 );
 
 export const httpApp = HttpRouter.toHttpApp(router);

@@ -26,6 +26,7 @@ export class GitHubAppError extends Schema.TaggedError<GitHubAppError>()(
       "token_request",
       "invalid_response",
       "not_installed",
+      "tenant_forbidden",
     ),
     status: Schema.optional(Schema.Number),
   },
@@ -100,6 +101,9 @@ const responseJson = (
   });
 
 export const makeGitHubApp = (input: {
+  readonly allowedOwners?:
+    | Readonly<Record<string, ReadonlyArray<string>>>
+    | undefined;
   readonly appId: string | undefined;
   readonly privateKey: string | undefined;
   readonly fetch?: GitHubFetch;
@@ -139,6 +143,20 @@ export const makeGitHubApp = (input: {
             message: "GitHub repository name is invalid",
             operation: "getInstallationToken",
             reason: "invalid_repository",
+          }),
+        );
+      }
+
+      if (
+        !input.allowedOwners?.[organizationId]?.some(
+          (allowed) => allowed.toLowerCase() === owner.toLowerCase(),
+        )
+      ) {
+        return yield* Effect.fail(
+          new GitHubAppError({
+            message: "GitHub owner is not authorized for this organization",
+            operation: "getInstallationToken",
+            reason: "tenant_forbidden",
           }),
         );
       }
@@ -296,6 +314,7 @@ export class GitHubApp extends Effect.Service<GitHubApp>()("GitHubApp", {
     const config = yield* GatewayConfig;
     return makeGitHubApp({
       appId: config.githubAppId,
+      allowedOwners: config.githubAppAllowedOwners,
       privateKey:
         config.githubAppPrivateKey === undefined
           ? undefined

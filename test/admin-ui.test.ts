@@ -454,3 +454,17 @@ describe("redaction invariants", () => {
     },
   );
 });
+
+it("hides the shared cache panel and skips its request for tenant admins", () => {
+  const tenant = renderAdminPage(false);
+  expect(tenant).toContain('aria-labelledby="nix-cache-heading" hidden');
+  expect(tenant).not.toContain(
+    'document.documentElement.setAttribute("data-gateway-admin", "")',
+  );
+  expect(tenant).toContain(
+    'if (!document.documentElement.hasAttribute("data-gateway-admin")) return;',
+  );
+  expect(renderAdminPage(true)).toContain(
+    'document.documentElement.setAttribute("data-gateway-admin", "")',
+  );
+});

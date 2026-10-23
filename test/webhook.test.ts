@@ -73,6 +73,14 @@ const config: GatewayConfigShape = {
 const configProviderFor = (gatewayConfig: GatewayConfigShape) =>
   ConfigProvider.fromMap(
     new Map([
+      ...(gatewayConfig.allowedOrganizationIds === undefined
+        ? []
+        : [
+            [
+              "LINEAR_ALLOWED_ORGANIZATION_IDS",
+              [...gatewayConfig.allowedOrganizationIds].join(","),
+            ] as const,
+          ]),
       ["LINEAR_CLIENT_ID", gatewayConfig.linearClientId],
       ["LINEAR_CLIENT_SECRET", "client-secret"],
       ["LINEAR_WEBHOOK_SECRET", secret],
@@ -1419,5 +1427,53 @@ describe("webhook replay, delivery, and identity invariants", () => {
         }),
       ),
     { timeout: 15_000, fastCheck: { numRuns: 20 } },
+  );
+});
+
+describe("webhook admission security", () => {
+  it.scopedLive(
+    "rejects a signed unadmitted org before delivery/run persistence",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          const now = yield* currentTime;
+          yield* install();
+          const req = signedRequest(createdPayload(now), {
+            delivery: "denied-delivery",
+          });
+          const response = yield* WebhookPipeline.handle(req);
+          expect(response.status).toBe(403);
+          expect(yield* RunRepo.get(sessionId("session-1"))).toEqual(
+            Option.none(),
+          );
+          expect(
+            yield* RunInputRepo.pending(sessionId("session-1")),
+          ).toHaveLength(0);
+          expect(
+            yield* DeliveryRepo.claim({
+              id: "denied-delivery" as import("../src/domain/ids.js").DeliveryId,
+              organizationId: "org",
+              payloadHash: "different",
+              payload: {},
+            }),
+          ).toBe("claimed");
+        }),
+        { ...config, allowedOrganizationIds: new Set(["other-org"]) },
+      ),
+  );
+  it.scopedLive(
+    "caps webhook bodies before HMAC verification even without Content-Length",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          const response = yield* WebhookPipeline.handle(
+            new Request("https://gateway.example/webhooks/linear", {
+              method: "POST",
+              body: "x".repeat(1024 * 1024 + 1),
+            }),
+          );
+          expect(response.status).toBe(413);
+        }),
+      ),
   );
 });

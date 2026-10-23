@@ -6,7 +6,13 @@ const testKey = new Uint8Array(32).fill(0x42);
 const testKeyBase64 = Buffer.from(testKey).toString("base64");
 
 const configProvider = ConfigProvider.fromMap(
-  new Map<string, string>([["TOKEN_ENCRYPTION_KEY", testKeyBase64]]),
+  new Map<string, string>([
+    ["LINEAR_CLIENT_ID", "test"],
+    ["LINEAR_CLIENT_SECRET", "test"],
+    ["LINEAR_WEBHOOK_SECRET", "test"],
+    ["PUBLIC_URL", "http://localhost:3000"],
+    ["TOKEN_ENCRYPTION_KEY", testKeyBase64],
+  ]),
 );
 
 const TestLive = TokenCrypto.Default.pipe(
@@ -72,7 +78,7 @@ describe("TokenCrypto", () => {
 
     it.effect.prop(
       "rejects unsupported version bytes",
-      { version: Schema.Literal(0, 2, 255) },
+      { version: Schema.Literal(0, 3, 255) },
       ({ version }) =>
         Effect.gen(function* () {
           const crypto = yield* TokenCrypto;
@@ -92,7 +98,13 @@ describe("TokenCrypto", () => {
   it.effect("fails with a bad key length", () =>
     Effect.gen(function* () {
       const badProvider = ConfigProvider.fromMap(
-        new Map<string, string>([["TOKEN_ENCRYPTION_KEY", "c2hvcnQ="]]),
+        new Map<string, string>([
+          ["LINEAR_CLIENT_ID", "test"],
+          ["LINEAR_CLIENT_SECRET", "test"],
+          ["LINEAR_WEBHOOK_SECRET", "test"],
+          ["PUBLIC_URL", "http://localhost:3000"],
+          ["TOKEN_ENCRYPTION_KEY", "c2hvcnQ="],
+        ]),
       );
       const badLayer = TokenCrypto.Default.pipe(
         Layer.provide(Layer.setConfigProvider(badProvider)),

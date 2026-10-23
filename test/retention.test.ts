@@ -1,5 +1,6 @@
-import { existsSync, rmSync } from "node:fs";
-import { symlink, writeFile } from "node:fs/promises";
+import * as fs from "node:fs";
+import { existsSync, realpathSync, rmSync, statSync } from "node:fs";
+import { link, readFile, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { it } from "@effect/vitest";
 import {
@@ -12,7 +13,7 @@ import {
   Layer,
   Schema,
 } from "effect";
-import { describe, expect } from "vitest";
+import { afterEach, describe, expect, vi } from "vitest";
 import { NixEnvironmentError } from "../src/domain/errors.js";
 import { InputId, SessionId, SourceKey } from "../src/domain/ids.js";
 import { GatewayConfig } from "../src/services/config.js";
@@ -36,7 +37,15 @@ import {
 } from "../src/services/store/sqlite-client.js";
 import { testPaths } from "./fixtures/paths.js";
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, fchownSync: vi.fn(actual.fchownSync) };
+});
 const testPath = testPaths();
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
+});
 const policy: RetentionPolicy = {
   intervalMs: 100,
   workspaceTtlMs: 100,
@@ -63,6 +72,121 @@ const withDatabase = <A, E>(effect: Effect.Effect<A, E, SqliteClient>) =>
   effect.pipe(Effect.provide(SqliteClientLive(":memory:")));
 
 describe("retention", () => {
+  it.scopedLive(
+    "migrates legacy ownership before worker deletion under the synchronous reopen fence without following symlinks",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        const nested = testPath("root/expired/nested");
+        const file = join(nested, "legacy.txt");
+        const sentinel = join(testPath("external"), "sentinel");
+        yield* Effect.promise(async () => {
+          await writeFile(file, "legacy");
+          await writeFile(sentinel, "keep");
+          await symlink(sentinel, join(expired, "file-link"));
+          await symlink(testPath("external"), join(expired, "directory-link"));
+        });
+        const before = statSync(sentinel);
+        const workerUid = statSync(expired).uid + 1;
+        vi.stubEnv("WORKER_UID", String(workerUid));
+        const migrated: string[] = [];
+        // Exercise real inode inspection and traversal, stubbing only the
+        // privileged syscall unavailable to the native test uid.
+        vi.spyOn(fs, "fchownSync").mockImplementation((fd, uid, gid) => {
+          expect(db.inTransaction).toBe(true);
+          expect([uid, gid]).toEqual([workerUid, workerUid]);
+          migrated.push(realpathSync(`/proc/self/fd/${fd}`));
+        });
+        const spawnSync = Bun.spawnSync;
+        const worker = vi
+          .spyOn(Bun, "spawnSync")
+          .mockImplementation((command, options) => {
+            expect(db.inTransaction).toBe(true);
+            expect(migrated.sort()).toEqual([expired, nested, file].sort());
+            // Run the real deletion entry point as the test uid after the mocked
+            // migration. Production uses setpriv to select the migrated uid.
+            if (!Array.isArray(command))
+              throw new Error("Expected helper command");
+            return spawnSync(command.slice(command.indexOf("--") + 1), options);
+          });
+        insertRun(db, "expired", "succeeded", expired);
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+        }).sweep(now);
+        expect(result.workspaces).toBe(1);
+        expect(result.skippedWorkspaces).toBe(0);
+        expect(worker).toHaveBeenCalledExactlyOnceWith(
+          expect.arrayContaining([
+            "--reuid",
+            String(workerUid),
+            "--config=/dev/null",
+            "--no-env-file",
+            "--no-install",
+            "remove-workspace-contents",
+            expired,
+          ]),
+          expect.objectContaining({ cwd: expect.not.stringContaining(root) }),
+        );
+        expect(existsSync(expired)).toBe(false);
+        expect(statSync(sentinel)).toMatchObject({
+          uid: before.uid,
+          gid: before.gid,
+          mode: before.mode,
+        });
+        expect(yield* Effect.promise(() => readFile(sentinel, "utf8"))).toBe(
+          "keep",
+        );
+        expect(db.query("SELECT workspace_path FROM agent_run").get()).toEqual({
+          workspace_path: null,
+        });
+      }).pipe(withDatabase),
+  );
+
+  it.scopedLive(
+    "preserves workspace records when legacy ownership migration rejects an external hardlink",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        const sentinel = join(testPath("external"), "sentinel");
+        yield* Effect.promise(async () => {
+          await writeFile(sentinel, "keep");
+          await link(sentinel, join(expired, "hardlink"));
+        });
+        const before = statSync(sentinel);
+        vi.stubEnv("WORKER_UID", String(before.uid + 1));
+        vi.spyOn(fs, "fchownSync").mockReturnValue(undefined);
+        const worker = vi.spyOn(Bun, "spawnSync");
+        insertRun(db, "expired", "succeeded", expired);
+        db.query(
+          "INSERT INTO workspace VALUES ('expired', ?, 'repo', 'url', 'main', 'ready', 1, 1)",
+        ).run(expired);
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+        }).sweep(now);
+        expect(result.workspaces).toBe(0);
+        expect(result.skippedWorkspaces).toBe(1);
+        expect(worker).not.toHaveBeenCalled();
+        expect(existsSync(expired)).toBe(true);
+        expect(statSync(sentinel).uid).toBe(before.uid);
+        expect(db.query("SELECT workspace_path FROM agent_run").get()).toEqual({
+          workspace_path: expired,
+        });
+        expect(db.query("SELECT canonical_path FROM workspace").get()).toEqual({
+          canonical_path: expired,
+        });
+      }).pipe(withDatabase),
+  );
+
   it.scopedLive(
     "deletes expired terminal workspaces and data while preserving active runs and recent data",
     () =>
@@ -211,6 +335,37 @@ describe("retention", () => {
       expect(existsSync(join(external, "sentinel"))).toBe(true);
       expect(existsSync(shared)).toBe(true);
     }).pipe(withDatabase),
+  );
+
+  it.scopedLive(
+    "removes nested workspace links without deleting or rewriting their external targets",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* SqliteClient;
+        const root = testPath("root");
+        const expired = testPath("root/expired");
+        const external = testPath("external");
+        const sentinel = join(external, "sentinel");
+        yield* Effect.promise(async () => {
+          await writeFile(sentinel, "keep");
+          await symlink(external, join(expired, "directory-link"));
+          await symlink(sentinel, join(expired, "file-link"));
+          await link(sentinel, join(expired, "hardlink"));
+        });
+        insertRun(db, "expired", "succeeded", expired);
+        const result = yield* makeRetention({
+          db,
+          workspaceRoot: root,
+          policy,
+          webhookReplayWindowMs: 100,
+        }).sweep(now);
+        expect(result.workspaces).toBe(1);
+        expect(result.skippedWorkspaces).toBe(0);
+        expect(existsSync(expired)).toBe(false);
+        expect(yield* Effect.promise(() => readFile(sentinel, "utf8"))).toBe(
+          "keep",
+        );
+      }).pipe(withDatabase),
   );
 
   it.scopedLive(
