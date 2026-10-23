@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { it } from "@effect/vitest";
 import { Deferred, Effect, Either, Fiber, Option, Schema } from "effect";
 import * as fc from "effect/FastCheck";
@@ -11,6 +12,7 @@ import {
 import {
   makeNixEnvironment,
   type NixEnvironmentDependencies,
+  nativeRunner,
   nixCacheKey,
   protectedNixCacheKeys,
 } from "../src/services/nix-environment.js";
@@ -18,6 +20,10 @@ import {
   SqliteClient,
   SqliteClientLive,
 } from "../src/services/store/sqlite-client.js";
+
+import { testPaths } from "./fixtures/paths.js";
+
+const descendantPath = testPaths();
 
 const closureSizeOutput = JSON.stringify({
   "/nix/store/abc-tool": { closureSize: 123 },
@@ -632,5 +638,117 @@ describe("NixEnvironment", () => {
       expect(state.removals).toEqual([`/roots/${prepared.cacheKey}`]);
       expect(gcCalls).toBe(3);
     },
+  );
+});
+
+describe("Nix liveness regressions", () => {
+  it.live(
+    "bounds a hung build, aborts it, and lets a subsequent call retry",
+    () =>
+      Effect.gen(function* () {
+        const state = fixture();
+        let aborted = false;
+        let hang = true;
+        const service = yield* makeNixEnvironment({
+          ...state.dependencies,
+          timeoutMs: 30,
+          run: (argv, signal) =>
+            hang
+              ? new Promise((_resolve) => {
+                  signal?.addEventListener("abort", () => {
+                    aborted = true;
+                  });
+                })
+              : state.dependencies.run(argv),
+        });
+        const result = yield* service
+          .prepare(repository(["git"]))
+          .pipe(Effect.either);
+        expect(Either.isLeft(result)).toBe(true);
+        if (Either.isLeft(result))
+          expect(result.left.message).toContain("timed out after 30ms");
+        expect(aborted).toBe(true);
+        hang = false;
+        expect(
+          (yield* service.prepare(repository(["git"]))).pathEntries,
+        ).toEqual(["/nix/store/abc-tool/bin"]);
+      }),
+  );
+
+  it.live.skipIf(process.platform === "win32")(
+    "terminates a real native build descendant when preparation times out",
+    () =>
+      Effect.gen(function* () {
+        const state = fixture();
+        const pidFile = descendantPath("nix-descendant.pid");
+        const service = yield* makeNixEnvironment({
+          ...state.dependencies,
+          timeoutMs: 500,
+          run: (_argv, signal) =>
+            nativeRunner(
+              [
+                "sh",
+                "-c",
+                'sleep 60 & child=$!; echo "$child" > "$1"; wait "$child"',
+                "nix-test",
+                pidFile,
+              ],
+              signal,
+            ),
+        });
+        const result = yield* service
+          .prepare(repository(["git"]))
+          .pipe(Effect.either);
+        expect(Either.isLeft(result)).toBe(true);
+        if (Either.isLeft(result))
+          expect(result.left.message).toContain("timed out after 500ms");
+        const pid = Number(
+          yield* Effect.promise(() => readFile(pidFile, "utf8")),
+        );
+        expect(Number.isSafeInteger(pid) && pid > 0).toBe(true);
+        const gone = yield* Effect.promise(async () => {
+          const deadline = Date.now() + 3000;
+          while (Date.now() < deadline) {
+            try {
+              process.kill(pid, 0);
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                "code" in error &&
+                error.code === "ESRCH"
+              )
+                return true;
+              throw error;
+            }
+            await Bun.sleep(20);
+          }
+          return false;
+        });
+        // Contain the fixture even if the native runner regresses.
+        if (!gone) process.kill(pid, "SIGKILL");
+        expect(gone).toBe(true);
+      }),
+  );
+
+  it.live("includes the bounded stderr tail in a build failure", () =>
+    Effect.gen(function* () {
+      const state = fixture();
+      const service = yield* makeNixEnvironment({
+        ...state.dependencies,
+        run: async () => ({
+          exitCode: 1,
+          stdout: "",
+          stderr: `${"x".repeat(8000)}specific build failure`,
+        }),
+      });
+      const result = yield* service
+        .prepare(repository(["git"]))
+        .pipe(Effect.either);
+      expect(Either.isLeft(result)).toBe(true);
+      if (Either.isLeft(result)) {
+        expect(result.left.message).toContain("specific build failure");
+        expect(result.left.message.length).toBeLessThan(4200);
+      }
+    }),
   );
 });

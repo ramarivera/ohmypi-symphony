@@ -1,6 +1,7 @@
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform";
 import { describe, expect, it } from "@effect/vitest";
 import {
+  Clock,
   ConfigProvider,
   Effect,
   Exit,
@@ -13,6 +14,7 @@ import {
 import { OAuthStateError } from "../src/domain/errors.js";
 import { AppUserId, OrganizationId, type TeamId } from "../src/domain/ids.js";
 import {
+  health,
   mcpOauthCallback,
   oauthCallback,
   oauthStart,
@@ -490,4 +492,61 @@ it.each([
 });
 it("preserves local run paths and queries", () => {
   expect(safeReturnTo("/runs/abc?tab=events")).toBe("/runs/abc?tab=events");
+});
+
+describe("Health reports reconciler liveness", () => {
+  it.live.each([
+    {
+      running: true,
+      age: 1000,
+      progressAge: 60000,
+      error: "a session failed",
+      expected: 200,
+    },
+    {
+      running: true,
+      age: 60000,
+      progressAge: 1000,
+      error: null,
+      expected: 200,
+    },
+    {
+      running: true,
+      age: 60000,
+      progressAge: 60000,
+      error: null,
+      expected: 503,
+    },
+    { running: true, age: 60_000, error: null, expected: 503 },
+    { running: false, age: 1000, error: null, expected: 503 },
+    { running: true, age: null, error: null, expected: 503 },
+  ])("returns $expected for running=$running completion age=$age", (testCase) =>
+    Effect.gen(function* () {
+      const now = yield* Clock.currentTimeMillis;
+      const reconciler = Reconciler.make({
+        tick: () => Effect.void,
+        catchup: () => Effect.void,
+        trigger: () => Effect.void,
+        awaitTrigger: () => Effect.never,
+        status: () =>
+          Effect.succeed({
+            running: testCase.running,
+            lastStartedAt: Option.some(now),
+            lastCompletedAt:
+              testCase.age === null
+                ? Option.none()
+                : Option.some(now - testCase.age),
+            lastProgressAt:
+              testCase.progressAge === undefined
+                ? Option.none()
+                : Option.some(now - testCase.progressAge),
+            lastError: Option.fromNullable(testCase.error),
+          }),
+      });
+      const response = yield* health.pipe(
+        Effect.provideService(Reconciler, reconciler),
+      );
+      expect(response.status).toBe(testCase.expected);
+    }),
+  );
 });

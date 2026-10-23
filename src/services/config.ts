@@ -40,6 +40,10 @@ export interface GatewayConfigShape {
   readonly ompCliPath: string;
   readonly port: number;
   readonly leaseDurationMs: number;
+  readonly rpcRequestTimeoutMs?: number;
+  readonly gitTimeoutMs?: number;
+  readonly nixTimeoutMs?: number;
+  readonly maxConcurrentWorkers?: number;
   readonly reconcilerIntervalMs: number;
   readonly reconcilerCatchupIntervalMs: number;
   readonly reconcilerCatchupMinAgeMs: number;
@@ -65,6 +69,14 @@ const positiveInteger = (name: string, fallback: number) =>
           );
     }),
   );
+const timeoutMilliseconds = (name: string, fallback: number) =>
+  positiveInteger(name, fallback).pipe(
+    Config.validate({
+      message: `${name} must not exceed 2147483647 ms`,
+      validation: (value) => value <= 2_147_483_647,
+    }),
+  );
+
 const decimalBetween = (name: string, fallback: number) =>
   Config.option(Config.string(name)).pipe(
     Config.mapOrFail((value) => {
@@ -203,6 +215,10 @@ const GatewayConfigValues = Config.all({
   ),
   port: positiveInteger("PORT", 3000),
   leaseDurationMs: positiveInteger("LEASE_DURATION_MS", 60_000),
+  rpcRequestTimeoutMs: timeoutMilliseconds("RPC_REQUEST_TIMEOUT_MS", 30_000),
+  gitTimeoutMs: timeoutMilliseconds("GIT_TIMEOUT_MS", 120_000),
+  nixTimeoutMs: timeoutMilliseconds("NIX_TIMEOUT_MS", 600_000),
+  maxConcurrentWorkers: positiveInteger("MAX_CONCURRENT_WORKERS", 4),
   reconcilerIntervalMs: positiveInteger("RECONCILER_INTERVAL_MS", 1_000),
   reconcilerCatchupIntervalMs: positiveInteger(
     "RECONCILER_CATCHUP_INTERVAL_MS",
@@ -292,7 +308,10 @@ export class GatewayConfig extends Effect.Service<GatewayConfig>()(
   "GatewayConfig",
   {
     accessors: true,
-    effect: Effect.gen(function* () {
+    effect: Effect.gen(function* (): Effect.fn.Return<
+      GatewayConfigShape,
+      ConfigError.ConfigError
+    > {
       const values = yield* Config.unwrap(GatewayConfigValues);
       const allowedIds = yield* optionalValue(
         "LINEAR_ALLOWED_ORGANIZATION_IDS",

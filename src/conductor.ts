@@ -73,6 +73,17 @@ export const GatewayServicesLive = Layer.mergeAll(
   Layer.provideMerge(GatewayConfig.Default),
 );
 
+// Recovery must finish before accepting deliveries or starting reconciliation.
+export const recoverGateway = Effect.gen(function* () {
+  yield* RunRepo.recoverInterruptedRuns();
+  yield* DeliveryRepo.recoverPendingDeliveries();
+});
+
+const recoveredServices = Layer.provideMerge(
+  Layer.scopedDiscard(recoverGateway),
+  GatewayServicesLive,
+);
+
 const gatewayLoggerLive = PinoLoggerLive.pipe(
   Layer.provideMerge(GatewayLogger.Default),
   Layer.provideMerge(GatewayConfig.Default),
@@ -101,7 +112,7 @@ const serverLayer = Layer.unwrapEffect(
   Effect.map(GatewayConfig, ({ port }) => BunHttpServer.layer({ port })),
 );
 
-const servicesWithServer = Layer.provideMerge(serverLayer, GatewayServicesLive);
+const servicesWithServer = Layer.provideMerge(serverLayer, recoveredServices);
 const servicesWithHttp = Layer.provideMerge(
   HttpServer.serve(router),
   servicesWithServer,

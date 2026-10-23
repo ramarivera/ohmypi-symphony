@@ -4,7 +4,9 @@ import { it } from "@effect/vitest";
 import {
   Clock,
   ConfigProvider,
+  Deferred,
   Effect,
+  Fiber,
   Layer,
   Logger,
   Option,
@@ -12,7 +14,8 @@ import {
   Schema,
 } from "effect";
 import pino from "pino";
-import { describe, expect } from "vitest";
+import { describe, expect, vi } from "vitest";
+import { DatabaseError } from "../src/domain/errors.js";
 import {
   AppUserId,
   IssueId,
@@ -1475,5 +1478,225 @@ describe("webhook admission security", () => {
           expect(response.status).toBe(413);
         }),
       ),
+  );
+});
+
+describe("Interrupted webhook delivery recovery", () => {
+  it.scopedLive(
+    "reclaims a delivery when its processing fiber was interrupted",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const installationRepo = yield* InstallationRepo;
+          const pipeline = yield* WebhookPipeline;
+          const entered = yield* Deferred.make<void>();
+          const spy = vi
+            .spyOn(installationRepo, "get")
+            .mockImplementation(() =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.zipRight(Effect.never),
+              ),
+            );
+          const now = yield* Clock.currentTimeMillis;
+          const payload = createdPayload(now);
+          const fiber = yield* Effect.fork(
+            pipeline.handle(
+              signedRequest(payload, { delivery: "interrupted-webhook" }),
+            ),
+          );
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(fiber);
+          spy.mockRestore();
+          const response = yield* pipeline.handle(
+            signedRequest(payload, { delivery: "interrupted-webhook" }),
+          );
+          expect(response.status).toBe(200);
+          expect(yield* Effect.promise(() => response.text())).toBe("OK");
+          expect(
+            Option.isSome(yield* RunRepo.get(sessionId("session-1"))),
+          ).toBe(true);
+        }),
+      ),
+  );
+});
+
+describe("Webhook cleanup write failures", () => {
+  it.scopedLive(
+    "logs failed cleanup and retries it on redelivery without a restart",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const installations = yield* InstallationRepo;
+          const deliveries = yield* DeliveryRepo;
+          const pipeline = yield* WebhookPipeline;
+          const entered = yield* Deferred.make<void>();
+          const blocked = vi
+            .spyOn(installations, "get")
+            .mockImplementation(() =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.zipRight(Effect.never),
+              ),
+            );
+          const mark = vi
+            .spyOn(deliveries, "mark")
+            .mockImplementation(() =>
+              Effect.fail(new DatabaseError({ message: "disk unavailable" })),
+            );
+          const messages: string[] = [];
+          const logger = Logger.make((options) => {
+            messages.push(String(options.message));
+          });
+          const payload = createdPayload(yield* Clock.currentTimeMillis);
+          const processing = yield* Effect.fork(
+            pipeline
+              .handle(
+                signedRequest(payload, { delivery: "cleanup-write-failure" }),
+              )
+              .pipe(
+                Effect.provide(Logger.replace(Logger.defaultLogger, logger)),
+              ),
+          );
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(processing);
+          expect(messages).toContain("webhook.delivery_cleanup_failed");
+          blocked.mockRestore();
+          // Even when repair also fails, return a retryable error instead of a false duplicate success.
+          const unavailable = yield* pipeline.handle(
+            signedRequest(payload, { delivery: "cleanup-write-failure" }),
+          );
+          expect(unavailable.status).toBe(500);
+          mark.mockRestore();
+          const retried = yield* pipeline.handle(
+            signedRequest(payload, { delivery: "cleanup-write-failure" }),
+          );
+          expect(retried.status).toBe(200);
+          expect(yield* Effect.promise(() => retried.text())).toBe("OK");
+          expect(
+            Option.isSome(yield* RunRepo.get(sessionId("session-1"))),
+          ).toBe(true);
+        }),
+      ),
+  );
+});
+
+describe("Webhook claim-owned failure marking", () => {
+  it.scopedLive.each(["identity", "payload"] as const)(
+    "persists a safe reason for a post-claim %s failure",
+    (kind) =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const deliveries = yield* DeliveryRepo;
+          const mark = yield* Effect.acquireRelease(
+            Effect.sync(() => vi.spyOn(deliveries, "mark")),
+            (spy) => Effect.sync(() => spy.mockRestore()),
+          );
+          const original = createdPayload(yield* Clock.currentTimeMillis);
+          const payload =
+            kind === "identity"
+              ? { ...original, oauthClientId: "untrusted-client-value" }
+              : { ...original, agentSession: "untrusted-session-value" };
+          const response = yield* WebhookPipeline.handle(
+            signedRequest(payload),
+          );
+          expect(response.status).toBe(kind === "identity" ? 401 : 400);
+          expect(mark).toHaveBeenCalledTimes(1);
+          expect(mark.mock.calls[0]?.slice(1)).toEqual([
+            "failed",
+            kind === "identity"
+              ? "OAuth client identity mismatch"
+              : "AgentSessionEvent payload is invalid",
+          ]);
+        }).pipe(Effect.scoped),
+      ),
+  );
+
+  it.scopedLive(
+    "does not overwrite a reclaimed delivery after a tagged processing failure",
+    () =>
+      withWebhook(
+        Effect.gen(function* () {
+          yield* install();
+          const installations = yield* InstallationRepo;
+          const deliveries = yield* DeliveryRepo;
+          const pipeline = yield* WebhookPipeline;
+          const claim = vi.spyOn(deliveries, "claim");
+          const originalClaim = deliveries.claim.bind(deliveries);
+          const originalMark = deliveries.mark.bind(deliveries);
+          const failed = vi
+            .spyOn(installations, "get")
+            .mockImplementationOnce(() =>
+              Effect.fail(new DatabaseError({ message: "processing failed" })),
+            );
+          const marks = vi
+            .spyOn(deliveries, "mark")
+            .mockImplementation((id, status, error) =>
+              originalMark(id, status, error).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    if (status !== "failed") return;
+                    const input = claim.mock.calls[0]?.[0];
+                    if (input === undefined)
+                      throw new Error("claim input missing");
+                    expect(yield* originalClaim(input).pipe(Effect.orDie)).toBe(
+                      "claimed",
+                    );
+                  }),
+                ),
+              ),
+            );
+          yield* Effect.gen(function* () {
+            const payload = createdPayload(yield* Clock.currentTimeMillis);
+            const response = yield* pipeline.handle(
+              signedRequest(payload, { delivery: "reclaimed-after-failure" }),
+            );
+            expect(response.status).toBe(500);
+            expect(marks).toHaveBeenCalledTimes(1);
+            const input = claim.mock.calls[0]?.[0];
+            if (input === undefined) throw new Error("claim input missing");
+            expect(yield* originalClaim(input)).toBe("duplicate");
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                claim.mockRestore();
+                marks.mockRestore();
+                failed.mockRestore();
+              }),
+            ),
+          );
+        }),
+      ),
+  );
+
+  it.scopedLive("does not mark a delivery when the claim itself fails", () =>
+    withWebhook(
+      Effect.gen(function* () {
+        yield* install();
+        const deliveries = yield* DeliveryRepo;
+        const claim = vi
+          .spyOn(deliveries, "claim")
+          .mockImplementation(() =>
+            Effect.fail(new DatabaseError({ message: "claim unavailable" })),
+          );
+        const mark = vi.spyOn(deliveries, "mark");
+        yield* Effect.gen(function* () {
+          const payload = createdPayload(yield* Clock.currentTimeMillis);
+          const response = yield* WebhookPipeline.handle(
+            signedRequest(payload),
+          );
+          expect(response.status).toBe(500);
+          expect(mark).not.toHaveBeenCalled();
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              claim.mockRestore();
+              mark.mockRestore();
+            }),
+          ),
+        );
+      }),
+    ),
   );
 });

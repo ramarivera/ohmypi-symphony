@@ -342,6 +342,34 @@ describe("Store repositories", () => {
     ),
   );
 
+  it.scopedLive("startup preserves another gateway's live lease", () =>
+    withRepos(
+      Effect.gen(function* () {
+        const repo = yield* RunRepo;
+        const sid = makeSessionId("live-gateway");
+        yield* repo.create({
+          sessionId: sid,
+          organizationId: makeOrganizationId("org"),
+          issueId: Option.none(),
+          now: 1000,
+        });
+        yield* repo.update(sid, { state: "starting" });
+        yield* repo.claimLease(sid, "live-owner", 60000, 1000);
+        expect(yield* repo.recoverInterruptedRuns(2000)).toBe(0);
+        const preserved = Option.getOrThrow(yield* repo.get(sid));
+        expect(preserved.state).toBe("starting");
+        expect(preserved.leaseOwner).toEqual(Option.some("live-owner"));
+        expect(yield* repo.claimLease(sid, "new-owner", 60000, 2000)).toBe(
+          false,
+        );
+        expect(yield* repo.recoverInterruptedRuns(61001)).toBe(1);
+        expect(yield* repo.claimLease(sid, "new-owner", 60000, 61001)).toBe(
+          true,
+        );
+      }),
+    ),
+  );
+
   it.scopedLive("recovers active runs and leases after a process restart", () =>
     withRepos(
       Effect.gen(function* () {
@@ -363,7 +391,7 @@ describe("Store repositories", () => {
           yield* runRepo.claimLease(
             makeSessionId("running-session"),
             "dead-process",
-            60_000,
+            500,
             1_000,
           ),
         ).toBe(true);
@@ -716,6 +744,67 @@ describe("Store repositories", () => {
             createdAt: 1_000,
             updatedAt: 2_000,
           });
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "reads one event by source key and seeds RPC sequence numerically within a session",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const sid = makeSessionId("targeted-events-🚀");
+          const other = makeSessionId("targeted-events-other");
+          for (const sessionId of [sid, other])
+            yield* RunRepo.create({
+              sessionId,
+              organizationId: makeOrganizationId("org-1"),
+              issueId: Option.none(),
+            });
+          expect(yield* RunEventRepo.maxRpcSequence(sid)).toBe(0);
+          const key = makeSourceKey(`retry:${sid}:3`);
+          yield* RunEventRepo.upsert({
+            sourceKey: key,
+            sessionId: sid,
+            kind: "retry",
+            level: "info",
+            payload: { nextAttemptAt: 900, scheduledAt: 500 },
+          });
+          const event = Option.getOrThrow(
+            yield* RunEventRepo.getBySourceKey(key),
+          );
+          expect(event.sourceKey).toBe(key);
+          expect(event.payload).toEqual({
+            nextAttemptAt: 900,
+            scheduledAt: 500,
+          });
+          expect(
+            yield* RunEventRepo.getBySourceKey(makeSourceKey("absent")),
+          ).toEqual(Option.none());
+          for (const sourceKey of [
+            `rpc:${sid}:2:progress`,
+            `rpc:${sid}:10:progress`,
+            `rpc:${sid}:9:progress`,
+            `rpc:${sid}:99garbage:progress`,
+            `rpc:${sid}:9007199254740992:progress`,
+            `rpc:${sid}:500`,
+            `rpc:${sid}:1e4:progress`,
+            `rpc:${sid}extra:1000:progress`,
+          ])
+            yield* RunEventRepo.upsert({
+              sourceKey: makeSourceKey(sourceKey),
+              sessionId: sid,
+              kind: "progress",
+              level: "info",
+            });
+          yield* RunEventRepo.upsert({
+            sourceKey: makeSourceKey(`rpc:${other}:2000:progress`),
+            sessionId: other,
+            kind: "progress",
+            level: "info",
+          });
+          expect(yield* RunEventRepo.maxRpcSequence(sid)).toBe(10);
+          expect(yield* RunEventRepo.maxRpcSequence(other)).toBe(2000);
         }),
       ),
   );
@@ -1338,5 +1427,73 @@ describe("pure invariants", () => {
         }),
       ),
     { timeout: 15_000, fastCheck: { numRuns: 20 } },
+  );
+});
+
+describe("Lease-fenced run writes", () => {
+  it.scopedLive(
+    "rejects completion and metadata writes from a replaced lease owner",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const repo = yield* RunRepo;
+          const sid = makeSessionId("lease-fence");
+          const now = yield* Clock.currentTimeMillis;
+          yield* repo.create({
+            sessionId: sid,
+            organizationId: makeOrganizationId("org"),
+            issueId: Option.none(),
+          });
+          yield* repo.claimLease(sid, "old-owner", 10, now - 100);
+          expect(yield* repo.claimLease(sid, "new-owner", 60_000, now)).toBe(
+            true,
+          );
+          for (const patch of [
+            { state: "succeeded" as const },
+            { ompSessionId: Option.some("stale-session") },
+          ]) {
+            const result = yield* repo
+              .update(sid, { ...patch, leaseOwner: "old-owner" })
+              .pipe(Effect.either);
+            expect(Either.isLeft(result)).toBe(true);
+          }
+          const run = Option.getOrThrow(yield* repo.get(sid));
+          expect(run.state).toBe("queued");
+          expect(run.ompSessionId).toEqual(Option.none());
+          expect(yield* RunEventRepo.list(sid)).toEqual([]);
+          yield* repo.update(sid, {
+            leaseOwner: "new-owner",
+            state: "succeeded",
+          });
+          expect(Option.getOrThrow(yield* repo.get(sid)).state).toBe(
+            "succeeded",
+          );
+        }),
+      ),
+  );
+
+  it.scopedLive(
+    "rejects writes after expiry even before another owner claims",
+    () =>
+      withRepos(
+        Effect.gen(function* () {
+          const sid = makeSessionId("expired-write");
+          yield* RunRepo.create({
+            sessionId: sid,
+            organizationId: makeOrganizationId("org"),
+            issueId: Option.none(),
+          });
+          const now = yield* Clock.currentTimeMillis;
+          yield* RunRepo.claimLease(sid, "expired-owner", 10, now - 100);
+          expect(
+            Either.isLeft(
+              yield* RunRepo.update(sid, {
+                leaseOwner: "expired-owner",
+                state: "succeeded",
+              }).pipe(Effect.either),
+            ),
+          ).toBe(true);
+        }),
+      ),
   );
 });

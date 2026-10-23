@@ -1,5 +1,5 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { Effect, Option, Redacted, Schema } from "effect";
+import { Cause, Effect, Option, Redacted, Schema } from "effect";
 import {
   type DatabaseError,
   type RowDecodeError,
@@ -935,16 +935,6 @@ const decodeDeliveryId = (
     ),
   );
 
-const markDelivery = (
-  deliveryRepo: DeliveryRepo,
-  deliveryId: DeliveryId | undefined,
-  status: "processed" | "failed",
-  error?: string,
-): Effect.Effect<void, never, never> =>
-  deliveryId === undefined
-    ? Effect.void
-    : deliveryRepo.mark(deliveryId, status, error).pipe(Effect.ignore);
-
 export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
   "WebhookPipeline",
   {
@@ -964,11 +954,28 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
       const runInputRepo = yield* RunInputRepo;
       const deliveryRepo = yield* DeliveryRepo;
       const promptTemplateRepo = yield* PromptTemplateRepo;
+      const failedCleanup = new Set<DeliveryId>();
+      const markClaimFailed = (
+        id: DeliveryId,
+        reason = "Webhook processing interrupted or failed",
+      ) =>
+        deliveryRepo.mark(id, "failed", reason).pipe(
+          Effect.tap(() => Effect.sync(() => failedCleanup.delete(id))),
+          Effect.catchAll((error) =>
+            Effect.gen(function* () {
+              failedCleanup.add(id);
+              yield* Effect.logError("webhook.delivery_cleanup_failed").pipe(
+                Effect.annotateLogs({ deliveryId: id, error: String(error) }),
+              );
+            }),
+          ),
+        );
 
       const handle = Effect.fn("WebhookPipeline.handle")(function* (
         request: Request,
       ): Effect.fn.Return<Response, never> {
         let deliveryId: DeliveryId | undefined;
+        let claimedDelivery = false;
 
         const process: Effect.Effect<Response, WebhookProcessingError, never> =
           Effect.gen(function* () {
@@ -1125,7 +1132,8 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
             const rawDeliveryId =
               request.headers.get(LINEAR_DELIVERY_HEADER) ??
               buildFallbackDeliveryId(parsed, timestamp);
-            deliveryId = yield* decodeDeliveryId(rawDeliveryId);
+            const decodedDeliveryId = yield* decodeDeliveryId(rawDeliveryId);
+            deliveryId = decodedDeliveryId;
 
             // Normalize webhookTimestamp on the decoded payload so the schema
             // sees a number even when the header was the source.
@@ -1148,13 +1156,45 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
               }),
             );
 
-            const claim = yield* deliveryRepo.claim({
-              id: deliveryId,
-              organizationId,
-              payloadHash: hash,
-              payload: parsed,
-              receivedAt,
-            });
+            // Retry a failed cleanup on redelivery before consulting the durable
+            // dedupe status. Only this process's completed, failed claims enter
+            // this set; an actively processing request is never reset here.
+            yield* Effect.uninterruptible(
+              Effect.gen(function* () {
+                if (failedCleanup.delete(decodedDeliveryId)) {
+                  yield* deliveryRepo
+                    .mark(
+                      decodedDeliveryId,
+                      "failed",
+                      "Retry failed webhook cleanup",
+                    )
+                    .pipe(
+                      Effect.onError(() =>
+                        Effect.sync(() => failedCleanup.add(decodedDeliveryId)),
+                      ),
+                    );
+                }
+              }),
+            );
+
+            // Keep the durable claim and its cleanup ownership hand-off atomic
+            // with respect to request-fiber interruption.
+            const claim = yield* deliveryRepo
+              .claim({
+                id: decodedDeliveryId,
+                organizationId,
+                payloadHash: hash,
+                payload: parsed,
+                receivedAt,
+              })
+              .pipe(
+                Effect.tap((result) =>
+                  Effect.sync(() => {
+                    claimedDelivery = result === "claimed";
+                  }),
+                ),
+                Effect.uninterruptible,
+              );
             if (claim === "duplicate") {
               yield* Effect.logInfo("webhook.deduplicated").pipe(
                 Effect.annotateLogs({
@@ -1313,65 +1353,49 @@ export class WebhookPipeline extends Effect.Service<WebhookPipeline>()(
           });
 
         return yield* process.pipe(
+          Effect.onError((cause) => {
+            const failure = Cause.failureOption(cause);
+            const reason =
+              Option.isSome(failure) &&
+              (failure.value._tag === "@Gateway/WebhookPayloadError" ||
+                failure.value._tag === "@Gateway/WebhookIdentityError")
+                ? failure.value.message
+                    .replace(
+                      /^OAuth client identity mismatch[\s\S]*$/u,
+                      "OAuth client identity mismatch",
+                    )
+                    .replace(
+                      /^Invalid (identifier|session id|organization id|input id|app user id|team id|issue id) [\s\S]*$/u,
+                      "Invalid $1",
+                    )
+                    .replace(
+                      /^AgentSessionEvent payload is invalid:[\s\S]*$/u,
+                      "AgentSessionEvent payload is invalid",
+                    )
+                : "Webhook processing interrupted or failed";
+            return claimedDelivery && deliveryId !== undefined
+              ? markClaimFailed(deliveryId, reason)
+              : Effect.void;
+          }),
           Effect.catchTags({
             "@Gateway/WebhookPayloadError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response(error.message, {
-                  status: error.status,
-                });
-              }),
+              Effect.succeed(
+                new Response(error.message, { status: error.status }),
+              ),
             "@Gateway/WebhookIdentityError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response(error.message, { status: 401 });
-              }),
-            "@Gateway/DatabaseError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response("Webhook processing failed", {
-                  status: 500,
-                });
-              }),
-            "@Gateway/RowDecodeError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response("Webhook processing failed", {
-                  status: 500,
-                });
-              }),
-            "@Gateway/TokenCipherError": (error) =>
-              Effect.gen(function* () {
-                yield* markDelivery(
-                  deliveryRepo,
-                  deliveryId,
-                  "failed",
-                  error.message,
-                );
-                return new Response("Webhook processing failed", {
-                  status: 500,
-                });
-              }),
+              Effect.succeed(new Response(error.message, { status: 401 })),
+            "@Gateway/DatabaseError": () =>
+              Effect.succeed(
+                new Response("Webhook processing failed", { status: 500 }),
+              ),
+            "@Gateway/RowDecodeError": () =>
+              Effect.succeed(
+                new Response("Webhook processing failed", { status: 500 }),
+              ),
+            "@Gateway/TokenCipherError": () =>
+              Effect.succeed(
+                new Response("Webhook processing failed", { status: 500 }),
+              ),
           }),
         );
       });

@@ -3,13 +3,17 @@ import { constants } from "node:fs";
 import {
   lstat,
   mkdir,
+  mkdtemp,
   open,
+  opendir,
   readFile,
   realpath,
+  rename,
   writeFile,
 } from "node:fs/promises";
+import { hostname } from "node:os";
 import { join } from "node:path";
-import { Effect, Option } from "effect";
+import { Clock, Effect, Option } from "effect";
 import {
   type DatabaseError,
   type RowDecodeError,
@@ -24,6 +28,7 @@ import {
   GitHubApp,
   type GitHubAppTokenService,
 } from "./github-app.js";
+import { detachedProcessGroup, signalProcessTree } from "./process.js";
 import { WorkspaceRepo } from "./store/repositories.js";
 import {
   prepareWorkerWorkspace,
@@ -33,6 +38,7 @@ import {
   cleanupWorkspaceProcess,
   gitEnvironment,
   needsWorkspaceIdentity,
+  removeWorkerWorkspace,
   workspaceProcess,
 } from "./workspace-process.js";
 
@@ -345,67 +351,12 @@ const runGit = (
   args: ReadonlyArray<string>,
   cwd: string | undefined,
   sessionId: string,
+  timeoutMs = 120_000,
   extraHeader?: string,
 ) =>
-  Effect.tryPromise({
-    try: async () => {
-      const child = Bun.spawn(
-        cwd === undefined
-          ? [
-              "git",
-              "-c",
-              "core.hooksPath=/dev/null",
-              "-c",
-              "credential.helper=",
-              ...args,
-            ]
-          : workerIdentityCommand(
-              [
-                "git",
-                "-c",
-                "core.hooksPath=/dev/null",
-                "-c",
-                "credential.helper=",
-                ...args,
-              ],
-              process.env.WORKER_UID,
-            ),
-        {
-          env: {
-            ...gitEnvironment(process.env),
-            ...(extraHeader === undefined
-              ? {}
-              : {
-                  GIT_CONFIG_COUNT: "1",
-                  GIT_CONFIG_KEY_0: GITHUB_EXTRA_HEADER_KEY,
-                  GIT_CONFIG_VALUE_0: extraHeader,
-                }),
-          },
-          ...(cwd ? { cwd } : {}),
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-      const [exitCode, stderr] = await Promise.all([
-        child.exited,
-        new Response(child.stderr).text(),
-      ]);
-      if (exitCode !== 0) {
-        throw new Error(
-          `git ${gitSubcommand(args)} failed: ${redactGitOutput(stderr.trim(), args)}`,
-        );
-      }
-    },
-    catch: (cause) =>
-      new WorkspaceError({
-        message:
-          cause instanceof Error
-            ? redactGitOutput(cause.message, args)
-            : "git command failed",
-        sessionId,
-        reason: "git_failed",
-      }),
-  });
+  runGitOutput(args, cwd, sessionId, timeoutMs, extraHeader).pipe(
+    Effect.asVoid,
+  );
 
 export const persistGitHubExtraHeader = (
   target: string,
@@ -480,25 +431,53 @@ const isGatewayGitHubExtraHeader = (value: string): boolean => {
   );
 };
 
-const runGitOutput = (
+export const runGitOutput = (
   args: ReadonlyArray<string>,
   cwd: string | undefined,
   sessionId: string,
+  timeoutMs = 120_000,
+  extraHeader?: string,
+  allowMissingConfig = false,
 ) =>
   Effect.tryPromise({
-    try: async () => {
-      const process = Bun.spawn(["git", ...args], {
-        env: gitEnvironment(globalThis.process.env),
-        ...(cwd ? { cwd } : {}),
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+    try: async (signal) => {
+      const command = [
+        "git",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "credential.helper=",
+        ...args,
+      ];
+      const process = Bun.spawn(
+        cwd === undefined
+          ? command
+          : workerIdentityCommand(command, globalThis.process.env.WORKER_UID),
+        {
+          env: {
+            ...gitEnvironment(globalThis.process.env),
+            ...(extraHeader === undefined
+              ? {}
+              : {
+                  GIT_CONFIG_COUNT: "1",
+                  GIT_CONFIG_KEY_0: GITHUB_EXTRA_HEADER_KEY,
+                  GIT_CONFIG_VALUE_0: extraHeader,
+                }),
+          },
+          detached: detachedProcessGroup,
+          ...(cwd ? { cwd } : {}),
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+      const abort = () => signalProcessTree(process, "SIGKILL");
+      signal.addEventListener("abort", abort, { once: true });
       const [exitCode, stdout, stderr] = await Promise.all([
         process.exited,
         new Response(process.stdout).text(),
         new Response(process.stderr).text(),
-      ]);
-      if (exitCode !== 0 && exitCode !== 1) {
+      ]).finally(() => signal.removeEventListener("abort", abort));
+      if (exitCode !== 0 && !(allowMissingConfig && exitCode === 1)) {
         throw new Error(
           `git ${gitSubcommand(args)} failed: ${redactGitOutput(stderr.trim(), args)}`,
         );
@@ -514,11 +493,22 @@ const runGitOutput = (
         sessionId,
         reason: "git_failed",
       }),
-  });
+  }).pipe(
+    Effect.timeoutFail({
+      duration: timeoutMs,
+      onTimeout: () =>
+        new WorkspaceError({
+          message: `git ${gitSubcommand(args)} timed out after ${timeoutMs}ms`,
+          sessionId,
+          reason: "git_failed",
+        }),
+    }),
+  );
 
 export const unsetGitHubExtraHeader = (
   target: string,
   sessionId: string,
+  timeoutMs = 120_000,
 ): Effect.Effect<void, never> => {
   if (needsWorkspaceIdentity())
     return cleanupWorkspaceProcess(
@@ -527,7 +517,7 @@ export const unsetGitHubExtraHeader = (
       "workspace.github_cleanup_failed",
       { sessionId },
     );
-  return removeGitHubExtraHeaders(target, sessionId).pipe(
+  return removeGitHubExtraHeaders(target, sessionId, timeoutMs).pipe(
     Effect.catchAll((error) =>
       Effect.logWarning("workspace.github_cleanup_failed").pipe(
         Effect.annotateLogs({ sessionId, error: error.message }),
@@ -539,6 +529,7 @@ export const unsetGitHubExtraHeader = (
 export const removeGitHubExtraHeaders = (
   target: string,
   sessionId: string,
+  timeoutMs = 120_000,
 ): Effect.Effect<void, WorkspaceError> =>
   Effect.gen(function* () {
     // --file works for a repository owned by the worker and never consults
@@ -554,6 +545,9 @@ export const removeGitHubExtraHeaders = (
       ],
       target,
       sessionId,
+      timeoutMs,
+      undefined,
+      true,
     );
     if (configuredHeaders.split(/\r?\n/u).some(isGatewayGitHubExtraHeader)) {
       yield* runGit(
@@ -695,7 +689,14 @@ const validateMarker = (
 ) =>
   Effect.gen(function* () {
     const raw = yield* readFileOrFail(markerPath, sessionId);
-    const parsed = parseMarker(JSON.parse(raw));
+    const parsed = yield* Effect.try({
+      try: () => parseMarker(JSON.parse(raw)),
+      catch: workspaceFailure(
+        "invalid workspace marker",
+        "marker_mismatch",
+        sessionId,
+      ),
+    });
     if (
       Option.isNone(parsed) ||
       parsed.value.repositoryId !== repository.id ||
@@ -713,10 +714,100 @@ const validateMarker = (
 
 export const makeWorkspace = (input: {
   readonly workspaceRoot: string;
+  readonly gitTimeoutMs?: number;
   readonly repo: WorkspaceRepoShape;
   readonly githubApp: GitHubAppTokenService | undefined;
 }) =>
   Effect.gen(function* () {
+    const hostKey = createHash("sha256")
+      .update(hostname())
+      .digest("hex")
+      .slice(0, 16);
+    // Ownership lives in the name, so even a crash between mkdir and the first
+    // write leaves enough information for recovery. Never infer death from age.
+    const stagingRecoveryGate = yield* Effect.makeSemaphore(1);
+    let stagingRecovered = false;
+    let stagingRetryAt = 0;
+    const recoverStaging = stagingRecoveryGate.withPermits(1)(
+      Effect.gen(function* () {
+        if (
+          stagingRecovered ||
+          (yield* Clock.currentTimeMillis) < stagingRetryAt
+        )
+          return;
+        yield* ensureRoot(input.workspaceRoot, "startup").pipe(
+          Effect.flatMap((root) =>
+            Effect.tryPromise({
+              try: async () => {
+                const entries = await opendir(root);
+                let scanned = 0;
+                let removed = 0;
+                for await (const entry of entries) {
+                  if (++scanned > 10_000 || removed >= 100) break;
+                  const owner =
+                    /^\.[a-f0-9]{32}-clone-([a-f0-9]{16})-([1-9][0-9]*)-[A-Za-z0-9]+$/u.exec(
+                      entry.name,
+                    );
+                  if (
+                    owner === null ||
+                    owner[1] !== hostKey ||
+                    !entry.isDirectory()
+                  )
+                    continue;
+                  const pid = Number(owner[2]);
+                  if (!Number.isSafeInteger(pid)) continue;
+                  try {
+                    process.kill(pid, 0);
+                    continue;
+                  } catch (error) {
+                    if (
+                      !(
+                        error instanceof Error &&
+                        "code" in error &&
+                        error.code === "ESRCH"
+                      )
+                    )
+                      continue;
+                  }
+                  // Dead owners cannot publish these random, per-clone names.
+                  // Forced removal is idempotent when multiple gateways clean up.
+                  await removeWorkerWorkspace(join(root, entry.name), root);
+                  removed++;
+                }
+              },
+              catch: workspaceFailure(
+                "recover abandoned clones",
+                "git_failed",
+                "startup",
+              ),
+            }),
+          ),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              stagingRecovered = true;
+            }),
+          ),
+          Effect.catchAll((error) =>
+            Effect.gen(function* () {
+              stagingRetryAt = (yield* Clock.currentTimeMillis) + 30_000;
+              yield* Effect.logWarning(
+                "workspace.staging_recovery_failed",
+              ).pipe(
+                Effect.annotateLogs({
+                  event: "workspace.staging_recovery_failed",
+                  error: String(error),
+                }),
+              );
+            }),
+          ),
+        );
+      }),
+    );
+    const git = (
+      args: ReadonlyArray<string>,
+      cwd: string | undefined,
+      sessionId: string,
+    ) => runGit(args, cwd, sessionId, input.gitTimeoutMs);
     const resolve = Effect.fn("Workspace.resolve")(function* (
       context: unknown,
     ): Effect.fn.Return<RepositoryResolution, DatabaseError | RowDecodeError> {
@@ -783,7 +874,7 @@ export const makeWorkspace = (input: {
               sessionId,
             );
       if (githubExtraHeader === undefined) {
-        yield* unsetGitHubExtraHeader(target, sessionId);
+        yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
         return;
       }
       yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
@@ -792,7 +883,8 @@ export const makeWorkspace = (input: {
     const clearGitHubExtraHeader = (
       sessionId: string,
       target: string,
-    ): Effect.Effect<void, never> => unsetGitHubExtraHeader(target, sessionId);
+    ): Effect.Effect<void, never> =>
+      unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
 
     const materialize = Effect.fn("Workspace.materialize")(function* (
       sessionId: string,
@@ -816,6 +908,7 @@ export const makeWorkspace = (input: {
           }),
         );
       }
+      yield* recoverStaging;
       const canonicalRoot = yield* ensureRoot(input.workspaceRoot, sessionId);
       const target = join(canonicalRoot, safeSessionKey(sessionId));
 
@@ -855,19 +948,56 @@ export const makeWorkspace = (input: {
           target,
           sessionId,
         );
-        yield* validateMarker(markerPath, repository, sessionId);
-        yield* refreshGitHubExtraHeader(sessionId, repository, canonicalTarget);
-
-        yield* Effect.logInfo("Workspace ready (reused)").pipe(
-          Effect.annotateLogs({
-            event: "workspace.ready",
-            repositoryId: repository.id,
-            path: canonicalTarget,
-            reused: true,
-          }),
+        const marker = yield* lstatOrMissing(
+          markerPath,
+          sessionId,
+          "marker_mismatch",
         );
+        if (Option.isSome(marker)) {
+          if (marker.value.isSymbolicLink() || !marker.value.isFile()) {
+            return yield* Effect.fail(
+              new WorkspaceError({
+                message: "Workspace marker is not a real file",
+                sessionId,
+                reason: "marker_mismatch",
+              }),
+            );
+          }
+          yield* validateMarker(markerPath, repository, sessionId);
+          yield* refreshGitHubExtraHeader(
+            sessionId,
+            repository,
+            canonicalTarget,
+          );
 
-        return canonicalTarget;
+          yield* Effect.logInfo("Workspace ready (reused)").pipe(
+            Effect.annotateLogs({
+              event: "workspace.ready",
+              repositoryId: repository.id,
+              path: canonicalTarget,
+              reused: true,
+            }),
+          );
+
+          return canonicalTarget;
+        }
+        // A missing marker can also mean an agent removed an untracked file.
+        // Preserve user work even when the old checkout cannot be reused.
+        yield* Effect.tryPromise({
+          try: () =>
+            rename(
+              canonicalTarget,
+              join(
+                canonicalRoot,
+                `.stale-${safeSessionKey(sessionId)}-${crypto.randomUUID()}`,
+              ),
+            ),
+          catch: workspaceFailure(
+            "preserve marker-less workspace",
+            "git_failed",
+            sessionId,
+          ),
+        });
       }
 
       let githubExtraHeader: string | undefined;
@@ -894,47 +1024,110 @@ export const makeWorkspace = (input: {
         }
       }
 
-      const cloneArgs = [
-        "clone",
-        "--no-checkout",
-        "--filter=blob:none",
-        "--",
-        repository.url,
-        target,
-      ];
-      yield* runGit(cloneArgs, undefined, sessionId, githubExtraHeader);
-      if (process.env.WORKER_UID)
-        yield* Effect.tryPromise({
-          try: () => prepareWorkerWorkspace(target, process.env.WORKER_UID),
-          catch: workspaceFailure(
-            "Could not assign workspace ownership",
-            "git_failed",
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const staging = yield* Effect.acquireRelease(
+            Effect.tryPromise({
+              try: () =>
+                mkdtemp(
+                  join(
+                    canonicalRoot,
+                    `.${safeSessionKey(sessionId)}-clone-${hostKey}-${process.pid}-`,
+                  ),
+                ),
+              catch: workspaceFailure(
+                "create clone directory",
+                "git_failed",
+                sessionId,
+              ),
+            }),
+            (path) =>
+              Effect.tryPromise({
+                try: () => removeWorkerWorkspace(path, canonicalRoot),
+                catch: workspaceFailure(
+                  "remove clone staging",
+                  "git_failed",
+                  sessionId,
+                ),
+              }).pipe(
+                Effect.catchAll((error) =>
+                  Effect.logWarning("workspace.staging_cleanup_failed").pipe(
+                    Effect.annotateLogs({ sessionId, error: error.message }),
+                  ),
+                ),
+              ),
+          );
+          const cloneArgs = [
+            "clone",
+            "--no-checkout",
+            "--filter=blob:none",
+            "--",
+            repository.url,
+            staging,
+          ];
+          yield* runGit(
+            cloneArgs,
+            undefined,
             sessionId,
-          ),
-        });
-      if (githubExtraHeader !== undefined) {
-        yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
-      }
-      // If anything after persisting the header fails, drop it so the next
-      // attempt doesn't inherit a stale/expired credential.
-      yield* Effect.gen(function* () {
-        yield* runGit(
-          ["fetch", "--depth=1", "--", "origin", repository.ref],
-          target,
-          sessionId,
-        );
-        yield* runGit(
-          ["checkout", "--detach", "--force", "FETCH_HEAD", "--"],
-          target,
-          sessionId,
-        );
-        yield* writeMarker(markerPath, repository, sessionId);
-      }).pipe(
-        Effect.onError(() =>
-          githubExtraHeader === undefined
-            ? Effect.void
-            : unsetGitHubExtraHeader(target, sessionId),
-        ),
+            input.gitTimeoutMs,
+            githubExtraHeader,
+          );
+          if (process.env.WORKER_UID)
+            yield* Effect.tryPromise({
+              try: () =>
+                prepareWorkerWorkspace(staging, process.env.WORKER_UID),
+              catch: workspaceFailure(
+                "Could not assign workspace ownership",
+                "git_failed",
+                sessionId,
+              ),
+            });
+          if (githubExtraHeader !== undefined) {
+            yield* persistGitHubExtraHeader(
+              staging,
+              sessionId,
+              githubExtraHeader,
+            );
+          }
+          // If anything after persisting the header fails, drop it so the next
+          // attempt doesn't inherit a stale/expired credential.
+          yield* Effect.gen(function* () {
+            yield* git(
+              ["fetch", "--depth=1", "--", "origin", repository.ref],
+              staging,
+              sessionId,
+            );
+            yield* git(
+              ["checkout", "--detach", "--force", "FETCH_HEAD", "--"],
+              staging,
+              sessionId,
+            );
+            yield* writeMarker(
+              join(staging, ".linear-gateway-workspace.json"),
+              repository,
+              sessionId,
+            );
+          }).pipe(
+            Effect.onError(() =>
+              githubExtraHeader === undefined
+                ? Effect.void
+                : unsetGitHubExtraHeader(
+                    staging,
+                    sessionId,
+                    input.gitTimeoutMs,
+                  ),
+            ),
+          );
+
+          yield* Effect.tryPromise({
+            try: () => rename(staging, target),
+            catch: workspaceFailure(
+              "publish cloned workspace",
+              "git_failed",
+              sessionId,
+            ),
+          });
+        }),
       );
 
       const finalTarget = yield* realpathOrFail(
@@ -988,6 +1181,7 @@ export class Workspace extends Effect.Service<Workspace>()("Workspace", {
         : undefined;
     return yield* makeWorkspace({
       workspaceRoot: config.workspaceRoot,
+      gitTimeoutMs: config.gitTimeoutMs ?? 120_000,
       repo,
       githubApp,
     });

@@ -25,9 +25,23 @@ const SECURITY_HEADERS: Record<string, string> = {
   "Cache-Control": "no-store",
 };
 
-const health = Effect.gen(function* () {
+export const health = Effect.gen(function* () {
   const status = yield* Reconciler.status();
-  const degraded = Option.isSome(status.lastError);
+  const now = yield* Clock.currentTimeMillis;
+  const config = yield* Effect.serviceOption(GatewayConfig);
+  const maxAgeMs = Math.max(
+    30_000,
+    Option.isSome(config) ? config.value.reconcilerIntervalMs * 3 : 30_000,
+  );
+  const lastAliveAt = Math.max(
+    Option.getOrElse(status.lastProgressAt ?? Option.none(), () => 0),
+    Option.getOrElse(status.lastCompletedAt, () => 0),
+  );
+  const degraded =
+    !status.running ||
+    (Option.isNone(status.lastCompletedAt) &&
+      Option.isNone(status.lastProgressAt ?? Option.none())) ||
+    now - lastAliveAt > maxAgeMs;
   const body = {
     status: degraded ? "degraded" : "ok",
     reconciler: {

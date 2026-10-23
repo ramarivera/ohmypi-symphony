@@ -118,7 +118,7 @@ describe("Reconciler", () => {
 
       expect(status.running).toBe(true);
       expect(status.lastStartedAt).toEqual(Option.some(2_000));
-      expect(status.lastCompletedAt).toEqual(Option.none());
+      expect(status.lastCompletedAt).toEqual(Option.some(2_000));
       expect(Option.getOrNull(status.lastError)).toContain("process failed");
     }),
   );

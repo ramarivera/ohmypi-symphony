@@ -221,6 +221,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
     const update = Effect.fn("RunRepo.update")(function* (
       sessionId: SessionId,
       patch: {
+        readonly leaseOwner?: string;
         readonly state?: RunState;
         readonly repositoryId?: Option.Option<WorkspaceId>;
         readonly workspacePath?: Option.Option<string>;
@@ -233,51 +234,74 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
       },
     ): Effect.fn.Return<void, DatabaseError | RowDecodeError> {
       yield* Effect.annotateCurrentSpan("sessionId", sessionId);
-      const current = yield* get(sessionId);
-      if (Option.isNone(current)) {
-        return yield* Effect.fail(
-          new DatabaseError({ message: `Unknown run ${sessionId}` }),
-        );
-      }
-      const run = current.value;
-
-      if (
-        TERMINAL_RUN_STATES.includes(run.state) &&
-        patch.state !== undefined &&
-        patch.state !== run.state
-      ) {
-        return yield* Effect.fail(
-          new DatabaseError({ message: "Terminal run state is immutable" }),
-        );
-      }
-
-      const state = patch.state ?? run.state;
-      const attempt = run.attempt + (patch.incrementAttempt ? 1 : 0);
-      const now = yield* Clock.currentTimeMillis;
-
-      const repositoryId = getNullable(run.repositoryId, patch.repositoryId);
-      const workspacePath = getNullable(run.workspacePath, patch.workspacePath);
-      const ompSessionId = getNullable(run.ompSessionId, patch.ompSessionId);
-      const ompSessionFile = getNullable(
-        run.ompSessionFile,
-        patch.ompSessionFile,
-      );
-      const terminalReason = getNullable(
-        run.terminalReason,
-        patch.terminalReason,
-      );
-      const lastActivityAt = getNullable(
-        run.lastActivityAt,
-        patch.lastActivityAt,
-      );
-      const nextAttemptAt = getNullable(run.nextAttemptAt, patch.nextAttemptAt);
-
-      // State transitions and their admin-visible events are one atomic
-      // operation. Otherwise a run_event failure leaves the run advanced
-      // without the event that explains the transition.
       yield* transact(
         db,
         Effect.gen(function* () {
+          const current = yield* get(sessionId);
+          if (Option.isNone(current)) {
+            return yield* Effect.fail(
+              new DatabaseError({ message: `Unknown run ${sessionId}` }),
+            );
+          }
+          const run = current.value;
+          const now = yield* Clock.currentTimeMillis;
+          if (
+            patch.leaseOwner !== undefined &&
+            (Option.getOrNull(run.leaseOwner) !== patch.leaseOwner ||
+              Option.getOrElse(run.leaseExpiresAt, () => 0) < now)
+          ) {
+            return yield* Effect.fail(
+              new DatabaseError({
+                message: `Run lease is no longer owned by ${patch.leaseOwner} for ${sessionId}`,
+              }),
+            );
+          }
+
+          if (
+            TERMINAL_RUN_STATES.includes(run.state) &&
+            patch.state !== undefined &&
+            patch.state !== run.state
+          ) {
+            return yield* Effect.fail(
+              new DatabaseError({ message: "Terminal run state is immutable" }),
+            );
+          }
+
+          const state = patch.state ?? run.state;
+          const attempt = run.attempt + (patch.incrementAttempt ? 1 : 0);
+          const repositoryId = getNullable(
+            run.repositoryId,
+            patch.repositoryId,
+          );
+          const workspacePath = getNullable(
+            run.workspacePath,
+            patch.workspacePath,
+          );
+          const ompSessionId = getNullable(
+            run.ompSessionId,
+            patch.ompSessionId,
+          );
+          const ompSessionFile = getNullable(
+            run.ompSessionFile,
+            patch.ompSessionFile,
+          );
+          const terminalReason = getNullable(
+            run.terminalReason,
+            patch.terminalReason,
+          );
+          const lastActivityAt = getNullable(
+            run.lastActivityAt,
+            patch.lastActivityAt,
+          );
+          const nextAttemptAt = getNullable(
+            run.nextAttemptAt,
+            patch.nextAttemptAt,
+          );
+
+          // State transitions and their admin-visible events are one atomic
+          // operation. Otherwise a run_event failure leaves the run advanced
+          // without the event that explains the transition.
+
           yield* tryDb(
             () =>
               db
@@ -300,6 +324,22 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
                 ),
             "RunRepo.update",
           );
+          if (
+            patch.nextAttemptAt !== undefined &&
+            Option.isSome(nextAttemptAt)
+          ) {
+            yield* runEventRepo.upsert({
+              sourceKey: Schema.decodeUnknownSync(SourceKey)(
+                `retry:${sessionId}:${attempt}`,
+              ),
+              sessionId,
+              kind: "retry",
+              level: "info",
+              payload: { scheduledAt: now, nextAttemptAt: nextAttemptAt.value },
+              status: "observed",
+              now,
+            });
+          }
           if (state !== run.state) {
             const sourceKey = Schema.decodeUnknownSync(SourceKey)(
               `state:${sessionId}:${attempt}:${state}`,
@@ -471,7 +511,7 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
           db
             .query(`
               UPDATE agent_run SET lease_owner=?, lease_expires_at=?, updated_at=?
-              WHERE session_id=? AND desired_state='running' AND state NOT IN ('succeeded','failed','canceled')
+              WHERE session_id=? AND state NOT IN ('succeeded','failed','canceled')
                 AND (lease_owner IS NULL OR lease_owner=? OR lease_expires_at<?)
             `)
             .run(owner, at + leaseDurationMs, at, sessionId, owner, at),
@@ -538,8 +578,9 @@ export class RunRepo extends Effect.Service<RunRepo>()("RunRepo", {
                   lease_expires_at=NULL,
                   updated_at=?
               WHERE state NOT IN ('succeeded','failed','canceled')
+                AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at < ?)
             `)
-              .run(at, at),
+              .run(at, at, at),
           "RunRepo.recoverInterruptedRuns",
         );
         return yield* runChanges(result, "RunRepo.recoverInterruptedRuns");

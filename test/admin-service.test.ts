@@ -120,6 +120,8 @@ const deps: AdminDeps = {
   runEventRepo: RunEventRepo.make({
     upsert: unreachable,
     list: unreachable,
+    getBySourceKey: unreachable,
+    maxRpcSequence: unreachable,
   }),
   mcpServerRepo: {
     listMcpServers: unreachable,

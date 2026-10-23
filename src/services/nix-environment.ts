@@ -14,6 +14,7 @@ import type {
 } from "../domain/models.js";
 import { isWithin } from "../util/paths.js";
 import { GatewayConfig } from "./config.js";
+import { detachedProcessGroup, signalProcessTree } from "./process.js";
 import { NixCacheRepo } from "./store/repositories.js";
 import { SqliteClient, tryDb } from "./store/sqlite-client.js";
 
@@ -60,7 +61,11 @@ export interface NixEnvironmentDependencies {
     ReadonlySet<string>,
     DatabaseError | RowDecodeError
   >;
-  readonly run: (argv: ReadonlyArray<string>) => Promise<NixProcessResult>;
+  readonly timeoutMs?: number;
+  readonly run: (
+    argv: ReadonlyArray<string>,
+    signal?: AbortSignal,
+  ) => Promise<NixProcessResult>;
   readonly filesystem?: NixEnvironmentFileSystem;
   readonly now?: () => number;
 }
@@ -174,15 +179,22 @@ const parseClosureSize = (output: string): number | NixEnvironmentError => {
   }
 };
 
-const nativeRunner = async (
+export const nativeRunner = async (
   argv: ReadonlyArray<string>,
+  signal?: AbortSignal,
 ): Promise<NixProcessResult> => {
-  const process = Bun.spawn([...argv], { stdout: "pipe", stderr: "pipe" });
+  const process = Bun.spawn([...argv], {
+    stdout: "pipe",
+    stderr: "pipe",
+    detached: detachedProcessGroup,
+  });
+  const abort = () => signalProcessTree(process, "SIGKILL");
+  signal?.addEventListener("abort", abort, { once: true });
   const [exitCode, stdout, stderr] = await Promise.all([
     process.exited,
     new Response(process.stdout).text(),
     new Response(process.stderr).text(),
-  ]);
+  ]).finally(() => signal?.removeEventListener("abort", abort));
   return { exitCode, stdout, stderr };
 };
 
@@ -272,19 +284,31 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
         }),
       );
       const result = yield* Effect.tryPromise({
-        try: () =>
-          input.run([
-            input.nixBinaryPath,
-            "build",
-            "--no-write-lock-file",
-            "--print-out-paths",
-            "--out-link",
-            join(root, "result"),
-            ...packages.map((pkg) => `${input.nixpkgsFlakeRef}#${pkg}`),
-          ]),
+        try: (signal) =>
+          input.run(
+            [
+              input.nixBinaryPath,
+              "build",
+              "--no-write-lock-file",
+              "--print-out-paths",
+              "--out-link",
+              join(root, "result"),
+              ...packages.map((pkg) => `${input.nixpkgsFlakeRef}#${pkg}`),
+            ],
+            signal,
+          ),
         catch: (cause) =>
           failure("process_failed", "Nix build could not be started", cause),
-      });
+      }).pipe(
+        Effect.timeoutFail({
+          duration: input.timeoutMs ?? 600_000,
+          onTimeout: () =>
+            failure(
+              "process_failed",
+              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+            ),
+        }),
+      );
       if (result.exitCode !== 0) {
         yield* Effect.logWarning("Nix environment build failed").pipe(
           Effect.annotateLogs({
@@ -296,7 +320,10 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
           }),
         );
         return yield* Effect.fail(
-          failure("process_failed", "Nix build failed"),
+          failure(
+            "process_failed",
+            `Nix build failed: ${result.stderr.trim().slice(-4096)}`,
+          ),
         );
       }
       const storePaths = parseStorePaths(result.stdout);
@@ -308,21 +335,33 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
           ),
         );
       const sizeResult = yield* Effect.tryPromise({
-        try: () =>
-          input.run([
-            input.nixBinaryPath,
-            "path-info",
-            "--json",
-            "--closure-size",
-            ...storePaths,
-          ]),
+        try: (signal) =>
+          input.run(
+            [
+              input.nixBinaryPath,
+              "path-info",
+              "--json",
+              "--closure-size",
+              ...storePaths,
+            ],
+            signal,
+          ),
         catch: (cause) =>
           failure(
             "process_failed",
             "Nix closure size query could not be started",
             cause,
           ),
-      });
+      }).pipe(
+        Effect.timeoutFail({
+          duration: input.timeoutMs ?? 600_000,
+          onTimeout: () =>
+            failure(
+              "process_failed",
+              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+            ),
+        }),
+      );
       if (sizeResult.exitCode !== 0) {
         return yield* Effect.fail(
           failure("process_failed", "Nix closure size query failed"),
@@ -420,21 +459,33 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
 
     const collectGarbage = Effect.gen(function* () {
       const gc = yield* Effect.tryPromise({
-        try: () =>
-          input.run([
-            input.nixBinaryPath,
-            "store",
-            "gc",
-            "--max-freed",
-            String(input.nixGcMaxBytes),
-          ]),
+        try: (signal) =>
+          input.run(
+            [
+              input.nixBinaryPath,
+              "store",
+              "gc",
+              "--max-freed",
+              String(input.nixGcMaxBytes),
+            ],
+            signal,
+          ),
         catch: (cause) =>
           failure(
             "gc_failed",
             "Nix garbage collection could not be started",
             cause,
           ),
-      });
+      }).pipe(
+        Effect.timeoutFail({
+          duration: input.timeoutMs ?? 600_000,
+          onTimeout: () =>
+            failure(
+              "process_failed",
+              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+            ),
+        }),
+      );
       if (gc.exitCode !== 0)
         return yield* Effect.fail(
           failure("gc_failed", "Nix garbage collection failed"),
@@ -473,15 +524,27 @@ export const makeNixEnvironment = (input: NixEnvironmentDependencies) =>
 
     const storeSize = Effect.gen(function* () {
       const result = yield* Effect.tryPromise({
-        try: () =>
-          input.run([input.nixBinaryPath, "path-info", "--all", "--json"]),
+        try: (signal) =>
+          input.run(
+            [input.nixBinaryPath, "path-info", "--all", "--json"],
+            signal,
+          ),
         catch: (cause) =>
           failure(
             "gc_failed",
             "Nix store size query could not be started",
             cause,
           ),
-      });
+      }).pipe(
+        Effect.timeoutFail({
+          duration: input.timeoutMs ?? 600_000,
+          onTimeout: () =>
+            failure(
+              "process_failed",
+              `Nix command timed out after ${input.timeoutMs ?? 600_000}ms`,
+            ),
+        }),
+      );
       if (result.exitCode !== 0)
         return yield* Effect.fail(
           failure("gc_failed", "Nix store size query failed"),
@@ -653,6 +716,7 @@ export class NixEnvironment extends Effect.Service<NixEnvironment>()(
         nixpkgsFlakeRef: config.nixpkgsFlakeRef,
         nixRootsDir: config.nixRootsDir,
         nixGcMaxBytes: config.nixGcMaxBytes,
+        timeoutMs: config.nixTimeoutMs ?? 600_000,
         repo,
         protectedCacheKeys,
         run: nativeRunner,
