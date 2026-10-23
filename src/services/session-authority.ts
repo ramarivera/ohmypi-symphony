@@ -4,20 +4,23 @@ import { fileURLToPath } from "node:url";
 import {
   Cause,
   Clock,
+  Context,
   Duration,
   Effect,
   Fiber,
+  Layer,
   Option,
   Queue,
   Ref,
-  Runtime,
   Schedule,
+  Semaphore,
 } from "effect";
 import {
   type DatabaseError,
   type InstallationRevokedError,
   InterruptedRunNoActionableInputError,
   type LinearApiError,
+  McpOAuthError,
   type NixEnvironmentError,
   type RowDecodeError,
   RpcProtocolError,
@@ -106,7 +109,7 @@ interface WorkerState {
 const CANCEL_GATE_TIMEOUT_MS = 30_000;
 
 const failureMessage = <E>(cause: Cause.Cause<E>): string => {
-  const failure = Cause.failureOption(cause);
+  const failure = Cause.findErrorOption(cause);
   return Option.isSome(failure) && failure.value instanceof Error
     ? failure.value.message
     : Cause.pretty(cause);
@@ -122,7 +125,7 @@ export const linearWorkerPrompt = (
   kind === "created" ? `${contract}\n\nLinear task:\n${body}` : body;
 
 const linearWorkerPromptWithTemplate = (
-  repo: PromptTemplateRepo,
+  repo: PromptTemplateRepo["Service"],
   organizationId: string,
   kind: "created" | "prompted" | "stop",
   body: string,
@@ -333,31 +336,13 @@ type AuthorityError =
   | InterruptedRunNoActionableInputError
   | NixEnvironmentError;
 
-export class SessionAuthority extends Effect.Service<SessionAuthority>()(
+export class SessionAuthority extends Context.Service<SessionAuthority>()(
   "SessionAuthority",
   {
-    accessors: true,
-    dependencies: [
-      ActivityProjector.Default,
-      InstallationRepo.Default,
-      McpServerRepo.Default,
-      McpOAuth.Default,
-      PromptTemplateRepo.Default,
-      RunEventRepo.Default,
-      RunInputRepo.Default,
-      RunRepo.Default,
-      LinearGateway.Default,
-      WorkspaceRepo.Default,
-      GatewayConfig.Default,
-      GitHubApp.Default,
-      RpcWorker.Default,
-      WorkerIdentityRepo.Default,
-      NixEnvironment.Default,
-    ],
-    scoped: Effect.gen(function* () {
+    make: Effect.gen(function* () {
       const scope = yield* Effect.scope;
-      const runtime = yield* Effect.runtime<never>();
-      const runPromise = Runtime.runPromise(runtime);
+      const runtime = yield* Effect.context<never>();
+      const runPromise = Effect.runPromiseWith(runtime);
       const mcpProxies = new Map<SessionId, () => void>();
       const stopMcpProxy = (sessionId: SessionId) => {
         mcpProxies.get(sessionId)?.();
@@ -407,7 +392,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           const linear = linearOption.value;
           return yield* linear.getIssue({ sessionId, issueId }).pipe(
             Effect.map((issue) => Option.some(issue.stateType === "canceled")),
-            Effect.catchAll((error) =>
+            Effect.catch((error) =>
               Effect.gen(function* () {
                 yield* Effect.logWarning(
                   "authority.notification_issue_fetch_failed",
@@ -438,7 +423,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         effect: Effect.Effect<A, E, never>,
       ): Effect.Effect<void, never, never> =>
         effect.pipe(
-          Effect.catchAll((error) =>
+          Effect.catch((error) =>
             Effect.logWarning("authority.best_effort_failed").pipe(
               Effect.annotateLogs({
                 event: "authority.best_effort_failed",
@@ -462,7 +447,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       // Count owners and waiters so idle session gates are released without
       // allowing a second gate to be created while an older waiter still exists.
       const processingGates = yield* Ref.make(
-        new Map<SessionId, { semaphore: Effect.Semaphore; users: number }>(),
+        new Map<SessionId, { semaphore: Semaphore.Semaphore; users: number }>(),
       );
       const withSessionProcessing = <A, E, R>(
         sessionId: SessionId,
@@ -470,7 +455,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       ) =>
         Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
-            const candidate = yield* Effect.makeSemaphore(1);
+            const candidate = yield* Semaphore.make(1);
             const semaphore = yield* Ref.modify(processingGates, (gates) => {
               const entry = gates.get(sessionId) ?? {
                 semaphore: candidate,
@@ -528,7 +513,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         Option.match(run.workspacePath, {
           onNone: () => Effect.void,
           onSome: (path) =>
-            Effect.zipRight(
+            Effect.andThen(
               workspace.clearGitHubExtraHeader(run.sessionId, path),
               removeMcpAgentDb(path),
             ),
@@ -552,7 +537,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             })
             .pipe(
               Effect.map(Option.some),
-              Effect.catchAll((error) =>
+              Effect.catch((error) =>
                 Effect.logWarning("issue.lifecycle_fetch_failed").pipe(
                   Effect.annotateLogs({
                     event: "issue.lifecycle_fetch_failed",
@@ -579,7 +564,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               const states = yield* linear
                 .teamStartedStates({ sessionId: run.sessionId, teamId })
                 .pipe(
-                  Effect.catchAll((error) =>
+                  Effect.catch((error) =>
                     Effect.logWarning("issue.lifecycle_states_failed").pipe(
                       Effect.annotateLogs({
                         event: "issue.lifecycle_states_failed",
@@ -603,7 +588,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     stateId: started.id,
                   })
                   .pipe(
-                    Effect.catchAll((error) =>
+                    Effect.catch((error) =>
                       Effect.logWarning(
                         "issue.lifecycle_state_update_failed",
                       ).pipe(
@@ -634,7 +619,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 delegateId: installation.appUserId,
               })
               .pipe(
-                Effect.catchAll((error) =>
+                Effect.catch((error) =>
                   Effect.logWarning(
                     "issue.lifecycle_delegate_update_failed",
                   ).pipe(
@@ -700,7 +685,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               candidates,
             })
             .pipe(
-              Effect.catchAll((error) =>
+              Effect.catch((error) =>
                 Effect.logDebug("repository.suggestions_failed").pipe(
                   Effect.annotateLogs({
                     event: "repository.suggestions_failed",
@@ -805,15 +790,15 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       // gate, so a stop landing mid-dispatch is either seen (mutation
       // refused) or blocks until the in-flight mutation completes.
       const sessionMutationGatesRef = yield* Ref.make<
-        ReadonlyMap<SessionId, Effect.Semaphore>
+        ReadonlyMap<SessionId, Semaphore.Semaphore>
       >(new Map());
       const sessionMutationGate = (
         sessionId: SessionId,
-      ): Effect.Effect<Effect.Semaphore, never, never> =>
+      ): Effect.Effect<Semaphore.Semaphore, never, never> =>
         Ref.modify(sessionMutationGatesRef, (gates) => {
           const existing = gates.get(sessionId);
           if (existing !== undefined) return [existing, gates];
-          const created = Effect.unsafeMakeSemaphore(1);
+          const created = Semaphore.makeUnsafe(1);
           const next = new Map(gates);
           next.set(sessionId, created);
           return [created, next];
@@ -884,7 +869,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         sessionId: SessionId,
       ): Effect.Effect<Option.Option<WorkerState>, never, never> =>
         Ref.get(workersRef).pipe(
-          Effect.map((workers) => Option.fromNullable(workers.get(sessionId))),
+          Effect.map((workers) => Option.fromNullishOr(workers.get(sessionId))),
         );
 
       const releaseIfNoWorker = (
@@ -1586,7 +1571,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
             // as an absent run.
             const current = yield* runRepo.get(run.sessionId).pipe(
               Effect.map((value) => ({ ok: true as const, value })),
-              Effect.catchAll((error) =>
+              Effect.catch((error) =>
                 Effect.succeed({
                   ok: false as const,
                   result: fail(`Unable to read run state: ${String(error)}`),
@@ -1624,7 +1609,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                         Effect.map((issue) =>
                           textResult(JSON.stringify(issue), issue),
                         ),
-                        Effect.catchAll((error) =>
+                        Effect.catch((error) =>
                           Effect.succeed(
                             fail(`Unable to read issue: ${String(error)}`),
                           ),
@@ -1645,7 +1630,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                             commentId,
                           }),
                         ),
-                        Effect.catchAll((error) =>
+                        Effect.catch((error) =>
                           Effect.succeed(
                             fail(`Unable to create comment: ${String(error)}`),
                           ),
@@ -1683,7 +1668,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                       })
                       .pipe(
                         Effect.map(() => textResult("Updated Linear issue")),
-                        Effect.catchAll((error) =>
+                        Effect.catch((error) =>
                           Effect.succeed(
                             fail(`Unable to update issue: ${String(error)}`),
                           ),
@@ -1728,7 +1713,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                         Effect.map(() =>
                           textResult("Added external URL to Linear session"),
                         ),
-                        Effect.catchAll((error) =>
+                        Effect.catch((error) =>
                           Effect.succeed(
                             fail(
                               `Unable to add external URL: ${String(error)}`,
@@ -1749,7 +1734,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               Effect.gen(function* () {
                 const fresh = yield* runRepo.get(run.sessionId).pipe(
                   Effect.map((value) => ({ ok: true as const, value })),
-                  Effect.catchAll((error) =>
+                  Effect.catch((error) =>
                     Effect.succeed({
                       ok: false as const,
                       result: fail(
@@ -1779,7 +1764,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               }),
             );
           }).pipe(
-            Effect.catchAll((error) =>
+            Effect.catch((error) =>
               Effect.succeed({
                 content: [
                   { type: "text", text: `Host tool failed: ${String(error)}` },
@@ -1879,7 +1864,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                         errorTag: error._tag,
                         reason: error.reason,
                       }),
-                      Effect.zipRight(Effect.fail(error)),
+                      Effect.andThen(Effect.fail(error)),
                     ),
                 ),
               );
@@ -1910,7 +1895,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 sessionId: run.sessionId,
                 error: error.message,
               }),
-              Effect.zipRight(Effect.fail(error)),
+              Effect.andThen(Effect.fail(error)),
             ),
           ),
         );
@@ -1948,7 +1933,10 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                           Option.isSome(token)
                             ? Effect.succeed(token.value.accessToken)
                             : Effect.fail(
-                                new Error("MCP credential disconnected"),
+                                new McpOAuthError({
+                                  message: "MCP credential disconnected",
+                                  reason: "disconnected",
+                                }),
                               ),
                         ),
                       ),
@@ -2006,7 +1994,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 sessionId: run.sessionId,
                 error: error.message,
               }),
-              Effect.zipRight(Effect.fail(error)),
+              Effect.andThen(Effect.fail(error)),
             ),
           ),
         );
@@ -2029,7 +2017,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 sessionId: run.sessionId,
                 error: error.message,
               }),
-              Effect.zipRight(Effect.fail(error)),
+              Effect.andThen(Effect.fail(error)),
             ),
           ),
         );
@@ -2047,7 +2035,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
         const queue = yield* Queue.unbounded<RpcEvent>();
 
         const unsubscribe = yield* worker.onEvent((event) => {
-          Queue.unsafeOffer(queue, event);
+          Queue.offerUnsafe(queue, event);
         });
 
         const consumer = yield* Effect.forkIn(
@@ -2057,8 +2045,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                 withSessionProcessing(
                   run.sessionId,
                   handleEvent(run.sessionId, event).pipe(
-                    Effect.catchAllCause((cause) =>
-                      Cause.isInterruptedOnly(cause)
+                    Effect.catchCause((cause) =>
+                      Cause.hasInterruptsOnly(cause)
                         ? Effect.failCause(cause)
                         : handleFailure(run.sessionId, {
                             message: failureMessage(cause),
@@ -2087,7 +2075,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
 
         yield* worker.start();
         yield* registerLinearHostTools(run, worker).pipe(
-          Effect.catchAll((error) =>
+          Effect.catch((error) =>
             Effect.gen(function* () {
               // Registration happens after the worker is started and indexed;
               // tear down that state before propagating the contract failure.
@@ -2698,8 +2686,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
               yield* runInputRepo.markProcessed(input.id);
             }
           }).pipe(
-            Effect.catchAllCause((cause) =>
-              Cause.isInterruptedOnly(cause)
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
                 ? Effect.failCause(cause)
                 : Effect.gen(function* () {
                     const current = yield* runRepo.get(sessionId);
@@ -2740,8 +2728,8 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
           ]);
           for (const sessionId of sessionIds) {
             yield* processSession(sessionId).pipe(
-              Effect.catchAllCause((cause) =>
-                Cause.isInterruptedOnly(cause)
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
                   ? Effect.failCause(cause)
                   : Effect.logWarning("authority.session_failed").pipe(
                       Effect.annotateLogs({
@@ -2798,7 +2786,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
                     scope,
                   ).pipe(Effect.asVoid),
             ),
-            Effect.catchAllCause((cause) =>
+            Effect.catchCause((cause) =>
               Effect.logWarning("authority.lease_renewal_failed").pipe(
                 Effect.annotateLogs({ sessionId, error: Cause.pretty(cause) }),
               ),
@@ -2808,7 +2796,7 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       });
       yield* Effect.addFinalizer(() =>
         shutdown().pipe(
-          Effect.catchAllCause((cause) =>
+          Effect.catchCause((cause) =>
             Effect.logError("authority.shutdown_failed").pipe(
               Effect.annotateLogs({ error: Cause.pretty(cause) }),
             ),
@@ -2837,4 +2825,25 @@ export class SessionAuthority extends Effect.Service<SessionAuthority>()(
       };
     }),
   },
-) {}
+) {
+  static readonly layerWithoutDependencies = Layer.effect(this, this.make);
+  static readonly layer = this.layerWithoutDependencies.pipe(
+    Layer.provide([
+      ActivityProjector.layer,
+      InstallationRepo.layer,
+      McpServerRepo.layer,
+      McpOAuth.layer,
+      PromptTemplateRepo.layer,
+      RunEventRepo.layer,
+      RunInputRepo.layer,
+      RunRepo.layer,
+      LinearGateway.layer,
+      WorkspaceRepo.layer,
+      GatewayConfig.layer,
+      GitHubApp.layer,
+      RpcWorker.layer,
+      WorkerIdentityRepo.layer,
+      NixEnvironment.layer,
+    ]),
+  );
+}
