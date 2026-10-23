@@ -101,11 +101,8 @@ Workspace ownership is migrated separately by preparation and retention under
 ownership migration: gateway log append/rotation and Nix root creation/removal
 don't chmod legacy files and retain access through DAC_OVERRIDE. Nix roots contain
 result symlinks into `/nix`; their targets must never be recursively chowned by
-this migration. The `/nix` store retains its Nix-managed ownership. The root
-gateway also needs a root-readable single-user Nix configuration: the legacy
-uid-1000 HOME at `/home/bun` causes Nix to fall back to `/root` and miss its
-experimental-feature settings. This separate deployment issue is tracked in
-`sym-2sm.18`.
+this migration. The `/nix` store retains its Nix-managed ownership. The gateway
+and worker Nix configuration is described below.
 
 Gateway auth/key mounts and Docker secrets outside `/app/data` aren't modified;
 provision them root-owned with mode 0400 before upgrading, including readonly mounts.
@@ -119,6 +116,47 @@ boundary. Workers currently share one uid and can access other workers'
 workspaces; this change doesn't provide per-run or per-tenant filesystem/network
 isolation. Model-provider API keys explicitly allowed for omp remain visible to
 the worker; gateway-only keys and arbitrary environment variables don't.
+
+## Nix in Docker
+
+The gateway has `HOME=/root`. Nix 2.30.3 is installed with `--no-daemon`;
+`/etc/nix/nix.conf` enables `nix-command flakes`, disables
+the Nix sandbox, and sets `build-users-group =` to empty for this single-user installation.
+The empty group makes builds run as the Nix caller. The gateway's
+`NixEnvironment` uses `nativeRunner` without a uid transition, so environment
+preparation runs as root. Only use a trusted, pinned `NIXPKGS_FLAKE_REF`.
+Don't expose a root Nix daemon to workers or run repository-supplied builders
+as the gateway.
+
+`/opt/nix/bin` is on PATH for both identities. Its image-owned profile link
+points directly into `/nix/store`, outside bun's private home and outside the
+persisted volume's profile directory. This also works with existing Nix
+volumes. The gateway builds the configured repository packages, records their
+closure metadata, and keeps GC roots for active runs. Session authority prepends
+the realized store paths' `bin` directories to PATH before RPC worker launch.
+Workers retain their workspace HOME and use those executables through ordinary
+filesystem reads, including while the gateway prepares another repository.
+`NIX_REMOTE`, `NIX_CONFIG`, `NIX_PATH`, and `NIX_PROFILES` aren't forwarded at
+either worker environment boundary. Workers don't need store database access.
+
+Worker-side `nix eval`, `nix build`, and other store commands are unsupported.
+In the isolated Docker worker, default store access fails on the shared store's
+permissions rather than selecting an immutable database connection. Request
+packages through the repository's `nixPackages` configuration so the gateway
+prepares them before launch. This environment contract isn't a sandbox against
+arbitrary worker code; native same-uid workers still have their user's access.
+
+Don't use `local?read-only=true` against the live shared store. In
+[Nix 2.30.3's local-store configuration](https://github.com/NixOS/nix/blob/2.30.3/src/libstore/include/nix/store/local-store.hh),
+read-only mode disables locking and requires an immutable database. The
+[local-store implementation](https://github.com/NixOS/nix/blob/2.30.3/src/libstore/local-store.cc)
+selects `SQLiteOpenMode::Immutable`, and
+[the SQLite wrapper](https://github.com/NixOS/nix/blob/2.30.3/src/libstore/sqlite.cc)
+opens it with `immutable=1`.
+[SQLite skips locking and change detection in that mode](https://sqlite.org/uri.html#uriimmutable),
+which can return incorrect results or corruption errors under concurrent writes.
+No store ownership migration or extra capability is required. Never recursively chown `/nix/store`
+or follow GC-root symlinks to change ownership.
 
 ## MCP OAuth
 

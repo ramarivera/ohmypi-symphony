@@ -2082,6 +2082,10 @@ describe("SessionAuthority Nix environment preparation", () => {
             `/nix/store/test-node/bin${process.env.PATH ? `:${process.env.PATH}` : ""}`,
           );
           expect(workerSpawnInputs[0]?.env?.HOME).toBe(process.env.HOME);
+          expect(workerSpawnInputs[0]?.env).not.toHaveProperty("NIX_REMOTE");
+          expect(workerSpawnInputs[0]?.env).not.toHaveProperty("NIX_CONFIG");
+          expect(workerSpawnInputs[0]?.env).not.toHaveProperty("NIX_PATH");
+          expect(workerSpawnInputs[0]?.env).not.toHaveProperty("NIX_PROFILES");
           expect(workerSpawnInputs[0]?.command).toContain("--extension");
           expect(workerSpawnInputs[0]?.command).toContain(
             resolveDeviationExtensionPath(),

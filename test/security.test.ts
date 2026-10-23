@@ -398,6 +398,28 @@ process.exit(0);`;
     expect(() => workerIdentityCommand(["omp"], "0")).toThrow();
   });
 
+  it("passes prepared package paths without inherited Nix store configuration", () => {
+    const inherited = {
+      PATH: "/nix/store/prepared-tool/bin:/opt/nix/bin:/bin",
+      HOME: "/workspace/.omp-home",
+      NIX_REMOTE: "daemon",
+      NIX_CONFIG: "store = local?read-only=true",
+      NIX_PATH: "nixpkgs=/gateway/nixpkgs",
+      NIX_PROFILES: "/gateway/profile",
+      TOKEN_ENCRYPTION_KEY: "gateway-only",
+    };
+    const prepared = workerEnvironment(inherited);
+    expect(prepared).toEqual({
+      PATH: inherited.PATH,
+      HOME: inherited.HOME,
+    });
+    expect(workerEnvironment(prepared)).toEqual(prepared);
+    expect(workerEnvironment({ PATH: "/bin" })).not.toHaveProperty(
+      "NIX_REMOTE",
+    );
+    expect(inherited.NIX_REMOTE).toBe("daemon");
+  });
+
   it("doesn't follow workspace symlinks when assigning worker ownership", async () => {
     const dir = await temporary();
     const workspace = join(dir, "workspace");

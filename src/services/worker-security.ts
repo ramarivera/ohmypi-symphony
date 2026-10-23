@@ -31,10 +31,6 @@ const WORKER_ENV = new Set([
   "COLORTERM",
   "TMPDIR",
   "NIX_SSL_CERT_FILE",
-  "NIX_PATH",
-  "NIX_PROFILES",
-  "NIX_REMOTE",
-  "NIX_CONFIG",
   "PI_CODING_AGENT_DIR",
   "PI_PACKAGE_DIR",
   "OMP_SKIP_UPDATE_CHECK",
@@ -50,6 +46,8 @@ const WORKER_ENV = new Set([
 export const workerEnvironment = (
   input: Record<string, string | undefined>,
 ): Record<string, string> =>
+  // The gateway realizes and roots packages before passing their bin paths.
+  // Workers use those files directly; they don't need Nix store configuration.
   Object.fromEntries(
     Object.entries(input).filter(
       (entry): entry is [string, string] =>
