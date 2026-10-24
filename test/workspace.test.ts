@@ -575,6 +575,42 @@ describe("Workspace", () => {
     }),
   );
 
+  it.live(
+    "never writes the bot identity into a repository enclosing a non-checkout target",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* gitFixture;
+        const outer = join(fixture.root, "enclosing-repo");
+        const inner = join(outer, "not-a-checkout");
+        yield* fixtureIo("enclosing repo creation", () =>
+          mkdir(inner, { recursive: true }),
+        );
+        yield* runGit(["init"], outer);
+        const id = sessionId("identity-scope");
+        const record = repositoryRecord({
+          id: "identity-scope",
+          url: "https://github.com/octo-org/private-repo.git",
+        });
+        const workspace = yield* makeWorkspace({
+          workspaceRoot: fixture.workspaceRoot,
+          repo: { listRepositories: () => Effect.succeed([]) },
+          githubApp: {
+            getBotIdentity: () =>
+              Effect.succeed({
+                name: "test-app[bot]",
+                email: "98765+test-app[bot]@users.noreply.github.com",
+              }),
+            getInstallationToken: () => Effect.succeed("fresh-token"),
+          },
+        });
+        yield* Effect.result(
+          workspace.refreshGitHubExtraHeader(id, record, inner),
+        );
+        expect(yield* readGitConfig("user.name", outer)).toBeUndefined();
+        expect(yield* readGitConfig("user.email", outer)).toBeUndefined();
+      }),
+  );
+
   it.live("unsets GitHub credentials when reusing without configuration", () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
