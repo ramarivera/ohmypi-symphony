@@ -2990,8 +2990,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                   const baseContext = Option.isSome(issueSnapshot)
                     ? {
                         ...webhookContext,
-                        teamId: issueSnapshot.value.teamId,
-                        projectId: issueSnapshot.value.projectId,
+                        teamId:
+                          issueSnapshot.value.teamId ?? webhookContext.teamId,
+                        projectId:
+                          issueSnapshot.value.projectId ??
+                          webhookContext.projectId,
                         issueLabels: labelSet(issueSnapshot.value.labels),
                         projectLabels: labelSet(
                           issueSnapshot.value.projectLabels,

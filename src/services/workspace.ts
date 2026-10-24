@@ -997,27 +997,29 @@ export const makeWorkspace = (input: {
         );
         if (Option.isNone(identity)) return;
         // runGit enters the checkout owner's uid before touching its local config.
-        yield* git(
+        // Identity is best-effort: a missing author must not fail workspace setup.
+        yield* Effect.forEach(
           [
-            "config",
-            "--local",
-            "--replace-all",
-            "user.name",
-            identity.value.name,
-          ],
-          target,
-          sessionId,
-        );
-        yield* git(
-          [
-            "config",
-            "--local",
-            "--replace-all",
-            "user.email",
-            identity.value.email,
-          ],
-          target,
-          sessionId,
+            ["user.name", identity.value.name],
+            ["user.email", identity.value.email],
+          ] as const,
+          ([key, value]) =>
+            git(
+              ["config", "--local", "--replace-all", key, value],
+              target,
+              sessionId,
+            ),
+          { discard: true },
+        ).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("workspace.git_identity_config_failed").pipe(
+              Effect.annotateLogs({
+                event: "workspace.git_identity_config_failed",
+                sessionId,
+                error: error.message,
+              }),
+            ),
+          ),
         );
       },
     );
