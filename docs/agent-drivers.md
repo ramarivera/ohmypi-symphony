@@ -19,6 +19,17 @@ attempt instead of depending on label order. No gateway restart is required.
 A persisted session ref keeps its driver across retries and follow-up turns;
 changing labels doesn't migrate an existing conversation between runtimes.
 
+## Repository routing
+
+Before selecting a repository, the authority fetches the current Linear issue's
+team, project, issue labels, and project labels. Agent-session webhooks often
+omit those fields. The same issue snapshot supplies driver labels and lifecycle
+checks, and the run stores the enriched team and project IDs. If the read fails,
+the gateway logs a warning and uses the webhook context.
+
+Routing precedence stays explicit repository ID, issue labels, project labels,
+project ID, team ID, then the default repository. Label matching ignores case.
+
 ## T3 connection modes
 
 `T3_MODE=launch` is the deployed mode. The gateway starts a private
@@ -98,6 +109,16 @@ Launched T3 agents use the same credential path as OMP workers: the GitHub
 App installation token scoped to the run's repository, persisted as
 `http.https://github.com/.extraheader` in the workspace's mode-0600 Git config
 and re-minted on resume. It expires after an hour and never reaches the T3 API.
+Workspace preparation also sets repo-local `user.name` and `user.email` for both
+drivers, including reused checkouts. The GitHub App slug comes from `GET /app`;
+`GET /users/<slug>[bot]` supplies the bot user ID, which differs from the App ID.
+The cached identity is `<slug>[bot]` with
+`<bot-user-id>+<slug>[bot]@users.noreply.github.com`. If the bot lookup fails,
+the gateway logs a warning and uses `<slug>[bot]@users.noreply.github.com`.
+If the App slug itself can't be read, preparation logs a warning and preserves
+any existing identity. Git config writes run as the workspace owner and never
+change global configuration.
+
 The T3 worker contract tells the agent to push a branch, open the PR through the
 GitHub REST API with that credential, and include the PR URL in its final
 response, which the authority links to the Linear session. The GitHub App

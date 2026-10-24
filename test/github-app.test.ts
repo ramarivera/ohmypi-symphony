@@ -305,3 +305,68 @@ describe("GitHubApp", () => {
     await Effect.runPromise(Effect.timeout(program, "5 seconds"));
   });
 });
+
+describe("GitHub App bot identity", () => {
+  it.live(
+    "looks up the bot user id, not the app id, and caches concurrent requests",
+    () =>
+      Effect.gen(function* () {
+        const requests: Array<{ url: string; init: RequestInit | undefined }> =
+          [];
+        const app = makeGitHubApp({
+          appId: "12345",
+          privateKey: privateKeyPem,
+          fetch: async (url, init) => {
+            requests.push({ url: String(url), init });
+            return String(url).endsWith("/app")
+              ? Response.json({ slug: "test-app", id: 12345 })
+              : Response.json({ id: 98765 });
+          },
+        });
+        const identity = {
+          name: "test-app[bot]",
+          email: "98765+test-app[bot]@users.noreply.github.com",
+        };
+        expect(
+          yield* Effect.all([app.getBotIdentity(), app.getBotIdentity()], {
+            concurrency: "unbounded",
+          }),
+        ).toEqual([identity, identity]);
+        expect(yield* app.getBotIdentity()).toEqual(identity);
+        expect(requests.map((r) => r.url)).toEqual([
+          "https://api.github.com/app",
+          "https://api.github.com/users/test-app%5Bbot%5D",
+        ]);
+        expect(
+          new Headers(requests[0]?.init?.headers).get("Authorization"),
+        ).toMatch(/^Bearer /u);
+        expect(
+          new Headers(requests[1]?.init?.headers).get("Authorization"),
+        ).toBeNull();
+      }),
+  );
+  for (const failure of ["status", "invalid", "network"] as const) {
+    it.live(
+      `falls back to the slug email on ${failure} bot lookup failure`,
+      () =>
+        Effect.gen(function* () {
+          const app = makeGitHubApp({
+            appId: "12345",
+            privateKey: privateKeyPem,
+            fetch: async (url) => {
+              if (String(url).endsWith("/app"))
+                return Response.json({ slug: "test-app" });
+              if (failure === "network") throw new Error("offline");
+              return failure === "status"
+                ? new Response(null, { status: 503 })
+                : Response.json({ id: "not-a-user-id" });
+            },
+          });
+          expect(yield* app.getBotIdentity()).toEqual({
+            name: "test-app[bot]",
+            email: "test-app[bot]@users.noreply.github.com",
+          });
+        }),
+    );
+  }
+});

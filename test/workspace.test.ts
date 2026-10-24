@@ -539,6 +539,11 @@ describe("Workspace", () => {
         workspaceRoot: fixture.workspaceRoot,
         repo: { listRepositories: () => Effect.succeed([]) },
         githubApp: {
+          getBotIdentity: () =>
+            Effect.succeed({
+              name: "test-app[bot]",
+              email: "98765+test-app[bot]@users.noreply.github.com",
+            }),
           getInstallationToken: () => {
             tokenCalls += 1;
             return Effect.succeed("fresh-token");
@@ -546,8 +551,20 @@ describe("Workspace", () => {
         },
       });
       yield* workspace.materialize(id, record);
+      expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
+      expect(yield* readGitConfig("user.email", target)).toBe(
+        "98765+test-app[bot]@users.noreply.github.com",
+      );
+      yield* runGit(["commit", "--allow-empty", "-m", "worker commit"], target);
+      yield* runGit(["config", "--local", "--unset", "user.email"], target);
       yield* workspace.materialize(id, record);
-      expect(tokenCalls).toBe(2);
+      expect(yield* readGitConfig("user.email", target)).toBe(
+        "98765+test-app[bot]@users.noreply.github.com",
+      );
+      yield* runGit(["config", "--local", "--unset", "user.name"], target);
+      yield* workspace.refreshGitHubExtraHeader(id, record, target);
+      expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
+      expect(tokenCalls).toBe(3);
       expect(
         yield* readGitConfigAll("http.https://github.com/.extraheader", target),
       ).toEqual(["X-User: retained", buildGitHubExtraHeader("fresh-token")]);
@@ -726,6 +743,11 @@ describe("Workspace", () => {
         workspaceRoot: fixture.workspaceRoot,
         repo: { listRepositories: () => Effect.succeed([]) },
         githubApp: {
+          getBotIdentity: () =>
+            Effect.succeed({
+              name: "test-app[bot]",
+              email: "98765+test-app[bot]@users.noreply.github.com",
+            }),
           getInstallationToken: () => Effect.succeed(token),
         },
       });
@@ -808,6 +830,11 @@ describe("Workspace", () => {
         workspaceRoot: fixture.workspaceRoot,
         repo: { listRepositories: () => Effect.succeed([]) },
         githubApp: {
+          getBotIdentity: () =>
+            Effect.succeed({
+              name: "test-app[bot]",
+              email: "98765+test-app[bot]@users.noreply.github.com",
+            }),
           getInstallationToken: () => {
             tokenCalls += 1;
             return Effect.succeed("unexpected-token");
@@ -1154,8 +1181,25 @@ it.live(
   () =>
     Effect.gen(function* () {
       const fixture = yield* gitFixture;
+      const uid = String(process.getuid?.() ?? 1000);
+      yield* Effect.acquireRelease(
+        Effect.sync(() => vi.stubEnv("WORKER_UID", uid)),
+        () => Effect.sync(() => vi.unstubAllEnvs()),
+      );
+      const nativeSpawn = Bun.spawn;
       const spy = yield* Effect.acquireRelease(
-        Effect.sync(() => vi.spyOn(Bun, "spawn")),
+        Effect.sync(() =>
+          vi.spyOn(Bun, "spawn").mockImplementation((command, options) => {
+            // Native tests can't setgroups. Verify the uid wrapper while executing
+            // the real Git operations as the checkout owner.
+            if (Array.isArray(command) && command[0] === "/usr/bin/setpriv")
+              return nativeSpawn(
+                command.slice(command.indexOf("--") + 1),
+                options,
+              );
+            return nativeSpawn(command, options);
+          }),
+        ),
         (value) => Effect.sync(() => value.mockRestore()),
       );
       const token = "ghs_argv_secret";
@@ -1163,16 +1207,48 @@ it.live(
       const workspace = yield* makeWorkspace({
         workspaceRoot: fixture.workspaceRoot,
         repo: { listRepositories: () => Effect.succeed([]) },
-        githubApp: { getInstallationToken: () => Effect.succeed(token) },
+        githubApp: {
+          getBotIdentity: () =>
+            Effect.succeed({
+              name: "test-app[bot]",
+              email: "98765+test-app[bot]@users.noreply.github.com",
+            }),
+          getInstallationToken: () => Effect.succeed(token),
+        },
       });
+      const globalConfigBefore = yield* fixtureIo("read global config", () =>
+        readFile(join(fixture.root, "gitconfig"), "utf8"),
+      );
       const target = yield* workspace.materialize(
         "secret-argv-test",
         repositoryRecord({ id: "secret-argv-test", url: fixture.url }),
+        uid,
       );
+      expect(yield* readGitConfig("user.name", target)).toBe("test-app[bot]");
+      expect(yield* readGitConfig("user.email", target)).toBe(
+        "98765+test-app[bot]@users.noreply.github.com",
+      );
+      yield* runGit(["commit", "--allow-empty", "-m", "worker commit"], target);
+      expect(
+        yield* fixtureIo("read global config", () =>
+          readFile(join(fixture.root, "gitconfig"), "utf8"),
+        ),
+      ).toBe(globalConfigBefore);
       const calls = spy.mock.calls;
       const commands = calls
         .map(([command]) => command)
         .filter((command): command is string[] => Array.isArray(command));
+      for (const key of ["user.name", "user.email"]) {
+        const configCommand = commands.find((command) => command.includes(key));
+        expect(configCommand?.slice(0, 5)).toEqual([
+          "/usr/bin/setpriv",
+          "--reuid",
+          uid,
+          "--regid",
+          uid,
+        ]);
+        expect(configCommand).toContain("--local");
+      }
       expect(JSON.stringify(commands)).not.toContain(token);
       expect(JSON.stringify(commands)).not.toContain(header);
       const clone = calls.find(

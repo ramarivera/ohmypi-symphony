@@ -59,6 +59,22 @@ const STARTED_STATES_CACHE_TTL_MS = 60 * 60 * 1000;
 const STARTED_STATES_CACHE_MAX_TEAMS = 100;
 const LIST_SESSION_ACTIVITIES_MAX_PAGES = 10;
 
+export interface LinearIssue {
+  readonly id: string;
+  readonly identifier: string | null;
+  readonly title: string;
+  readonly description: string | null;
+  readonly stateId: string | null;
+  readonly stateName: string | null;
+  readonly stateType: string | null;
+  readonly delegateId: string | null;
+  readonly url: string | null;
+  readonly teamId: string | null;
+  readonly labels: ReadonlyArray<string>;
+  readonly projectId: string | null;
+  readonly projectLabels: ReadonlyArray<string>;
+}
+
 export class LinearGateway extends Context.Service<LinearGateway>()(
   "LinearGateway",
   {
@@ -1108,19 +1124,7 @@ export class LinearGateway extends Context.Service<LinearGateway>()(
         readonly sessionId: string;
         readonly issueId: string;
       }): Effect.fn.Return<
-        {
-          readonly id: string;
-          readonly identifier: string | null;
-          readonly title: string;
-          readonly description: string | null;
-          readonly stateId: string | null;
-          readonly stateName: string | null;
-          readonly stateType: string | null;
-          readonly delegateId: string | null;
-          readonly url: string | null;
-          readonly teamId: string | null;
-          readonly labels: ReadonlyArray<string>;
-        },
+        LinearIssue,
         | InstallationRevokedError
         | LinearApiError
         | LinearRateLimitError
@@ -1187,6 +1191,8 @@ export class LinearGateway extends Context.Service<LinearGateway>()(
                     throw new Error(`Linear issue ${issueId} not found`);
                   const state = issue.state ? await issue.state : null;
                   const labelsConnection = await issue.labels();
+                  const project = await issue.project;
+                  const projectLabels = project ? await project.labels() : null;
                   return {
                     id: issue.id,
                     identifier: issue.identifier ?? null,
@@ -1198,6 +1204,9 @@ export class LinearGateway extends Context.Service<LinearGateway>()(
                     delegateId: issue.delegateId ?? null,
                     url: issue.url ?? null,
                     teamId: issue.teamId ?? null,
+                    projectId: issue.projectId ?? project?.id ?? null,
+                    projectLabels:
+                      projectLabels?.nodes.map((label) => label.name) ?? [],
                     labels: Array.isArray(labelsConnection?.nodes)
                       ? labelsConnection.nodes.map((label) => label.name)
                       : [],

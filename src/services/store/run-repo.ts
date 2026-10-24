@@ -220,6 +220,8 @@ export class RunRepo extends Context.Service<RunRepo>()("RunRepo", {
       sessionId: SessionId,
       patch: {
         readonly leaseOwner?: string;
+        readonly teamId?: Option.Option<TeamId>;
+        readonly projectId?: Option.Option<ProjectId>;
         readonly state?: RunState;
         readonly repositoryId?: Option.Option<WorkspaceId>;
         readonly workspacePath?: Option.Option<string>;
@@ -304,11 +306,13 @@ export class RunRepo extends Context.Service<RunRepo>()("RunRepo", {
             () =>
               db
                 .query(`
-              UPDATE agent_run SET state=?, repository_id=?, workspace_path=?, omp_session_id=?, omp_session_file=?,
+              UPDATE agent_run SET state=?, team_id=?, project_id=?, repository_id=?, workspace_path=?, omp_session_id=?, omp_session_file=?,
                 terminal_reason=?, last_activity_at=?, next_attempt_at=?, attempt=attempt+?, updated_at=? WHERE session_id=?
             `)
                 .run(
                   state,
+                  optionToSql(getNullable(run.teamId, patch.teamId)),
+                  optionToSql(getNullable(run.projectId, patch.projectId)),
                   optionToSql(repositoryId),
                   optionToSql(workspacePath),
                   optionToSql(ompSessionId),

@@ -969,12 +969,58 @@ export const makeWorkspace = (input: {
               repository,
               sessionId,
             );
+      yield* configureGitIdentity(sessionId, target);
       if (githubExtraHeader === undefined) {
         yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
         return;
       }
       yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
     });
+
+    const configureGitIdentity = Effect.fn("Workspace.configureGitIdentity")(
+      function* (
+        sessionId: string,
+        target: string,
+      ): Effect.fn.Return<void, WorkspaceError> {
+        if (input.githubApp === undefined) return;
+        const identity = yield* input.githubApp.getBotIdentity().pipe(
+          Effect.map(Option.some),
+          Effect.catch(() =>
+            Effect.logWarning("workspace.git_identity_lookup_failed").pipe(
+              Effect.annotateLogs({
+                event: "workspace.git_identity_lookup_failed",
+                sessionId,
+              }),
+              Effect.as(Option.none()),
+            ),
+          ),
+        );
+        if (Option.isNone(identity)) return;
+        // runGit enters the checkout owner's uid before touching its local config.
+        yield* git(
+          [
+            "config",
+            "--local",
+            "--replace-all",
+            "user.name",
+            identity.value.name,
+          ],
+          target,
+          sessionId,
+        );
+        yield* git(
+          [
+            "config",
+            "--local",
+            "--replace-all",
+            "user.email",
+            identity.value.email,
+          ],
+          target,
+          sessionId,
+        );
+      },
+    );
 
     const clearGitHubExtraHeader = (
       sessionId: string,
@@ -1218,6 +1264,7 @@ export const makeWorkspace = (input: {
               staging,
               sessionId,
             );
+            yield* configureGitIdentity(sessionId, staging);
             yield* writeMarker(
               join(staging, ".linear-gateway-workspace.json"),
               repository,
