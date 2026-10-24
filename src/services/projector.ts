@@ -553,7 +553,7 @@ export class ActivityProjector extends Context.Service<ActivityProjector>()(
         sourceKey: string,
         text: string,
       ): Effect.fn.Return<boolean, DatabaseError | RowDecodeError> {
-        const body = `### Agent deviation report\n\n${boundedText(text)}\n\n_Reported automatically by OhMyPi during this run._`;
+        const body = `### Agent deviation report\n\n${boundedText(text)}\n\n_Reported automatically by Partitura during this run._`;
         return yield* enqueueAndDispatch(
           sessionId,
           sourceKey,
@@ -760,7 +760,7 @@ export class ActivityProjector extends Context.Service<ActivityProjector>()(
               const body = Option.match(
                 Option.fromNullishOr(draft.get(sessionId)),
                 {
-                  onNone: () => "OhMyPi run completed.",
+                  onNone: () => "Partitura run completed.",
                   onSome: (value) => value,
                 },
               );
@@ -778,7 +778,7 @@ export class ActivityProjector extends Context.Service<ActivityProjector>()(
                 n.delete(sessionId);
                 return n;
               });
-              const message = text(event.message) ?? "OhMyPi worker failed";
+              const message = text(event.message) ?? "Partitura worker failed";
               yield* terminal(sessionId, sourceKey, "error", message);
               return;
             }

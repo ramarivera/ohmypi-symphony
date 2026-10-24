@@ -284,7 +284,7 @@ export const launchT3Daemon = Effect.fn("T3Launcher.launch")(function* (
           "--ttl",
           "30d",
           "--label",
-          `ohmypi-symphony ${input.sessionId}`.slice(0, 80),
+          `Partitura ${input.sessionId}`.slice(0, 80),
           "--json",
         ]),
         {

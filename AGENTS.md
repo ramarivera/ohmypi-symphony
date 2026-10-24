@@ -1,9 +1,9 @@
 # AGENTS.md
 
-Canonical instructions for coding agents in `ramarivera/ohmypi-symphony`
-(package `ohmypi-linear-gateway`). `CLAUDE.md` imports this file.
+Canonical instructions for coding agents in `ramarivera/partitura`
+(package `partitura`). `CLAUDE.md` imports this file.
 
-The gateway is a Bun + Effect v4 service that receives Linear agent-session
+Partitura is a Bun + Effect v4 service that receives Linear agent-session
 webhooks, runs Oh My Pi (`omp`) workers over RPC in per-session workspaces, and
 projects worker activity back to Linear. State is one SQLite file.
 

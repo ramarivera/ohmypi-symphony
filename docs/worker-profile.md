@@ -76,7 +76,7 @@ providers:
 | Setting | Meaning |
 | --- | --- |
 | `CLIPROXYAPI_BASE_URL` | CLIProxyAPI origin, http(s) without credentials, query or fragment. |
-| `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE` | Dedicated, revocable Symphony client key. In Docker, a root-owned mode-0400 secret. Both settings are required together. |
+| `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE` | Dedicated, revocable Partitura client key. In Docker, a root-owned mode-0400 secret. Both settings are required together. |
 | `WORKER_DEFAULT_MODEL` | `provider/model[:thinking]`. Defaults to `cliproxyapi/gpt-6-sol` when `WORKER_PROFILE_DIR` and CLIProxyAPI are configured. Native/dev runs without a profile leave omp's default unchanged. Passed as `--model` to fresh sessions only; resumed sessions keep their saved model. |
 | `WORKER_EXTENSION_PATHS` | Comma-separated absolute paths of image-installed extensions loaded into every worker. The image sets pi-claude-cli. |
 | `WORKER_CLAUDE_EXECUTABLE` | Claude Code launcher for pi-claude-cli. The image sets `/usr/local/bin/claude-cliproxy`. |

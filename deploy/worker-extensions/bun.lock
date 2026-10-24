@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "ohmypi-symphony-worker-extensions",
+      "name": "partitura-worker-extensions",
       "dependencies": {
         "@ramarivera/pi-claude-cli": "0.5.1",
       },

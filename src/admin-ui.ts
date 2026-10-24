@@ -89,7 +89,7 @@ function renderDocument(meta: {
  */
 export function renderLandingPage(): string {
   return renderDocument({
-    title: "OhMyPi ↔ Linear — Connect",
+    title: "Partitura · Connect Linear",
     body: LANDING_BODY,
     script: THEME_SCRIPT,
     extraHead: `<script>${THEME_BOOTSTRAP_SCRIPT}</script>`,
@@ -105,7 +105,7 @@ export function renderLandingPage(): string {
  */
 export function renderAdminPage(gatewayAdmin = false): string {
   return renderDocument({
-    title: "OhMyPi ↔ Linear — Console",
+    title: "Partitura · Console",
     body: ADMIN_BODY,
     script: `${THEME_SCRIPT}
 ${ADMIN_SCRIPT}`,
@@ -124,7 +124,7 @@ export function renderRunDetailPage(
   nextEventsUrl: string | null = null,
 ): string {
   return renderDocument({
-    title: `OhMyPi run ${model.run.sessionId}`,
+    title: `Partitura run ${model.run.sessionId}`,
     body: renderRunDetailBody(model, csrfToken, nextEventsUrl),
     script: `${THEME_SCRIPT}
 ${RUN_DETAIL_SCRIPT}`,
