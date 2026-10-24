@@ -1191,8 +1191,17 @@ export class LinearGateway extends Context.Service<LinearGateway>()(
                     throw new Error(`Linear issue ${issueId} not found`);
                   const state = issue.state ? await issue.state : null;
                   const labelsConnection = await issue.labels();
-                  const project = await issue.project;
-                  const projectLabels = project ? await project.labels() : null;
+                  let projectId = issue.projectId ?? null;
+                  let projectLabels: string[] = [];
+                  try {
+                    const project = await issue.project;
+                    const labels = project ? await project.labels() : null;
+                    projectId ??= project?.id ?? null;
+                    projectLabels =
+                      labels?.nodes.map((label) => label.name) ?? [];
+                  } catch (error) {
+                    if (rateLimitDelay(error) !== null) throw error;
+                  }
                   return {
                     id: issue.id,
                     identifier: issue.identifier ?? null,
@@ -1204,9 +1213,8 @@ export class LinearGateway extends Context.Service<LinearGateway>()(
                     delegateId: issue.delegateId ?? null,
                     url: issue.url ?? null,
                     teamId: issue.teamId ?? null,
-                    projectId: issue.projectId ?? project?.id ?? null,
-                    projectLabels:
-                      projectLabels?.nodes.map((label) => label.name) ?? [],
+                    projectId,
+                    projectLabels,
                     labels: Array.isArray(labelsConnection?.nodes)
                       ? labelsConnection.nodes.map((label) => label.name)
                       : [],

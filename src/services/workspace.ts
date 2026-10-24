@@ -985,14 +985,18 @@ export const makeWorkspace = (input: {
         if (input.githubApp === undefined) return;
         const identity = yield* input.githubApp.getBotIdentity().pipe(
           Effect.map(Option.some),
-          Effect.catch(() =>
-            Effect.logWarning("workspace.git_identity_lookup_failed").pipe(
-              Effect.annotateLogs({
-                event: "workspace.git_identity_lookup_failed",
-                sessionId,
-              }),
-              Effect.as(Option.none()),
-            ),
+          Effect.catch((error) =>
+            error.reason === "disabled"
+              ? Effect.succeed(Option.none())
+              : Effect.logWarning("workspace.git_identity_lookup_failed").pipe(
+                  Effect.annotateLogs({
+                    event: "workspace.git_identity_lookup_failed",
+                    sessionId,
+                    reason: error.reason,
+                    error: error.message,
+                  }),
+                  Effect.as(Option.none()),
+                ),
           ),
         );
         if (Option.isNone(identity)) return;

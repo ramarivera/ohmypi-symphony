@@ -3991,6 +3991,77 @@ describe("AgentDriver authority integration", () => {
 });
 
 describe("SessionAuthority repository routing enrichment", () => {
+  it.live(
+    "cancels a sparse webhook when the enriched issue team is inaccessible",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const runs = yield* RunRepo;
+            yield* (yield* InstallationRepo).put({
+              ...install(testOrganizationId),
+              accessibleTeamIds: Option.some([]),
+              canAccessAllPublicTeams: Option.some(false),
+            });
+            linearIssueTeamId = "api-team";
+            yield* runs.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.some(testIssueId),
+            });
+            yield* (yield* RunInputRepo).enqueue({
+              id: Schema.decodeUnknownSync(InputId)("denied-routing-input"),
+              sessionId: testSessionId,
+              kind: "created",
+              body: "Fix routing",
+              payload: {},
+            });
+            yield* (yield* SessionAuthority).processSession(testSessionId);
+            const run = Option.getOrThrow(yield* runs.get(testSessionId));
+            expect(run.state).toBe("canceled");
+            expect(run.terminalReason).toEqual(
+              Option.some("Linear team access was removed"),
+            );
+            expect(run.teamId).toEqual(Option.some("api-team"));
+            expect(linearIssueReads).toBe(1);
+            expect(workerSpawnInputs).toEqual([]);
+          }),
+        { withLinearGateway: true },
+      ),
+  );
+  it.live("preserves known team and project IDs when issue lookup fails", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const runs = yield* RunRepo;
+          yield* (yield* InstallationRepo).put(install(testOrganizationId));
+          const teamId = Schema.decodeUnknownSync(TeamId)("known-team");
+          const projectId =
+            Schema.decodeUnknownSync(ProjectId)("known-project");
+          linearIssueLookupFails = true;
+          yield* runs.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+            teamId: Option.some(teamId),
+            projectId: Option.some(projectId),
+          });
+          yield* (yield* RunInputRepo).enqueue({
+            id: Schema.decodeUnknownSync(InputId)("preserved-routing-input"),
+            sessionId: testSessionId,
+            kind: "created",
+            body: "Fix routing",
+            payload: {},
+          });
+          yield* (yield* SessionAuthority).processSession(testSessionId);
+          const run = Option.getOrThrow(yield* runs.get(testSessionId));
+          expect(run.teamId).toEqual(Option.some(teamId));
+          expect(run.projectId).toEqual(Option.some(projectId));
+          expect(linearIssueReads).toBe(1);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
   for (const route of [
     "project",
     "issue-label",

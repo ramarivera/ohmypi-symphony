@@ -212,11 +212,13 @@ export const makeGitHubApp = (input: {
                     }),
                   ),
             ),
-            Effect.catch(() =>
+            Effect.catch((error) =>
               Effect.logWarning("github.bot_user_lookup_failed").pipe(
                 Effect.annotateLogs({
                   event: "github.bot_user_lookup_failed",
                   bot: name,
+                  reason: error.reason,
+                  error: error.message,
                 }),
                 Effect.as(`${name}@users.noreply.github.com`),
               ),

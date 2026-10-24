@@ -369,4 +369,40 @@ describe("GitHub App bot identity", () => {
         }),
     );
   }
+  it.live(
+    "retries the bot user lookup after a fallback and then caches the id-based identity",
+    () =>
+      Effect.gen(function* () {
+        const requests: string[] = [];
+        let userCalls = 0;
+        const app = makeGitHubApp({
+          appId: "12345",
+          privateKey: privateKeyPem,
+          fetch: async (url) => {
+            requests.push(String(url));
+            if (String(url).endsWith("/app"))
+              return Response.json({ slug: "test-app" });
+            userCalls += 1;
+            return userCalls === 1
+              ? new Response(null, { status: 503 })
+              : Response.json({ id: 98765 });
+          },
+        });
+        expect(yield* app.getBotIdentity()).toEqual({
+          name: "test-app[bot]",
+          email: "test-app[bot]@users.noreply.github.com",
+        });
+        expect(userCalls).toBe(1);
+        const identity = {
+          name: "test-app[bot]",
+          email: "98765+test-app[bot]@users.noreply.github.com",
+        };
+        expect(yield* app.getBotIdentity()).toEqual(identity);
+        expect(userCalls).toBe(2);
+        expect(requests).toHaveLength(4);
+        expect(yield* app.getBotIdentity()).toEqual(identity);
+        expect(userCalls).toBe(2);
+        expect(requests).toHaveLength(4);
+      }),
+  );
 });

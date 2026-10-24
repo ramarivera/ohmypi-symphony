@@ -50,6 +50,7 @@ const sdkState = vi.hoisted(() => {
       }>
     >;
     teamCalls: number;
+    issueHandler: (id: string) => Promise<unknown>;
     activityHandler: (input: ActivityInput) => Promise<unknown>;
   } = {
     activities: [],
@@ -61,6 +62,7 @@ const sdkState = vi.hoisted(() => {
     createdSessionInputs: [],
     startedStates: new Map(),
     teamCalls: 0,
+    issueHandler: async () => undefined,
     activityHandler: async () => ({
       success: true,
       agentActivityId: "activity-id",
@@ -68,6 +70,9 @@ const sdkState = vi.hoisted(() => {
   };
 
   class TestLinearClient {
+    issue(id: string): Promise<unknown> {
+      return state.issueHandler(id);
+    }
     createAgentActivity(input: ActivityInput): Promise<unknown> {
       state.activities.push(input);
       for (const waiter of state.waiters.splice(0)) {
@@ -146,6 +151,7 @@ const sdkState = vi.hoisted(() => {
       state.createdSessionInputs.length = 0;
       state.startedStates.clear();
       state.teamCalls = 0;
+      state.issueHandler = async () => undefined;
       state.activityHandler = async () => ({
         success: true,
         agentActivityId: "activity-id",
@@ -701,6 +707,89 @@ describe("LinearGateway parity", () => {
         expect(reason.error).toBeInstanceOf(LinearRateLimitError);
     }
   });
+});
+
+describe("LinearGateway.getIssue project enrichment", () => {
+  for (const stage of ["project", "project-labels"] as const) {
+    for (const failure of [
+      "unavailable",
+      "rate-limited",
+      "persistent-rate-limit",
+    ] as const) {
+      effectIt.live(`handles ${failure} during ${stage} enrichment`, () =>
+        Effect.gen(function* () {
+          let attempts = 0;
+          sdkState.state.issueHandler = async (id) => {
+            attempts += 1;
+            const load = async () => {
+              if (failure === "unavailable")
+                throw new Error("project unavailable");
+              if (failure === "persistent-rate-limit" || attempts === 1)
+                throw { status: 429, retryAfter: 0 };
+            };
+            return {
+              id,
+              identifier: "TEST-1",
+              title: "Issue snapshot",
+              description: "Still available",
+              stateId: "state-started",
+              state: Promise.resolve({
+                id: "state-started",
+                name: "Started",
+                type: "started",
+              }),
+              delegateId: "app-user",
+              url: "https://linear.app/test/issue/TEST-1",
+              teamId: "api-team",
+              projectId: "api-project",
+              labels: async () => ({ nodes: [{ name: "issue-label" }] }),
+              get project() {
+                return (async () => {
+                  if (stage === "project") await load();
+                  return {
+                    id: "api-project",
+                    labels: async () => {
+                      if (stage === "project-labels") await load();
+                      return { nodes: [{ name: "project-label" }] };
+                    },
+                  };
+                })();
+              },
+            };
+          };
+          const gateway = yield* LinearGateway;
+          const result = yield* Effect.result(
+            gateway.getIssue({ sessionId, issueId }),
+          );
+          expect(attempts).toBe(failure === "unavailable" ? 1 : 2);
+          if (failure === "persistent-rate-limit") {
+            expect(result._tag).toBe("Failure");
+            if (result._tag === "Failure")
+              expect(result.failure).toBeInstanceOf(LinearRateLimitError);
+          } else {
+            expect(result._tag).toBe("Success");
+            if (result._tag === "Success")
+              expect(result.success).toEqual({
+                id: issueId,
+                identifier: "TEST-1",
+                title: "Issue snapshot",
+                description: "Still available",
+                stateId: "state-started",
+                stateName: "Started",
+                stateType: "started",
+                delegateId: "app-user",
+                url: "https://linear.app/test/issue/TEST-1",
+                teamId: "api-team",
+                projectId: "api-project",
+                projectLabels:
+                  failure === "unavailable" ? [] : ["project-label"],
+                labels: ["issue-label"],
+              });
+          }
+        }).pipe(Effect.provide(gatewayLayer)),
+      );
+    }
+  }
 });
 
 describe("LinearGateway.createSessionOnIssue", () => {
