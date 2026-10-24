@@ -603,11 +603,22 @@ describe("Workspace", () => {
             getInstallationToken: () => Effect.succeed("fresh-token"),
           },
         });
-        yield* Effect.result(
+        const refreshed = yield* Effect.result(
           workspace.refreshGitHubExtraHeader(id, record, inner),
         );
+        // Refresh must get past identity setup and stop at credential
+        // persistence, so the assertions below exercise the identity guard.
+        expect(Result.isFailure(refreshed)).toBe(true);
+        if (Result.isFailure(refreshed)) {
+          expect(refreshed.failure.message).toBe(
+            "Could not persist GitHub credential",
+          );
+        }
         expect(yield* readGitConfig("user.name", outer)).toBeUndefined();
         expect(yield* readGitConfig("user.email", outer)).toBeUndefined();
+        expect(
+          yield* readGitConfig("http.https://github.com/.extraheader", outer),
+        ).toBeUndefined();
       }),
   );
 
