@@ -983,6 +983,15 @@ export const makeWorkspace = (input: {
         target: string,
       ): Effect.fn.Return<void, WorkspaceError> {
         if (input.githubApp === undefined) return;
+        // Without its own .git, `git config --local` would walk up and write
+        // into whatever repository encloses the target.
+        const ownsGitDir = yield* Effect.promise(() =>
+          lstat(join(target, ".git")).then(
+            () => true,
+            () => false,
+          ),
+        );
+        if (!ownsGitDir) return;
         const identity = yield* input.githubApp.getBotIdentity().pipe(
           Effect.map(Option.some),
           Effect.catch((error) =>
