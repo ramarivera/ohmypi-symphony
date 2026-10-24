@@ -964,25 +964,25 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
           switch (type) {
             case "agent_start":
               kind = "agent";
-              text = "OhMyPi agent started";
+              text = "Partitura agent started";
               level = "info";
               break;
             case "turn_start":
               kind = "turn";
-              text = "OhMyPi agent turn started";
+              text = "Partitura agent turn started";
               level = "info";
               break;
             case "turn_end":
               kind = "turn";
-              text = "OhMyPi agent turn ended";
+              text = "Partitura agent turn ended";
               level = "info";
               break;
             case "agent_end":
               kind = "agent";
               text =
                 event.willContinue === true
-                  ? "OhMyPi agent turn ended (will continue)"
-                  : "OhMyPi agent ended";
+                  ? "Partitura agent turn ended (will continue)"
+                  : "Partitura agent ended";
               level = "result";
               break;
             case "tool_execution_start":
@@ -997,15 +997,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               break;
             case "message_end":
               kind = "message";
-              text = "OhMyPi message ended";
+              text = "Partitura message ended";
               level = "info";
               break;
             case "prompt_result":
               kind = "prompt";
               text =
                 event.agentInvoked === false
-                  ? "OhMyPi command completed without agent"
-                  : "OhMyPi prompt result";
+                  ? "Partitura command completed without agent"
+                  : "Partitura prompt result";
               level = event.agentInvoked === false ? "result" : "info";
               break;
             case "extension_ui_request": {
@@ -1026,7 +1026,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               text =
                 typeof event.message === "string"
                   ? event.message
-                  : "OhMyPi worker failed";
+                  : "Partitura worker failed";
               break;
             default:
               text = type;
@@ -1114,7 +1114,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         yield* projector.thought(
           sessionId,
           `local-command:${sourceId}`,
-          "The OhMyPi command completed without starting an agent turn.",
+          "The Partitura command completed without starting an agent turn.",
         );
       });
 
@@ -1270,7 +1270,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               sessionId,
               `failure:${correlationId}`,
               "error",
-              `The OhMyPi run failed after ${run.attempt} attempts. Reference: ${correlationId}`,
+              `The Partitura run failed after ${run.attempt} attempts. Reference: ${correlationId}`,
             );
             yield* releaseMutationGate(sessionId);
             yield* clearSessionStopDeferrals(sessionId);
@@ -1455,7 +1455,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
               message:
                 typeof event.message === "string"
                   ? event.message
-                  : "OhMyPi worker failed",
+                  : "Partitura worker failed",
             }),
           );
         }
@@ -2847,7 +2847,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 yield* projector.thought(
                   sessionId,
                   `retry:${resumed.attempt}`,
-                  `Retrying the interrupted OhMyPi run (attempt ${resumed.attempt}).`,
+                  `Retrying the interrupted Partitura run (attempt ${resumed.attempt}).`,
                 );
                 if (Option.isSome(resumed.ompSessionFile)) {
                   yield* worker.followUp(
@@ -2927,7 +2927,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     `run-url:${sessionId}`,
                     [
                       {
-                        label: "OhMyPi run",
+                        label: "Partitura run",
                         url: runUrlForSession(sessionId),
                       },
                     ],

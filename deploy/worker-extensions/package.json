@@ -1,5 +1,5 @@
 {
-  "name": "ohmypi-symphony-worker-extensions",
+  "name": "partitura-worker-extensions",
   "private": true,
   "description": "omp extensions installed read-only into the gateway image for every worker. Pinned with bun.lock; see docs/worker-profile.md.",
   "dependencies": {

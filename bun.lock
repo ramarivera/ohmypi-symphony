@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "ohmypi-linear-gateway",
+      "name": "partitura",
       "dependencies": {
         "@effect/platform-bun": "4.0.6",
         "@linear/sdk": "89.0.0",

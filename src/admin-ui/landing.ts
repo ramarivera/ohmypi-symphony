@@ -8,7 +8,7 @@
 import { THEME_CONTROLS } from "./theme";
 export const LANDING_BODY = `
 <header class="landing-header">
-  <div class="brand"><strong>OhMyPi</strong> &nbsp;↔&nbsp; Linear Control Plane</div>
+  <div class="brand"><strong>Partitura</strong> &nbsp;↔&nbsp; Linear Control Plane</div>
   <div class="landing-header-tools">
     <div class="version">v1 · operator console</div>
     ${THEME_CONTROLS}
@@ -68,7 +68,7 @@ export const LANDING_BODY = `
           <h3>Route the first issue</h3>
           <p>
             Pick the repositories the gateway may route to, set a default, and the next
-            assigned issue spins up an OhMyPi session in the right worktree with the right
+            assigned issue starts an OMP or T3 Code session in the right worktree with the right
             ref — automatically.
           </p>
         </div>

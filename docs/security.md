@@ -157,7 +157,7 @@ allowlist forwards no direct model-provider keys or endpoints, including
 `OPENROUTER_API_KEY`. The one model credential
 a worker sees is the dedicated CLIProxyAPI client key, which the gateway reads
 from `CLIPROXYAPI_API_KEY` or `CLIPROXYAPI_API_KEY_FILE` and injects per run with
-`CLIPROXYAPI_BASE_URL`. The worker can read it, so give Symphony its own
+`CLIPROXYAPI_BASE_URL`. The worker can read it, so give Partitura its own
 client key. CLIProxyAPI currently stays keyless, so the gateway still sends its
 key but revocation won't take effect until CLIProxyAPI enforces client keys.
 Gateway-only keys and arbitrary

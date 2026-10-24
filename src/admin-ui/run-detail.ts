@@ -220,7 +220,7 @@ export function renderRunDetailBody(
   return `<main class="run-detail" data-run-updated-at="${model.run.updatedAt}">
   <header class="run-header">
     <div>
-      <p class="eyebrow">OhMyPi run</p>
+      <p class="eyebrow">Partitura run</p>
       <h1>${present(model.run.sessionId)}</h1>
       <p class="run-status" data-state="${escapeHtml(model.run.state)}">${present(model.run.state)}</p>
     </div>

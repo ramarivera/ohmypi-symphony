@@ -113,7 +113,7 @@ export interface GatewayConfigShape {
   readonly workerProfileMaxEntries?: number;
   /** CLIProxyAPI origin; the only model endpoint workers are configured for. */
   readonly cliproxyApiBaseUrl?: string | undefined;
-  /** Dedicated Symphony client key, passed only into worker environments. */
+  /** Dedicated Partitura client key, passed only into worker environments. */
   readonly cliproxyApiKey?: Redacted.Redacted<string> | undefined;
   readonly workerDefaultModel?: string | undefined;
   /** Gateway-installed omp extensions loaded into every worker, e.g. pi-claude-cli. */
