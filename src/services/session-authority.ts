@@ -2990,7 +2990,14 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                           )
                       : Option.none<LinearIssue>();
                   const webhookContext = inputContext(input.payload);
-                  const baseContext = Option.isSome(issueSnapshot)
+                  // Unavailable metadata never clears ids the run already knows.
+                  const knownTeamId = Option.getOrNull(latest.teamId) as
+                    | string
+                    | null;
+                  const knownProjectId = Option.getOrNull(latest.projectId) as
+                    | string
+                    | null;
+                  const enrichedContext = Option.isSome(issueSnapshot)
                     ? {
                         ...webhookContext,
                         teamId:
@@ -3004,6 +3011,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                         ),
                       }
                     : webhookContext;
+                  const baseContext = {
+                    ...enrichedContext,
+                    teamId: enrichedContext.teamId ?? knownTeamId,
+                    projectId: enrichedContext.projectId ?? knownProjectId,
+                  };
                   yield* updateRun(sessionId, {
                     teamId: Option.fromNullishOr(
                       baseContext.teamId as TeamId | null,
