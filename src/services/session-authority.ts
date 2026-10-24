@@ -2927,7 +2927,9 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     `run-url:${sessionId}`,
                     [
                       {
-                        label: "Partitura run",
+                        // This label is part of the persisted payload for the
+                        // stable run-url key. Keep it compatible on resume.
+                        label: "OhMyPi run",
                         url: runUrlForSession(sessionId),
                       },
                     ],
