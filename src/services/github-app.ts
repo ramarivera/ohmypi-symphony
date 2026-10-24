@@ -222,8 +222,10 @@ export const makeGitHubApp = (input: {
               ),
             ),
           );
-          botIdentity = { name, email };
-          return botIdentity;
+          const identity = { name, email };
+          // Only cache the id-based address so a transient lookup failure retries.
+          if (!email.startsWith(name)) botIdentity = identity;
+          return identity;
         }),
       );
     },

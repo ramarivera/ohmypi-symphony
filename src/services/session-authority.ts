@@ -2737,28 +2737,31 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 onSome: (value) => value,
               },
             );
-            if (
+            const teamDenied = (teamId: string): boolean =>
               snapshotKnown &&
-              Option.isSome(run.teamId) &&
               !canAccessAll &&
-              !teamAccess.includes(run.teamId.value)
-            ) {
-              if (Option.isSome(run.workspacePath)) {
-                yield* removeMcpConfig(run.workspacePath.value);
-              }
-              yield* updateRun(sessionId, {
-                state: "canceled",
-                terminalReason: Option.some("Linear team access was removed"),
+              !teamAccess.some((id) => id === teamId);
+            const cancelForTeamAccess = (teamId: string) =>
+              Effect.gen(function* () {
+                if (Option.isSome(run.workspacePath)) {
+                  yield* removeMcpConfig(run.workspacePath.value);
+                }
+                yield* updateRun(sessionId, {
+                  state: "canceled",
+                  terminalReason: Option.some("Linear team access was removed"),
+                });
+                yield* clearWorkspaceCredentials(run);
+                yield* projector.terminal(
+                  sessionId,
+                  `team-access-removed:${teamId}`,
+                  "response",
+                  "Stopped because this Linear installation no longer has access to the issue's team.",
+                );
+                yield* releaseMutationGate(sessionId);
+                yield* clearSessionStopDeferrals(sessionId);
               });
-              yield* clearWorkspaceCredentials(run);
-              yield* projector.terminal(
-                sessionId,
-                `team-access-removed:${run.teamId.value}`,
-                "response",
-                "Stopped because this Linear installation no longer has access to the issue's team.",
-              );
-              yield* releaseMutationGate(sessionId);
-              yield* clearSessionStopDeferrals(sessionId);
+            if (Option.isSome(run.teamId) && teamDenied(run.teamId.value)) {
+              yield* cancelForTeamAccess(run.teamId.value);
               return;
             }
             let worker: RpcWorkerHandle | undefined = Option.getOrElse(
@@ -3009,6 +3012,15 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                       baseContext.projectId as ProjectId | null,
                     ),
                   });
+                  // Sparse webhooks can omit the team, so the gate above may not
+                  // have seen it; recheck once the Linear issue supplied it.
+                  if (
+                    baseContext.teamId !== null &&
+                    teamDenied(baseContext.teamId)
+                  ) {
+                    yield* cancelForTeamAccess(baseContext.teamId);
+                    return;
+                  }
                   const resolvedContext = {
                     ...baseContext,
                     organizationId:
