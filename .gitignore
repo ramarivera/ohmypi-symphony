@@ -17,3 +17,6 @@ fnox.out
 # Beads local worktree coordination
 .beads.gate.lock
 .beads.gate.lock.*
+
+# Local file-backed deployment credentials.
+deploy/tailscale/secrets/
