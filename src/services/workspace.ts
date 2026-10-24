@@ -969,12 +969,64 @@ export const makeWorkspace = (input: {
               repository,
               sessionId,
             );
+      yield* configureGitIdentity(sessionId, target);
       if (githubExtraHeader === undefined) {
         yield* unsetGitHubExtraHeader(target, sessionId, input.gitTimeoutMs);
         return;
       }
       yield* persistGitHubExtraHeader(target, sessionId, githubExtraHeader);
     });
+
+    const configureGitIdentity = Effect.fn("Workspace.configureGitIdentity")(
+      function* (
+        sessionId: string,
+        target: string,
+      ): Effect.fn.Return<void, WorkspaceError> {
+        if (input.githubApp === undefined) return;
+        const identity = yield* input.githubApp.getBotIdentity().pipe(
+          Effect.map(Option.some),
+          Effect.catch((error) =>
+            error.reason === "disabled"
+              ? Effect.succeed(Option.none())
+              : Effect.logWarning("workspace.git_identity_lookup_failed").pipe(
+                  Effect.annotateLogs({
+                    event: "workspace.git_identity_lookup_failed",
+                    sessionId,
+                    reason: error.reason,
+                    error: error.message,
+                  }),
+                  Effect.as(Option.none()),
+                ),
+          ),
+        );
+        if (Option.isNone(identity)) return;
+        // runGit enters the checkout owner's uid before touching its local config.
+        // Identity is best-effort: a missing author must not fail workspace setup.
+        yield* Effect.forEach(
+          [
+            ["user.name", identity.value.name],
+            ["user.email", identity.value.email],
+          ] as const,
+          ([key, value]) =>
+            git(
+              ["config", "--local", "--replace-all", key, value],
+              target,
+              sessionId,
+            ),
+          { discard: true },
+        ).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("workspace.git_identity_config_failed").pipe(
+              Effect.annotateLogs({
+                event: "workspace.git_identity_config_failed",
+                sessionId,
+                error: error.message,
+              }),
+            ),
+          ),
+        );
+      },
+    );
 
     const clearGitHubExtraHeader = (
       sessionId: string,
@@ -1218,6 +1270,7 @@ export const makeWorkspace = (input: {
               staging,
               sessionId,
             );
+            yield* configureGitIdentity(sessionId, staging);
             yield* writeMarker(
               join(staging, ".linear-gateway-workspace.json"),
               repository,

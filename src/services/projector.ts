@@ -694,12 +694,7 @@ export class ActivityProjector extends Context.Service<ActivityProjector>()(
               );
               return;
             case "agent_start":
-              yield* thought(
-                sessionId,
-                sourceKey,
-                "OhMyPi worker started",
-                true,
-              );
+              yield* thought(sessionId, sourceKey, "Worker started", true);
               return;
             case "turn_start":
               yield* thought(

@@ -33,7 +33,7 @@ import {
   type TokenRefreshError,
   type WorkspaceError,
 } from "../domain/errors.js";
-import type { SessionId, SourceKey } from "../domain/ids.js";
+import type { ProjectId, SessionId, SourceKey, TeamId } from "../domain/ids.js";
 import {
   type AgentRun,
   isDeferredNotificationStopPayload,
@@ -57,7 +57,7 @@ import {
 import { openDriverWorker } from "../drivers/worker-adapter.js";
 import { GatewayConfig, type T3LaunchConfig } from "./config.js";
 import { GitHubApp } from "./github-app.js";
-import { LinearGateway } from "./linear-gateway.js";
+import { LinearGateway, type LinearIssue } from "./linear-gateway.js";
 import {
   removeMcpConfig,
   resolveEffectiveMcpServers,
@@ -554,6 +554,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         run: AgentRun,
         payload: unknown,
         installation: { readonly appUserId: string },
+        issueSnapshot?: Option.Option<LinearIssue>,
       ): Effect.Effect<void, never> =>
         Effect.gen(function* () {
           if (Option.isNone(linearOption)) return;
@@ -562,26 +563,28 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
             return;
           }
           const runIssueId = run.issueId.value;
-          const issue = yield* linear
-            .getIssue({
-              sessionId: run.sessionId,
-              issueId: runIssueId,
-            })
-            .pipe(
-              Effect.map(Option.some),
-              Effect.catch((error) =>
-                Effect.logWarning("issue.lifecycle_fetch_failed").pipe(
-                  Effect.annotateLogs({
-                    event: "issue.lifecycle_fetch_failed",
-                    sessionId: run.sessionId,
-                    issueId: runIssueId,
-                    error:
-                      error instanceof Error ? error.message : String(error),
-                  }),
-                  Effect.as(Option.none()),
+          const issue =
+            issueSnapshot ??
+            (yield* linear
+              .getIssue({
+                sessionId: run.sessionId,
+                issueId: runIssueId,
+              })
+              .pipe(
+                Effect.map(Option.some),
+                Effect.catch((error) =>
+                  Effect.logWarning("issue.lifecycle_fetch_failed").pipe(
+                    Effect.annotateLogs({
+                      event: "issue.lifecycle_fetch_failed",
+                      sessionId: run.sessionId,
+                      issueId: runIssueId,
+                      error:
+                        error instanceof Error ? error.message : String(error),
+                    }),
+                    Effect.as(Option.none()),
+                  ),
                 ),
-              ),
-            );
+              ));
           if (Option.isNone(issue)) return;
 
           const stateType = issue.value.stateType?.toLowerCase();
@@ -2024,6 +2027,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         run: AgentRun,
         cwd: string,
         refreshWorkspaceCredentials = false,
+        issueSnapshot?: Option.Option<LinearIssue>,
       ): Effect.fn.Return<
         RpcWorkerHandle,
         | DatabaseError
@@ -2049,7 +2053,11 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
         let labels = Option.isSome(latestInput)
           ? inputContext(latestInput.value.payload).issueLabels
           : [];
+        if (issueSnapshot !== undefined && Option.isSome(issueSnapshot)) {
+          labels = issueSnapshot.value.labels;
+        }
         if (
+          issueSnapshot === undefined &&
           Option.isNone(saved) &&
           Option.isSome(run.issueId) &&
           Option.isSome(linearOption)
@@ -2729,28 +2737,31 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 onSome: (value) => value,
               },
             );
-            if (
+            const teamDenied = (teamId: string): boolean =>
               snapshotKnown &&
-              Option.isSome(run.teamId) &&
               !canAccessAll &&
-              !teamAccess.includes(run.teamId.value)
-            ) {
-              if (Option.isSome(run.workspacePath)) {
-                yield* removeMcpConfig(run.workspacePath.value);
-              }
-              yield* updateRun(sessionId, {
-                state: "canceled",
-                terminalReason: Option.some("Linear team access was removed"),
+              !teamAccess.some((id) => id === teamId);
+            const cancelForTeamAccess = (teamId: string) =>
+              Effect.gen(function* () {
+                if (Option.isSome(run.workspacePath)) {
+                  yield* removeMcpConfig(run.workspacePath.value);
+                }
+                yield* updateRun(sessionId, {
+                  state: "canceled",
+                  terminalReason: Option.some("Linear team access was removed"),
+                });
+                yield* clearWorkspaceCredentials(run);
+                yield* projector.terminal(
+                  sessionId,
+                  `team-access-removed:${teamId}`,
+                  "response",
+                  "Stopped because this Linear installation no longer has access to the issue's team.",
+                );
+                yield* releaseMutationGate(sessionId);
+                yield* clearSessionStopDeferrals(sessionId);
               });
-              yield* clearWorkspaceCredentials(run);
-              yield* projector.terminal(
-                sessionId,
-                `team-access-removed:${run.teamId.value}`,
-                "response",
-                "Stopped because this Linear installation no longer has access to the issue's team.",
-              );
-              yield* releaseMutationGate(sessionId);
-              yield* clearSessionStopDeferrals(sessionId);
+            if (Option.isSome(run.teamId) && teamDenied(run.teamId.value)) {
+              yield* cancelForTeamAccess(run.teamId.value);
               return;
             }
             let worker: RpcWorkerHandle | undefined = Option.getOrElse(
@@ -2925,7 +2936,7 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                 yield* projector.thought(
                   sessionId,
                   `accepted:${input.id}`,
-                  "Request accepted; preparing the OhMyPi worker.",
+                  "Request accepted; preparing the worker.",
                 );
                 const existingWorkspacePath =
                   Option.isSome(latest.repositoryId) &&
@@ -2955,7 +2966,73 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     true,
                   );
                 } else {
-                  const baseContext = inputContext(input.payload);
+                  const issueSnapshot =
+                    Option.isSome(latest.issueId) && Option.isSome(linearOption)
+                      ? yield* linearOption.value
+                          .getIssue({
+                            sessionId,
+                            issueId: latest.issueId.value,
+                          })
+                          .pipe(
+                            Effect.map(Option.some),
+                            Effect.catch(() =>
+                              Effect.logWarning(
+                                "repository.routing_issue_fetch_failed",
+                              ).pipe(
+                                Effect.annotateLogs({
+                                  event:
+                                    "repository.routing_issue_fetch_failed",
+                                  sessionId,
+                                }),
+                                Effect.as(Option.none<LinearIssue>()),
+                              ),
+                            ),
+                          )
+                      : Option.none<LinearIssue>();
+                  const webhookContext = inputContext(input.payload);
+                  // Unavailable metadata never clears ids the run already knows.
+                  const knownTeamId = Option.getOrNull(latest.teamId) as
+                    | string
+                    | null;
+                  const knownProjectId = Option.getOrNull(latest.projectId) as
+                    | string
+                    | null;
+                  const enrichedContext = Option.isSome(issueSnapshot)
+                    ? {
+                        ...webhookContext,
+                        teamId:
+                          issueSnapshot.value.teamId ?? webhookContext.teamId,
+                        projectId:
+                          issueSnapshot.value.projectId ??
+                          webhookContext.projectId,
+                        issueLabels: labelSet(issueSnapshot.value.labels),
+                        projectLabels: labelSet(
+                          issueSnapshot.value.projectLabels,
+                        ),
+                      }
+                    : webhookContext;
+                  const baseContext = {
+                    ...enrichedContext,
+                    teamId: enrichedContext.teamId ?? knownTeamId,
+                    projectId: enrichedContext.projectId ?? knownProjectId,
+                  };
+                  yield* updateRun(sessionId, {
+                    teamId: Option.fromNullishOr(
+                      baseContext.teamId as TeamId | null,
+                    ),
+                    projectId: Option.fromNullishOr(
+                      baseContext.projectId as ProjectId | null,
+                    ),
+                  });
+                  // Sparse webhooks can omit the team, so the gate above may not
+                  // have seen it; recheck once the Linear issue supplied it.
+                  if (
+                    baseContext.teamId !== null &&
+                    teamDenied(baseContext.teamId)
+                  ) {
+                    yield* cancelForTeamAccess(baseContext.teamId);
+                    return;
+                  }
                   const resolvedContext = {
                     ...baseContext,
                     organizationId:
@@ -3020,10 +3097,13 @@ export class SessionAuthority extends Context.Service<SessionAuthority>()(
                     updatedOption.value,
                     input.payload,
                     installation.value,
+                    issueSnapshot,
                   );
                   worker = yield* startWorker(
                     updatedOption.value,
                     workspacePath,
+                    false,
+                    issueSnapshot,
                   );
                 }
                 const agentInvoked = yield* worker.prompt(

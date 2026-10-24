@@ -1,5 +1,13 @@
 import { createSign } from "node:crypto";
-import { Context, Deferred, Effect, Layer, Redacted, Schema } from "effect";
+import {
+  Context,
+  Deferred,
+  Effect,
+  Layer,
+  Redacted,
+  Schema,
+  Semaphore,
+} from "effect";
 import { GatewayConfig } from "./config.js";
 
 const GITHUB_API = "https://api.github.com";
@@ -27,12 +35,19 @@ export class GitHubAppError extends Schema.TaggedError<GitHubAppError>()(
       "invalid_response",
       "not_installed",
       "tenant_forbidden",
+      "bot_identity",
     ]),
     status: Schema.optional(Schema.Number),
   },
 ) {}
 
+export interface GitBotIdentity {
+  readonly name: string;
+  readonly email: string;
+}
+
 export interface GitHubAppTokenService {
+  readonly getBotIdentity: () => Effect.Effect<GitBotIdentity, GitHubAppError>;
   readonly getInstallationToken: (
     owner: string,
     repository: string,
@@ -118,6 +133,105 @@ export const makeGitHubApp = (input: {
     { readonly token: string; readonly expiresAt: number }
   >();
   const inFlight = new Map<string, Deferred.Deferred<string, GitHubAppError>>();
+
+  let botIdentity: GitBotIdentity | undefined;
+  const identityGate = Semaphore.makeUnsafe(1);
+  const getBotIdentity = Effect.fn("GitHubApp.getBotIdentity")(
+    function* (): Effect.fn.Return<GitBotIdentity, GitHubAppError> {
+      return yield* identityGate.withPermits(1)(
+        Effect.gen(function* () {
+          if (botIdentity !== undefined) return botIdentity;
+          const { appId, privateKey } = input;
+          if (appId === undefined || privateKey === undefined) {
+            return yield* new GitHubAppError({
+              message: "GitHub App credentials are not configured",
+              operation: "getBotIdentity",
+              reason: "disabled",
+            });
+          }
+          const jwt = yield* Effect.try({
+            try: () => buildGitHubAppJwt(appId, privateKey, now()),
+            catch: () =>
+              new GitHubAppError({
+                message: "Could not sign GitHub App JWT",
+                operation: "getBotIdentity",
+                reason: "jwt",
+              }),
+          });
+          const headers = {
+            Accept: "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+          };
+          const app = yield* responseJson(
+            fetchImpl,
+            "app_identity",
+            "bot_identity",
+            `${GITHUB_API}/app`,
+            {
+              headers: { ...headers, Authorization: `Bearer ${jwt}` },
+              signal: AbortSignal.timeout(10_000),
+            },
+          );
+          if (
+            typeof app !== "object" ||
+            app === null ||
+            !("slug" in app) ||
+            typeof app.slug !== "string" ||
+            !/^[a-zA-Z0-9-]+$/u.test(app.slug)
+          ) {
+            return yield* new GitHubAppError({
+              message: "GitHub App slug response was invalid",
+              operation: "getBotIdentity",
+              reason: "invalid_response",
+            });
+          }
+          const name = `${app.slug}[bot]`;
+          const email = yield* responseJson(
+            fetchImpl,
+            "bot_user",
+            "bot_identity",
+            `${GITHUB_API}/users/${encodeURIComponent(name)}`,
+            {
+              headers,
+              signal: AbortSignal.timeout(10_000),
+            },
+          ).pipe(
+            Effect.flatMap((user) =>
+              typeof user === "object" &&
+              user !== null &&
+              "id" in user &&
+              typeof user.id === "number" &&
+              Number.isSafeInteger(user.id) &&
+              user.id > 0
+                ? Effect.succeed(`${user.id}+${name}@users.noreply.github.com`)
+                : Effect.fail(
+                    new GitHubAppError({
+                      message: "GitHub bot user response was invalid",
+                      operation: "getBotIdentity",
+                      reason: "invalid_response",
+                    }),
+                  ),
+            ),
+            Effect.catch((error) =>
+              Effect.logWarning("github.bot_user_lookup_failed").pipe(
+                Effect.annotateLogs({
+                  event: "github.bot_user_lookup_failed",
+                  bot: name,
+                  reason: error.reason,
+                  error: error.message,
+                }),
+                Effect.as(`${name}@users.noreply.github.com`),
+              ),
+            ),
+          );
+          const identity = { name, email };
+          // Only cache the id-based address so a transient lookup failure retries.
+          if (!email.startsWith(name)) botIdentity = identity;
+          return identity;
+        }),
+      );
+    },
+  );
 
   const getInstallationToken = Effect.fn("GitHubApp.getInstallationToken")(
     function* (
@@ -303,7 +417,7 @@ export const makeGitHubApp = (input: {
     },
   );
 
-  return { getInstallationToken };
+  return { getInstallationToken, getBotIdentity };
 };
 
 export class GitHubApp extends Context.Service<GitHubApp>()("GitHubApp", {

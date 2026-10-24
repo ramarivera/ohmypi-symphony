@@ -30,6 +30,7 @@ import {
   IssueId,
   McpServerId,
   OrganizationId,
+  ProjectId,
   SessionId,
   SourceKey,
   TeamId,
@@ -76,6 +77,7 @@ import {
 import { WorkerIdentityRepo } from "../src/services/store/worker-identity-repo.js";
 import { TokenCrypto } from "../src/services/token-crypto.js";
 import { tokenContext } from "../src/services/token-migration.js";
+import { safeSessionKey } from "../src/services/workspace.js";
 import { FakeT3Server } from "./fixtures/fake-t3.js";
 import { testPaths } from "./fixtures/paths.js";
 
@@ -1026,6 +1028,10 @@ const toolExternalUrlCalls: Array<{
   }>;
 }> = [];
 let linearIssueLabels: ReadonlyArray<string> = [];
+let linearIssueTeamId: string | null = null;
+let linearIssueProjectId: string | null = null;
+let linearProjectLabels: ReadonlyArray<string> = [];
+let linearIssueReads = 0;
 let linearIssueLookupFails = false;
 let linearIssueStateType = "started";
 let elicitationWaiter: Deferred.Deferred<void, never> | undefined;
@@ -1200,8 +1206,9 @@ const mockToolsGateway = LinearGateway.of({
   refreshInstallation: () => Effect.die(new Error("unused in authority tests")),
   listSessionActivities: () =>
     Effect.die(new Error("unused in authority tests")),
-  getIssue: () =>
-    linearIssueLookupFails
+  getIssue: () => {
+    linearIssueReads++;
+    return linearIssueLookupFails
       ? Effect.fail(
           new LinearApiError({
             message: "issue lookup unavailable",
@@ -1218,9 +1225,12 @@ const mockToolsGateway = LinearGateway.of({
           stateType: linearIssueStateType,
           delegateId: "authority-app-user",
           url: null,
-          teamId: null,
+          teamId: linearIssueTeamId,
+          projectId: linearIssueProjectId,
+          projectLabels: linearProjectLabels,
           labels: linearIssueLabels,
-        }),
+        });
+  },
   updateIssue: () => Effect.void,
   addSessionExternalUrls: (input: {
     readonly sessionId: string;
@@ -1272,6 +1282,10 @@ const withAuthority = <A, E>(
       authorityTestRoot = testPath("temporary");
       linearIssueLookupFails = false;
       linearIssueLabels = [];
+      linearIssueTeamId = null;
+      linearIssueProjectId = null;
+      linearProjectLabels = [];
+      linearIssueReads = 0;
       linearIssueStateType = "started";
       toolExternalUrlCalls.length = 0;
       terminalFailure = undefined;
@@ -3915,6 +3929,11 @@ describe("AgentDriver authority integration", () => {
           {
             withLinearGateway: true,
             githubApp: {
+              getBotIdentity: () =>
+                Effect.succeed({
+                  name: "test-app[bot]",
+                  email: "98765+test-app[bot]@users.noreply.github.com",
+                }),
               getInstallationToken: () => Effect.succeed("ghs_launch"),
             },
             config: [
@@ -3969,4 +3988,203 @@ describe("AgentDriver authority integration", () => {
         );
       }),
   );
+});
+
+describe("SessionAuthority repository routing enrichment", () => {
+  it.live(
+    "cancels a sparse webhook when the enriched issue team is inaccessible",
+    () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const runs = yield* RunRepo;
+            yield* (yield* InstallationRepo).put({
+              ...install(testOrganizationId),
+              accessibleTeamIds: Option.some([]),
+              canAccessAllPublicTeams: Option.some(false),
+            });
+            linearIssueTeamId = "api-team";
+            yield* runs.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.some(testIssueId),
+            });
+            yield* (yield* RunInputRepo).enqueue({
+              id: Schema.decodeUnknownSync(InputId)("denied-routing-input"),
+              sessionId: testSessionId,
+              kind: "created",
+              body: "Fix routing",
+              payload: {},
+            });
+            yield* (yield* SessionAuthority).processSession(testSessionId);
+            const run = Option.getOrThrow(yield* runs.get(testSessionId));
+            expect(run.state).toBe("canceled");
+            expect(run.terminalReason).toEqual(
+              Option.some("Linear team access was removed"),
+            );
+            expect(run.teamId).toEqual(Option.some("api-team"));
+            expect(linearIssueReads).toBe(1);
+            expect(workerSpawnInputs).toEqual([]);
+          }),
+        { withLinearGateway: true },
+      ),
+  );
+  it.live("preserves known team and project IDs when issue lookup fails", () =>
+    withAuthority(
+      () =>
+        Effect.gen(function* () {
+          const runs = yield* RunRepo;
+          yield* (yield* InstallationRepo).put(install(testOrganizationId));
+          const teamId = Schema.decodeUnknownSync(TeamId)("known-team");
+          const projectId =
+            Schema.decodeUnknownSync(ProjectId)("known-project");
+          linearIssueLookupFails = true;
+          yield* runs.create({
+            sessionId: testSessionId,
+            organizationId: testOrganizationId,
+            issueId: Option.some(testIssueId),
+            teamId: Option.some(teamId),
+            projectId: Option.some(projectId),
+          });
+          yield* (yield* RunInputRepo).enqueue({
+            id: Schema.decodeUnknownSync(InputId)("preserved-routing-input"),
+            sessionId: testSessionId,
+            kind: "created",
+            body: "Fix routing",
+            payload: {},
+          });
+          yield* (yield* SessionAuthority).processSession(testSessionId);
+          const run = Option.getOrThrow(yield* runs.get(testSessionId));
+          expect(run.teamId).toEqual(Option.some(teamId));
+          expect(run.projectId).toEqual(Option.some(projectId));
+          expect(linearIssueReads).toBe(1);
+        }),
+      { withLinearGateway: true },
+    ),
+  );
+  for (const route of [
+    "project",
+    "issue-label",
+    "project-label",
+    "team",
+    "webhook",
+    "default",
+  ] as const) {
+    it.live(`routes sparse webhooks using ${route} context`, () =>
+      withAuthority(
+        () =>
+          Effect.gen(function* () {
+            const repositories = yield* WorkspaceRepo;
+            const runs = yield* RunRepo;
+            yield* (yield* InstallationRepo).put(install(testOrganizationId));
+            linearIssueTeamId = "api-team";
+            linearIssueProjectId = "api-project";
+            linearIssueLabels = ["REPO:ONYXIO", "driver:omp"];
+            linearProjectLabels = ["PROJECT:ONYXIO"];
+            linearIssueLookupFails = route === "webhook" || route === "default";
+            const id = Schema.decodeUnknownSync(WorkspaceId)("routed-repo");
+            const fallbackId =
+              Schema.decodeUnknownSync(WorkspaceId)("default-repo");
+            for (const repoId of [id, fallbackId]) {
+              yield* repositories.createRepository({
+                id: repoId,
+                organizationId: testOrganizationId,
+                url: "https://github.com/fixture/routing.git",
+                ref: "main",
+                isDefault: repoId === fallbackId,
+                projectIds:
+                  repoId === id && (route === "project" || route === "webhook")
+                    ? [
+                        Schema.decodeUnknownSync(ProjectId)(
+                          route === "webhook"
+                            ? "webhook-project"
+                            : "api-project",
+                        ),
+                      ]
+                    : [],
+                teamIds:
+                  repoId === id && route === "team"
+                    ? [Schema.decodeUnknownSync(TeamId)("api-team")]
+                    : [],
+                labels:
+                  repoId === id
+                    ? route === "issue-label"
+                      ? ["repo:onyxio"]
+                      : route === "project-label"
+                        ? ["project:onyxio"]
+                        : []
+                    : [],
+              });
+            }
+            yield* runs.create({
+              sessionId: testSessionId,
+              organizationId: testOrganizationId,
+              issueId: Option.some(testIssueId),
+            });
+            yield* (yield* RunInputRepo).enqueue({
+              id: Schema.decodeUnknownSync(InputId)("routing-input"),
+              sessionId: testSessionId,
+              kind: "created",
+              body: "Fix routing",
+              payload:
+                route === "webhook"
+                  ? {
+                      agentSession: {
+                        issue: {
+                          teamId: "webhook-team",
+                          projectId: "webhook-project",
+                        },
+                      },
+                    }
+                  : {},
+            });
+            // Reuse a real checkout to exercise resolution without network access.
+            const cwd = join(authorityTestRoot, safeSessionKey(testSessionId));
+            yield* Effect.promise(async () => {
+              await mkdir(cwd, { recursive: true });
+              const init = Bun.spawn(["git", "init", cwd], {
+                stdout: "ignore",
+                stderr: "pipe",
+              });
+              if ((await init.exited) !== 0)
+                throw new Error(await new Response(init.stderr).text());
+              await writeFile(
+                join(cwd, ".linear-gateway-workspace.json"),
+                JSON.stringify({
+                  repositoryId: route === "default" ? fallbackId : id,
+                  url: "https://github.com/fixture/routing.git",
+                  ref: "main",
+                }),
+              );
+            });
+            yield* (yield* SessionAuthority).processSession(testSessionId);
+            const run = Option.getOrThrow(yield* runs.get(testSessionId));
+            expect(run.repositoryId).toEqual(
+              Option.some(route === "default" ? fallbackId : id),
+            );
+            expect(run.teamId).toEqual(
+              Option.fromNullishOr(
+                route === "webhook"
+                  ? "webhook-team"
+                  : route === "default"
+                    ? null
+                    : "api-team",
+              ),
+            );
+            expect(run.projectId).toEqual(
+              Option.fromNullishOr(
+                route === "webhook"
+                  ? "webhook-project"
+                  : route === "default"
+                    ? null
+                    : "api-project",
+              ),
+            );
+            expect(workerSpawnInputs).toHaveLength(1);
+            expect(linearIssueReads).toBe(1);
+          }),
+        { withLinearGateway: true },
+      ),
+    );
+  }
 });
